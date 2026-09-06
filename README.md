@@ -16,6 +16,9 @@ which exists to move originals and says so.)
 It can also just [sort a folder by quality](#sorting-a-folder-by-quality) and
 build nothing.
 
+[`cleanup.bat`](#cleanupbat-moving-undersized-images-out) ships alongside it and does
+the one thing k2prep will not: move undersized images out of the source folder.
+
 ## Install and run
 
 ```bash
@@ -56,7 +59,7 @@ k2prep.py <folder> [options]
 
 | Option | Default | Meaning |
 |---|---|---|
-| `<folder>` | required | Input folder, positional. Non-recursive. |
+| `<folder>` | required | Input folder, positional. Non-recursive; see [`-R`](#-r-a-folder-and-its-subfolders) to sweep its subfolders too. |
 | `--report` | off | Dry run. Analyse and write a report; write no images. |
 | `--threshold N` | 0 | Process only images whose composite score ≥ N. 0 processes everything that fits a tier. Range 0–10. |
 | `--png` | off | Write PNG instead of JPEG q97 4:4:4. |
@@ -93,6 +96,92 @@ exactly: outputs left by an earlier run that the current one does not place
 (because the threshold changed, or merging moved an image elsewhere) are removed
 and listed under `SUPERSEDED OUTPUTS` in the final report. The source folder is
 never touched, so anything removed is one re-run away from coming back.
+
+## `-R`: a folder and its subfolders
+
+k2prep itself is non-recursive on purpose: one folder is one dataset, with one
+`_prep` and one `dataset.toml` written next to it. If your photos are already
+split into subfolders — one per subject, per shoot, per concept — pass `-R` (or
+`-r`) to `run.bat` and it runs k2prep once for the folder, then once for each
+first-level subfolder:
+
+```bash
+run.bat -R "L:\train" --report --threshold 6
+```
+
+```
+L:\train\          ->  L:\train\_prep\
+L:\train\alice\    ->  L:\train\alice\_prep\
+L:\train\bob\      ->  L:\train\bob\_prep\
+```
+
+Every folder keeps its own `_prep`, its own reports and its own `dataset.toml`,
+because that is what the trainer wants: separate datasets, not one pile. Nothing
+below the first level is visited.
+
+Subfolders whose name starts with an underscore are skipped, which covers
+`_prep` and the `_foldername` sidecars that `cleanup.bat` makes. The `score*`
+and `quality*` folders that `--sort` produces are **not** skipped — building a
+dataset out of one triaged tier is a real thing to want.
+
+The remaining options are passed to k2prep unchanged, once per folder. The
+folder is whichever argument names a directory that exists, so it can go
+anywhere on the line and is never mistaken for an option's value. A folder that
+fails does not stop the sweep: the failures are listed at the end and the exit
+code is non-zero.
+
+`-R` is a `run.bat` feature. `python k2prep.py` on its own still takes exactly
+one folder.
+
+## `cleanup.bat`: moving undersized images out
+
+k2prep skips images too small for the 512 tier and names them in the report, but
+it never removes anything, so a folder full of thumbnails stays a folder full of
+thumbnails. `cleanup.bat` is the separate, deliberate step that takes them out
+of the way:
+
+```bash
+cleanup.bat "L:\train\alice" 1024
+```
+
+That moves every image with fewer than 1024×1024 pixels, along with its `.txt`
+caption sidecar, out of the folder and its first-level subfolders into a sidecar
+folder named after the source with a leading underscore, keeping the structure:
+
+```
+L:\train\alice\small.jpg      ->  L:\train\_alice\small.jpg
+L:\train\alice\1\small.jpg    ->  L:\train\_alice\1\small.jpg
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `<folder>` | required | Folder to clean, positional. Its first-level subfolders are cleaned too, except those starting with an underscore. |
+| `<size>` | required | Threshold, positional. `N` means `N`×`N`; `WxH` is also accepted, e.g. `1600x900`. |
+| `--dim` | off | Compare dimensions instead of area: move an image if either side is shorter than the threshold's. |
+| `--dry-run` | off | List what would move and touch nothing. |
+
+The default test is **area**, not dimensions: `1024` means fewer than 1,048,576
+pixels. A 2048×400 panorama has 819,200 and is moved; a 1200×900 frame has
+1,080,000 and stays. If you would rather reject anything with a short side under
+the threshold — which is closer to what decides whether an image can fill a
+bucket — use `--dim`, and that same panorama goes for its 400px side while
+1200×900 goes with it.
+
+Nothing is deleted and nothing is overwritten. The images are still on disk, one
+folder over, so a threshold set too aggressively is undone by moving them back.
+If a file of that name is already in the sidecar folder the pair is left where
+it is and reported, rather than renamed — a renamed image and its caption would
+stop agreeing about their own name. Unreadable files stay put and are listed.
+Run `--dry-run` first.
+
+`cleanup.bat` and `-R` skip the same folders, so the usual order needs no
+special care:
+
+```bash
+cleanup.bat "L:\train" 1024 --dry-run
+cleanup.bat "L:\train" 1024
+run.bat -R "L:\train" --report
+```
 
 ## Sorting a folder by quality
 
