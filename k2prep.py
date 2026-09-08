@@ -39,7 +39,7 @@ import numpy as np
 from PIL import Image, ImageOps
 from tqdm import tqdm
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 EPS = 1e-6
 
@@ -607,7 +607,8 @@ ST_ERROR = "error"
 @dataclass
 class Result:
     path: Path
-    name: str
+    name: str                     # relpath-qualified under --recursive
+    dataset: str = ""             # source dir relative to the root, "" = root
     status: str = ST_CANDIDATE
     error: str = ""
 
@@ -718,9 +719,9 @@ def _assign(res: Result) -> bool:
     return True
 
 
-def analyse_geometry(path: Path) -> Result:
+def analyse_geometry(path: Path, dataset: str = "") -> Result:
     """Phase A for two-pass mode: header reads only, no pixels touched."""
-    res = Result(path=path, name=path.name)
+    res = Result(path=path, name=qualified_name(dataset, path.name), dataset=dataset)
     try:
         res.src_w, res.src_h, _fmt, _qt = read_geometry(path)
         _assign(res)
@@ -819,9 +820,9 @@ def score_rendered(res: Result, resample: int) -> None:
     res.scored = True
 
 
-def analyse(path: Path) -> Result:
+def analyse(path: Path, dataset: str = "") -> Result:
     """Phase A for --single-pass: decode and score the source up front."""
-    res = Result(path=path, name=path.name)
+    res = Result(path=path, name=qualified_name(dataset, path.name), dataset=dataset)
     try:
         img, fmt, qtables = load_source(path)
 
@@ -1195,9 +1196,8 @@ def plan_merge(accepted: list["Result"]):
 # ---------------------------------------------------------------------------
 
 def scan_folder(folder: Path) -> tuple[list[Path], list[str]]:
-    """Non-recursive. Returns (image paths sorted by filename, unknown-extension
-    filenames sorted). --recursive is a Phase 2 hook: this stays one function
-    returning a list of paths."""
+    """One directory, files only. Returns (image paths sorted by filename,
+    unknown-extension filenames sorted)."""
     images: list[Path] = []
     unknown: list[str] = []
     for entry in os.scandir(folder):
@@ -1212,6 +1212,143 @@ def scan_folder(folder: Path) -> tuple[list[Path], list[str]]:
     images.sort(key=lambda p: p.name)
     unknown.sort()
     return images, unknown
+
+
+def qualified_name(dataset: str, name: str) -> str:
+    """Display / cache-key name: relpath-qualified under --recursive, bare at
+    the root - so a non-recursive run's cache entries and reports look exactly
+    as they always did."""
+    return f"{dataset}/{name}" if dataset else name
+
+
+def dataset_dir(prep_dir: Path, dataset: str) -> Path:
+    """_prep/<relpath>, mirroring the source tree; the root maps to _prep
+    itself, so a tree with no subfolders produces the flat layout unchanged."""
+    return prep_dir / dataset if dataset else prep_dir
+
+
+def tier_dir(prep_dir: Path, dataset: str, tier: int) -> Path:
+    return dataset_dir(prep_dir, dataset) / str(tier)
+
+
+def _is_link(entry: os.DirEntry) -> bool:
+    """A symlink or a Windows junction: anything that points elsewhere.
+
+    is_dir(follow_symlinks=False) is not enough - Windows reports a junction as
+    a real directory there - so ask for the reparse tag, which is non-zero for
+    every kind of reparse point. Anything that cannot be classified is treated
+    as a link, since the safe direction is not following it.
+    """
+    try:
+        if entry.is_symlink():
+            return True
+        st = entry.stat(follow_symlinks=False)
+    except OSError:
+        return True
+    return getattr(st, "st_reparse_tag", 0) != 0
+
+
+class ScanError(RuntimeError):
+    """The source tree cannot be mirrored into _prep. Raised before any work."""
+
+
+def scan_tree(root: Path, recursive: bool):
+    """The scanner. A dataset is any directory that directly contains at least
+    one image; its images are only the files directly in it, so each source
+    directory maps 1:1 to _prep/<relpath>/<tier>/ and pooling a subtree is the
+    user's call, made by flattening the source.
+
+    Returns (images, unknown, dirs, notes):
+      images  - sorted list of (dataset relpath, path)
+      unknown - relpath-qualified unknown-extension names, sorted
+      dirs    - every directory visited (relpath, root = ""), sorted; this is
+                what sweeping and TOML emission iterate, so a dataset whose
+                images all vanished still gets its stale outputs cleared
+      notes   - report lines about skipped links and unreadable directories
+
+    Directories whose name starts with "_" or "." are skipped at every depth.
+    The underscore rule is what keeps a nested _prep left by an earlier
+    per-folder run (run.bat -R) from being ingested as source - those hold
+    already-cropped renders of the same photographs. Directory links and
+    junctions are never followed: a junction cycle would loop forever and one
+    pointing outside the tree would drag foreign folders in.
+
+    A source directory named like a tier ("1024") would make _prep/<x>/1024
+    ambiguous - dataset or tier folder - and "reports" at the first level would
+    collide with _prep/reports. Both raise ScanError; rename the folder.
+    """
+    if not recursive:
+        images, unknown = scan_folder(root)
+        return [("", p) for p in images], unknown, [""], []
+
+    tier_names = {str(t) for t in TIERS}
+    out_images: list[tuple[str, Path]] = []
+    out_unknown: list[str] = []
+    dirs: list[str] = []
+    notes: list[str] = []
+    skipped = 0
+    visited: set[str] = set()
+
+    def walk(directory: Path, rel: str) -> None:
+        nonlocal skipped
+        try:
+            real = os.path.normcase(str(directory.resolve()))
+        except OSError as exc:
+            notes.append(f"cannot resolve {rel or root}: {exc}")
+            return
+        if real in visited:                      # junction/symlink cycle backstop
+            return
+        visited.add(real)
+        try:
+            entries = sorted(os.scandir(directory), key=lambda e: e.name)
+        except OSError as exc:
+            notes.append(f"cannot read {rel or root}: {exc}")
+            return
+        dirs.append(rel)
+        subdirs: list[tuple[Path, str]] = []
+        for entry in entries:
+            name = entry.name
+            relname = qualified_name(rel, name)
+            try:
+                is_dir = entry.is_dir()
+            except OSError:
+                continue
+            if is_dir:
+                if name.startswith(("_", ".")):
+                    skipped += 1
+                    continue
+                if _is_link(entry):
+                    notes.append(f"skipped {relname}: directory links and "
+                                 f"junctions are not followed")
+                    continue
+                low = name.lower()
+                if low in tier_names:
+                    raise ScanError(
+                        f"source folder {relname!r} is named like a k2prep tier "
+                        f"folder, which makes _prep/{relname} ambiguous. Rename "
+                        f"it, or run without --recursive.")
+                if rel == "" and low == REPORTS_DIRNAME:
+                    raise ScanError(
+                        f"source folder {relname!r} would collide with "
+                        f"_prep/{REPORTS_DIRNAME}. Rename it, or run without "
+                        f"--recursive.")
+                subdirs.append((Path(entry.path), relname))
+                continue
+            ext = os.path.splitext(name)[1]
+            if ext in KNOWN_EXTENSIONS:
+                out_images.append((rel, Path(entry.path)))
+            elif ext.lower() != ".txt":
+                out_unknown.append(relname)
+        for sub, relname in subdirs:
+            walk(sub, relname)
+
+    walk(root, "")
+    if skipped:
+        notes.append(f"skipped {skipped} folder(s) starting with '_' or '.'")
+    out_images.sort(key=lambda dp: (dp[0], dp[1].name))
+    out_unknown.sort()
+    dirs.sort()
+    return out_images, out_unknown, dirs, notes
 
 
 def caption_for(path: Path) -> Path | None:
@@ -1799,7 +1936,8 @@ def already_correct(path: Path, bucket: tuple[int, int]) -> bool:
         return False          # unreadable or truncated: rewrite it
 
 
-def sweep_superseded(prep_dir: Path, planned: dict[int, set[str]],
+def sweep_superseded(prep_dir: Path, datasets: list[str],
+                     planned: dict[tuple[str, int], set[str]],
                      dry_run: bool) -> list[str]:
     """Remove tier-folder files this run does not place, and report them.
 
@@ -1809,20 +1947,61 @@ def sweep_superseded(prep_dir: Path, planned: dict[int, set[str]],
     still sitting there. _prep/ is generated output and is rebuilt from the
     source on demand, so clearing it is safe; the source folder is never
     touched by this or anything else.
+
+    `datasets` is every directory the scan visited, not just those with
+    accepted images: a dataset whose images all vanished or all fell below the
+    threshold still gets its stale outputs cleared, exactly as an emptied
+    folder always has in the flat layout.
     """
     removed: list[str] = []
-    for tier in TIERS:
-        tier_dir = prep_dir / str(tier)
-        if not tier_dir.is_dir():
-            continue
-        keep = planned.get(tier, set())
-        for path in sorted(tier_dir.iterdir(), key=lambda p: p.name):
-            if not path.is_file() or path.name in keep:
+    for ds in datasets:
+        for tier in TIERS:
+            d = tier_dir(prep_dir, ds, tier)
+            if not d.is_dir():
                 continue
-            removed.append(f"{tier}/{path.name}")
-            if not dry_run:
-                path.unlink()
+            keep = planned.get((ds, tier), set())
+            for path in sorted(d.iterdir(), key=lambda p: p.name):
+                if not path.is_file() or path.name in keep:
+                    continue
+                removed.append(f"{qualified_name(ds, str(tier))}/{path.name}")
+                if not dry_run:
+                    path.unlink()
     return removed
+
+
+def find_stale_datasets(prep_dir: Path, datasets: list[str]) -> list[str]:
+    """Dataset folders under _prep whose source directory was not scanned this
+    run - a renamed or deleted source subfolder leaves its outputs behind.
+
+    Only ever reported, never deleted: removing whole trees over a rename is
+    the kind of tidiness that costs someone an afternoon. The regenerated TOML
+    does not reference them, so they cannot poison training either way.
+    """
+    known = set(datasets)
+    tier_names = {str(t) for t in TIERS}
+    stale: set[str] = set()
+
+    def walk(d: Path, rel: str) -> None:
+        try:
+            entries = sorted(os.scandir(d), key=lambda e: e.name)
+        except OSError:
+            return
+        for entry in entries:
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+            name = entry.name
+            if rel == "" and (name == REPORTS_DIRNAME
+                              or name.startswith((SORT_DIR_PREFIX,
+                                                  QUALITY_DIR_PREFIX))):
+                continue
+            if name in tier_names:               # a tier folder: don't descend
+                if rel not in known:
+                    stale.add(rel)
+                continue
+            walk(Path(entry.path), qualified_name(rel, name))
+
+    walk(prep_dir, "")
+    return sorted(stale)
 
 
 # ---------------------------------------------------------------------------
@@ -1830,25 +2009,26 @@ def sweep_superseded(prep_dir: Path, planned: dict[int, set[str]],
 # ---------------------------------------------------------------------------
 
 def resolve_names(accepted: list[Result], ext: str) -> list[str]:
-    """Assign output stems, resolve collisions per tier folder, and share a lone
-    caption across colliding stems. Returns report lines."""
-    taken: dict[int, set[str]] = defaultdict(set)
-    groups: dict[tuple[int, str], list[Result]] = defaultdict(list)
+    """Assign output stems, resolve collisions per tier folder - per dataset,
+    since two datasets never share an output folder - and share a lone caption
+    across colliding stems. Returns report lines."""
+    taken: dict[tuple[str, int], set[str]] = defaultdict(set)
+    groups: dict[tuple[str, int, str], list[Result]] = defaultdict(list)
     lines: list[str] = []
 
     for res in accepted:                          # scan order
         stem = res.path.stem
         candidate, n = stem, 1
-        while candidate in taken[res.tier]:
+        while candidate in taken[(res.dataset, res.tier)]:
             n += 1
             candidate = f"{stem}_{n}"
-        taken[res.tier].add(candidate)
+        taken[(res.dataset, res.tier)].add(candidate)
         res.out_stem = candidate
         res.out_name = candidate + ext
         res.collided = candidate != stem
-        groups[(res.tier, stem)].append(res)
+        groups[(res.dataset, res.tier, stem)].append(res)
 
-    for (_tier, stem), group in groups.items():
+    for (_dataset, _tier, stem), group in groups.items():
         if len(group) < 2:
             continue
         # Colliding stems are almost always the same photograph in two formats,
@@ -1955,6 +2135,7 @@ def build_report(args, folder: Path, results: list[Result], unknown: list[str],
     w(f"finished    : {finished:%Y-%m-%d %H:%M:%S}")
     w(f"options     : threshold={args.threshold} filter={args.filter} "
       f"format={fmt_desc} threads={args.local_threads}"
+      f"{' recursive=on' if getattr(args, 'recursive', False) else ''}"
       f"{' force=on' if args.force else ''}"
       f"{' no-merge=on' if args.no_merge else ''}")
     w(f"tiers       : {', '.join(str(t) for t in TIERS)}   "
@@ -2098,7 +2279,7 @@ def build_report(args, folder: Path, results: list[Result], unknown: list[str],
     w(f"SKIPPED - already processed  ({_fmt_int(len(already))} images)")
     w("-" * 66)
     for r in already:
-        w(f"{r.name:<{name_w}}-> {r.tier}/{r.out_name}")
+        w(f"{r.name:<{name_w}}-> {qualified_name(r.dataset, str(r.tier))}/{r.out_name}")
     w("")
 
     # -- collisions ----------------------------------------------------------
@@ -2169,41 +2350,52 @@ def build_report(args, folder: Path, results: list[Result], unknown: list[str],
     w("")
 
     show_before = stage == STAGE_FINAL and not args.no_merge and bool(moves)
-    before_counts: dict[tuple[int, tuple[int, int]], int] = defaultdict(int)
-    for m in (moves or []):
-        before_counts[(m.from_tier, m.from_bucket)] += 1
-    for r in processed:
-        if not r.merged:
-            before_counts[(r.tier, r.bucket)] += 1
+    # Per dataset: each _prep/<dataset>/<tier> is its own [[datasets]] block,
+    # and musubi forms batches within a dataset only - a bucket that is healthy
+    # summed across datasets can still be undersized in every one of them.
+    label_datasets = getattr(args, "recursive", False)
+    ds_list = sorted({r.dataset for r in processed}
+                     | {m.res.dataset for m in (moves or [])})
 
     w("BUCKET DISTRIBUTION" + ("   (was -> now, across the merge)" if show_before else ""))
-    for tier in TIERS:
-        rows = [r for r in processed if r.tier == tier]
-        pre = {b: n for (t, b), n in before_counts.items() if t == tier and n > 0}
-        if not rows and not pre:
-            continue
-        w(f"  tier {tier}")
-        counts: dict[tuple[int, int], int] = defaultdict(int)
-        for r in rows:
-            counts[r.bucket] += 1
-        for bucket in sorted(set(counts) | set(pre),
-                             key=lambda b: (-counts.get(b, 0), b)):
-            n = counts.get(b := bucket, 0)
-            label = f"{bucket[0]}x{bucket[1]}"
-            warns = []
-            if 0 < n < MIN_BUCKET_SIZE:
-                warns.append(f"fewer than {MIN_BUCKET_SIZE} images")
-            if n % 2 == 1:
-                warns.append("odd count, trailing batch of 1")
-            note = f"   *** WARNING: {'; '.join(warns)}" if warns else ""
-            if show_before:
-                was = pre.get(bucket, 0)
-                cell = f"{_fmt_int(was):>6} ->{_fmt_int(n):>6}"
-                if n == 0:
-                    note = "   (dissolved)"
-            else:
-                cell = f"{_fmt_int(n):>8}"
-            w(f"    {label:>11} {family_of_bucket(tier, bucket):<6} {cell}{note}")
+    for ds in ds_list:
+        if label_datasets:
+            w(f"  dataset {ds or '(root)'}")
+        ds_processed = [r for r in processed if r.dataset == ds]
+        before_counts: dict[tuple[int, tuple[int, int]], int] = defaultdict(int)
+        for m in (moves or []):
+            if m.res.dataset == ds:
+                before_counts[(m.from_tier, m.from_bucket)] += 1
+        for r in ds_processed:
+            if not r.merged:
+                before_counts[(r.tier, r.bucket)] += 1
+        for tier in TIERS:
+            rows = [r for r in ds_processed if r.tier == tier]
+            pre = {b: n for (t, b), n in before_counts.items() if t == tier and n > 0}
+            if not rows and not pre:
+                continue
+            w(f"  tier {tier}")
+            counts: dict[tuple[int, int], int] = defaultdict(int)
+            for r in rows:
+                counts[r.bucket] += 1
+            for bucket in sorted(set(counts) | set(pre),
+                                 key=lambda b: (-counts.get(b, 0), b)):
+                n = counts.get(b := bucket, 0)
+                label = f"{bucket[0]}x{bucket[1]}"
+                warns = []
+                if 0 < n < MIN_BUCKET_SIZE:
+                    warns.append(f"fewer than {MIN_BUCKET_SIZE} images")
+                if n % 2 == 1:
+                    warns.append("odd count, trailing batch of 1")
+                note = f"   *** WARNING: {'; '.join(warns)}" if warns else ""
+                if show_before:
+                    was = pre.get(bucket, 0)
+                    cell = f"{_fmt_int(was):>6} ->{_fmt_int(n):>6}"
+                    if n == 0:
+                        note = "   (dissolved)"
+                else:
+                    cell = f"{_fmt_int(n):>8}"
+                w(f"    {label:>11} {family_of_bucket(tier, bucket):<6} {cell}{note}")
     if not processed:
         w("  (none)")
     w("")
@@ -2501,27 +2693,36 @@ caption_extension = ".txt"
 """
 
 
-def emit_toml(prep_dir: Path, stamp: datetime) -> Path | None:
+def emit_toml(prep_dir: Path, stamp: datetime,
+              datasets: list[str] = [""]) -> Path | None:
+    """One [[datasets]] block per populated <dataset>/<tier> leaf. Only the
+    datasets this run scanned are emitted, so outputs orphaned by a renamed
+    source folder never leak into training."""
     blocks = []
-    for tier in TIERS:
-        tier_dir = prep_dir / str(tier)
-        if not tier_dir.is_dir():
-            continue
-        if not any(p.suffix.lower() in KNOWN_EXTENSIONS or p.suffix in KNOWN_EXTENSIONS
-                   for p in tier_dir.iterdir() if p.is_file()):
-            continue
-        # Forward slashes: TOML and Windows backslashes interact badly.
-        directory = str(tier_dir.resolve()).replace("\\", "/")
-        blocks.append(
-            "\n[[datasets]]\n"
-            f'image_directory = "{directory}"\n'
-            f'cache_directory = "{directory}/{CACHE_DIRNAME}"\n'
-            f"resolution = [{tier}, {tier}]\n"
-            "enable_bucket = true\n"
-            "bucket_no_upscale = false\n"
-            f"batch_size = {BATCH_SIZE_BY_TIER[tier]}\n"
-            "num_repeats = 1\n"
-        )
+    for ds in datasets:
+        ds_blocks = []
+        for tier in TIERS:
+            d = tier_dir(prep_dir, ds, tier)
+            if not d.is_dir():
+                continue
+            if not any(p.suffix.lower() in KNOWN_EXTENSIONS or p.suffix in KNOWN_EXTENSIONS
+                       for p in d.iterdir() if p.is_file()):
+                continue
+            # Forward slashes: TOML and Windows backslashes interact badly.
+            directory = str(d.resolve()).replace("\\", "/")
+            ds_blocks.append(
+                "\n[[datasets]]\n"
+                f'image_directory = "{directory}"\n'
+                f'cache_directory = "{directory}/{CACHE_DIRNAME}"\n'
+                f"resolution = [{tier}, {tier}]\n"
+                "enable_bucket = true\n"
+                "bucket_no_upscale = false\n"
+                f"batch_size = {BATCH_SIZE_BY_TIER[tier]}\n"
+                "num_repeats = 1\n"
+            )
+        if ds and ds_blocks:
+            ds_blocks[0] = f"\n# --- {ds} ---" + ds_blocks[0]
+        blocks.extend(ds_blocks)
     if not blocks:
         return None
 
@@ -2598,9 +2799,19 @@ def parse_args(argv=None):
         description="Crop and resize a folder of photographs onto musubi-tuner's "
                     "exact bucket dimensions for Krea 2 LoRA training.",
     )
-    p.add_argument("folder", help="Input folder. Non-recursive. Never modified.")
+    p.add_argument("folder", help="Input folder. Never modified. One dataset, "
+                                  "unless --recursive.")
     p.add_argument("--report", action="store_true",
                    help="Dry run: analyse and write a report, write no images.")
+    p.add_argument("--recursive", action="store_true",
+                   help="Treat every subfolder that directly contains images "
+                        "as its own dataset, sharing one _prep, one set of "
+                        "reports and one dataset.toml: each dataset's output "
+                        "goes to _prep/<subfolder>/<tier>/ and becomes its own "
+                        "[[datasets]] block. Folders starting with '_' or '.' "
+                        "are skipped at every depth; links and junctions are "
+                        "never followed. (run.bat -R is the other thing: one "
+                        "independent run, and one _prep, per subfolder.)")
     p.add_argument("--threshold", type=_threshold_arg, default=0, metavar="N",
                    help="Process only images whose composite score >= N (0..10). "
                         "Default 0.")
@@ -2654,6 +2865,12 @@ def parse_args(argv=None):
                         f"and all.")
     p.add_argument("--version", action="version", version=f"k2prep {__version__}")
     args = p.parse_args(argv)
+    if args.recursive and args.sort is not None:
+        p.error("--sort cannot be combined with --recursive: sorting triages "
+                "one folder into quality folders under its own _prep, and what "
+                "that should mean across a tree of datasets is not decided. "
+                "Run --sort on one folder at a time, or run.bat -R to sweep "
+                "each subfolder separately.")
     if args.move and args.sort is None:
         p.error("--move is only available with --sort; on its own it would have "
                 "nothing to move and would still delete your originals")
@@ -2908,10 +3125,20 @@ def main(argv=None) -> int:
     started = datetime.now()
     t0 = time.perf_counter()
 
-    images, unknown = scan_folder(folder)
-    if not images:
+    try:
+        pairs, unknown, seen_dirs, scan_notes = scan_tree(folder, args.recursive)
+    except ScanError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if not pairs:
         print(f"No images found in {folder} "
               f"({len(unknown)} files with unknown extensions).")
+    if args.recursive:
+        n_datasets = len({ds for ds, _p in pairs})
+        scan_notes.append(f"--recursive: {n_datasets} dataset(s) with images "
+                          f"across {len(seen_dirs)} folder(s) scanned.")
+    for note in scan_notes:
+        print(f"note: {note}")
 
     prep_dir = folder / PREP_DIRNAME
     reports_dir = prep_dir / REPORTS_DIRNAME
@@ -2919,23 +3146,23 @@ def main(argv=None) -> int:
     resample = RESAMPLE_FILTERS[args.filter]
 
     if args.sort is not None:
-        return run_sort(args, folder, prep_dir, reports_dir, images, unknown,
-                        resample, started, t0)
+        return run_sort(args, folder, prep_dir, reports_dir,
+                        [p for _ds, p in pairs], unknown, resample, started, t0)
 
     # -- phase A: geometry (and, in single-pass mode, source scores) ---------
     # Two-pass mode reads headers only here: nothing is decoded until there is
     # a bucket to render into.
     worker = analyse if args.single_pass else analyse_geometry
     results: list[Result] = []
-    if images:
+    if pairs:
         with ThreadPoolExecutor(max_workers=args.local_threads) as pool:
-            futures = [pool.submit(worker, p) for p in images]
+            futures = [pool.submit(worker, p, ds) for ds, p in pairs]
             for fut in tqdm(as_completed(futures), total=len(futures),
                             desc="analysing" if args.single_pass else "scanning ",
                             unit="img"):
                 results.append(fut.result())
-    # Report ordering is by filename, not completion order.
-    results.sort(key=lambda r: r.name)
+    # Report ordering is by dataset then filename, not completion order.
+    results.sort(key=lambda r: (r.dataset, r.name))
     for r in results:
         if r.status == ST_CANDIDATE:
             r.caption_src = caption_for(r.path)
@@ -2953,7 +3180,7 @@ def main(argv=None) -> int:
     prelim_path = _free_path(reports_dir, f"{kind}-{stamp}-preliminary", ".txt")
     prelim_path.write_text(
         build_report(args, folder, results, unknown, [], started, datetime.now(),
-                     time.perf_counter() - t0, [], STAGE_PRELIMINARY),
+                     time.perf_counter() - t0, list(scan_notes), STAGE_PRELIMINARY),
         encoding="utf-8",
     )
 
@@ -2989,10 +3216,17 @@ def main(argv=None) -> int:
     accepted = [r for r in results if r.status == ST_ACCEPTED]
 
     # -- merge: consolidate undersized buckets before writing anything -------
+    # Per dataset, never across: each _prep/<dataset>/<tier> is its own
+    # [[datasets]] block and musubi forms batches within a dataset only, so a
+    # bucket in one dataset can never pad out an undersized one in another.
     moves: list[Move] = []
     unmerged: list[tuple[Result, str]] = []
     if not args.no_merge and accepted:
-        moves, unmerged, _before, _after = plan_merge(accepted)
+        for ds in sorted({r.dataset for r in accepted}):
+            m, u, _before, _after = plan_merge(
+                [r for r in accepted if r.dataset == ds])
+            moves.extend(m)
+            unmerged.extend(u)
 
     # Names are resolved after merging, because collisions are per tier folder
     # and merging can move an image into a different tier.
@@ -3003,27 +3237,29 @@ def main(argv=None) -> int:
         r.caption_borrowed = False
     collisions = resolve_names(accepted, ext)
 
-    planned: dict[int, set[str]] = defaultdict(set)
+    planned: dict[tuple[str, int], set[str]] = defaultdict(set)
     for r in accepted:
-        planned[r.tier].add(r.out_name)
+        planned[(r.dataset, r.tier)].add(r.out_name)
         if r.caption_src is not None:
-            planned[r.tier].add(f"{r.out_stem}.txt")
+            planned[(r.dataset, r.tier)].add(f"{r.out_stem}.txt")
 
     if not args.force:
         for r in accepted:
-            if already_correct(prep_dir / str(r.tier) / r.out_name, r.bucket):
+            if already_correct(tier_dir(prep_dir, r.dataset, r.tier) / r.out_name,
+                               r.bucket):
                 r.status = ST_ALREADY
 
-    removed = sweep_superseded(prep_dir, planned, dry_run=args.report)
+    removed = sweep_superseded(prep_dir, seen_dirs, planned, dry_run=args.report)
     to_write = [r for r in results if r.status == ST_ACCEPTED]
 
     # -- phase C: parallel write ---------------------------------------------
     if not args.report and to_write:
-        for tier in sorted({r.tier for r in to_write}):
-            (prep_dir / str(tier)).mkdir(parents=True, exist_ok=True)
+        for ds, tier in sorted({(r.dataset, r.tier) for r in to_write}):
+            tier_dir(prep_dir, ds, tier).mkdir(parents=True, exist_ok=True)
         with ThreadPoolExecutor(max_workers=args.local_threads) as pool:
             futures = {
-                pool.submit(write_output, r, prep_dir / str(r.tier), resample, ext): r
+                pool.submit(write_output, r,
+                            tier_dir(prep_dir, r.dataset, r.tier), resample, ext): r
                 for r in to_write
             }
             for fut in tqdm(as_completed(futures), total=len(futures),
@@ -3038,7 +3274,13 @@ def main(argv=None) -> int:
     elapsed = time.perf_counter() - t0
     finished = datetime.now()
 
-    notes: list[str] = []
+    notes: list[str] = list(scan_notes)
+    if args.recursive:
+        for ds in find_stale_datasets(prep_dir, seen_dirs):
+            notes.append(f"stale output folder {PREP_DIRNAME}/{ds} has no "
+                         f"matching source folder this run; left alone, and "
+                         f"not referenced by the TOML. Delete it by hand if "
+                         f"it is unwanted.")
     if not args.single_pass and candidates:
         # Written in dry runs too: it costs nothing and makes the recommended
         # "--report first, then run for real" workflow skip a second rendering
@@ -3054,13 +3296,13 @@ def main(argv=None) -> int:
         notes.append(f"{TOML_FILENAME} not written: a dry run creates no tier "
                      "folders for it to point at.")
     else:
-        toml_path = emit_toml(prep_dir, finished)
+        toml_path = emit_toml(prep_dir, finished, seen_dirs)
         if toml_path is None:
             notes.append(f"{TOML_FILENAME} not written, no tier folder has images.")
         elif toml_path.name != TOML_FILENAME:
             notes.append(f"{TOML_FILENAME} exists and was not written by k2prep, "
                          f"so it was left alone and {toml_path.name} written instead.")
-    for note in notes:
+    for note in notes[len(scan_notes):]:      # scan notes were printed up front
         print(f"note: {note}")
 
     # -- final report ---------------------------------------------------------
@@ -3080,13 +3322,19 @@ def main(argv=None) -> int:
     for r in results:
         if r.status in (ST_ACCEPTED, ST_ALREADY):
             by_tier[r.tier] += 1
-    undersized = sum(1 for n in bucket_counts(
-        [r for r in results if r.status in (ST_ACCEPTED, ST_ALREADY)]).values()
-        if 0 < n < MIN_BUCKET_SIZE)
+    # Undersized is judged per dataset: buckets never pool across datasets.
+    per_ds_bucket: dict[tuple[str, int, tuple[int, int]], int] = defaultdict(int)
+    for r in results:
+        if r.status in (ST_ACCEPTED, ST_ALREADY):
+            per_ds_bucket[(r.dataset, r.tier, r.bucket)] += 1
+    undersized = sum(1 for n in per_ds_bucket.values()
+                     if 0 < n < MIN_BUCKET_SIZE)
 
     print()
     print(f"k2prep {'scan' if args.report else 'run'}: {len(results)} images "
           f"in {_hms(elapsed)}")
+    if args.recursive:
+        print(f"  datasets    {len({r.dataset for r in results}):>7}")
     for tier in TIERS:
         if by_tier[tier]:
             print(f"  tier {tier:<5} {by_tier[tier]:>7}")

@@ -6,11 +6,14 @@ rem
 rem      run.bat <folder> [options]
 rem      run.bat -R <folder> [options]
 rem
-rem  k2prep itself is non-recursive by design: one folder is one dataset, with
-rem  one _prep and one set of reports written next to it. -R (or -r) does not
-rem  change that. It runs k2prep once for <folder>, then once more for each
-rem  first-level subfolder, so every folder still gets its own _prep and its own
-rem  reports. Nothing below the first level is visited.
+rem  -R runs k2prep once for <folder>, then once more for each first-level
+rem  subfolder, so every folder gets its OWN _prep, reports and dataset.toml -
+rem  independent datasets, trained separately. Nothing below the first level is
+rem  visited. This is not k2prep's --recursive, which is one run over the whole
+rem  tree producing ONE shared _prep and ONE dataset.toml with a [[datasets]]
+rem  block per subfolder - several concepts trained together. Pick one; passing
+rem  --recursive together with -R runs the tree mode once per subfolder, which
+rem  is rarely what anyone means.
 rem
 rem  Subfolders whose name starts with an underscore are skipped: that is
 rem  k2prep's own _prep output and cleanup.bat's _foldername sidecars. The

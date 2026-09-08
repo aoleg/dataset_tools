@@ -558,6 +558,166 @@ def test_too_few_images_cannot_be_rescued():
     assert len(unmerged) == 5
 
 
+# ---------------------------------------------------------------------------
+# --recursive
+# ---------------------------------------------------------------------------
+
+def test_recursive_refuses_sort():
+    import contextlib, io
+    for argv in (["f", "--recursive", "--sort"],
+                 ["f", "--sort", "3", "--recursive"]):
+        with contextlib.redirect_stderr(io.StringIO()):
+            try:
+                k.parse_args(argv)
+            except SystemExit as exc:
+                assert exc.code != 0
+            else:
+                raise AssertionError("--sort was accepted with --recursive")
+    assert k.parse_args(["f", "--recursive"]).recursive is True
+
+
+def test_qualified_name_and_tier_dir():
+    from pathlib import Path
+    assert k.qualified_name("", "a.jpg") == "a.jpg"
+    assert k.qualified_name("x/y", "a.jpg") == "x/y/a.jpg"
+    prep = Path("root") / k.PREP_DIRNAME
+    assert k.tier_dir(prep, "", 1024) == prep / "1024"
+    assert k.tier_dir(prep, "x/y", 512) == prep / "x" / "y" / "512"
+
+
+def _touch(path, data=b"x"):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+
+
+def test_scan_tree_skips_underscore_dot_and_qualifies():
+    import tempfile
+    from pathlib import Path
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        _touch(root / "rootimg.jpg")
+        _touch(root / "a" / "x.jpg")
+        _touch(root / "a" / "x.txt")
+        _touch(root / "a" / "deep" / "y.png")
+        _touch(root / "a" / "deep" / "odd.tiff")
+        _touch(root / "_prep" / "1024" / "old.jpg")   # own output: never source
+        _touch(root / "_side" / "z.jpg")
+        _touch(root / ".hidden" / "h.jpg")
+        (root / "b").mkdir()                          # no images: visited, empty
+        pairs, unknown, dirs, _notes = k.scan_tree(root, recursive=True)
+        assert [(ds, p.name) for ds, p in pairs] == [
+            ("", "rootimg.jpg"), ("a", "x.jpg"), ("a/deep", "y.png")]
+        assert unknown == ["a/deep/odd.tiff"]
+        assert dirs == ["", "a", "a/deep", "b"]
+        # non-recursive: the root only, exactly the old behaviour
+        pairs, unknown, dirs, notes = k.scan_tree(root, recursive=False)
+        assert [(ds, p.name) for ds, p in pairs] == [("", "rootimg.jpg")]
+        assert (dirs, notes) == ([""], [])
+
+
+def test_scan_tree_refuses_reserved_names():
+    import tempfile
+    from pathlib import Path
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        _touch(root / "a" / "1024" / "x.jpg")         # tier name, any depth
+        try:
+            k.scan_tree(root, recursive=True)
+        except k.ScanError:
+            pass
+        else:
+            raise AssertionError("tier-named source folder was accepted")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        _touch(root / "reports" / "x.jpg")            # first level only
+        try:
+            k.scan_tree(root, recursive=True)
+        except k.ScanError:
+            pass
+        else:
+            raise AssertionError("first-level 'reports' folder was accepted")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        _touch(root / "a" / "reports" / "x.jpg")      # deeper is fine
+        pairs, _u, _d, _n = k.scan_tree(root, recursive=True)
+        assert [(ds, p.name) for ds, p in pairs] == [("a/reports", "x.jpg")]
+
+
+def test_collisions_are_scoped_per_dataset():
+    from pathlib import Path
+    def named(dataset, filename):
+        res = k.Result(path=Path(filename), name=k.qualified_name(dataset, filename),
+                       dataset=dataset)
+        res.tier = 1024
+        return res
+    across = [named("a", "photo.jpg"), named("b", "photo.jpg")]
+    assert k.resolve_names(across, ".jpg") == []
+    assert [r.out_stem for r in across] == ["photo", "photo"]
+    within = [named("a", "photo.jpg"), named("a", "photo.png")]
+    lines = k.resolve_names(within, ".jpg")
+    assert [r.out_stem for r in within] == ["photo", "photo_2"]
+    assert len(lines) == 1
+
+
+def _write_image(path, w, h, color=(120, 90, 60)):
+    from PIL import Image
+    path.parent.mkdir(parents=True, exist_ok=True)
+    img = Image.new("RGB", (w, h), color)
+    img.save(path, "JPEG", quality=95)
+
+
+def test_recursive_end_to_end():
+    """Two datasets plus root images -> one _prep mirroring the tree, one TOML
+    with a [[datasets]] block per populated leaf, and a clean second run."""
+    import contextlib, io, tempfile, tomllib
+    from pathlib import Path
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        _write_image(root / "rootimg.jpg", 1200, 1200)
+        _write_image(root / "a" / "x.jpg", 1200, 1200)
+        (root / "a" / "x.txt").write_text("a caption", encoding="utf-8")
+        _write_image(root / "a" / "deep" / "y.jpg", 640, 480)
+        _write_image(root / "_side" / "z.jpg", 1200, 1200)   # must be ignored
+        argv = [str(root), "--recursive", "--threads", "1"]
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert k.main(argv) == 0
+        prep = root / k.PREP_DIRNAME
+        assert (prep / "1024" / "rootimg.jpg").is_file()
+        assert (prep / "a" / "1024" / "x.jpg").is_file()
+        assert (prep / "a" / "1024" / "x.txt").read_text(encoding="utf-8") == "a caption"
+        assert (prep / "a" / "deep" / "512" / "y.jpg").is_file()
+        assert not list(prep.rglob("z.jpg"))
+        with open(prep / k.TOML_FILENAME, "rb") as fh:
+            doc = tomllib.load(fh)
+        listed = [d["image_directory"] for d in doc["datasets"]]
+        assert len(listed) == 3
+        for d in listed:
+            p = Path(d)
+            assert p.is_dir() and any(p.iterdir()), d
+        # outputs land on real buckets, and the second run rewrites nothing
+        from PIL import Image
+        for out in prep.rglob("*.jpg"):
+            tier = int(out.parent.name)
+            with Image.open(out) as img:
+                assert img.size in k.generate_buckets(tier), out
+        stamps = {p: p.stat().st_mtime_ns for p in prep.rglob("*.jpg")}
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert k.main(argv) == 0
+        assert {p: p.stat().st_mtime_ns for p in prep.rglob("*.jpg")} == stamps
+
+
+def test_recursive_refuses_tier_named_folder_end_to_end():
+    import contextlib, io, tempfile
+    from pathlib import Path
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        _write_image(root / "768" / "x.jpg", 1200, 1200)
+        with contextlib.redirect_stdout(io.StringIO()), \
+             contextlib.redirect_stderr(io.StringIO()):
+            assert k.main([str(root), "--recursive", "--threads", "1"]) == 2
+        assert not (root / k.PREP_DIRNAME).exists()
+
+
 def main():
     tests = [v for name, v in sorted(globals().items()) if name.startswith("test_")]
     failed = 0

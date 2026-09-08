@@ -59,8 +59,9 @@ k2prep.py <folder> [options]
 
 | Option | Default | Meaning |
 |---|---|---|
-| `<folder>` | required | Input folder, positional. Non-recursive; see [`-R`](#-r-a-folder-and-its-subfolders) to sweep its subfolders too. |
+| `<folder>` | required | Input folder, positional. One dataset, unless `--recursive`. |
 | `--report` | off | Dry run. Analyse and write a report; write no images. |
+| `--recursive` | off | Every subfolder that directly contains images is its own dataset, sharing one `_prep` and one `dataset.toml`. See [below](#--recursive-several-datasets-one-_prep). |
 | `--threshold N` | 0 | Process only images whose composite score ≥ N. 0 processes everything that fits a tier. Range 0–10. |
 | `--png` | off | Write PNG instead of JPEG q97 4:4:4. |
 | `--filter NAME` | `lanczos` | `lanczos`, `box`, `bicubic`, `bilinear`. |
@@ -79,7 +80,8 @@ Use `--filter box` for heavily compressed sources. Box averaging suppresses 8×8
 block artifacts more cleanly than Lanczos, which can ring on them.
 
 Output goes to `<folder>/_prep/{1024,768,512}/`, flat, with `.txt` caption
-sidecars copied alongside, plus `_prep/dataset.toml`. Every run writes two
+sidecars copied alongside, plus `_prep/dataset.toml` (under `--recursive`, each
+dataset gets its tier folders at `_prep/<subfolder>/<tier>/` instead). Every run writes two
 timestamped reports to `<folder>/_prep/reports/`:
 
 - `*-preliminary.txt` — the natural, per-family bucket assignment, before any
@@ -97,13 +99,71 @@ exactly: outputs left by an earlier run that the current one does not place
 and listed under `SUPERSEDED OUTPUTS` in the final report. The source folder is
 never touched, so anything removed is one re-run away from coming back.
 
-## `-R`: a folder and its subfolders
+## `--recursive`: several datasets, one `_prep`
 
-k2prep itself is non-recursive on purpose: one folder is one dataset, with one
-`_prep` and one `dataset.toml` written next to it. If your photos are already
-split into subfolders — one per subject, per shoot, per concept — pass `-R` (or
-`-r`) to `run.bat` and it runs k2prep once for the folder, then once for each
-first-level subfolder:
+If your photos are split into subfolders — one per subject, per shoot, per
+concept — and you want to train them **together** in one run, pass
+`--recursive`. Every directory that directly contains at least one image
+becomes its own dataset, and the whole tree shares one `_prep`, one set of
+reports and one `dataset.toml`:
+
+```bash
+run.bat "L:\train" --recursive --report
+```
+
+```
+L:\train\photo.jpg          ->  L:\train\_prep\1024\
+L:\train\alice\...          ->  L:\train\_prep\alice\{1024,768,512}\
+L:\train\bob\indoor\...     ->  L:\train\_prep\bob\indoor\{1024,768,512}\
+```
+
+The output mirrors the source tree, so a tree with no subfolders produces
+exactly the flat layout — `--recursive` on a plain folder changes nothing. A
+dataset's images are only the files **directly** in it: `bob\` and
+`bob\indoor\` are separate datasets and separate `[[datasets]]` blocks, and
+whether they *should* be one dataset is a balancing decision k2prep will not
+guess. If you want a subtree pooled, flatten it in the source.
+
+Everything that is per-dataset stays per-dataset:
+
+- **Bucket merging** never moves an image between datasets. musubi forms
+  batches within a `[[datasets]]` block only, so a bucket that looks healthy
+  summed across datasets can still be undersized in every one of them — the
+  report's bucket distribution and its warnings are therefore printed per
+  dataset.
+- **Filename collisions** are resolved per dataset per tier; `alice\photo.jpg`
+  and `bob\photo.jpg` keep their names.
+- **Idempotency and superseded-output sweeping** work per dataset, so a re-run
+  after a threshold change behaves exactly as in the flat layout, in every
+  dataset at once.
+
+What the scan skips, at every depth: folders starting with `_` (which covers
+`_prep` — including one left inside a subfolder by an earlier `run.bat -R`
+run — and `cleanup.bat`'s `_foldername` sidecars) and folders starting with
+`.`. Directory symlinks and junctions are never followed: a junction cycle
+would loop forever, and one pointing outside the tree would drag foreign
+folders in. An unreadable folder is reported and the scan continues.
+
+Two names are refused with a clear error rather than mirrored: a source folder
+named like a tier (`1024`, `768`, `512`) anywhere in the tree — it would make
+`_prep\x\1024` ambiguous — and a first-level folder named `reports`, which
+would collide with `_prep\reports`. Rename them.
+
+If a source subfolder is renamed or deleted, its old outputs under `_prep` are
+reported as stale and **left alone** — the regenerated TOML simply no longer
+references them, so they cannot leak into training. Note that `dataset.toml`
+always describes the *last* run: a later non-recursive run on the same root
+rewrites it for the root dataset only (the subfolder outputs themselves are
+untouched, and one `--recursive` re-run restores the full TOML).
+
+`--sort` is refused together with `--recursive`; triage one folder at a time.
+
+## `-R`: independent runs per subfolder
+
+`run.bat -R` is the other tool for a folder of subfolders, and the opposite
+trade: it runs k2prep once for the folder, then once for each first-level
+subfolder, so every folder keeps its **own** `_prep`, its own reports and its
+own `dataset.toml` — independent datasets, trained separately:
 
 ```bash
 run.bat -R "L:\train" --report --threshold 6
@@ -115,9 +175,8 @@ L:\train\alice\    ->  L:\train\alice\_prep\
 L:\train\bob\      ->  L:\train\bob\_prep\
 ```
 
-Every folder keeps its own `_prep`, its own reports and its own `dataset.toml`,
-because that is what the trainer wants: separate datasets, not one pile. Nothing
-below the first level is visited.
+Train them together: `--recursive`. Train them separately: `-R`. Nothing below
+the first level is visited by `-R`.
 
 Subfolders whose name starts with an underscore are skipped, which covers
 `_prep` and the `_foldername` sidecars that `cleanup.bat` makes. The `score*`
@@ -130,8 +189,8 @@ anywhere on the line and is never mistaken for an option's value. A folder that
 fails does not stop the sweep: the failures are listed at the end and the exit
 code is non-zero.
 
-`-R` is a `run.bat` feature. `python k2prep.py` on its own still takes exactly
-one folder.
+`-R` is a `run.bat` feature; combining it with `--recursive` would run the tree
+mode once per subfolder, which is rarely what anyone means.
 
 ## `cleanup.bat`: moving undersized images out
 
