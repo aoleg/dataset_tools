@@ -4,22 +4,30 @@
 
 ## Install
 
-It needs Python 3.10 or newer. The Bing and DuckDuckGo backends also need one package:
+It needs Python 3.10 or newer. On Windows, run `install.bat`. It creates a `venv` folder next to the script and installs `requirements.txt` into it. Running it again updates the packages.
+
+Without `install.bat`, install the one package yourself:
 
 ```
 pip install ddgs
 ```
 
-The SearXNG backend needs no package, but the instance must allow JSON output. See [SearXNG](#searxng).
+Only the Bing and DuckDuckGo backends need `ddgs`. The SearXNG backend needs no package, but the instance must allow JSON output. See [SearXNG](#searxng).
 
 ## Usage
 
+On Windows, use `run.bat`. It runs the script with the venv Python and passes all arguments to it unchanged. Relative paths, for `-f` and `-o`, are relative to the current folder.
+
 ```
-python ddg_images.py "query one" "query two" -o posters
-python ddg_images.py -f queries.txt -o posters --pages 30
-python ddg_images.py "historic poster" --backend searxng
-python ddg_images.py "historic poster" --backend searxng --engines "bing images,flickr,wikicommons.images"
+run.bat "query one" "query two" -o posters
+run.bat -f queries.txt -o posters --pages 30
+run.bat "historic poster" --backend searxng
+run.bat "historic poster" --backend searxng --engines "bing images,flickr,wikicommons.images"
 ```
+
+Elsewhere, or with the package installed yourself, use `python ddg_images.py` with the same arguments.
+
+`run.bat` pauses at the end when it is started by double-click, or when the script fails. PowerShell starts a `.bat` file in the same way as Explorer, so it also pauses there. Set `NOPAUSE=1` to prevent this.
 
 Give the queries on the command line, in a text file with one query per line (`-f`), or both. The file can be UTF-8 or the Windows Cyrillic code page (cp1251) that Notepad writes as "ANSI".
 
