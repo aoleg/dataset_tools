@@ -52,6 +52,7 @@ def search(queries, pages, region, delay, backend):
     """Yield unique result dicts across all queries and pages."""
     seen = set()
     ddgs = DDGS(timeout=20)
+    any_results = False
     for q in queries:
         seen_q = set()  # URLs seen for this query; detects the end of its results
         for page in range(1, pages + 1):
@@ -73,6 +74,7 @@ def search(queries, pages, region, delay, backend):
                 break
 
             urls = {r["image"] for r in batch if r.get("image")}
+            any_results = any_results or bool(urls)
             fresh_q = urls - seen_q
             seen_q |= urls
             new = [r for r in batch if r.get("image") and r["image"] not in seen]
@@ -83,6 +85,13 @@ def search(queries, pages, region, delay, backend):
             if not fresh_q:  # the engine keeps returning the same page: end of results
                 break
             time.sleep(delay + random.uniform(0, delay))
+
+    if not any_results and backend == "duckduckgo":
+        # ddgs reports an HTTP 403 from i.js as "No results found", so a blocked
+        # engine looks the same as an empty search.
+        print("\nWARNING: DuckDuckGo returned no images for any query. This usually means it\n"
+              "rejected the requests: as of October 2026 its image API needs tokens that\n"
+              "only its own page script computes, and ddgs does not send them. Use --backend bing.")
 
 
 def download(row, outdir):

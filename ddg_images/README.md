@@ -24,7 +24,7 @@ Give the queries on the command line, in a text file with one query per line (`-
 |---|---|---|
 | `-f`, `--file` | none | text file with one query per line; empty lines are ignored |
 | `-o`, `--out` | `images` | output folder; it is created if it does not exist |
-| `--backend` | `bing` | `bing` (about 35 images per page) or `duckduckgo` (about 100 per page) |
+| `--backend` | `bing` | `bing` (about 35 images per page) or `duckduckgo` (about 100 per page, but see [DuckDuckGo returns nothing](#duckduckgo-returns-nothing)) |
 | `--pages` | 30 | maximum number of result pages per query |
 | `--region` | `ru-ru` | search region, for example `us-en` or `de-de`; only DuckDuckGo uses it, Bing ignores it |
 | `--delay` | 3 | seconds between page requests; the real wait is a random value between this and twice this |
@@ -65,3 +65,9 @@ At the end the script prints a count for each status.
 - Search engines limit automated requests. If you get many errors, increase `--delay`.
 - The script removes the `Connection: keep-alive` header from the ddgs DuckDuckGo engine. Some ddgs versions send it, HTTP/2 does not allow it, and every DuckDuckGo request then fails with "malformed headers". Tested with ddgs 9.16.0.
 - The downloaded images belong to their owners. Check the license before you use them.
+
+## DuckDuckGo returns nothing
+
+As of October 2026, `--backend duckduckgo` finds no images: every query shows `0 results` on page 1. The script then prints a warning. Use the Bing backend.
+
+The cause is on the DuckDuckGo side. Its image API (`duckduckgo.com/i.js`) now expects extra parameters (`jsa`, `jsa_hash`, `dp`, `j_id`) that the script of its own search page computes in the browser. ddgs 9.16.0, the newest version at that time, does not send them. DuckDuckGo then answers 403 and marks the client as a bot, and ddgs reports this as "No results found". A normal browser on the same computer gets results, so the block is against the client, not the IP address. The backend may work again if a later ddgs version supports the new parameters.
