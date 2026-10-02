@@ -267,13 +267,13 @@ What it will not do:
 
 `--copy-to` is the third job, next to building a dataset and sorting. It scores every image in a tree, then copies only the originals that are good enough **and** large enough into a separate folder, with the same subfolder structure and their `.txt` captions. Nothing is resized or re-encoded: the copies are byte-identical to the sources.
 
-Step 1, the survey. `--report` scores everything and copies nothing:
+Step 1, the survey. `--report` scores everything and copies nothing. You do not need to know the resolution or the threshold yet; the report shows what each combination would select:
 
 ```bash
-run.bat "L:\photos" --recursive --copy-to "L:\selected" --min-res 1024 --threshold 6 --report
+run.bat "L:\photos" --recursive --copy-to "L:\selected" --report
 ```
 
-Step 2, the copy. The same line without `--report`:
+Step 2, the copy, with the values you chose from the report:
 
 ```bash
 run.bat "L:\photos" --recursive --copy-to "L:\selected" --min-res 1024 --threshold 6
@@ -293,7 +293,7 @@ An image is copied when both gates pass:
 
 Without `--recursive`, only the images directly in the folder are looked at, as in every other mode. With it, the whole tree is scanned with the same rules as a `--recursive` dataset run: folders starting with `_` or `.` are skipped, and links and junctions are not followed. Folders named `1024`, `768`, `512` or `reports` are allowed here, because nothing is mirrored into `_prep`.
 
-The report goes to `<folder>\_prep\reports\`, named `copy-scan-*.txt` for a `--report` run and `copy-*.txt` for a real one. It lists every image with its dimensions and scores: the selected ones with what happened to each, and the rest with the reason they were not selected. Its summary has a score histogram split by whether the image meets `--min-res`, a **threshold preview** that shows how many images each `--threshold` from 10 to 0 would select, and, under `--recursive`, a count per folder. Read the preview after step 1 to choose the threshold for step 2. The scores are cached in `_prep\metrics-cache.json`, so step 2 does not render anything again.
+The report goes to `<folder>\_prep\reports\`, named `copy-scan-*.txt` for a `--report` run and `copy-*.txt` for a real one. It lists every image with its dimensions and scores: the selected ones with what happened to each, and the rest with the reason they were not selected. Its summary has a score histogram, a **selection grid**, and, under `--recursive`, a count per folder. The grid has one row per `--min-res` (any, 512, 768, 1024, 1280, 1536, 2048, and the run's own value) and one column per `--threshold` from 1 to 10, and each cell is the number of images that combination would copy. Read the grid after step 1 to choose both values for step 2. The scores are cached in `_prep\metrics-cache.json`, so step 2 does not render anything again.
 
 The target is created if it does not exist. It must not overlap the source: the target cannot be the source, contain it, or sit inside its `_prep`. A target inside the source is accepted only under a folder whose name starts with `_` or `.`, such as `L:\photos\_selected`, because the scan skips those folders. Any other folder in the source would be scanned as source by the next `--recursive` run.
 

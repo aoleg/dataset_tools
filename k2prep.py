@@ -2794,6 +2794,11 @@ def build_sort_report(args, folder: Path, results: list[Result],
     return "\n".join(line.rstrip() for line in out) + "\n"
 
 
+# The --min-res rows of the copy report's selection grid, beside 0 and the
+# run's own --min-res.
+GRID_MIN_RES = (512, 768, 1024, 1280, 1536, 2048)
+
+
 def meets_min_res(res: Result, min_res: int) -> bool:
     """--min-res N means the area of an N x N image: the pixel budget of the N
     bucket, whatever the aspect ratio."""
@@ -2828,10 +2833,15 @@ def build_copy_report(args, folder: Path, target: Path, results: list[Result],
       f"filter={args.filter} threads={args.local_threads}"
       f"{' recursive=on' if args.recursive else ''}"
       f"{' force=on' if args.force else ''}")
-    w(f"selection   : score >= {args.threshold} AND at least "
-      f"{min_res * min_res:,} pixels ({min_res}x{min_res})")
-    w("              Resolution is area, so any aspect ratio with the pixel")
-    w(f"              budget of the {min_res} bucket passes.")
+    if min_res:
+        w(f"selection   : score >= {args.threshold} AND at least "
+          f"{min_res * min_res:,} pixels ({min_res}x{min_res})")
+        w("              Resolution is area, so any aspect ratio with the pixel")
+        w(f"              budget of the {min_res} bucket passes.")
+    else:
+        w(f"selection   : score >= {args.threshold}, any resolution. The")
+        w("              SELECTION GRID in the summary shows what each")
+        w("              --min-res and --threshold would select.")
     w(f"scoring     : every image is judged at the {SORT_TIER} tier, as in --sort,")
     w("              so scores compare across folders. An image already at or")
     w(f"              below the {SORT_TIER} tier is scored as it is, never upscaled.")
@@ -2918,27 +2928,43 @@ def build_copy_report(args, folder: Path, target: Path, results: list[Result],
     w("SUMMARY")
     w("=" * 66)
     w("")
-    big = [r for r in scored if meets_min_res(r, min_res)]
-    w(f"SCORE DISTRIBUTION  (all scored images; '>= res' meets {min_res}x{min_res})")
     hist = defaultdict(int)
     hist_big = defaultdict(int)
     for r in scored:
         hist[r.composite] += 1
-    for r in big:
-        hist_big[r.composite] += 1
+        if meets_min_res(r, min_res):
+            hist_big[r.composite] += 1
     peak = max(hist.values()) if hist else 0
-    w(f"  {'':>2}  {'':<40}  {'all':>8}  {'>= res':>8}")
+    if min_res:
+        w(f"SCORE DISTRIBUTION  (all scored images; '>= res' meets "
+          f"{min_res}x{min_res})")
+        w(f"  {'':>2}  {'':<40}  {'all':>8}  {'>= res':>8}")
+    else:
+        w("SCORE DISTRIBUTION  (all scored images)")
     for score in range(10, 0, -1):
         n = hist[score]
         bar = "#" * (round(40 * n / peak) if peak else 0)
-        w(f"  {score:>2}  {bar:<40}  {_fmt_int(n):>8}  {_fmt_int(hist_big[score]):>8}")
+        big = f"  {_fmt_int(hist_big[score]):>8}" if min_res else ""
+        w(f"  {score:>2}  {bar:<40}  {_fmt_int(n):>8}{big}")
     w("")
 
-    w(f"THRESHOLD PREVIEW  (images a run would select at --min-res {min_res})")
-    for t in range(10, -1, -1):
-        n = sum(1 for r in big if r.composite >= t)
-        mark = "   <- this run" if t == args.threshold else ""
-        w(f"  --threshold {t:<3} {_fmt_int(n):>8}{mark}")
+    # Every combination of the two gates at once, so one --report run is
+    # enough to choose both: the survey is usually run before either is known.
+    w("SELECTION GRID  (images a run would select: rows --min-res, "
+      "columns --threshold)")
+    rows = sorted({0, min_res, *GRID_MIN_RES})
+    w(f"  {'--min-res':<11}" + "".join(f"{t:>8}" for t in range(1, 11)))
+    for res in rows:
+        fits = [r.composite for r in scored if meets_min_res(r, res)]
+        cells = ""
+        for t in range(1, 11):
+            n = sum(1 for c in fits if c >= t)
+            here = res == min_res and t == max(args.threshold, 1)
+            cells += f"{_fmt_int(n) + ('*' if here else ''):>8}"
+        w(f"  {(str(res) if res else 'any'):<11}{cells}")
+    w("")
+    w("'*' marks this run's settings. --threshold 0 selects the same as 1: no")
+    w("image scores below 1. --min-res N counts images with at least N x N pixels.")
     w("")
 
     if args.recursive:

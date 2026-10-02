@@ -831,6 +831,34 @@ def test_copy_to_end_to_end():
         assert "IN THE TARGET BUT NOT SELECTED  (1)" in text
         assert "a/deep/pano.jpg" in text.split("IN THE TARGET BUT NOT SELECTED")[1]
 
+        # The grid has a row for the run's own --min-res, and its cell at the
+        # run's threshold is starred and equals what the run selected.
+        grid = text.split("SELECTION GRID  (")[1].split("\n\n")[0].splitlines()
+        row = next(line.split() for line in grid if line.split()[:1] == ["1300"])
+        assert row[5] == "2*", row                 # threshold 5: top, tier
+        assert "\nSELECTED  (2 images)" in text
+
+
+def test_selection_grid_counts_every_combination():
+    from datetime import datetime
+    from pathlib import Path
+    def res(name, w, h, score):
+        r = k.Result(path=Path(name), name=name)
+        r.src_w, r.src_h, r.composite, r.scored = w, h, score, True
+        return r
+    results = [res("a", 2048, 2048, 9), res("b", 1024, 1024, 5),
+               res("c", 800, 600, 9), res("d", 1536, 768, 2)]
+    args = k.parse_args(["f", "--copy-to", "t"])
+    text = k.build_copy_report(args, Path("f"), Path("t"), results, [], [],
+                               datetime.now(), datetime.now(), 0.0, [])
+    grid = text.split("SELECTION GRID  (")[1].split("\n\n")[0].splitlines()
+    rows = {line.split()[0]: line.split()[1:] for line in grid[2:]}
+    assert rows["any"][0] == "4*"                  # threshold 1, no gate
+    assert rows["any"][8] == "2"                   # >= 9: a, c
+    assert rows["1024"][0] == "3"                  # a, b, d (1536x768 = 1024^2 + 12.5%)
+    assert rows["1024"][4] == "2"                  # >= 5: a, b
+    assert rows["2048"] == ["1"] * 9 + ["0"]       # a only, score 9
+
 
 def main():
     tests =[v for name, v in sorted(globals().items()) if name.startswith("test_")]
