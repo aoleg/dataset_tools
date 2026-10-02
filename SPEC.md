@@ -6,43 +6,25 @@ Build specification, Phase 1.
 
 ## 1. Purpose
 
-Take a messy folder of mixed photographs and produce a small, clean, bucket-tight
-training set for musubi-tuner's Krea 2 trainer.
+Take a messy folder of mixed photographs and produce a small, clean, bucket-tight training set for musubi-tuner's Krea 2 trainer.
 
-The problem being solved: musubi-tuner assigns each image to the nearest entry in a
-generated bucket list by aspect ratio alone. At `resolution = [1024, 1024]` that list
-has 65 entries spaced roughly 1.5% apart near square, so a folder of ordinary
-photographs scatters across 15+ buckets. Batches are formed per bucket
-(`BucketBatchManager` in `dataset/bucket.py`), so a scattered dataset produces many
-undersized batches and wastes the batch-size setting entirely.
+The problem being solved: musubi-tuner assigns each image to the nearest entry in a generated bucket list by aspect ratio alone. At `resolution = [1024, 1024]` that list has 65 entries spaced roughly 1.5% apart near square, so a folder of ordinary photographs scatters across 15+ buckets. Batches are formed per bucket (`BucketBatchManager` in `dataset/bucket.py`), so a scattered dataset produces many undersized batches and wastes the batch-size setting entirely.
 
-This tool crops and resizes every qualifying image to land on exactly one of 7 chosen
-aspect ratios across 3 resolution tiers, so the trainer sees at most 21 buckets and
-usually far fewer.
+This tool crops and resizes every qualifying image to land on exactly one of 7 chosen aspect ratios across 3 resolution tiers, so the trainer sees at most 21 buckets and usually far fewer.
 
-Secondary purpose: score input quality and reject material that would teach the LoRA
-compression artifacts.
+Secondary purpose: score input quality and reject material that would teach the LoRA compression artifacts.
 
 ### Selection philosophy
 
-The output is a **subset**, not a transformation of the whole folder. Images that
-fail `--threshold` or that are too small are **skipped entirely**: not copied, not
-moved, not modified. The source folder is never written to and never has anything
-removed from it. The only record of a rejection is the report.
+The output is a **subset**, not a transformation of the whole folder. Images that fail `--threshold` or that are too small are **skipped entirely**: not copied, not moved, not modified. The source folder is never written to and never has anything removed from it. The only record of a rejection is the report.
 
-This is deliberate. The input is assumed to be low-to-medium quality material of
-mixed provenance, and the goal is to extract the usable part of it.
+This is deliberate. The input is assumed to be low-to-medium quality material of mixed provenance, and the goal is to extract the usable part of it.
 
 ### Critical correctness requirement
 
-Output dimensions **must exactly match an entry in musubi-tuner's generated bucket
-list** for the tier they are placed in. If they do not, the trainer snaps by aspect
-ratio to a nearby bucket and applies a second blind center-crop on top of ours.
+Output dimensions **must exactly match an entry in musubi-tuner's generated bucket list** for the tier they are placed in. If they do not, the trainer snaps by aspect ratio to a nearby bucket and applies a second blind center-crop on top of ours.
 
-The target dimensions are therefore **generated with musubi's own algorithm**
-(section 4.2), not by rounding `sqrt(area × AR)` to a multiple of 16. Those two
-methods disagree: for 4:3 at the 1024 tier, naive rounding gives 1168×880, which is
-not in musubi's list; the real bucket is 1184×880.
+The target dimensions are therefore **generated with musubi's own algorithm** (section 4.2), not by rounding `sqrt(area × AR)` to a multiple of 16. Those two methods disagree: for 4:3 at the 1024 tier, naive rounding gives 1168×880, which is not in musubi's list; the real bucket is 1184×880.
 
 ---
 
@@ -59,9 +41,7 @@ k2prep/
 └── LICENSE              MIT
 ```
 
-Single file is deliberate. The script is roughly 900 lines and splitting it adds
-import ceremony for no benefit. If it grows past ~1500 lines, split out `metrics.py`
-and `buckets.py` only.
+Single file is deliberate. The script is roughly 900 lines and splitting it adds import ceremony for no benefit. If it grows past ~1500 lines, split out `metrics.py` and `buckets.py` only.
 
 `.gitignore` must include `venv/`, `__pycache__/`, `*.pyc`, `_prep/`.
 
@@ -77,9 +57,7 @@ numpy>=1.24.0
 tqdm>=4.66.0
 ```
 
-Nothing else. No OpenCV: Pillow plus numpy covers every operation here, and avoiding
-the OpenCV wheel keeps `install.bat` fast and sidesteps the DLL problems it causes on
-Windows.
+Nothing else. No OpenCV: Pillow plus numpy covers every operation here, and avoiding the OpenCV wheel keeps `install.bat` fast and sidesteps the DLL problems it causes on Windows.
 
 Python 3.10 or newer.
 
@@ -115,8 +93,7 @@ call venv\Scripts\activate.bat
 python k2prep.py %*
 ```
 
-`run.bat` must pass `%*` through unmodified so `run.bat "L:\train\photos" --report`
-works. Do not `pause` at the end of `run.bat`; it breaks scripted use.
+`run.bat` must pass `%*` through unmodified so `run.bat "L:\train\photos" --report` works. Do not `pause` at the end of `run.bat`; it breaks scripted use.
 
 ---
 
@@ -129,19 +106,11 @@ TIERS = [1024, 768, 512]          # nominal resolution, descending
 UPSCALE_TOLERANCE = 1.15          # max permitted linear upscale into a tier
 ```
 
-`TIERS` must be a single module-level constant. Krea 2's technical report states that
-pretraining progressively scaled through 256px, 512px and 1024px stages, and there is
-secondhand advice circulating that 768 should therefore be avoided for training. That
-advice is anecdotal rather than measured, and 768 is included here for demotion
-granularity: without it the gap between tiers is 4× in area and near-boundary images
-lose most of their pixels. Editing one line reverts that decision.
+`TIERS` must be a single module-level constant. Krea 2's technical report states that pretraining progressively scaled through 256px, 512px and 1024px stages, and there is secondhand advice circulating that 768 should therefore be avoided for training. That advice is anecdotal rather than measured, and 768 is included here for demotion granularity: without it the gap between tiers is 4× in area and near-boundary images lose most of their pixels. Editing one line reverts that decision.
 
-256 is deliberately **not** a tier. Anything that does not reach the 512 tier is
-skipped.
+256 is deliberately **not** a tier. Anything that does not reach the 512 tier is skipped.
 
-`UPSCALE_TOLERANCE` prevents cliff-edge demotion. Lanczos upscaling softens slightly
-but fabricates nothing, so a 15% upscale is a far better trade than dropping a tier
-and discarding 44% of the pixels.
+`UPSCALE_TOLERANCE` prevents cliff-edge demotion. Lanczos upscaling softens slightly but fabricates nothing, so a 15% upscale is a far better trade than dropping a tier and discarding 44% of the pixels.
 
 Resulting minimum **post-crop** source areas:
 
@@ -155,8 +124,7 @@ Below 198,218 px post-crop the image is skipped as too small.
 
 ### 4.2 Bucket generation (must match musubi-tuner exactly)
 
-Port of `BucketSelector.__init__` from `src/musubi_tuner/dataset/bucket.py`.
-`RESOLUTION_STEPS_KREA2 = 16` (VAE f8 compression × patch size 2).
+Port of `BucketSelector.__init__` from `src/musubi_tuner/dataset/bucket.py`. `RESOLUTION_STEPS_KREA2 = 16` (VAE f8 compression × patch size 2).
 
 ```python
 RESO_STEPS = 16
@@ -179,8 +147,7 @@ def generate_buckets(resolution: int, steps: int = RESO_STEPS) -> list[tuple[int
 
 Expected list sizes: 65 at 1024, 49 at 768, 33 at 512.
 
-There must be a unit test asserting `len(generate_buckets(1024)) == 65` and that
-`(1184, 880) in generate_buckets(1024)` while `(1168, 880) not in generate_buckets(1024)`.
+There must be a unit test asserting `len(generate_buckets(1024)) == 65` and that `(1184, 880) in generate_buckets(1024)` while `(1168, 880) not in generate_buckets(1024)`.
 
 ### 4.3 Aspect-ratio families
 
@@ -191,13 +158,9 @@ AR_FAMILIES = ["9:16", "2:3", "4:5", "1:1", "5:4", "3:2", "16:9"]
 AR_NOMINAL  = [0.5647, 0.6667, 0.8028, 1.0000, 1.2456, 1.5000, 1.7708]
 ```
 
-The nominal values are the *actual 1024-tier bucket ratios*, not the idealised ones.
-9:16 is 0.5647 not 0.5625; 4:5 is 0.8028 not 0.8000.
+The nominal values are the *actual 1024-tier bucket ratios*, not the idealised ones. 9:16 is 0.5647 not 0.5625; 4:5 is 0.8028 not 0.8000.
 
-**The per-tier bucket dimensions differ**, because the 16px grid is coarser relative
-to a smaller image. Resolve each family to its tier's bucket at runtime with
-`min(buckets, key=lambda b: abs(b[0]/b[1] - nominal))`. The resulting table, which
-`--report` must print for verification:
+**The per-tier bucket dimensions differ**, because the 16px grid is coarser relative to a smaller image. Resolve each family to its tier's bucket at runtime with `min(buckets, key=lambda b: abs(b[0]/b[1] - nominal))`. The resulting table, which `--report` must print for verification:
 
 | Family | 1024 tier | 768 tier | 512 tier |
 |---|---|---|---|
@@ -209,12 +172,9 @@ to a smaller image. Resolve each family to its tier's bucket at runtime with
 | 3:2 | 1248×832 (1.5000) | 944×624 (1.5128) | 624×416 (1.5000) |
 | 16:9 | 1360×768 (1.7708) | 1024×576 (1.7778) | 672×384 (1.7500) |
 
-Latent token counts are near-constant within a tier: ~4,050–4,096 at 1024,
-~2,280–2,304 at 768, ~1,008–1,024 at 512. This matters for the emitted TOML
-(section 10).
+Latent token counts are near-constant within a tier: ~4,050–4,096 at 1024, ~2,280–2,304 at 768, ~1,008–1,024 at 512. This matters for the emitted TOML (section 10).
 
-Because the ratios differ between tiers, **the crop box cannot be computed until the
-tier is known**. See section 5.
+Because the ratios differ between tiers, **the crop box cannot be computed until the tier is known**. See section 5.
 
 ---
 
@@ -225,29 +185,21 @@ Order matters. Deviating from it produces wrong crops or wrong tiers.
 ### 5.1 Load and normalise
 
 1. Open with Pillow. Catch and log truncated/corrupt files; do not crash the batch.
-2. Apply `ImageOps.exif_transpose(img)` **before reading dimensions**. Phone and DSLR
-   portraits are stored landscape with an orientation tag; skipping this
-   bucket-assigns them along the wrong axis.
-3. Convert to `RGB` if not already (handles `P`, `LA`, `RGBA`, `CMYK`, `I;16`). For
-   `RGBA`, composite over white; do not just drop the alpha channel.
+2. Apply `ImageOps.exif_transpose(img)` **before reading dimensions**. Phone and DSLR portraits are stored landscape with an orientation tag; skipping this bucket-assigns them along the wrong axis.
+3. Convert to `RGB` if not already (handles `P`, `LA`, `RGBA`, `CMYK`, `I;16`). For `RGBA`, composite over white; do not just drop the alpha channel.
 4. Record `src_w`, `src_h`, `src_ar = src_w / src_h`.
 
-EXIF is **not** carried to the output. Do not pass `exif=` to `save()`. This is what
-prevents orientation being applied twice by downstream viewers. ICC profiles are also
-dropped; all inputs are assumed sRGB.
+EXIF is **not** carried to the output. Do not pass `exif=` to `save()`. This is what prevents orientation being applied twice by downstream viewers. ICC profiles are also dropped; all inputs are assumed sRGB.
 
 ### 5.2 Assign aspect-ratio family
 
 `family = argmin |AR_NOMINAL[i] - src_ar|`.
 
-No guard, no exclusion. A 21:9 panorama is assigned to 16:9 and cropped hard. This is
-intentional: the whole point is to stop weird dimensions multiplying buckets. The crop
-fraction is recorded and reported so heavy crops remain visible.
+No guard, no exclusion. A 21:9 panorama is assigned to 16:9 and cropped hard. This is intentional: the whole point is to stop weird dimensions multiplying buckets. The crop fraction is recorded and reported so heavy crops remain visible.
 
 ### 5.3 Assign tier
 
-For each tier in `TIERS` (descending), resolve the family's bucket at that tier,
-compute the exact post-crop source area, and take the first tier that fits:
+For each tier in `TIERS` (descending), resolve the family's bucket at that tier, compute the exact post-crop source area, and take the first tier that fits:
 
 ```python
 for tier in TIERS:
@@ -259,9 +211,7 @@ for tier in TIERS:
 return None   # -> skipped, too small
 ```
 
-The area test uses **post-crop** dimensions. A 2400×600 panorama has 1.44 MP but only
-1067×600 = 0.64 MP after cropping to the 768-tier 16:9 ratio, so it belongs in the 768
-tier. Testing raw source area would place it in 1024 and force an upscale.
+The area test uses **post-crop** dimensions. A 2400×600 panorama has 1.44 MP but only 1067×600 = 0.64 MP after cropping to the 768-tier 16:9 ratio, so it belongs in the 768 tier. Testing raw source area would place it in 1024 and force an upscale.
 
 ### 5.4 Compute crop box
 
@@ -275,10 +225,7 @@ def crop_dims(w, h, target_ar):
         return w, int(round(w / target_ar))     # too tall: trim height
 ```
 
-Crop origin: horizontal always centred. Vertical centred **except** when the target is
-portrait (`target_ar < 1.0`), in which case bias the origin to 1/3 of the excess
-rather than 1/2. Heads sit above centre in almost all photography and this is right
-more often than centre at zero cost.
+Crop origin: horizontal always centred. Vertical centred **except** when the target is portrait (`target_ar < 1.0`), in which case bias the origin to 1/3 of the excess rather than 1/2. Heads sit above centre in almost all photography and this is right more often than centre at zero cost.
 
 ```python
 excess_y = src_h - ch
@@ -291,43 +238,29 @@ This function is the `--anchor` seam. See section 13.
 
 ### 5.5 Crop and resize in one pass
 
-Use Pillow's `box` argument so the resampling filter operates directly on the crop
-region. Do not crop to an intermediate image and then resize; that is an extra
-allocation and, with some filters, an extra rounding.
+Use Pillow's `box` argument so the resampling filter operates directly on the crop region. Do not crop to an intermediate image and then resize; that is an extra allocation and, with some filters, an extra rounding.
 
 ```python
 out = img.resize((bw, bh), resample=FILTER, box=box)
 ```
 
-**Filter default is `Image.LANCZOS`.** Not bilinear. Pillow scales the filter support
-by the reduction factor so `BILINEAR` is antialiased, but it is soft, and because our
-output dimensions match a bucket exactly, musubi will skip its own resize entirely
-(`if bucket_reso == (image_width, image_height): return`). Our resampler is the final
-word on what the VAE encoder sees.
+**Filter default is `Image.LANCZOS`.** Not bilinear. Pillow scales the filter support by the reduction factor so `BILINEAR` is antialiased, but it is soft, and because our output dimensions match a bucket exactly, musubi will skip its own resize entirely (`if bucket_reso == (image_width, image_height): return`). Our resampler is the final word on what the VAE encoder sees.
 
-`--filter` accepts `lanczos` (default), `box`, `bicubic`, `bilinear`. `box` maps to
-`Image.BOX` and reproduces what musubi's `cv2.INTER_AREA` would have done; it is the
-better choice for heavily compressed sources, since box averaging suppresses 8×8 block
-artifacts more cleanly than Lanczos, which can ring on them.
+`--filter` accepts `lanczos` (default), `box`, `bicubic`, `bilinear`. `box` maps to `Image.BOX` and reproduces what musubi's `cv2.INTER_AREA` would have done; it is the better choice for heavily compressed sources, since box averaging suppresses 8×8 block artifacts more cleanly than Lanczos, which can ring on them.
 
 ### 5.6 Save
 
-Default: JPEG, `quality=97`, `subsampling=0` (4:4:4), `optimize=True`. Roughly
-250–400 KB per 1 MP image and visually indistinguishable from PNG after a VAE encode.
+Default: JPEG, `quality=97`, `subsampling=0` (4:4:4), `optimize=True`. Roughly 250–400 KB per 1 MP image and visually indistinguishable from PNG after a VAE encode.
 
 `--png` switches to PNG, `compress_level=6`. Expect 1.5–2.5 MB per image.
 
-Output extension always matches the format actually written, regardless of input
-extension.
+Output extension always matches the format actually written, regardless of input extension.
 
 ### 5.7 Caption sidecar
 
-If `<stem>.txt` exists next to the source, copy it into the tier folder beside the
-produced image, renamed to match the output stem. Copy verbatim; do not re-encode or
-strip whitespace.
+If `<stem>.txt` exists next to the source, copy it into the tier folder beside the produced image, renamed to match the output stem. Copy verbatim; do not re-encode or strip whitespace.
 
-Missing captions are counted and listed in the report. They are not an error and do
-not prevent processing.
+Missing captions are counted and listed in the report. They are not an error and do not prevent processing.
 
 A skipped image's caption is never copied anywhere.
 
@@ -335,35 +268,24 @@ A skipped image's caption is never copied anywhere.
 
 ## 6. Quality scoring
 
-Four sub-metrics, each scored 1–10 on a **fixed absolute scale**. The bins are not
-percentiles. `--threshold 6` must mean the same thing on every folder, on every run,
-forever; percentile bins would make it dataset-relative and unreproducible.
+Four sub-metrics, each scored 1–10 on a **fixed absolute scale**. The bins are not percentiles. `--threshold 6` must mean the same thing on every folder, on every run, forever; percentile bins would make it dataset-relative and unreproducible.
 
-All metrics are computed on the **source** image after EXIF transpose and RGB
-conversion, before any crop or resize, because `--threshold` gates whether processing
-happens at all.
+All metrics are computed on the **source** image after EXIF transpose and RGB conversion, before any crop or resize, because `--threshold` gates whether processing happens at all.
 
-Work on the luma plane: `L = img.convert("L")` as a numpy `float32` array. For speed,
-metrics B and D may be computed on a centre crop of at most 1024×1024 pixels when the
-source is larger; state this in the report header.
+Work on the luma plane: `L = img.convert("L")` as a numpy `float32` array. For speed, metrics B and D may be computed on a centre crop of at most 1024×1024 pixels when the source is larger; state this in the report header.
 
 ### 6.1 Q — compression quality
 
-From the JPEG quantization tables, available as `img.quantization` in Pillow (dict of
-table index to 64-element list). PNG and other lossless inputs score 10.
+From the JPEG quantization tables, available as `img.quantization` in Pillow (dict of table index to 64-element list). PNG and other lossless inputs score 10.
 
-Method: reconstruct the IJG standard luma table, generate the scaled table for each
-quality 1–100 using the standard IJG scaling formula, and pick the quality that
-minimises sum of squared differences against the image's table 0.
+Method: reconstruct the IJG standard luma table, generate the scaled table for each quality 1–100 using the standard IJG scaling formula, and pick the quality that minimises sum of squared differences against the image's table 0.
 
 ```
 scale = 5000/q if q < 50 else 200 - 2q
 value = clamp((std[i] * scale + 50) / 100, 1, 255)
 ```
 
-If the best-fit residual exceeds a threshold, the encoder used non-standard tables
-(common with Adobe and several phone encoders). In that case set `Q = None`, mark it
-`n/a` in the report, and exclude it from the composite.
+If the best-fit residual exceeds a threshold, the encoder used non-standard tables (common with Adobe and several phone encoders). In that case set `Q = None`, mark it `n/a` in the report, and exclude it from the composite.
 
 | Estimated JPEG q | Score |
 |---|---|
@@ -404,10 +326,7 @@ Same for rows. `B_ratio = max(ratio_x, ratio_y)`.
 | ≤2.00 | 2 |
 | >2.00 | 1 |
 
-**Known limitation, must be stated in the report header:** if an image was rescaled
-after being JPEG-encoded, the 8px grid no longer aligns and this metric reads clean on
-genuinely damaged material. When `Q` is `None` *and* the source dimensions are not both
-multiples of 8, append a `?` to the B score in the report to flag it as unreliable.
+**Known limitation, must be stated in the report header:** if an image was rescaled after being JPEG-encoded, the 8px grid no longer aligns and this metric reads clean on genuinely damaged material. When `Q` is `None` *and* the source dimensions are not both multiples of 8, append a `?` to the B score in the report to flag it as unreliable.
 
 ### 6.3 D — detail
 
@@ -435,25 +354,15 @@ Normalising by contrast keeps low-contrast but sharp images from being penalised
 | ≥0.004 | 2 |
 | <0.004 | 1 |
 
-**These bands are a starting point and are explicitly uncalibrated.** They produce
-genuine false positives on bokeh, fog, snow, and deliberately minimal compositions.
-Define them as a module-level constant table with a comment saying so, run `--report`
-on a real folder, look at the distribution, and adjust before trusting `--threshold`
-to act on D.
+**These bands are a starting point and are explicitly uncalibrated.** They produce genuine false positives on bokeh, fog, snow, and deliberately minimal compositions. Define them as a module-level constant table with a comment saying so, run `--report` on a real folder, look at the distribution, and adjust before trusting `--threshold` to act on D.
 
 ### 6.4 R — resolution headroom (reported, not scored into the composite)
 
 `R_factor = sqrt(post_crop_area / assigned_bucket_area)`
 
-**Tier-relative.** A clean 640×480 photo assigned to the 512 tier has R_factor ≈ 1.03
-and is fine. Measuring against 1024 would score every small image as garbage and
-defeat the whole tier system.
+**Tier-relative.** A clean 640×480 photo assigned to the 512 tier has R_factor ≈ 1.03 and is fine. Measuring against 1024 would score every small image as garbage and defeat the whole tier system.
 
-Reported as a raw factor to two decimals, not a 1–10 score. It is informative rather
-than disqualifying: a factor near 1.0 means the source was barely larger than the
-target, so whatever artifacts it has survive at full strength into training. Images
-below `1 / UPSCALE_TOLERANCE` are already skipped as too small by section 5.3, so R
-needs no separate gate.
+Reported as a raw factor to two decimals, not a 1–10 score. It is informative rather than disqualifying: a factor near 1.0 means the source was barely larger than the target, so whatever artifacts it has survive at full strength into training. Images below `1 / UPSCALE_TOLERANCE` are already skipped as too small by section 5.3, so R needs no separate gate.
 
 ### 6.5 Composite
 
@@ -461,14 +370,9 @@ needs no separate gate.
 composite = min(s for s in (Q, B, D) if s is not None)
 ```
 
-**Minimum, not weighted mean.** Quality faults are disqualifying rather than additive:
-a 6000px razor-sharp photo saved at JPEG q55 is a bad training image, and an average
-would let the good dimensions hide that. `min` makes `--threshold 6` mean "every
-available metric is at least 6," which is a claim a human can verify by looking at one
-image.
+**Minimum, not weighted mean.** Quality faults are disqualifying rather than additive: a 6000px razor-sharp photo saved at JPEG q55 is a bad training image, and an average would let the good dimensions hide that. `min` makes `--threshold 6` mean "every available metric is at least 6," which is a claim a human can verify by looking at one image.
 
-If all three are `None` (should be impossible), composite is 10 and the image is
-flagged in the report.
+If all three are `None` (should be impossible), composite is 10 and the image is flagged in the report.
 
 ---
 
@@ -486,54 +390,36 @@ flagged in the report.
 
 A single `_prep` parent means the input scanner skips exactly one directory name.
 
-Tier folders hold accepted images plus their `.txt` sidecars, flat. Each populated
-tier folder is one `[[datasets]]` block in the training TOML.
+Tier folders hold accepted images plus their `.txt` sidecars, flat. Each populated tier folder is one `[[datasets]]` block in the training TOML.
 
-**There is no exclusion folder.** Rejected images are skipped: nothing is written for
-them, and the source file stays exactly where it is. The report is the only record.
-This makes the full filename lists in the report's rejection sections load-bearing
-rather than decorative, so they must not be truncated.
+**There is no exclusion folder.** Rejected images are skipped: nothing is written for them, and the source file stays exactly where it is. The report is the only record. This makes the full filename lists in the report's rejection sections load-bearing rather than decorative, so they must not be truncated.
 
-The intended recovery workflow: lower `--threshold` and re-run. Because existing
-outputs are skipped (section 7.3), the second run only adds the newly-qualifying
-images and costs nothing for the ones already processed.
+The intended recovery workflow: lower `--threshold` and re-run. Because existing outputs are skipped (section 7.3), the second run only adds the newly-qualifying images and costs nothing for the ones already processed.
 
 ### 7.1 Scanning
 
 - Non-recursive. Only files directly in the input folder.
 - Skip `_prep/` unconditionally.
-- Accept extensions: `.jpg .jpeg .png .webp .bmp .avif` and their uppercase forms.
-  Deliberately mirrors musubi's `IMAGE_EXTENSIONS`. Mixed-case variants like `.Jpg`
-  will not be found; report a count and list of files skipped for unknown extension so
-  the user notices.
+- Accept extensions: `.jpg .jpeg .png .webp .bmp .avif` and their uppercase forms. Deliberately mirrors musubi's `IMAGE_EXTENSIONS`. Mixed-case variants like `.Jpg` will not be found; report a count and list of files skipped for unknown extension so the user notices.
 - Sort by filename before processing, so reports from two runs are diffable.
 
 ### 7.2 Filename collisions
 
-Two sources can produce the same output name (`photo.jpg` and `photo.png` both become
-`photo.jpg`). Resolve by suffixing `_2`, `_3`, … in scan order.
+Two sources can produce the same output name (`photo.jpg` and `photo.png` both become `photo.jpg`). Resolve by suffixing `_2`, `_3`, … in scan order.
 
-Caption handling for collisions: if only one of the colliding sources has a `.txt`,
-copy that same caption to **both** output stems. Colliding stems are almost always the
-same photograph in two formats, so the caption applies to both. Log every collision in
-the report.
+Caption handling for collisions: if only one of the colliding sources has a `.txt`, copy that same caption to **both** output stems. Colliding stems are almost always the same photograph in two formats, so the caption applies to both. Log every collision in the report.
 
-Collisions are resolved per tier folder, not globally. Two images that collide by name
-but land in different tiers do not need suffixing.
+Collisions are resolved per tier folder, not globally. Two images that collide by name but land in different tiers do not need suffixing.
 
 ### 7.3 Idempotency
 
-Skip an image if its output file already exists in its assigned tier, unless
-`--force`. Report the skip count. This script will be run repeatedly while tuning
-`--threshold`, and re-encoding 8,000 images to discover nothing changed is a waste.
+Skip an image if its output file already exists in its assigned tier, unless `--force`. Report the skip count. This script will be run repeatedly while tuning `--threshold`, and re-encoding 8,000 images to discover nothing changed is a waste.
 
 ### 7.4 `--recursive`: several datasets, one `_prep`
 
 Added in 1.1.0; this is the Phase 2 design section 13 deferred.
 
-A **dataset is any directory that directly contains at least one image**, and its
-images are only the files directly in it. The output mirrors the source tree
-inside a single `_prep` at the scan root, tier folders at the leaves:
+A **dataset is any directory that directly contains at least one image**, and its images are only the files directly in it. The output mirrors the source tree inside a single `_prep` at the scan root, tier folders at the leaves:
 
 ```
 parent/
@@ -545,48 +431,51 @@ parent/
     └── dataset.toml            one, shared
 ```
 
-Two properties fall out of that rule and are the reason for it: non-recursive
-mode is the degenerate case (a tree with no subfolders produces byte-identical
-output with and without the flag), and each source directory maps 1:1 to one
-`[[datasets]]` block. Pooling a subtree is the user's call, made by flattening
-the source; k2prep does not guess.
+Two properties fall out of that rule and are the reason for it: non-recursive mode is the degenerate case (a tree with no subfolders produces byte-identical output with and without the flag), and each source directory maps 1:1 to one `[[datasets]]` block. Pooling a subtree is the user's call, made by flattening the source; k2prep does not guess.
 
 Scan rules, at every depth:
 
-- Skip directories starting with `_` (covers `_prep` — including one left in a
-  subfolder by an earlier `run.bat -R` run, which holds already-cropped renders
-  of the same photos — and `cleanup.bat` sidecars) and starting with `.`.
-- Never follow directory symlinks or junctions (cycles, escapes); a visited set
-  of resolved paths is the backstop. Skips are noted in the report.
+- Skip directories starting with `_` (covers `_prep` — including one left in a subfolder by an earlier `run.bat -R` run, which holds already-cropped renders of the same photos — and `cleanup.bat` sidecars) and starting with `.`.
+- Never follow directory symlinks or junctions (cycles, escapes); a visited set of resolved paths is the backstop. Skips are noted in the report.
 - An unreadable directory is reported and the scan continues.
-- Refuse with a clear error, before any work: a source directory named like a
-  tier (`1024`/`768`/`512`) anywhere — it would make `_prep/<x>/1024` ambiguous
-  between "dataset" and "tier folder" — and a first-level directory named
-  `reports`, which would collide with `_prep/reports`.
+- Refuse with a clear error, before any work: a source directory named like a tier (`1024`/`768`/`512`) anywhere — it would make `_prep/<x>/1024` ambiguous between "dataset" and "tier folder" — and a first-level directory named `reports`, which would collide with `_prep/reports`.
 
-Everything per-dataset stays per-dataset, because each populated
-`<dataset>/<tier>` leaf is its own `[[datasets]]` block and musubi forms batches
-within a dataset only:
+Everything per-dataset stays per-dataset, because each populated `<dataset>/<tier>` leaf is its own `[[datasets]]` block and musubi forms batches within a dataset only:
 
 - the merge pass runs once per dataset and never moves an image across datasets;
-- the report's bucket distribution and its undersized/odd warnings are printed
-  per dataset;
+- the report's bucket distribution and its undersized/odd warnings are printed per dataset;
 - filename collisions are resolved per (dataset, tier);
-- idempotency checks and superseded-output sweeping run per dataset, over every
-  directory the scan visited — so a dataset whose images all vanished still gets
-  its stale outputs cleared, exactly as an emptied folder does in the flat
-  layout;
-- the score cache is keyed by relpath-qualified name (`summer/img.jpg`), so root
-  entries stay compatible with non-recursive runs.
+- idempotency checks and superseded-output sweeping run per dataset, over every directory the scan visited — so a dataset whose images all vanished still gets its stale outputs cleared, exactly as an emptied folder does in the flat layout;
+- the score cache is keyed by relpath-qualified name (`summer/img.jpg`), so root entries stay compatible with non-recursive runs.
 
-Outputs orphaned by a renamed or deleted source subfolder are reported as stale
-and left alone; the regenerated TOML does not reference them, so they cannot
-leak into training. `--sort` is refused together with `--recursive` — what
-triage means across a tree of datasets is deliberately undecided.
+Outputs orphaned by a renamed or deleted source subfolder are reported as stale and left alone; the regenerated TOML does not reference them, so they cannot leak into training. `--sort` is refused together with `--recursive` — what triage means across a tree of datasets is deliberately undecided.
 
-`run.bat -R` remains the other thing: one independent run, `_prep` and TOML per
-first-level subfolder (train separately), versus `--recursive`'s one shared
-`_prep` and TOML (train together).
+`run.bat -R` remains the other thing: one independent run, `_prep` and TOML per first-level subfolder (train separately), versus `--recursive`'s one shared `_prep` and TOML (train together).
+
+### 7.5 `--copy-to`: select originals into another folder
+
+Added in 1.2.0. A third mode next to the dataset build and `--sort`: score a folder, or a tree under `--recursive`, and copy the original of every image that passes two gates into a target folder that mirrors the source tree. It builds no tier folders and no TOML.
+
+The gates:
+
+- **Score:** `composite >= --threshold`, the same comparison as the dataset run. The score is taken as `--sort` takes it, on the image rendered at the 1024 tier (or at its own size when it is already at or below that tier), so one threshold means the same thing in every folder of the tree. The score cache in `_prep/metrics-cache.json` is shared with `--sort`, so the `--report` pass pays for the renders and the real run reuses them.
+- **Resolution:** `src_w × src_h >= N × N` for `--min-res N`, on the displayed (EXIF-oriented) dimensions. Area rather than sides, because N names the pixel budget of the N bucket and every aspect ratio of that bucket has about N × N pixels. Default 0, no gate. `--min-res` without `--copy-to` is refused.
+
+Every image is scored, including the ones that fail the resolution gate, because the report is the quality survey of the whole tree.
+
+Placement: `<target>/<relpath>/<filename>`, with `<stem>.txt` beside it when the source has one. `shutil.copy2` copies the bytes and keeps the modification time. Nothing is decoded or re-encoded.
+
+The target belongs to the user, so:
+
+- An existing file with the same size as its source and a modification time within 2 s of it (FAT stores mtime at 2 s resolution) is the copy an earlier run made, and it is skipped. Re-runs are idempotent.
+- An existing file that differs is a conflict. The image and its caption are copied together or not at all, so a conflicting pair is skipped, reported, and makes the exit code 1. `--force` overwrites.
+- Nothing in the target is deleted. A copy left by an earlier run that the current run does not select is listed under `IN THE TARGET BUT NOT SELECTED` and left alone.
+
+The target must not overlap the source. It is refused when it is the source, contains the source, or is inside `<source>/_prep`. Inside the source, it is accepted only under a folder whose name starts with `_` or `.`, because the scan skips those, and otherwise the next `--recursive` run would ingest the copies as source. The scan uses the `--recursive` rules of section 7.4 without the reserved-name checks: a source folder named `1024` or `reports` is harmless when nothing is mirrored into `_prep`.
+
+One report per run, in `_prep/reports/`: `copy-scan-YYYYMMDD-HHMMSS.txt` under `--report`, `copy-YYYYMMDD-HHMMSS.txt` otherwise. Sections: `SELECTED` with the action per image, `NOT SELECTED` with the failed gate or gates, `CONFLICTS`, `IN THE TARGET BUT NOT SELECTED`, `MISSING CAPTIONS` for selected images, unknown extensions, `ERRORS`, and a summary with the score histogram split by the resolution gate, a threshold preview (how many images each `--threshold` from 10 to 0 would select at this `--min-res`), and a per-folder count under `--recursive`.
+
+`--copy-to` is refused together with `--sort`, and so are `--move` and `--vl`, which need `--sort`. `--png`, `--single-pass` and `--no-merge` are ignored with a note. `run.bat` passes the value of `--copy-to` through as the target so it is never taken for the source folder, and refuses `-R` with `--copy-to`, because each per-folder run would copy into the root of the same target and flatten the tree.
 
 ---
 
@@ -607,14 +496,12 @@ k2prep.py <folder> [options]
 | `--threads N` | 4 | Worker threads. Range 1–32. |
 | `--force` | off | Overwrite existing outputs instead of skipping. |
 | `--emit-toml` | off | Also write a ready-to-use musubi dataset TOML (section 10). |
+| `--copy-to TARGET` | off | Copy the originals that pass `--threshold` and `--min-res` into `TARGET`, mirroring the source tree. Section 7.5. |
+| `--min-res N` | 0 | With `--copy-to` only: minimum area of N × N pixels. |
 
-`--report` and `--threshold` compose: `--report --threshold 7` shows what a
-threshold-7 run *would* do without writing anything. Given that rejections are not
-recoverable from disk, running `--report` first is the recommended workflow and the
-README should say so.
+`--report` and `--threshold` compose: `--report --threshold 7` shows what a threshold-7 run *would* do without writing anything. Given that rejections are not recoverable from disk, running `--report` first is the recommended workflow and the README should say so.
 
-Argument validation must be strict and fail fast with a clear message. An out-of-range
-`--threshold` or `--threads` exits non-zero; do not silently clamp.
+Argument validation must be strict and fail fast with a clear message. An out-of-range `--threshold` or `--threads` exits non-zero; do not silently clamp.
 
 ---
 
@@ -743,22 +630,13 @@ TIMING
 
 ### 9.2 Notes on the summary
 
-The bucket distribution is the section that tells you whether the exercise worked. If
-it still shows 15 populated buckets, something upstream is wrong.
+The bucket distribution is the section that tells you whether the exercise worked. If it still shows 15 populated buckets, something upstream is wrong.
 
-Emit a `*** WARNING` line on any bucket holding fewer than 8 images, because
-`num_batches = ceil(len(bucket) / batch_size)` means small buckets produce undersized
-batches. Also warn on any bucket with an odd count, which always leaves a trailing
-batch of 1.
+Emit a `*** WARNING` line on any bucket holding fewer than 8 images, because `num_batches = ceil(len(bucket) / batch_size)` means small buckets produce undersized batches. Also warn on any bucket with an odd count, which always leaves a trailing batch of 1.
 
-The quality histogram uses fixed 1–10 bins with counts and a bar. It is a display of
-the distribution, not an adaptive binning. It covers every image that reached a tier,
-including those below the threshold, so the user can see what a different threshold
-would recover.
+The quality histogram uses fixed 1–10 bins with counts and a bar. It is a display of the distribution, not an adaptive binning. It covers every image that reached a tier, including those below the threshold, so the user can see what a different threshold would recover.
 
-Report file size: for 8,000 images the per-image table is roughly 1 MB of text. That is
-acceptable. Do not truncate any section, especially the skip lists, since they are the
-only record of what was rejected.
+Report file size: for 8,000 images the per-image table is roughly 1 MB of text. That is acceptable. Do not truncate any section, especially the skip lists, since they are the only record of what was rejected.
 
 ---
 
@@ -814,8 +692,7 @@ Rules:
 - Forward slashes in paths. TOML and Windows backslashes interact badly.
 - Skip tiers with zero images.
 - `batch_size`: 2 at 1024, 3 at 768, 8 at 512.
-- Never overwrite an existing `dataset.toml`; write `dataset-2.toml` and say so in the
-  console output and the report.
+- Never overwrite an existing `dataset.toml`; write `dataset-2.toml` and say so in the console output and the report.
 
 ---
 
@@ -823,23 +700,16 @@ Rules:
 
 `concurrent.futures.ThreadPoolExecutor`, default 4 workers, `--threads 1..32`.
 
-Threads rather than processes is correct here: Pillow releases the GIL for JPEG
-decode, resize and encode, which is where essentially all the time goes. Processes
-would add pickling overhead and complicate the progress bar for no gain.
+Threads rather than processes is correct here: Pillow releases the GIL for JPEG decode, resize and encode, which is where essentially all the time goes. Processes would add pickling overhead and complicate the progress bar for no gain.
 
 Requirements:
 
-- Per-image work fully independent. No shared mutable state; collect futures and
-  assemble results after.
-- Filename-collision resolution (section 7.2) is inherently sequential. Do it in the
-  main thread after the parallel analysis phase and before the write phase, or reserve
-  output names under a lock.
+- Per-image work fully independent. No shared mutable state; collect futures and assemble results after.
+- Filename-collision resolution (section 7.2) is inherently sequential. Do it in the main thread after the parallel analysis phase and before the write phase, or reserve output names under a lock.
 - Progress via `tqdm` over completed futures.
 - Report ordering by filename, not completion order. Sort results before writing.
-- One image raising must not kill the run. Catch broadly per image, record the
-  exception text in the report's `ERRORS` section, continue.
-- `--threads 1` must produce byte-identical output and an identical report (apart from
-  the timing line) to `--threads 16`. If it does not, there is shared state.
+- One image raising must not kill the run. Catch broadly per image, record the exception text in the report's `ERRORS` section, continue.
+- `--threads 1` must produce byte-identical output and an identical report (apart from the timing line) to `--threads 16`. If it does not, there is shared state.
 
 ---
 
@@ -847,30 +717,21 @@ Requirements:
 
 The implementation is correct when all of these hold.
 
-1. `generate_buckets(1024)` returns 65 entries, `generate_buckets(768)` returns 49,
-   `generate_buckets(512)` returns 33.
+1. `generate_buckets(1024)` returns 65 entries, `generate_buckets(768)` returns 49, `generate_buckets(512)` returns 33.
 2. `(1184, 880) in generate_buckets(1024)` and `(1168, 880) not in generate_buckets(1024)`.
-3. Every image written to `_prep/<tier>/` has dimensions present in
-   `generate_buckets(tier)`. Verify by walking the output tree.
-4. A JPEG with EXIF orientation 6 is bucketed on its *displayed* dimensions, and the
-   output file has no EXIF block.
+3. Every image written to `_prep/<tier>/` has dimensions present in `generate_buckets(tier)`. Verify by walking the output tree.
+4. A JPEG with EXIF orientation 6 is bucketed on its *displayed* dimensions, and the output file has no EXIF block.
 5. A 2400×600 image is assigned to the **768** tier, bucket 1024×576.
 6. A 640×480 image is assigned to the **512** tier, bucket 560×464.
 7. A 400×300 image is skipped as too small, and no file is written for it anywhere.
-8. After any run, the input folder contains exactly the files it contained before,
-   byte-identical, plus the `_prep/` directory.
-9. Running twice without `--force` writes no images on the second run and reports the
-   correct already-processed count.
+8. After any run, the input folder contains exactly the files it contained before, byte-identical, plus the `_prep/` directory.
+9. Running twice without `--force` writes no images on the second run and reports the correct already-processed count.
 10. `--report` writes exactly one file and creates no tier directories.
 11. `--threshold 11` and `--threads 0` exit non-zero with a readable message.
-12. A folder containing `photo.jpg`, `photo.png` and `photo.txt` produces two output
-    images and two caption files with matching stems.
-13. A corrupt/truncated JPEG appears in the report's `ERRORS` section and does not
-    abort the run.
-14. `--threads 1` and `--threads 8` produce identical reports apart from the timing
-    line.
-15. `--emit-toml` output parses with `tomllib.load` and every `image_directory` it
-    names exists and is non-empty.
+12. A folder containing `photo.jpg`, `photo.png` and `photo.txt` produces two output images and two caption files with matching stems.
+13. A corrupt/truncated JPEG appears in the report's `ERRORS` section and does not abort the run.
+14. `--threads 1` and `--threads 8` produce identical reports apart from the timing line.
+15. `--emit-toml` output parses with `tomllib.load` and every `image_directory` it names exists and is non-empty.
 
 ---
 
@@ -878,37 +739,24 @@ The implementation is correct when all of these hold.
 
 ### Hooks to leave in place
 
-**`--anchor`.** All crop-box computation must go through a single function with the
-signature `(src_w, src_h, target_ar) -> (left, top, right, bottom)`. Centre-with-
-portrait-bias is one implementation; a face-aware one is another with the same
-signature. Keep every caller going through it and Phase 2 is a one-file change.
+**`--anchor`.** All crop-box computation must go through a single function with the signature `(src_w, src_h, target_ar) -> (left, top, right, bottom)`. Centre-with- portrait-bias is one implementation; a face-aware one is another with the same signature. Keep every caller going through it and Phase 2 is a one-file change.
 
-**`--recursive`.** Implemented in 1.1.0; the design decision (mirror the source
-tree, per-dataset scoping everywhere) is recorded in section 7.4.
+**`--recursive`.** Implemented in 1.1.0; the design decision (mirror the source tree, per-dataset scoping everywhere) is recorded in section 7.4.
 
-**`--keep-rejected`.** If the skip-only policy ever proves too aggressive, the hook is
-a single branch at the point of rejection. Do not build the folder structure for it now.
+**`--keep-rejected`.** If the skip-only policy ever proves too aggressive, the hook is a single branch at the point of rejection. Do not build the folder structure for it now.
 
-**Deblocking.** If it is ever added it belongs in the DCT domain (ffmpeg's `deblock` /
-`spp` / `uspp`), gated on a measured B ratio, and applied only when R_factor is below
-about 1.5. A generic spatial denoiser (NLM, bilateral) is not acceptable at any
-strength: it cannot distinguish JPEG ringing from skin pores, fabric weave and hair,
-and removing those is precisely how you train a LoRA that produces plastic skin.
+**Deblocking.** If it is ever added it belongs in the DCT domain (ffmpeg's `deblock` / `spp` / `uspp`), gated on a measured B ratio, and applied only when R_factor is below about 1.5. A generic spatial denoiser (NLM, bilateral) is not acceptable at any strength: it cannot distinguish JPEG ringing from skin pores, fabric weave and hair, and removing those is precisely how you train a LoRA that produces plastic skin.
 
 ### Non-goals for Phase 1
 
 - No 256 tier.
-- No lossless JPEG cropping via jpegtran. Its only advantage is avoiding a re-encode,
-  which evaporates the moment you re-encode at q97 anyway, and the EXIF-rotation
-  interaction (`-rotate` then `-crop` in separate passes, then clearing the orientation
-  tag) is the most bug-prone part of the whole design for the least benefit.
+- No lossless JPEG cropping via jpegtran. Its only advantage is avoiding a re-encode, which evaporates the moment you re-encode at q97 anyway, and the EXIF-rotation interaction (`-rotate` then `-crop` in separate passes, then clearing the orientation tag) is the most bug-prone part of the whole design for the least benefit.
 - No upscaling beyond `UPSCALE_TOLERANCE`.
 - No writing to, moving within, or deleting from the source folder under any flag.
 - No ICC handling. All inputs assumed sRGB.
 - No duplicate or near-duplicate detection.
 - No caption generation, editing or validation beyond copying and counting.
-- No video, no animated formats. First-frame extraction is not acceptable behaviour;
-  reject with a clear message.
+- No video, no animated formats. First-frame extraction is not acceptable behaviour; reject with a clear message.
 
 ---
 
@@ -916,19 +764,10 @@ and removing those is precisely how you train a LoRA that produces plastic skin.
 
 Short, in this order:
 
-1. What the tool does, in two sentences, including that it produces a filtered subset
-   and never modifies the source folder.
-2. `install.bat`, then `run.bat <folder> --report`, then
-   `run.bat <folder> --threshold 6 --emit-toml`. State plainly that `--report` first is
-   the intended workflow, because rejections leave no artifact on disk.
+1. What the tool does, in two sentences, including that it produces a filtered subset and never modifies the source folder.
+2. `install.bat`, then `run.bat <folder> --report`, then `run.bat <folder> --threshold 6 --emit-toml`. State plainly that `--report` first is the intended workflow, because rejections leave no artifact on disk.
 3. The full option table from section 8.
-4. **Why the output dimensions look arbitrary.** This is the question every user will
-   ask. Explain that 1184×880 rather than 1168×880 is not a rounding error but an exact
-   match to musubi-tuner's generated bucket list, and that any other value causes the
-   trainer to re-crop.
-5. A warning not to set `bucket_no_upscale = true` in the training TOML, with the
-   one-line reason: it bypasses the bucket list and gives each image its own dimensions
-   floored to 16.
+4. **Why the output dimensions look arbitrary.** This is the question every user will ask. Explain that 1184×880 rather than 1168×880 is not a rounding error but an exact match to musubi-tuner's generated bucket list, and that any other value causes the trainer to re-crop.
+5. A warning not to set `bucket_no_upscale = true` in the training TOML, with the one-line reason: it bypasses the bucket list and gives each image its own dimensions floored to 16.
 6. How to read the bucket distribution section of the report and what the warnings mean.
-7. A note that the D metric bands are uncalibrated and should be checked against a
-   `--report` histogram before `--threshold` is trusted to act on them.
+7. A note that the D metric bands are uncalibrated and should be checked against a `--report` histogram before `--threshold` is trusted to act on them.

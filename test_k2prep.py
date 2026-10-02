@@ -718,8 +718,122 @@ def test_recursive_refuses_tier_named_folder_end_to_end():
         assert not (root / k.PREP_DIRNAME).exists()
 
 
+# ---------------------------------------------------------------------------
+# --copy-to
+# ---------------------------------------------------------------------------
+
+def _detailed_image(path, w, h):
+    """Noise upscaled 4x: enough detail to score 10, so the threshold test
+    below depends on resolution and flatness alone."""
+    import numpy as np
+    from PIL import Image
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(w * 10007 + h)
+    arr = rng.integers(0, 255, (h // 4, w // 4, 3), dtype=np.uint8)
+    Image.fromarray(arr).resize((w, h), Image.BICUBIC).save(path, "JPEG", quality=95)
+
+
+def _rejects(argv):
+    import contextlib, io
+    with contextlib.redirect_stderr(io.StringIO()):
+        try:
+            k.parse_args(argv)
+        except SystemExit as exc:
+            return exc.code != 0
+    return False
+
+
+def test_copy_to_option_rules():
+    assert _rejects(["f", "--copy-to", "t", "--sort"])
+    assert _rejects(["f", "--min-res", "1024"])           # needs --copy-to
+    assert _rejects(["f", "--copy-to", "t", "--min-res", "-1"])
+    assert _rejects(["f", "--copy-to", "t", "--min-res", "1024x768"])
+    assert _rejects(["f", "--copy-to", "t", "--move"])
+    args = k.parse_args(["f", "--copy-to", "t", "--min-res", "1024", "--recursive"])
+    assert (args.copy_to, args.min_res, args.recursive) == ("t", 1024, True)
+
+
+def test_min_res_is_area():
+    from pathlib import Path
+    def res(w, h):
+        r = k.Result(path=Path("x.jpg"), name="x.jpg")
+        r.src_w, r.src_h = w, h
+        return r
+    assert k.meets_min_res(res(1024, 1024), 1024)
+    assert k.meets_min_res(res(1536, 768), 1024)          # wide, same budget
+    assert not k.meets_min_res(res(1200, 800), 1024)      # 960,000 px
+    assert not k.meets_min_res(res(1023, 1024), 1024)
+    assert k.meets_min_res(res(1, 1), 0)
+
+
+def test_copy_target_must_not_overlap_the_source():
+    from pathlib import Path
+    src = Path("C:/data/src")
+    assert k.check_copy_target(src, src) is not None
+    assert k.check_copy_target(src, Path("C:/data")) is not None
+    assert k.check_copy_target(src, src / "picked") is not None
+    assert k.check_copy_target(src, src / k.PREP_DIRNAME / "x") is not None
+    assert k.check_copy_target(src, src / "_picked" / "x") is None
+    assert k.check_copy_target(src, Path("C:/data/src2")) is None
+    assert k.check_copy_target(src, Path("D:/picked")) is None
+
+
+def test_copy_to_end_to_end():
+    """Both gates, a mirrored tree, verbatim copies with captions, a dry run
+    that writes nothing, idempotent re-runs, and a conflict that is reported
+    rather than overwritten."""
+    import contextlib, io, tempfile
+    from pathlib import Path
+    with tempfile.TemporaryDirectory() as tmp:
+        src, out = Path(tmp) / "src", Path(tmp) / "out"
+        _detailed_image(src / "top.jpg", 1600, 1200)
+        (src / "top.txt").write_text("top", encoding="utf-8")
+        _detailed_image(src / "a" / "deep" / "pano.jpg", 1536, 768)
+        _detailed_image(src / "a" / "small.jpg", 800, 600)      # too small
+        _write_image(src / "a" / "flat.jpg", 2000, 2000)        # scores 1
+        _detailed_image(src / "1024" / "tier.jpg", 1400, 1400)  # name is fine here
+        _detailed_image(src / "_skip" / "x.jpg", 2000, 2000)    # never scanned
+        argv = [str(src), "--recursive", "--copy-to", str(out),
+                "--min-res", "1024", "--threshold", "5", "--threads", "1"]
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert k.main(argv + ["--report"]) == 0
+        assert not out.exists()
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert k.main(argv) == 0
+        got = sorted(p.relative_to(out).as_posix() for p in out.rglob("*") if p.is_file())
+        assert got == ["1024/tier.jpg", "a/deep/pano.jpg", "top.jpg", "top.txt"], got
+        for rel in got:
+            assert (out / rel).read_bytes() == (src / rel).read_bytes(), rel
+
+        stamps = {p: p.stat().st_mtime_ns for p in out.rglob("*")}
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert k.main(argv) == 0
+        assert {p: p.stat().st_mtime_ns for p in out.rglob("*")} == stamps
+
+        (out / "top.txt").write_text("edited by hand", encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert k.main(argv) == 1
+        assert (out / "top.txt").read_text(encoding="utf-8") == "edited by hand"
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert k.main(argv + ["--force"]) == 0
+        assert (out / "top.txt").read_text(encoding="utf-8") == "top"
+
+        # A tighter run leaves earlier copies alone and names them.
+        tighter = [a if a != "1024" else "1300" for a in argv]
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert k.main(tighter) == 0
+        assert (out / "a" / "deep" / "pano.jpg").is_file()
+        report = max((src / k.PREP_DIRNAME / k.REPORTS_DIRNAME).glob("copy-2*.txt"),
+                     key=lambda p: p.stat().st_mtime_ns)
+        text = report.read_text(encoding="utf-8")
+        assert "IN THE TARGET BUT NOT SELECTED  (1)" in text
+        assert "a/deep/pano.jpg" in text.split("IN THE TARGET BUT NOT SELECTED")[1]
+
+
 def main():
-    tests = [v for name, v in sorted(globals().items()) if name.startswith("test_")]
+    tests =[v for name, v in sorted(globals().items()) if name.startswith("test_")]
     failed = 0
     for fn in tests:
         try:

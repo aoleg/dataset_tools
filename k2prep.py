@@ -39,7 +39,7 @@ import numpy as np
 from PIL import Image, ImageOps
 from tqdm import tqdm
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 EPS = 1e-6
 
@@ -648,6 +648,11 @@ class Result:
     sort_tier: int = 0            # 1 = best, in --sort N mode
     sort_dirname: str = ""
 
+    # --copy-to
+    reject_reason: str = ""
+    copy_dest: Path | None = None
+    copy_action: str = ""
+
     # --vl
     vl_scores: dict[str, int] | None = None
     vl_mean: float | None = None
@@ -731,8 +736,8 @@ def analyse_geometry(path: Path, dataset: str = "") -> Result:
     return res
 
 
-def analyse_for_sort(path: Path) -> Result:
-    """Phase A for --sort: geometry against the 1024 tier only.
+def analyse_for_sort(path: Path, dataset: str = "") -> Result:
+    """Phase A for --sort and --copy-to: geometry against the 1024 tier only.
 
     Sorting asks one question - how good would this photograph be if it went
     into training - and that question has a single answer, so it is always asked
@@ -744,7 +749,7 @@ def analyse_for_sort(path: Path) -> Result:
     An image already at or below the 1024 tier is scored as it is. Upscaling it
     first would invent detail and flatter the result.
     """
-    res = Result(path=path, name=path.name)
+    res = Result(path=path, name=qualified_name(dataset, path.name), dataset=dataset)
     try:
         res.src_w, res.src_h, _fmt, _qt = read_geometry(path)
         if res.src_w < 1 or res.src_h < 1:
@@ -1252,7 +1257,7 @@ class ScanError(RuntimeError):
     """The source tree cannot be mirrored into _prep. Raised before any work."""
 
 
-def scan_tree(root: Path, recursive: bool):
+def scan_tree(root: Path, recursive: bool, reserved: bool = True):
     """The scanner. A dataset is any directory that directly contains at least
     one image; its images are only the files directly in it, so each source
     directory maps 1:1 to _prep/<relpath>/<tier>/ and pooling a subtree is the
@@ -1276,6 +1281,8 @@ def scan_tree(root: Path, recursive: bool):
     A source directory named like a tier ("1024") would make _prep/<x>/1024
     ambiguous - dataset or tier folder - and "reports" at the first level would
     collide with _prep/reports. Both raise ScanError; rename the folder.
+    reserved=False drops both checks, for --copy-to, which mirrors the tree
+    into its own target rather than into _prep.
     """
     if not recursive:
         images, unknown = scan_folder(root)
@@ -1322,12 +1329,12 @@ def scan_tree(root: Path, recursive: bool):
                                  f"junctions are not followed")
                     continue
                 low = name.lower()
-                if low in tier_names:
+                if reserved and low in tier_names:
                     raise ScanError(
                         f"source folder {relname!r} is named like a k2prep tier "
                         f"folder, which makes _prep/{relname} ambiguous. Rename "
                         f"it, or run without --recursive.")
-                if rel == "" and low == REPORTS_DIRNAME:
+                if reserved and rel == "" and low == REPORTS_DIRNAME:
                     raise ScanError(
                         f"source folder {relname!r} would collide with "
                         f"_prep/{REPORTS_DIRNAME}. Rename it, or run without "
@@ -1915,6 +1922,124 @@ def find_stale_sorted(prep_dir: Path, results: list[Result]) -> list[str]:
             if target is not None and target != folder:
                 stale.append(f"{folder}/{path.name}   (this run files it under {target})")
     return stale
+
+
+# ---------------------------------------------------------------------------
+# --copy-to: selection and file placement
+# ---------------------------------------------------------------------------
+#
+# Copies the ORIGINAL of every image that passes both gates - score and
+# resolution - into a separate target folder, mirroring the source tree, with
+# its .txt sidecar. shutil.copy2 copies bytes and keeps the mtime: nothing is
+# decoded or re-encoded on the way.
+#
+# The source is read-only here as everywhere else. The target is the user's
+# folder, not k2prep's, so nothing in it is ever deleted, and a file that
+# differs from the one this run would copy is reported, not overwritten, unless
+# --force. Copies left by an earlier run that this run no longer selects are
+# listed and left alone.
+
+COPY_COPIED = "copied"
+COPY_PRESENT = "already there"
+COPY_CONFLICT = "conflict"
+COPY_FAILED = "failed"
+
+# copy2 keeps the mtime, but FAT and some network shares store it at 2 s
+# resolution, so an exact comparison would call every re-run a conflict there.
+COPY_MTIME_SLACK_NS = 2_000_000_000
+
+
+def _path_inside(child: Path, parent: Path) -> bool:
+    """True if child is parent or below it. Case-insensitive on Windows."""
+    c = os.path.normcase(str(child))
+    p = os.path.normcase(str(parent))
+    try:
+        return os.path.commonpath([c, p]) == p
+    except ValueError:                            # different drives
+        return False
+
+
+def check_copy_target(source: Path, target: Path) -> str | None:
+    """Why target cannot receive copies of source, or None if it can.
+
+    The two must not overlap. A target that holds the source could put copies
+    among the originals. A target inside the source would be scanned as source
+    by the next --recursive run, so its copies would be scored and copied
+    again - unless it sits under a folder the scan skips, which is any folder
+    whose name starts with '_' or '.'.
+    """
+    if _path_inside(source, target):
+        what = "is" if _path_inside(target, source) else "contains"
+        return (f"the target folder {what} the source folder; copies could "
+                f"land among the originals. Choose a folder outside {source}.")
+    if _path_inside(target, source / PREP_DIRNAME):
+        return (f"the target folder is inside {PREP_DIRNAME}, which belongs to "
+                f"k2prep's own runs. Choose a folder outside it.")
+    if _path_inside(target, source):
+        rel = target.relative_to(source)
+        if not any(part.startswith(("_", ".")) for part in rel.parts):
+            return (f"the target folder is inside the source folder, so the "
+                    f"next --recursive run would scan the copies as source. "
+                    f"Choose a folder outside {source}, or one whose name "
+                    f"starts with an underscore, e.g. {source / '_selected'}.")
+    return None
+
+
+def copy_dest_dir(target: Path, dataset: str) -> Path:
+    """target/<relpath>, mirroring the source tree; the root maps to target."""
+    return target / dataset if dataset else target
+
+
+def _target_state(src: Path, dst: Path) -> str:
+    """'absent', 'same' (the copy an earlier run made) or 'different'."""
+    if not dst.exists():
+        return "absent"
+    if not dst.is_file():
+        return "different"
+    s, d = src.stat(), dst.stat()
+    if (s.st_size == d.st_size
+            and abs(s.st_mtime_ns - d.st_mtime_ns) <= COPY_MTIME_SLACK_NS):
+        return "same"
+    return "different"
+
+
+def place_copy(res: Result, target: Path, force: bool, dry_run: bool) -> None:
+    """Copy one source image, and its caption, to its mirrored place."""
+    dest_dir = copy_dest_dir(target, res.dataset)
+    pairs = [(res.path, dest_dir / res.path.name)]
+    if res.caption_src is not None:
+        pairs.append((res.caption_src, dest_dir / res.caption_src.name))
+    res.copy_dest = pairs[0][1]
+
+    try:
+        states = [_target_state(src, dst) for src, dst in pairs]
+    except OSError as exc:
+        res.copy_action = COPY_FAILED
+        res.error = f"{type(exc).__name__}: {exc}"
+        return
+    # The pair moves together: copying the image while its caption clashes
+    # would leave a target image described by somebody else's caption.
+    clash = [dst for (_src, dst), st in zip(pairs, states) if st == "different"]
+    if clash and not force:
+        res.copy_action = COPY_CONFLICT
+        res.error = f"{clash[0].name} already exists in the target and differs"
+        return
+    todo = [(src, dst) for (src, dst), st in zip(pairs, states) if st != "same"]
+    if not todo:
+        res.copy_action = COPY_PRESENT
+        return
+    if dry_run:
+        res.copy_action = COPY_COPIED
+        return
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        for src, dst in todo:
+            shutil.copy2(src, dst)
+    except Exception as exc:
+        res.copy_action = COPY_FAILED
+        res.error = f"{type(exc).__name__}: {exc}"
+        return
+    res.copy_action = COPY_COPIED
 
 
 def already_correct(path: Path, bucket: tuple[int, int]) -> bool:
@@ -2669,6 +2794,175 @@ def build_sort_report(args, folder: Path, results: list[Result],
     return "\n".join(line.rstrip() for line in out) + "\n"
 
 
+def meets_min_res(res: Result, min_res: int) -> bool:
+    """--min-res N means the area of an N x N image: the pixel budget of the N
+    bucket, whatever the aspect ratio."""
+    return res.src_w * res.src_h >= min_res * min_res
+
+
+def build_copy_report(args, folder: Path, target: Path, results: list[Result],
+                      unknown: list[str], left_over: list[Result],
+                      started: datetime, finished: datetime, elapsed: float,
+                      notes: list[str]) -> str:
+    out: list[str] = []
+    w = out.append
+
+    scored = [r for r in results if r.scored and r.status != ST_ERROR]
+    selected = [r for r in results if r.status == ST_ACCEPTED]
+    rejected = [r for r in results if r.status in (ST_BELOW, ST_SMALL)]
+    conflicts = [r for r in selected if r.copy_action == COPY_CONFLICT]
+    errors = [r for r in results
+              if r.status == ST_ERROR or r.copy_action == COPY_FAILED]
+    name_w = max([26] + [len(r.name) for r in results]) + 2
+    min_res = args.min_res
+    copied = "would copy" if args.report else "copied"
+
+    w("k2prep copy report")
+    w("=" * 66)
+    w(f"folder      : {folder}")
+    w(f"target      : {target}")
+    w(f"run         : {'copy / dry run, nothing copied' if args.report else 'copy'}")
+    w(f"started     : {started:%Y-%m-%d %H:%M:%S}")
+    w(f"finished    : {finished:%Y-%m-%d %H:%M:%S}")
+    w(f"options     : threshold={args.threshold} min-res={min_res} "
+      f"filter={args.filter} threads={args.local_threads}"
+      f"{' recursive=on' if args.recursive else ''}"
+      f"{' force=on' if args.force else ''}")
+    w(f"selection   : score >= {args.threshold} AND at least "
+      f"{min_res * min_res:,} pixels ({min_res}x{min_res})")
+    w("              Resolution is area, so any aspect ratio with the pixel")
+    w(f"              budget of the {min_res} bucket passes.")
+    w(f"scoring     : every image is judged at the {SORT_TIER} tier, as in --sort,")
+    w("              so scores compare across folders. An image already at or")
+    w(f"              below the {SORT_TIER} tier is scored as it is, never upscaled.")
+    w("policy      : originals and their .txt captions are copied byte for byte,")
+    w("              mirroring the source tree. The source is not modified.")
+    w("              Nothing in the target is deleted, and a different file")
+    w("              already there is not overwritten without --force.")
+    for note in notes:
+        w(f"note        : {note}")
+    w("")
+
+    def row(r: Result, last: str) -> str:
+        src = f"{r.src_w}x{r.src_h}"
+        mp = f"{r.src_w * r.src_h / 1e6:.1f}"
+        return (f"{r.name:<{name_w}}{src:<12}{mp:>6}  "
+                f"{_score_cell(r.q):>3} {_score_cell(r.b):>3} {_score_cell(r.d):>3} "
+                f"{r.composite:>6} {r.composite_fine:>7.2f}  {last}")
+
+    head = (f"{'filename':<{name_w}}{'source':<12}{'MP':>6}  "
+            f"{'Q~':>3} {'B':>3} {'D':>3} {'score':>6} {'fine':>7}  ")
+
+    w(f"SELECTED  ({_fmt_int(len(selected))} images)")
+    w("-" * 66)
+    if selected:
+        w(head + "action")
+    for r in sorted(selected, key=lambda r: r.name):
+        action = copied if r.copy_action == COPY_COPIED else r.copy_action
+        cap = "" if r.caption_src is not None else "  (no caption)"
+        w(row(r, action + cap))
+    if selected:
+        w("")
+        w("Q~ is informational; the score is min(B, D), 'fine' the score plus its")
+        w("position inside its band.")
+    w("")
+
+    w(f"NOT SELECTED  ({_fmt_int(len(rejected))} images)")
+    w("-" * 66)
+    if rejected:
+        w(head + "reason")
+    for r in sorted(rejected, key=lambda r: r.name):
+        w(row(r, r.reject_reason))
+    w("")
+
+    w(f"CONFLICTS  ({_fmt_int(len(conflicts))})")
+    w("-" * 66)
+    if conflicts:
+        w("Selected, but the target already holds a different file of that")
+        w("name. Not copied; --force overwrites.")
+    for r in conflicts:
+        w(f"{r.name:<{name_w}}{r.error}")
+    w("")
+
+    w(f"IN THE TARGET BUT NOT SELECTED  ({_fmt_int(len(left_over))})")
+    w("-" * 66)
+    if left_over:
+        w("Copied by an earlier run with looser settings. Left alone: the")
+        w("target is yours, and k2prep deletes nothing in it.")
+    for r in left_over:
+        w(f"{r.name:<{name_w}}{r.reject_reason}")
+    w("")
+
+    missing = [r.name for r in selected if r.caption_src is None]
+    w(f"MISSING CAPTIONS  ({_fmt_int(len(missing))}, selected images only)")
+    w("-" * 66)
+    for n in missing:
+        w(n)
+    w("")
+
+    w(f"SKIPPED - unknown extension  ({_fmt_int(len(unknown))})")
+    w("-" * 66)
+    for n in unknown:
+        w(n)
+    w("")
+
+    w(f"ERRORS  ({_fmt_int(len(errors))})")
+    w("-" * 66)
+    if errors:
+        w("Not copied.")
+    for r in errors:
+        w(f"{r.name:<{name_w}}{r.error}")
+    w("")
+
+    w("=" * 66)
+    w("SUMMARY")
+    w("=" * 66)
+    w("")
+    big = [r for r in scored if meets_min_res(r, min_res)]
+    w(f"SCORE DISTRIBUTION  (all scored images; '>= res' meets {min_res}x{min_res})")
+    hist = defaultdict(int)
+    hist_big = defaultdict(int)
+    for r in scored:
+        hist[r.composite] += 1
+    for r in big:
+        hist_big[r.composite] += 1
+    peak = max(hist.values()) if hist else 0
+    w(f"  {'':>2}  {'':<40}  {'all':>8}  {'>= res':>8}")
+    for score in range(10, 0, -1):
+        n = hist[score]
+        bar = "#" * (round(40 * n / peak) if peak else 0)
+        w(f"  {score:>2}  {bar:<40}  {_fmt_int(n):>8}  {_fmt_int(hist_big[score]):>8}")
+    w("")
+
+    w(f"THRESHOLD PREVIEW  (images a run would select at --min-res {min_res})")
+    for t in range(10, -1, -1):
+        n = sum(1 for r in big if r.composite >= t)
+        mark = "   <- this run" if t == args.threshold else ""
+        w(f"  --threshold {t:<3} {_fmt_int(n):>8}{mark}")
+    w("")
+
+    if args.recursive:
+        w("BY FOLDER")
+        w(f"  {'folder':<40}{'images':>8}{'>= res':>8}{'>= thr':>8}{'selected':>10}")
+        by_ds: dict[str, list[Result]] = defaultdict(list)
+        for r in results:
+            by_ds[r.dataset].append(r)
+        for ds in sorted(by_ds):
+            rs = by_ds[ds]
+            sc = [r for r in rs if r.scored and r.status != ST_ERROR]
+            n_res = sum(1 for r in sc if meets_min_res(r, min_res))
+            n_thr = sum(1 for r in sc if r.composite >= args.threshold)
+            n_sel = sum(1 for r in rs if r.status == ST_ACCEPTED)
+            w(f"  {(ds or '.'):<40}{len(rs):>8}{n_res:>8}{n_thr:>8}{n_sel:>10}")
+        w("")
+
+    w("TIMING")
+    rate = len(results) / elapsed if elapsed > 0 else 0.0
+    w(f"  scored   {_fmt_int(len(results))} images in {_hms(elapsed)} "
+      f"({rate:.1f} img/s, {args.local_threads} threads)")
+    return "\n".join(line.rstrip() for line in out) + "\n"
+
+
 # ---------------------------------------------------------------------------
 # 10  --emit-toml
 # ---------------------------------------------------------------------------
@@ -2783,6 +3077,18 @@ def _sort_tiers_arg(value: str) -> int:
     return n
 
 
+def _min_res_arg(value: str) -> int:
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"--min-res takes one number, the side of a square bucket such as "
+            f"1024, got {value!r}")
+    if n < 0:
+        raise argparse.ArgumentTypeError(f"--min-res must be 0 or more, got {n}")
+    return n
+
+
 def _threads_arg(value: str) -> int:
     try:
         n = int(value)
@@ -2839,6 +3145,22 @@ def parse_args(argv=None):
                         f"divides this folder into N populated tiers, "
                         f"{QUALITY_DIR_PREFIX}1 best. Writes no tier folders "
                         f"and no TOML.")
+    p.add_argument("--copy-to", metavar="TARGET", dest="copy_to",
+                   help="Select instead of building a dataset: score every "
+                        f"image at the {SORT_TIER} tier, as --sort does, and "
+                        "copy the ORIGINAL of each one that passes "
+                        "--threshold and --min-res, with its .txt sidecar, "
+                        "byte for byte into TARGET, mirroring the source "
+                        "tree. TARGET is created if needed and must not "
+                        "overlap the source. Nothing in it is deleted or "
+                        "overwritten without --force. With --report, scores "
+                        "and reports only. Add --recursive for subfolders.")
+    p.add_argument("--min-res", type=_min_res_arg, default=0, metavar="N",
+                   dest="min_res",
+                   help="With --copy-to, copy only images with at least N x N "
+                        "pixels, measured as area: 1024 is the pixel budget of "
+                        "the 1024 bucket, so 1536x768 passes and 1200x800 "
+                        "does not. Default 0, no resolution gate.")
     p.add_argument("--move", action="store_true",
                    help="With --sort, move the originals instead of copying "
                         "them. This is the only k2prep option that removes "
@@ -2871,6 +3193,13 @@ def parse_args(argv=None):
                 "that should mean across a tree of datasets is not decided. "
                 "Run --sort on one folder at a time, or run.bat -R to sweep "
                 "each subfolder separately.")
+    if args.copy_to is not None and args.sort is not None:
+        p.error("--copy-to cannot be combined with --sort: sorting files every "
+                "image under a folder for its score, copying selects the ones "
+                "that pass; run them separately")
+    if args.min_res and args.copy_to is None:
+        p.error("--min-res is only available with --copy-to; a dataset run "
+                "already assigns each image the largest tier it fills")
     if args.move and args.sort is None:
         p.error("--move is only available with --sort; on its own it would have "
                 "nothing to move and would still delete your originals")
@@ -3107,6 +3436,145 @@ def run_sort(args, folder: Path, prep_dir: Path, reports_dir: Path,
 
 
 # ---------------------------------------------------------------------------
+# --copy-to run
+# ---------------------------------------------------------------------------
+
+def run_copy(args, folder: Path, target: Path, prep_dir: Path,
+             reports_dir: Path, pairs: list[tuple[str, Path]],
+             unknown: list[str], scan_notes: list[str], resample: int,
+             started: datetime, t0: float) -> int:
+    """Select by score and resolution, and copy the originals that pass.
+
+    Builds no dataset: no tier folders, no TOML. Scoring is --sort's, at the
+    1024 tier, and shares its cache, so the --report pass that comes first
+    pays for every render and the real run reuses all of them.
+    """
+    notes: list[str] = list(scan_notes)
+    for flag, why in (("png", "originals are copied verbatim, so the output "
+                              "format option does not apply"),
+                      ("single_pass", f"copying always scores the rendered "
+                                      f"{SORT_TIER}-tier image, as --sort does"),
+                      ("no_merge", "copying does not use buckets")):
+        if getattr(args, flag, None):
+            notes.append(f"--{flag.replace('_', '-')} ignored: {why}.")
+    if not args.min_res:
+        notes.append("--min-res not given: no resolution gate, the score alone "
+                     "decides.")
+
+    results: list[Result] = []
+    if pairs:
+        with ThreadPoolExecutor(max_workers=args.local_threads) as pool:
+            futures = [pool.submit(analyse_for_sort, p, ds) for ds, p in pairs]
+            for fut in tqdm(as_completed(futures), total=len(futures),
+                            desc="scanning ", unit="img"):
+                results.append(fut.result())
+    results.sort(key=lambda r: (r.dataset, r.name))
+    for r in results:
+        if r.status == ST_CANDIDATE:
+            r.caption_src = caption_for(r.path)
+
+    # -- score everything, small images included -----------------------------
+    # The report is the quality survey of the whole tree, so an image that
+    # fails the resolution gate is still scored; a small one costs little.
+    todo = [r for r in results if r.status == ST_CANDIDATE]
+    cache_hits = 0
+    if todo:
+        cache = {} if args.force else load_score_cache(prep_dir)
+        pending = []
+        for r in todo:
+            if apply_cached_score(r, cache):
+                cache_hits += 1
+            else:
+                pending.append(r)
+        if pending:
+            with ThreadPoolExecutor(max_workers=args.local_threads) as pool:
+                futures = {pool.submit(score_rendered, r, resample): r
+                           for r in pending}
+                for fut in tqdm(as_completed(futures), total=len(futures),
+                                desc="scoring  ", unit="img"):
+                    r = futures[fut]
+                    try:
+                        fut.result()
+                    except Exception as exc:
+                        r.status = ST_ERROR
+                        r.error = f"{type(exc).__name__}: {exc}"
+        save_score_cache(prep_dir, results, datetime.now())
+        notes.append(f"scores cached in {CACHE_FILENAME} "
+                     f"({cache_hits} of {len(todo)} reused this run).")
+
+    # -- both gates ------------------------------------------------------------
+    for r in results:
+        if r.status != ST_CANDIDATE:
+            continue
+        reasons = []
+        if not meets_min_res(r, args.min_res):
+            reasons.append(f"{r.src_w * r.src_h:,} px < "
+                           f"{args.min_res}x{args.min_res}")
+        if r.composite < args.threshold:
+            reasons.append(f"score {r.composite} < {args.threshold}")
+        r.reject_reason = ", ".join(reasons)
+        if not reasons:
+            r.status = ST_ACCEPTED
+        elif not meets_min_res(r, args.min_res):
+            r.status = ST_SMALL
+        else:
+            r.status = ST_BELOW
+
+    # -- copy, sequentially: the disk is the bottleneck, not the CPU ----------
+    selected = [r for r in results if r.status == ST_ACCEPTED]
+    for r in tqdm(selected, desc="copying  " if not args.report else "planning ",
+                  unit="img", disable=not selected):
+        place_copy(r, target, args.force, args.report)
+    left_over = [r for r in results if r.status in (ST_BELOW, ST_SMALL)
+                 and (copy_dest_dir(target, r.dataset) / r.path.name).exists()]
+
+    elapsed = time.perf_counter() - t0
+    finished = datetime.now()
+    for note in notes[len(scan_notes):]:      # scan notes were printed up front
+        print(f"note: {note}")
+
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    kind = "copy-scan" if args.report else "copy"
+    report_path = _free_path(reports_dir, f"{kind}-{started:%Y%m%d-%H%M%S}", ".txt")
+    report_path.write_text(
+        build_copy_report(args, folder, target, results, unknown, left_over,
+                          started, finished, elapsed, notes),
+        encoding="utf-8",
+    )
+
+    counts = defaultdict(int)
+    for r in selected:
+        counts[r.copy_action] += 1
+    errors = sum(1 for r in results
+                 if r.status == ST_ERROR or r.copy_action == COPY_FAILED)
+    small = sum(1 for r in results if r.status == ST_SMALL)
+    below = sum(1 for r in results if r.status == ST_BELOW)
+
+    print()
+    print(f"k2prep copy{' (dry run)' if args.report else ''}: "
+          f"{len(results)} images in {_hms(elapsed)}")
+    print(f"  selected    {len(selected):>7}   "
+          f"(score >= {args.threshold}, >= {args.min_res}x{args.min_res} px)")
+    verb = "would copy " if args.report else "copied     "
+    print(f"  {verb}{counts[COPY_COPIED]:>7}")
+    print(f"  already     {counts[COPY_PRESENT]:>7}")
+    if counts[COPY_CONFLICT]:
+        print(f"  conflicts   {counts[COPY_CONFLICT]:>7}   "
+              f"(a different file is in the target; --force overwrites)")
+    print(f"  too small   {small:>7}")
+    print(f"  below thr.  {below:>7}")
+    print(f"  errors      {errors:>7}")
+    if unknown:
+        print(f"  unknown ext {len(unknown):>7}")
+    if left_over:
+        print(f"  left over   {len(left_over):>7}   "
+              f"(in the target from an earlier run, not selected now)")
+    print(f"  target      {target}")
+    print(f"  report      {report_path}")
+    return 1 if errors or counts[COPY_CONFLICT] else 0
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
@@ -3122,11 +3590,22 @@ def main(argv=None) -> int:
         return 2
     folder = folder.resolve()
 
+    target = None
+    if args.copy_to is not None:
+        target = Path(args.copy_to).expanduser().resolve()
+        why = check_copy_target(folder, target)
+        if why is None and target.exists() and not target.is_dir():
+            why = f"the target exists and is not a directory: {target}"
+        if why is not None:
+            print(f"error: --copy-to: {why}", file=sys.stderr)
+            return 2
+
     started = datetime.now()
     t0 = time.perf_counter()
 
     try:
-        pairs, unknown, seen_dirs, scan_notes = scan_tree(folder, args.recursive)
+        pairs, unknown, seen_dirs, scan_notes = scan_tree(
+            folder, args.recursive, reserved=target is None)
     except ScanError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -3135,7 +3614,8 @@ def main(argv=None) -> int:
               f"({len(unknown)} files with unknown extensions).")
     if args.recursive:
         n_datasets = len({ds for ds, _p in pairs})
-        scan_notes.append(f"--recursive: {n_datasets} dataset(s) with images "
+        what = "folder(s)" if target is not None else "dataset(s)"
+        scan_notes.append(f"--recursive: {n_datasets} {what} with images "
                           f"across {len(seen_dirs)} folder(s) scanned.")
     for note in scan_notes:
         print(f"note: {note}")
@@ -3148,6 +3628,9 @@ def main(argv=None) -> int:
     if args.sort is not None:
         return run_sort(args, folder, prep_dir, reports_dir,
                         [p for _ds, p in pairs], unknown, resample, started, t0)
+    if target is not None:
+        return run_copy(args, folder, target, prep_dir, reports_dir, pairs,
+                        unknown, scan_notes, resample, started, t0)
 
     # -- phase A: geometry (and, in single-pass mode, source scores) ---------
     # Two-pass mode reads headers only here: nothing is decoded until there is
