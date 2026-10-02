@@ -3,13 +3,16 @@
 Reframe photos of people: trim wasted space around the subject (one person or a
 group), leave passers-by out, and crop to one of the k2prep aspect ratios.
 
-Phases 1-5 (this version): detection, per-person measurements, subject
-selection and crop planning. Every image is analysed with three models; the detections are
-merged into one list of people, each person is measured, and the subject group
-is chosen, or the photo is marked to stay unchanged (crowd, no clear subject).
+Every image is analysed with three models; the detections are merged into one
+list of people, each person is measured, and the subject group is chosen, or
+the photo is marked to stay unchanged (crowd, no clear subject).
 The crop holds the subject with margins, in one of the k2prep aspect ratios.
-JPEG crops are planned for a lossless crop (whole DCT blocks, no re-encoding)
-unless --reencode is given. Results go to <out>/plan.json. --previews draws the
+Output goes to <folder>/_reframed/<same relative path>: JPEG crops are lossless
+(whole DCT blocks, no re-encoding) unless --reencode is given, other formats are
+re-encoded in their own format, unchanged photos are copied, and .txt captions
+are copied along. With --resize every photo is instead cropped and resized into
+its k2prep bucket and filed under <tier>/ the way k2prep does it.
+--dry-run writes only plan.json and the previews: --previews draws the
 detections, --people the measurements, --verdicts the subject choice and the
 planned crop.
 Per-photo corrections: <folder>/overrides.txt, see OVERRIDES_NAME.
@@ -17,12 +20,14 @@ Per-photo corrections: <folder>/overrides.txt, see OVERRIDES_NAME.
   faces           : face_yolov8m.pt  (Bingsu/adetailer, Hugging Face)
   pose keypoints  : yolo26x-pose.pt  (ultralytics assets)
 
-Usage:    python reframe.py <folder> [<folder> ...] [--out DIR] [--previews]
+Usage:    python reframe.py <folder> [<folder> ...] [--dry-run] [--verdicts] [--resize [--png]]
+          [--reencode] [--ratios 2:3,4:5,...] [--skip-unchanged] [--overwrite] [--out DIR]
           python reframe.py --fetch-models
 """
 import argparse
 import json
 import math
+import shutil
 from functools import lru_cache
 import os
 import sys
@@ -45,6 +50,8 @@ PEOPLE_VERSION = 4           # bump when build_people or measure_people changes
 PEOPLE_PREVIEW_DIRNAME = "_people"
 VERDICT_PREVIEW_DIRNAME = "_verdicts"
 PLAN_NAME = "plan.json"
+WRITTEN_NAME = "written.json"     # what each run wrote, so the next one can skip or replace it
+OUTPUT_VERSION = 1                # bump when the files written for a plan change
 # One line per photo, path relative to the folder, then an action:
 #   photo.jpg keep          leave the photo unchanged
 #   photo.jpg crop          crop to the chosen group even if the rules say no
@@ -130,11 +137,21 @@ def load_models(download: bool = False) -> dict:
 # Detection
 # ---------------------------------------------------------------------------
 
+def to_rgb(img: Image.Image) -> Image.Image:
+    """RGB; transparency is composited over white, as k2prep does."""
+    if img.mode == "RGB":
+        return img
+    if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+        rgba = img.convert("RGBA")
+        bg = Image.new("RGB", rgba.size, (255, 255, 255))
+        bg.paste(rgba, mask=rgba.split()[-1])
+        return bg
+    return img.convert("RGB")
+
+
 def load_image(path: Path) -> Image.Image:
     with Image.open(path) as im:
-        img = ImageOps.exif_transpose(im)
-        if img.mode != "RGB":
-            img = img.convert("RGB")
+        img = to_rgb(ImageOps.exif_transpose(im))
         img.load()
     return img
 
@@ -930,6 +947,274 @@ def plan_crop(det: dict, sel: dict, head: dict, families, lossless: bool) -> dic
 
 
 # ---------------------------------------------------------------------------
+# Writing
+# ---------------------------------------------------------------------------
+
+RESIZE_JPEG_QUALITY = 97      # k2prep's output settings
+RESIZE_PNG_LEVEL = 6
+WEBP_QUALITY = 95             # re-encoding a WebP: its original quality is unknown
+
+
+def crop_dims(w: int, h: int, target_ar: float):
+    """k2prep: minimal crop to the target ratio, in source pixels."""
+    if w / h > target_ar:
+        cw, ch = int(round(h * target_ar)), h
+    else:
+        cw, ch = w, int(round(w / target_ar))
+    return max(1, min(cw, w)), max(1, min(ch, h))
+
+
+def k2_crop_box(src_w: int, src_h: int, target_ar: float):
+    """k2prep's crop_box: centred, but a third of the spare height above for portrait targets."""
+    cw, ch = crop_dims(src_w, src_h, target_ar)
+    left = (src_w - cw) // 2
+    top = int((src_h - ch) * (1 / 3 if target_ar < 1.0 else 1 / 2))
+    return left, top, left + cw, top + ch
+
+
+def assign_family(src_ar: float) -> str:
+    return AR_FAMILIES[min(range(len(AR_NOMINAL)), key=lambda i: abs(AR_NOMINAL[i] - src_ar))]
+
+
+def assign_tier(src_w: int, src_h: int, family: str):
+    """k2prep: the largest tier whose bucket the crop fills within UPSCALE_TOLERANCE."""
+    for tier in (1024, 768, 512):
+        bw, bh = bucket_for(tier, family)
+        cw, ch = crop_dims(src_w, src_h, bw / bh)
+        if cw * ch >= (bw * bh) / (UPSCALE_TOLERANCE ** 2):
+            return tier, (bw, bh)
+    return None
+
+
+def bucket_plan(box) -> dict | None:
+    """k2prep's bucket for the region box (display pixels): tier, bucket and the
+    exact box to resize from, or None if it is too small for 512."""
+    x0, y0, x1, y1 = box
+    w, h = x1 - x0, y1 - y0
+    family = assign_family(w / h)
+    fit = assign_tier(w, h, family)
+    if fit is None:
+        return None
+    tier, bucket = fit
+    l, t, r, b = k2_crop_box(w, h, bucket[0] / bucket[1])
+    return {"tier": tier, "bucket": list(bucket), "family": family, "box": [x0 + l, y0 + t, x0 + r, y0 + b]}
+
+
+def exif_for_output(exif_bytes: bytes | None, width: int, height: int, keep_orientation: bool) -> bytes | None:
+    """The source EXIF without its thumbnail (it shows the whole photo), with the
+    new pixel size, and the orientation reset when the pixels are already upright."""
+    if not exif_bytes:
+        return None
+    try:
+        ex = Image.Exif()
+        ex.load(exif_bytes)
+        sub = ex.get_ifd(0x8769)
+        if sub:
+            sub[0xA002], sub[0xA003] = width, height
+        if not keep_orientation and 274 in ex:
+            ex[274] = 1
+        return ex.tobytes()
+    except Exception:  # noqa: BLE001 - a damaged EXIF block is dropped, not fatal
+        return None
+
+
+def atomic_target(dst: Path) -> Path:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    return dst.with_name(dst.name + ".part")
+
+
+def write_lossless(src: Path, dst: Path, stored_box) -> None:
+    """Crop whole DCT blocks: no decoding, no re-encoding. The EXIF orientation
+    tag stays, since the stored pixels keep their orientation."""
+    import jpeglib
+    im = jpeglib.read_dct(str(src))
+    sf = np.asarray(im.samp_factor)                  # rows: (vertical, horizontal) per component
+    maxv, maxh = int(sf[:, 0].max()), int(sf[:, 1].max())
+    x0, y0, x1, y1 = stored_box
+    w, h = x1 - x0, y1 - y0
+    for i, name in enumerate(("Y", "Cb", "Cr", "K")):
+        arr = getattr(im, name, None)
+        if arr is None or i >= len(sf):
+            continue
+        v, hh = int(sf[i][0]), int(sf[i][1])
+        bx0, by0 = x0 * hh // maxh // 8, y0 * v // maxv // 8
+        bw, bh = math.ceil(w * hh / maxh / 8), math.ceil(h * v / maxv / 8)
+        setattr(im, name, arr[by0:by0 + bh, bx0:bx0 + bw].copy())
+    im.width, im.height = w, h
+    for m in im.markers:
+        if m.type == jpeglib.JPEG_APP1 and bytes(m.content[:6]) == b"Exif\x00\x00":
+            new = exif_for_output(bytes(m.content), w, h, keep_orientation=True)
+            if new:
+                m.content = new
+                m.length = len(new)
+    tmp = atomic_target(dst)
+    im.write_dct(str(tmp))
+    os.replace(tmp, dst)
+
+
+def write_reencoded(src: Path, dst: Path, box) -> None:
+    """Crop the upright image and save it in its own format; a JPEG keeps its
+    quantization tables and chroma subsampling, so the quality stays as it was."""
+    from PIL import JpegImagePlugin
+    with Image.open(src) as im:
+        fmt = im.format or ""
+        info = dict(im.info)
+        qtables = getattr(im, "quantization", None)
+        sampling = JpegImagePlugin.get_sampling(im) if fmt == "JPEG" else -1
+        img = ImageOps.exif_transpose(im)
+        img.load()
+    out = img.crop(tuple(box))
+    exif = exif_for_output(info.get("exif"), out.width, out.height, keep_orientation=False)
+    kw = {k: v for k, v in (("exif", exif), ("icc_profile", info.get("icc_profile"))) if v}
+    tmp = atomic_target(dst)
+    if fmt == "JPEG":
+        if out.mode not in ("RGB", "L", "CMYK"):
+            out = out.convert("RGB")
+        if qtables:
+            kw["qtables"] = qtables
+        if sampling in (0, 1, 2):
+            kw["subsampling"] = sampling
+        out.save(tmp, "JPEG", optimize=True, **kw)
+    elif fmt == "PNG":
+        out.save(tmp, "PNG", compress_level=RESIZE_PNG_LEVEL, **kw)
+    elif fmt == "WEBP":
+        out.save(tmp, "WEBP", quality=WEBP_QUALITY, method=6, **kw)
+    else:
+        out.save(tmp, fmt or None, **kw)
+    os.replace(tmp, dst)
+
+
+def write_bucket(src: Path, dst: Path, bplan: dict, png: bool) -> None:
+    """k2prep's render: crop and resize to the bucket in one Lanczos pass from the
+    original, no EXIF or ICC (k2prep drops them so orientation is never applied twice)."""
+    img = load_image(src)
+    out = img.resize(tuple(bplan["bucket"]), resample=Image.LANCZOS, box=tuple(bplan["box"]))
+    tmp = atomic_target(dst)
+    if png:
+        out.save(tmp, "PNG", compress_level=RESIZE_PNG_LEVEL)
+    else:
+        out.save(tmp, "JPEG", quality=RESIZE_JPEG_QUALITY, subsampling=0, optimize=True)
+    os.replace(tmp, dst)
+
+
+def caption_of(path: Path) -> Path | None:
+    cap = path.with_suffix(".txt")
+    return cap if cap.is_file() else None
+
+
+def file_sig(path: Path | None):
+    if path is None:
+        return None
+    st = path.stat()
+    return [st.st_size, st.st_mtime_ns]
+
+
+def output_jobs(root: Path, files, plan: dict, args) -> dict:
+    """rel -> job: what to write for each photo, and where (relative to the output folder)."""
+    jobs, taken = {}, set()
+    for path in files:
+        rel = path.relative_to(root).as_posix()
+        p = plan[rel]
+        c = p.get("crop") or {}
+        cropping = c.get("verdict") == "crop"
+        if args.resize:
+            head = image_header(path)
+            w, h = head["stored"][::-1] if head["orientation"] in (5, 6, 7, 8) else head["stored"]
+            if (not cropping) and args.skip_unchanged:
+                continue
+            region = c["box"] if cropping else [0, 0, w, h]
+            bp = bucket_plan(region)
+            if bp is None:
+                jobs[rel] = {"kind": "too_small"}
+                continue
+            parent = Path(rel).parent
+            ext = ".png" if args.png else ".jpg"
+            stem, n = Path(rel).stem, 1
+            out_rel = (parent / str(bp["tier"]) / (stem + ext)).as_posix()
+            while out_rel.lower() in taken:              # a.jpg and a.png in one folder
+                n += 1
+                out_rel = (parent / str(bp["tier"]) / f"{stem}-{n}{ext}").as_posix()
+            taken.add(out_rel.lower())
+            jobs[rel] = {"kind": "bucket", "out": out_rel, "bucket": bp, "png": args.png}
+        elif cropping:
+            mode = "lossless" if c.get("lossless") else "reencode"
+            jobs[rel] = {"kind": mode, "out": rel, "box": c["box"], "stored_box": c.get("stored_box")}
+        elif not args.skip_unchanged:
+            jobs[rel] = {"kind": "copy", "out": rel}
+        cap = caption_of(path)
+        if rel in jobs and cap is not None:
+            jobs[rel]["caption"] = str(Path(jobs[rel]["out"]).with_suffix(".txt").as_posix())
+    return jobs
+
+
+def write_outputs(root: Path, out_dir: Path, files, plan: dict, args) -> None:
+    log_path = out_dir / WRITTEN_NAME
+    try:
+        old = json.loads(log_path.read_text(encoding="utf-8"))
+        old = old.get("files", {}) if old.get("version") == OUTPUT_VERSION else {}
+    except (OSError, ValueError):
+        old = {}
+    jobs = output_jobs(root, files, plan, args)
+    new, counts, t0 = {}, {}, time.time()
+    by_rel = {p.relative_to(root).as_posix(): p for p in files}
+
+    def remove(entry):
+        for key in ("out", "caption"):
+            f = entry.get(key)
+            if f and (out_dir / f).is_file():
+                (out_dir / f).unlink()
+
+    for rel, job in jobs.items():
+        if job["kind"] == "too_small":
+            counts["too small for 512 (skipped)"] = counts.get("too small for 512 (skipped)", 0) + 1
+            if rel in old:
+                remove(old[rel])
+            continue
+        src = by_rel[rel]
+        cap = caption_of(src)
+        sig = {"src": file_sig(src), "caption_src": file_sig(cap), **{k: v for k, v in job.items()}}
+        prev = old.get(rel)
+        done = prev is not None and prev.get("sig") == sig and (out_dir / job["out"]).is_file() and \
+            ("caption" not in job or (out_dir / job["caption"]).is_file())
+        if done and not args.overwrite:
+            new[rel] = prev
+            counts["already done"] = counts.get("already done", 0) + 1
+            continue
+        if prev is not None:
+            remove(prev)
+        dst = out_dir / job["out"]
+        try:
+            if job["kind"] == "lossless":
+                write_lossless(src, dst, job["stored_box"])
+            elif job["kind"] == "reencode":
+                write_reencoded(src, dst, job["box"])
+            elif job["kind"] == "bucket":
+                write_bucket(src, dst, job["bucket"], job["png"])
+            else:
+                atomic = atomic_target(dst)
+                shutil.copy2(src, atomic)
+                os.replace(atomic, dst)
+            if cap is not None:
+                shutil.copy2(cap, out_dir / job["caption"])
+        except Exception as ex:  # noqa: BLE001 - one bad file must not stop the run
+            print(f"  could not write {rel}: {type(ex).__name__}: {ex}")
+            counts["failed"] = counts.get("failed", 0) + 1
+            continue
+        new[rel] = {"sig": sig, "out": job["out"], **({"caption": job["caption"]} if "caption" in job else {})}
+        label = {"lossless": "cropped (lossless)", "reencode": "cropped (re-encoded)", "copy": "copied unchanged",
+                 "bucket": f"resized to {job['bucket']['tier']}" if "bucket" in job else ""}[job["kind"]]
+        counts[label] = counts.get(label, 0) + 1
+    # outputs of photos that are gone, or that this run no longer writes
+    for rel, entry in old.items():
+        if rel not in new:
+            remove(entry)
+            counts["old output removed"] = counts.get("old output removed", 0) + 1
+    write_json(log_path, {"version": OUTPUT_VERSION, "written": datetime.now().isoformat(timespec="seconds"),
+                          "files": new})
+    print("  " + ", ".join(f"{v} {k}" for k, v in sorted(counts.items())) + f" ({time.time() - t0:.0f}s)")
+
+
+# ---------------------------------------------------------------------------
 # Previews
 # ---------------------------------------------------------------------------
 
@@ -1047,11 +1332,14 @@ def draw_verdict(img: Image.Image, det: dict, sel: dict, dest: Path, plan: dict 
 # Scanning and cache
 # ---------------------------------------------------------------------------
 
-def scan(root: Path):
-    """Images under root; folders whose names start with "_" are skipped."""
+def scan(root: Path, out_dir: Path | None = None):
+    """Images under root; folders whose names start with "_", and the output
+    folder, are skipped."""
     out = []
+    skip = out_dir.resolve() if out_dir else None
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = sorted(d for d in dirnames if not d.startswith("_"))
+        dirnames[:] = sorted(d for d in dirnames if not d.startswith("_")
+                             and (skip is None or (Path(dirpath) / d).resolve() != skip))
         for fn in sorted(filenames):
             if os.path.splitext(fn)[1].lower() in IMAGE_EXTS:
                 out.append(Path(dirpath) / fn)
@@ -1101,6 +1389,13 @@ def main(argv=None) -> int:
                     help="aspect ratios to choose from, comma-separated (default: all seven k2prep ratios)")
     ap.add_argument("--reencode", action="store_true",
                     help="plan JPEG crops for re-encoding instead of a lossless DCT crop")
+    ap.add_argument("--dry-run", action="store_true", help="write plan.json and the previews only")
+    ap.add_argument("--resize", action="store_true",
+                    help="resize every photo into its k2prep bucket and sort it into <tier>/ folders")
+    ap.add_argument("--png", action="store_true", help="with --resize: write PNG instead of JPEG")
+    ap.add_argument("--skip-unchanged", action="store_true",
+                    help="do not copy (or, with --resize, resize) the photos that are not cropped")
+    ap.add_argument("--overwrite", action="store_true", help="write every output again, even if it is up to date")
     ap.add_argument("--redetect", action="store_true", help="ignore the detection cache")
     ap.add_argument("--fetch-models", action="store_true", help="download the models and load them once")
     args = ap.parse_args(argv)
@@ -1120,6 +1415,8 @@ def main(argv=None) -> int:
             ap.error(f"not a folder: {r}")
     if args.out and len(roots) > 1:
         ap.error("--out works with one folder only")
+    if args.png and not args.resize:
+        ap.error("--png works with --resize only")
     families = [r.strip() for r in args.ratios.split(",") if r.strip()]
     bad = [r for r in families if r not in AR_FAMILIES]
     if bad or not families:
@@ -1130,7 +1427,7 @@ def main(argv=None) -> int:
         out_dir = Path(args.out).resolve() if args.out else root / OUT_DIRNAME
         cache_path = out_dir / DETECTIONS_NAME
         cache = {} if args.redetect else load_cache(cache_path)
-        files = scan(root)
+        files = scan(root, out_dir)
         overrides = read_overrides(root)
         known = {path.relative_to(root).as_posix().lower() for path in files}
         for rel in sorted(set(overrides) - known):
@@ -1167,7 +1464,8 @@ def main(argv=None) -> int:
             sel = select_subject(det, overrides.get(rel.lower()))
             crop = None
             if sel["verdict"] == "crop":
-                crop = plan_crop(det, sel, image_header(path), families, lossless=not args.reencode)
+                crop = plan_crop(det, sel, image_header(path), families,
+                                 lossless=not (args.reencode or args.resize))
             plan[rel] = dict(sel, crop=crop)
             if args.verdicts:
                 img = img or load_image(path)
@@ -1191,6 +1489,8 @@ def main(argv=None) -> int:
         print(f"{n_new} detected, {len(files) - n_new} from cache, {time.time() - t0:.0f}s; "
               f"{n_crop} to crop, {len(plan) - n_crop} unchanged" + (f", {n_flag} flagged" if n_flag else "")
               + f" -> {out_dir / PLAN_NAME}")
+        if not args.dry_run:
+            write_outputs(root, out_dir, files, plan, args)
     return 0
 
 
