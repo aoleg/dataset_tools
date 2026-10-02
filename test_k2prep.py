@@ -822,11 +822,15 @@ def test_copy_to_end_to_end():
 
         # A tighter run leaves earlier copies alone and names them.
         tighter = [a if a != "1024" else "1300" for a in argv]
+        # The report this run writes, found as the one that was not there
+        # before: picking the newest by mtime is a coin toss on Windows, where
+        # two quick runs can share a clock tick.
+        reports = src / k.PREP_DIRNAME / k.REPORTS_DIRNAME
+        before = set(reports.iterdir())
         with contextlib.redirect_stdout(io.StringIO()):
             assert k.main(tighter) == 0
         assert (out / "a" / "deep" / "pano.jpg").is_file()
-        report = max((src / k.PREP_DIRNAME / k.REPORTS_DIRNAME).glob("copy-2*.txt"),
-                     key=lambda p: p.stat().st_mtime_ns)
+        (report,) = set(reports.iterdir()) - before
         text = report.read_text(encoding="utf-8")
         assert "IN THE TARGET BUT NOT SELECTED  (1)" in text
         assert "a/deep/pano.jpg" in text.split("IN THE TARGET BUT NOT SELECTED")[1]
@@ -837,6 +841,29 @@ def test_copy_to_end_to_end():
         row = next(line.split() for line in grid if line.split()[:1] == ["1300"])
         assert row[5] == "2*", row                 # threshold 5: top, tier
         assert "\nSELECTED  (2 images)" in text
+
+
+def test_each_runs_every_first_level_folder_and_keeps_bangs():
+    """-R moved out of run.bat because cmd's delayed expansion deleted every
+    '!' in a path. The sweep must reach folders whose names carry the
+    characters cmd treats specially, and skip '_' and '.' folders."""
+    import contextlib, io, tempfile
+    from pathlib import Path
+    assert _rejects(["f", "-R", "--copy-to", "t"])
+    assert k.parse_args(["f", "-R"]).each is True
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "!!!!_ДАТАСЕТ" / "!!!_OK"
+        _write_image(root / "r.jpg", 1200, 1200)
+        _write_image(root / "a & b 100% ^x" / "s.jpg", 1200, 1200)
+        _write_image(root / "!c" / "t.jpg", 1200, 1200)
+        _write_image(root / "_side" / "u.jpg", 1200, 1200)
+        _write_image(root / ".hid" / "v.jpg", 1200, 1200)
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert k.main([str(root), "-R", "--threads", "1"]) == 0
+        for folder in (root, root / "a & b 100% ^x", root / "!c"):
+            assert (folder / k.PREP_DIRNAME / "1024").is_dir(), folder
+        for folder in (root / "_side", root / ".hid"):
+            assert not (folder / k.PREP_DIRNAME).exists(), folder
 
 
 def test_selection_grid_counts_every_combination():

@@ -1,5 +1,5 @@
 @echo off
-setlocal enabledelayedexpansion
+setlocal disabledelayedexpansion
 rem ---------------------------------------------------------------------------
 rem  cleanup.bat - run cleanup.py inside the local venv.
 rem
@@ -18,44 +18,14 @@ rem
 rem  Subfolders whose name starts with an underscore are skipped, so _prep and
 rem  the sidecar folder itself are never touched.
 rem
-rem  As in run.bat, the folder is whichever argument names an existing
-rem  directory, and it is resolved before this script switches to its own
-rem  directory so that a relative path means what you typed.
+rem  Every argument goes to cleanup.py exactly as typed, for the reason given
+rem  in run.bat: parsing it here deleted every "!" in a path.
 rem ---------------------------------------------------------------------------
 
-rem  shift moves %0 too, so %~dp0 stops meaning this script once the
-rem  parsing loop below has run. Take the directory first.
-set "HERE=%~dp0"
-
-set "FOLDER="
-set "ARGS="
-
-:parse
-if "%~1"=="" goto parsed
-if defined FOLDER goto addarg
-if not exist "%~1\" goto addarg
-set "FOLDER=%~f1"
-shift
-goto parse
-:addarg
-set "ARGS=!ARGS! %1"
-shift
-goto parse
-:parsed
-
-cd /d "%HERE%"
-if not exist venv\Scripts\activate.bat (
+if not exist "%~dp0venv\Scripts\python.exe" (
     echo Virtual environment not found. Run install.bat first.
     pause
     exit /b 1
 )
-call venv\Scripts\activate.bat
-
-rem  A line with no existing folder on it goes straight through, so that
-rem  cleanup.bat --help and a mistyped path both get argparse's own answer.
-if defined FOLDER (
-    python cleanup.py "%FOLDER%" %ARGS%
-) else (
-    python cleanup.py %ARGS%
-)
+"%~dp0venv\Scripts\python.exe" "%~dp0cleanup.py" %*
 exit /b %errorlevel%

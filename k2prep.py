@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import copy
 import hashlib
 import io
 import json
@@ -1273,7 +1274,7 @@ def scan_tree(root: Path, recursive: bool, reserved: bool = True):
 
     Directories whose name starts with "_" or "." are skipped at every depth.
     The underscore rule is what keeps a nested _prep left by an earlier
-    per-folder run (run.bat -R) from being ingested as source - those hold
+    per-folder run (-R) from being ingested as source - those hold
     already-cropped renders of the same photographs. Directory links and
     junctions are never followed: a junction cycle would loop forever and one
     pointing outside the tree would drag foreign folders in.
@@ -3087,10 +3088,14 @@ def _sort_tiers_arg(value: str) -> int:
     try:
         n = int(value)
     except ValueError:
+        # --sort takes an optional value, so a folder written right after it
+        # is read as that value.
+        hint = (". Put the folder before --sort"
+                if os.path.isdir(value) else "")
         raise argparse.ArgumentTypeError(
             f"--sort takes a number of quality tiers "
             f"({MIN_QUALITY_TIERS}..{MAX_QUALITY_TIERS}) or nothing at all, "
-            f"got {value!r}")
+            f"got {value!r}{hint}")
     if n < MIN_QUALITY_TIERS:
         raise argparse.ArgumentTypeError(
             f"--sort {n} would put every image in one place, which sorts "
@@ -3142,8 +3147,16 @@ def parse_args(argv=None):
                         "goes to _prep/<subfolder>/<tier>/ and becomes its own "
                         "[[datasets]] block. Folders starting with '_' or '.' "
                         "are skipped at every depth; links and junctions are "
-                        "never followed. (run.bat -R is the other thing: one "
+                        "never followed. (-R is the other thing: one "
                         "independent run, and one _prep, per subfolder.)")
+    p.add_argument("-R", action="store_true", dest="each",
+                   help="Run once for the folder, then once for each "
+                        "first-level subfolder, so every folder gets its OWN "
+                        "_prep, reports and dataset.toml: independent "
+                        "datasets, trained separately. Subfolders starting "
+                        "with '_' or '.' are skipped. A folder that fails does "
+                        "not stop the sweep. (--recursive is the other thing: "
+                        "one run, one _prep, the datasets trained together.)")
     p.add_argument("--threshold", type=_threshold_arg, default=0, metavar="N",
                    help="Process only images whose composite score >= N (0..10). "
                         "Default 0.")
@@ -3217,8 +3230,13 @@ def parse_args(argv=None):
         p.error("--sort cannot be combined with --recursive: sorting triages "
                 "one folder into quality folders under its own _prep, and what "
                 "that should mean across a tree of datasets is not decided. "
-                "Run --sort on one folder at a time, or run.bat -R to sweep "
+                "Run --sort on one folder at a time, or -R to sweep "
                 "each subfolder separately.")
+    if args.each and args.copy_to is not None:
+        p.error("-R cannot be combined with --copy-to: every per-folder run "
+                "would copy into the root of the same target and flatten the "
+                "tree. Use --recursive instead: one run over the whole tree, "
+                "mirrored into the target.")
     if args.copy_to is not None and args.sort is not None:
         p.error("--copy-to cannot be combined with --sort: sorting files every "
                 "image under a folder for its score, copying selects the ones "
@@ -3579,8 +3597,10 @@ def run_copy(args, folder: Path, target: Path, prep_dir: Path,
     print()
     print(f"k2prep copy{' (dry run)' if args.report else ''}: "
           f"{len(results)} images in {_hms(elapsed)}")
+    res_rule = (f">= {args.min_res}x{args.min_res} px" if args.min_res
+                else "any resolution")
     print(f"  selected    {len(selected):>7}   "
-          f"(score >= {args.threshold}, >= {args.min_res}x{args.min_res} px)")
+          f"(score >= {args.threshold}, {res_rule})")
     verb = "would copy " if args.report else "copied     "
     print(f"  {verb}{counts[COPY_COPIED]:>7}")
     print(f"  already     {counts[COPY_PRESENT]:>7}")
@@ -3606,7 +3626,69 @@ def run_copy(args, folder: Path, target: Path, prep_dir: Path,
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+    if args.each:
+        return run_each(args)
+    return run_one(args)
 
+
+def run_each(args) -> int:
+    """-R: one independent run for the folder, then one per first-level
+    subfolder, each with its own _prep, reports and TOML.
+
+    This used to live in run.bat, which had to parse the command line to find
+    the folder. Delayed expansion, which that parsing needed, deleted every
+    '!' in a path, and a folder named "!!!_photos" became "_photos". Here the
+    folder is argparse's positional and nothing is re-parsed.
+
+    Folders starting with '_' (k2prep's _prep, cleanup's sidecars) or '.' are
+    skipped, and links and junctions are not followed. A folder that fails
+    does not stop the sweep.
+    """
+    root = Path(args.folder).expanduser()
+    if not root.is_dir():
+        print(f"error: folder does not exist: {root}", file=sys.stderr)
+        return 2
+    root = root.resolve()
+    folders = [root]
+    skipped = []
+    for entry in sorted(os.scandir(root), key=lambda e: e.name.lower()):
+        try:
+            if not entry.is_dir():
+                continue
+        except OSError:
+            continue
+        if entry.name.startswith(("_", ".")) or _is_link(entry):
+            skipped.append(Path(entry.path))
+        else:
+            folders.append(Path(entry.path))
+
+    failed: list[Path] = []
+    for folder in folders:
+        print(f"\n=== {folder}")
+        one = copy.copy(args)
+        one.folder = str(folder)
+        one.each = False
+        try:
+            code = run_one(one)
+        except Exception as exc:                  # one folder must not end the sweep
+            print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)
+            code = 1
+        if code:
+            failed.append(folder)
+    for folder in skipped:
+        print(f"\n=== skipped {folder}")
+
+    print()
+    if not failed:
+        print(f"All {len(folders)} folder(s) finished.")
+        return 0
+    print(f"{len(failed)} of {len(folders)} folder(s) failed:")
+    for folder in failed:
+        print(f"    {folder}")
+    return 1
+
+
+def run_one(args) -> int:
     folder = Path(args.folder).expanduser()
     if not folder.exists():
         print(f"error: folder does not exist: {folder}", file=sys.stderr)

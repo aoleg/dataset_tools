@@ -43,6 +43,7 @@ k2prep.py <folder> [options]
 | `<folder>` | required | Input folder, positional. One dataset, unless `--recursive`. |
 | `--report` | off | Dry run. Analyse and write a report; write no images. |
 | `--recursive` | off | Every subfolder that directly contains images is its own dataset, sharing one `_prep` and one `dataset.toml`. See [below](#--recursive-several-datasets-one-_prep). |
+| `-R` | off | One independent run for the folder and one for each first-level subfolder, each with its own `_prep`. See [below](#-r-independent-runs-per-subfolder). |
 | `--threshold N` | 0 | Process only images whose composite score ≥ N. 0 processes everything that fits a tier. Range 0–10. |
 | `--png` | off | Write PNG instead of JPEG q97 4:4:4. |
 | `--filter NAME` | `lanczos` | `lanczos`, `box`, `bicubic`, `bilinear`. |
@@ -91,7 +92,7 @@ Everything that is per-dataset stays per-dataset:
 - **Filename collisions** are resolved per dataset per tier; `alice\photo.jpg` and `bob\photo.jpg` keep their names.
 - **Idempotency and superseded-output sweeping** work per dataset, so a re-run after a threshold change behaves exactly as in the flat layout, in every dataset at once.
 
-What the scan skips, at every depth: folders starting with `_` (which covers `_prep` — including one left inside a subfolder by an earlier `run.bat -R` run — and `cleanup.bat`'s `_foldername` sidecars) and folders starting with `.`. Directory symlinks and junctions are never followed: a junction cycle would loop forever, and one pointing outside the tree would drag foreign folders in. An unreadable folder is reported and the scan continues.
+What the scan skips, at every depth: folders starting with `_` (which covers `_prep` — including one left inside a subfolder by an earlier `-R` run — and `cleanup.bat`'s `_foldername` sidecars) and folders starting with `.`. Directory symlinks and junctions are never followed: a junction cycle would loop forever, and one pointing outside the tree would drag foreign folders in. An unreadable folder is reported and the scan continues.
 
 Two names are refused with a clear error rather than mirrored: a source folder named like a tier (`1024`, `768`, `512`) anywhere in the tree — it would make `_prep\x\1024` ambiguous — and a first-level folder named `reports`, which would collide with `_prep\reports`. Rename them.
 
@@ -101,10 +102,10 @@ If a source subfolder is renamed or deleted, its old outputs under `_prep` are r
 
 ## `-R`: independent runs per subfolder
 
-`run.bat -R` is the other tool for a folder of subfolders, and the opposite trade: it runs k2prep once for the folder, then once for each first-level subfolder, so every folder keeps its **own** `_prep`, its own reports and its own `dataset.toml` — independent datasets, trained separately:
+`-R` is the other tool for a folder of subfolders, and the opposite trade: it runs k2prep once for the folder, then once for each first-level subfolder, so every folder keeps its **own** `_prep`, its own reports and its own `dataset.toml` — independent datasets, trained separately:
 
 ```bash
-run.bat -R "L:\train" --report --threshold 6
+run.bat "L:\train" -R --report --threshold 6
 ```
 
 ```
@@ -115,13 +116,15 @@ L:\train\bob\      ->  L:\train\bob\_prep\
 
 Train them together: `--recursive`. Train them separately: `-R`. Nothing below the first level is visited by `-R`.
 
-Subfolders whose name starts with an underscore are skipped, which covers `_prep` and the `_foldername` sidecars that `cleanup.bat` makes. The `score*` and `quality*` folders that `--sort` produces are **not** skipped — building a dataset out of one triaged tier is a real thing to want.
+Subfolders whose name starts with an underscore are skipped, which covers `_prep` and the `_foldername` sidecars that `cleanup.bat` makes. Subfolders starting with `.`, and links and junctions, are skipped too. The `score*` and `quality*` folders that `--sort` produces are **not** skipped — building a dataset out of one triaged tier is a real thing to want.
 
-The remaining options are passed to k2prep unchanged, once per folder. The folder is whichever argument names a directory that exists, so it can go anywhere on the line and is never mistaken for an option's value. The value of `--copy-to` is the exception: it is always the target, never the folder. A folder that fails does not stop the sweep: the failures are listed at the end and the exit code is non-zero.
+The other options apply to every folder. A folder that fails does not stop the sweep: the failures are listed at the end and the exit code is non-zero.
 
 `-R` is refused together with `--copy-to`, because every per-folder run would copy into the root of the same target and flatten the tree. Use `--recursive`.
 
-`-R` is a `run.bat` feature; combining it with `--recursive` would run the tree mode once per subfolder, which is rarely what anyone means.
+Combining `-R` with `--recursive` runs the tree mode once per subfolder, which is rarely what anyone means.
+
+`-R` used to be implemented in `run.bat`, which deleted every `!` in a path: `"K:\!!!!_data\!!!_ok"` arrived as `K:\_ok`. Since 1.2.0 it is a k2prep option, and `run.bat` and `cleanup.bat` pass every argument through untouched, so `!`, `&`, `%`, `^` and non-Latin letters in folder names all work. Put the folder first on the line, or anywhere except straight after `--sort`, which takes an optional number and would read the folder as that number.
 
 ## `cleanup.bat`: moving undersized images out
 
@@ -154,7 +157,7 @@ Nothing is deleted and nothing is overwritten. The images are still on disk, one
 ```bash
 cleanup.bat "L:\train" 1024 --dry-run
 cleanup.bat "L:\train" 1024
-run.bat -R "L:\train" --report
+run.bat "L:\train" -R --report
 ```
 
 ## Sorting a folder by quality

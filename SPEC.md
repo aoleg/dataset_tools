@@ -82,18 +82,19 @@ pause
 
 ```
 @echo off
-setlocal
-cd /d "%~dp0"
-if not exist venv\Scripts\activate.bat (
+setlocal disabledelayedexpansion
+if not exist "%~dp0venv\Scripts\python.exe" (
     echo Virtual environment not found. Run install.bat first.
     pause
     exit /b 1
 )
-call venv\Scripts\activate.bat
-python k2prep.py %*
+"%~dp0venv\Scripts\python.exe" "%~dp0k2prep.py" %*
+exit /b %errorlevel%
 ```
 
 `run.bat` must pass `%*` through unmodified so `run.bat "L:\train\photos" --report` works. Do not `pause` at the end of `run.bat`; it breaks scripted use.
+
+`run.bat` must not parse its arguments. Version 1.1 did, to implement `-R`, and the delayed expansion its argument loop needed deleted every `!` in a path: `K:\!!!!_DATA\!!!_OK` arrived as `K:\_OK`. Anything that needs the command line understood belongs in `k2prep.py`, where argparse reads it as Unicode. `run.bat` calls the venv's `python.exe` by full path rather than after a `cd`, so a relative folder means what it meant where it was typed. `cleanup.bat` follows the same rules.
 
 ---
 
@@ -435,7 +436,7 @@ Two properties fall out of that rule and are the reason for it: non-recursive mo
 
 Scan rules, at every depth:
 
-- Skip directories starting with `_` (covers `_prep` — including one left in a subfolder by an earlier `run.bat -R` run, which holds already-cropped renders of the same photos — and `cleanup.bat` sidecars) and starting with `.`.
+- Skip directories starting with `_` (covers `_prep` — including one left in a subfolder by an earlier `-R` run, which holds already-cropped renders of the same photos — and `cleanup.bat` sidecars) and starting with `.`.
 - Never follow directory symlinks or junctions (cycles, escapes); a visited set of resolved paths is the backstop. Skips are noted in the report.
 - An unreadable directory is reported and the scan continues.
 - Refuse with a clear error, before any work: a source directory named like a tier (`1024`/`768`/`512`) anywhere — it would make `_prep/<x>/1024` ambiguous between "dataset" and "tier folder" — and a first-level directory named `reports`, which would collide with `_prep/reports`.
@@ -450,7 +451,7 @@ Everything per-dataset stays per-dataset, because each populated `<dataset>/<tie
 
 Outputs orphaned by a renamed or deleted source subfolder are reported as stale and left alone; the regenerated TOML does not reference them, so they cannot leak into training. `--sort` is refused together with `--recursive` — what triage means across a tree of datasets is deliberately undecided.
 
-`run.bat -R` remains the other thing: one independent run, `_prep` and TOML per first-level subfolder (train separately), versus `--recursive`'s one shared `_prep` and TOML (train together).
+`-R` remains the other thing: one independent run, `_prep` and TOML per first-level subfolder (train separately), versus `--recursive`'s one shared `_prep` and TOML (train together).
 
 ### 7.5 `--copy-to`: select originals into another folder
 
@@ -475,7 +476,7 @@ The target must not overlap the source. It is refused when it is the source, con
 
 One report per run, in `_prep/reports/`: `copy-scan-YYYYMMDD-HHMMSS.txt` under `--report`, `copy-YYYYMMDD-HHMMSS.txt` otherwise. Sections: `SELECTED` with the action per image, `NOT SELECTED` with the failed gate or gates, `CONFLICTS`, `IN THE TARGET BUT NOT SELECTED`, `MISSING CAPTIONS` for selected images, unknown extensions, `ERRORS`, and a summary with the score histogram (split by the resolution gate when `--min-res` is given), a selection grid, and a per-folder count under `--recursive`. The grid counts the images each combination of the two gates would select: rows are `--min-res` 0, 512, 768, 1024, 1280, 1536, 2048 and the run's own value, columns are `--threshold` 1 to 10 (0 selects the same as 1, because no image scores below 1), and the run's own cell is starred. It exists because the survey is run before either value is known, and one `--report` pass must be enough to choose both.
 
-`--copy-to` is refused together with `--sort`, and so are `--move` and `--vl`, which need `--sort`. `--png`, `--single-pass` and `--no-merge` are ignored with a note. `run.bat` passes the value of `--copy-to` through as the target so it is never taken for the source folder, and refuses `-R` with `--copy-to`, because each per-folder run would copy into the root of the same target and flatten the tree.
+`--copy-to` is refused together with `--sort`, and so are `--move` and `--vl`, which need `--sort`. `--png`, `--single-pass` and `--no-merge` are ignored with a note. `-R` is refused with `--copy-to`, because each per-folder run would copy into the root of the same target and flatten the tree.
 
 ---
 
