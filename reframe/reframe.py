@@ -21,13 +21,15 @@ Per-photo corrections: <folder>/overrides.txt, see OVERRIDES_NAME.
   pose keypoints  : yolo26x-pose.pt  (ultralytics assets)
 
 Usage:    python reframe.py <folder> [<folder> ...] [--dry-run] [--verdicts] [--resize [--png]]
-          [--reencode] [--ratios 2:3,4:5,...] [--skip-unchanged] [--overwrite] [--out DIR]
+          [--reencode] [--ratios 2:3,4:5,...] [--skip-unchanged] [--overwrite] [--threads N] [--out DIR]
           python reframe.py --fetch-models
 """
 import argparse
 import json
 import math
 import shutil
+import threading
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from functools import lru_cache
 import os
 import sys
@@ -122,6 +124,13 @@ def model_path(name: str, download: bool) -> Path:
         if not path.exists():
             raise RuntimeError(f"download of {fname} failed")
     return path
+
+
+# The models are shared by all worker threads, but a YOLO predictor keeps
+# per-call state and is not safe to run from two threads at once. Detection
+# therefore runs one image at a time; decoding, measuring, previews and
+# writing run in parallel around it.
+GPU_LOCK = threading.Lock()
 
 
 def load_models(download: bool = False) -> dict:
@@ -1032,6 +1041,40 @@ def atomic_target(dst: Path) -> Path:
     return dst.with_name(dst.name + ".part")
 
 
+def rewrite_header(data: bytes, exif: bytes | None) -> bytes:
+    """Replace the EXIF segment (APP1 "Exif") of a JPEG file and drop the MPF
+    index (APP2 "MPF"), working on the marker segments before the image data.
+
+    This is done on the file bytes, not through jpeglib's marker objects:
+    replacing a marker's content there crashed the process (heap corruption)
+    when several threads wrote at once.
+    """
+    if data[:2] != b"\xff\xd8":
+        return data
+    out, pos, done_exif = [data[:2]], 2, False
+    while pos + 4 <= len(data) and data[pos] == 0xFF:
+        marker = data[pos + 1]
+        if marker == 0xDA:                           # start of scan: the rest is image data
+            break
+        if 0xD0 <= marker <= 0xD7 or marker == 0x01:
+            out.append(data[pos:pos + 2])
+            pos += 2
+            continue
+        length = int.from_bytes(data[pos + 2:pos + 4], "big")
+        seg = data[pos:pos + 2 + length]
+        body = seg[4:]
+        if marker == 0xE1 and body[:6] == b"Exif\x00\x00" and not done_exif:
+            done_exif = True
+            if exif and len(exif) + 2 <= 0xFFFF:
+                seg = b"\xff\xe1" + (len(exif) + 2).to_bytes(2, "big") + exif
+        elif marker == 0xE2 and body[:4] == b"MPF\x00":
+            seg = b""                                # points at images the crop does not carry
+        out.append(seg)
+        pos += 2 + length
+    out.append(data[pos:])
+    return b"".join(out)
+
+
 def write_lossless(src: Path, dst: Path, stored_box) -> None:
     """Crop whole DCT blocks: no decoding, no re-encoding. The EXIF orientation
     tag stays, since the stored pixels keep their orientation."""
@@ -1050,17 +1093,14 @@ def write_lossless(src: Path, dst: Path, stored_box) -> None:
         bw, bh = math.ceil(w * hh / maxh / 8), math.ceil(h * v / maxv / 8)
         setattr(im, name, arr[by0:by0 + bh, bx0:bx0 + bw].copy())
     im.width, im.height = w, h
-    # The MPF index (APP2) of an MPO points at appended images that a crop does
-    # not carry (libjpeg stops at the first image), so it goes.
-    im.markers = [m for m in im.markers if not (m.type == jpeglib.MarkerType.JPEG_APP2 and bytes(m.content[:4]) == b"MPF\x00")]
-    for m in im.markers:
-        if m.type == jpeglib.JPEG_APP1 and bytes(m.content[:6]) == b"Exif\x00\x00":
-            new = exif_for_output(bytes(m.content), w, h, keep_orientation=True)
-            if new:
-                m.content = new
-                m.length = len(new)
     tmp = atomic_target(dst)
     im.write_dct(str(tmp))
+    # EXIF without the whole-photo thumbnail and with the new size; no MPF index
+    # (an MPO's appended images are not in the crop: libjpeg reads the first only)
+    data = tmp.read_bytes()
+    with Image.open(src) as orig:
+        exif = exif_for_output(orig.info.get("exif"), w, h, keep_orientation=True)
+    tmp.write_bytes(rewrite_header(data, exif))
     os.replace(tmp, dst)
 
 
@@ -1159,6 +1199,23 @@ def output_jobs(root: Path, files, plan: dict, args) -> dict:
     return jobs
 
 
+def write_job(task):
+    """Write one output; runs in a worker process (see write_outputs)."""
+    out_dir, job, src = task
+    dst = Path(out_dir) / job["out"]
+    src = Path(src)
+    if job["kind"] == "lossless":
+        write_lossless(src, dst, job["stored_box"])
+    elif job["kind"] == "reencode":
+        write_reencoded(src, dst, job["box"])
+    elif job["kind"] == "bucket":
+        write_bucket(src, dst, job["bucket"], job["png"])
+    else:
+        atomic = atomic_target(dst)
+        shutil.copy2(src, atomic)
+        os.replace(atomic, dst)
+
+
 def write_outputs(root: Path, out_dir: Path, files, plan: dict, args) -> None:
     log_path = out_dir / WRITTEN_NAME
     try:
@@ -1176,6 +1233,7 @@ def write_outputs(root: Path, out_dir: Path, files, plan: dict, args) -> None:
             if f and (out_dir / f).is_file():
                 (out_dir / f).unlink()
 
+    todo = []                                         # (rel, job, src, caption source, signature)
     for rel, job in jobs.items():
         if job["kind"] == "too_small":
             counts["too small for 512 (skipped)"] = counts.get("too small for 512 (skipped)", 0) + 1
@@ -1194,22 +1252,49 @@ def write_outputs(root: Path, out_dir: Path, files, plan: dict, args) -> None:
             continue
         if prev is not None:
             remove(prev)
-        dst = out_dir / job["out"]
+        todo.append((rel, job, src, cap, sig))
+
+    # Worker processes, not threads: jpeglib crashes the whole process (heap
+    # corruption) when another thread works with Pillow while it runs, even with
+    # its own calls one at a time. A process runs one write at a time.
+    written = []
+    if todo:
+        workers = max(1, min(args.threads, len(todo)))
+        pool = ProcessPoolExecutor(max_workers=workers) if workers > 1 else None
         try:
-            if job["kind"] == "lossless":
-                write_lossless(src, dst, job["stored_box"])
-            elif job["kind"] == "reencode":
-                write_reencoded(src, dst, job["box"])
-            elif job["kind"] == "bucket":
-                write_bucket(src, dst, job["bucket"], job["png"])
+            if pool is None:
+                results = []
+                for item in todo:
+                    try:
+                        write_job((str(out_dir), item[1], str(item[2])))
+                        results.append((item, None))
+                    except Exception as ex:  # noqa: BLE001
+                        results.append((item, ex))
             else:
-                atomic = atomic_target(dst)
-                shutil.copy2(src, atomic)
-                os.replace(atomic, dst)
+                futures = {pool.submit(write_job, (str(out_dir), item[1], str(item[2]))): item for item in todo}
+                results = []
+                for fut in as_completed(futures):
+                    try:
+                        fut.result()
+                        results.append((futures[fut], None))
+                    except Exception as ex:  # noqa: BLE001
+                        results.append((futures[fut], ex))
+        finally:
+            if pool is not None:
+                pool.shutdown()
+        for item, ex in results:
+            if ex is None:
+                written.append(item)
+            else:                                    # one bad file must not stop the run
+                print(f"  could not write {item[0]}: {type(ex).__name__}: {ex}")
+                counts["failed"] = counts.get("failed", 0) + 1
+    # Captions last and in order: two photos with one stem (a.jpg, a.png) share a.txt.
+    for rel, job, src, cap, sig in sorted(written, key=lambda t: t[0]):
+        try:
             if cap is not None:
                 shutil.copy2(cap, out_dir / job["caption"])
-        except Exception as ex:  # noqa: BLE001 - one bad file must not stop the run
-            print(f"  could not write {rel}: {type(ex).__name__}: {ex}")
+        except OSError as ex:
+            print(f"  could not copy the caption of {rel}: {ex}")
             counts["failed"] = counts.get("failed", 0) + 1
             continue
         new[rel] = {"sig": sig, "out": job["out"], **({"caption": job["caption"]} if "caption" in job else {})}
@@ -1222,7 +1307,7 @@ def write_outputs(root: Path, out_dir: Path, files, plan: dict, args) -> None:
             remove(entry)
             counts["old output removed"] = counts.get("old output removed", 0) + 1
     write_json(log_path, {"version": OUTPUT_VERSION, "written": datetime.now().isoformat(timespec="seconds"),
-                          "files": new})
+                          "files": dict(sorted(new.items()))})
     print("  " + ", ".join(f"{v} {k}" for k, v in sorted(counts.items())) + f" ({time.time() - t0:.0f}s)")
 
 
@@ -1383,6 +1468,16 @@ def write_json(path: Path, obj) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
+def threads_arg(value: str) -> int:
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"--threads must be an integer, got {value!r}")
+    if not 1 <= n <= 32:
+        raise argparse.ArgumentTypeError(f"--threads must be 1..32, got {n}")
+    return n
+
+
 def main(argv=None) -> int:
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -1408,6 +1503,8 @@ def main(argv=None) -> int:
     ap.add_argument("--skip-unchanged", action="store_true",
                     help="do not copy (or, with --resize, resize) the photos that are not cropped")
     ap.add_argument("--overwrite", action="store_true", help="write every output again, even if it is up to date")
+    ap.add_argument("--threads", type=threads_arg, default=4, metavar="N",
+                    help="worker threads, 1..32 (default 4); detection itself runs one image at a time")
     ap.add_argument("--redetect", action="store_true", help="ignore the detection cache")
     ap.add_argument("--fetch-models", action="store_true", help="download the models and load them once")
     args = ap.parse_args(argv)
@@ -1445,28 +1542,33 @@ def main(argv=None) -> int:
         for rel in sorted(set(overrides) - known):
             print(f"  {OVERRIDES_NAME}: no such photo: {rel}")
         print(f"{root}: {len(files)} image(s)" + (f", {len(overrides)} override(s)" if overrides else ""))
-        t0, n_new = time.time(), 0
-        results, plan = {}, {}
-        for k, path in enumerate(files, 1):
-            rel = path.relative_to(root).as_posix()
+        t0 = time.time()
+        stats = {}
+        for path in files:
             st = path.stat()
-            c = cache.get(rel)
-            fresh = c is None or c.get("size") != st.st_size or c.get("mtime_ns") != st.st_mtime_ns
+            c = cache.get(path.relative_to(root).as_posix())
+            stats[path] = (st, c is None or c.get("size") != st.st_size or c.get("mtime_ns") != st.st_mtime_ns)
+        n_new = sum(1 for _, fresh in stats.values() if fresh)
+        if n_new and models is None:
+            models = load_models()                   # once, before the threads start
+
+        def analyse(path):
+            """Detection (under the GPU lock), measurements, subject, crop plan and
+            previews for one photo -> (rel, detections, plan entry, log line)."""
+            rel = path.relative_to(root).as_posix()
+            st, fresh = stats[path]
             img = None
             if fresh:
-                if models is None:
-                    models = load_models()
                 img = load_image(path)
-                det = detect(models, img)
+                with GPU_LOCK:
+                    det = detect(models, img)
                 det.update(size=st.st_size, mtime_ns=st.st_mtime_ns)
-                n_new += 1
             else:
-                det = c
+                det = cache[rel]
             if det.get("people_version") != PEOPLE_VERSION:
                 img = img or load_image(path)                # focus needs the pixels
                 det["people"] = people_for(det, img)
                 det["people_version"] = PEOPLE_VERSION
-            results[rel] = det
             if args.previews:
                 img = img or load_image(path)
                 draw_preview(img, det, out_dir / PREVIEW_DIRNAME / (rel + ".jpg"))
@@ -1478,7 +1580,6 @@ def main(argv=None) -> int:
             if sel["verdict"] == "crop":
                 crop = plan_crop(det, sel, image_header(path), families,
                                  lossless=not (args.reencode or args.resize))
-            plan[rel] = dict(sel, crop=crop)
             if args.verdicts:
                 img = img or load_image(path)
                 draw_verdict(img, det, sel, out_dir / VERDICT_PREVIEW_DIRNAME / (rel + ".jpg"), crop)
@@ -1489,16 +1590,38 @@ def main(argv=None) -> int:
                 what = f"unchanged, {crop['reason']}"
             else:
                 what = f"unchanged, {sel['reason']}"
-            print(f"[{k}/{len(files)}] {rel}: {len(det['people'])} people; {what}"
-                  + "".join(f" [{f}]" for f in sel["flags"] + (crop or {}).get("flags", []))
-                  + ("" if fresh else " (cached)"), flush=True)
+            line = (f"{rel}: {len(det['people'])} people; {what}"
+                    + "".join(f" [{f}]" for f in sel["flags"] + (crop or {}).get("flags", []))
+                    + ("" if fresh else " (cached)"))
+            return rel, det, dict(sel, crop=crop), line
+
+        results, plan, failed = {}, {}, []
+        with ThreadPoolExecutor(max_workers=args.threads) as pool:
+            futures = {pool.submit(analyse, path): path for path in files}
+            for k, fut in enumerate(as_completed(futures), 1):
+                path = futures[fut]
+                try:
+                    rel, det, entry, line = fut.result()
+                except Exception as ex:  # noqa: BLE001 - one bad file must not stop the run
+                    rel = path.relative_to(root).as_posix()
+                    failed.append(rel)
+                    print(f"[{k}/{len(files)}] {rel}: could not be analysed: {type(ex).__name__}: {ex}",
+                          flush=True)
+                    continue
+                results[rel], plan[rel] = det, entry
+                print(f"[{k}/{len(files)}] {line}", flush=True)
+        order = [p.relative_to(root).as_posix() for p in files]
+        results = {r: results[r] for r in order if r in results}
+        plan = {r: plan[r] for r in order if r in plan}
+        files = [p for p in files if p.relative_to(root).as_posix() in plan]
         write_json(cache_path, {"version": CACHE_VERSION, "models": models_signature(),
                                 "written": datetime.now().isoformat(timespec="seconds"), "files": results})
         write_json(out_dir / PLAN_NAME, {"written": datetime.now().isoformat(timespec="seconds"),
                                          "people_version": PEOPLE_VERSION, "photos": plan})
         n_crop = sum(1 for v in plan.values() if v["crop"] and v["crop"]["verdict"] == "crop")
         n_flag = sum(1 for v in plan.values() if v["flags"] or (v["crop"] or {}).get("flags"))
-        print(f"{n_new} detected, {len(files) - n_new} from cache, {time.time() - t0:.0f}s; "
+        print(f"{n_new} detected, {len(stats) - n_new} from cache, {time.time() - t0:.0f}s, "
+              f"{args.threads} thread(s); " + (f"{len(failed)} failed; " if failed else "") +
               f"{n_crop} to crop, {len(plan) - n_crop} unchanged" + (f", {n_flag} flagged" if n_flag else "")
               + f" -> {out_dir / PLAN_NAME}")
         if not args.dry_run:

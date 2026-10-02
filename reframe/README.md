@@ -50,6 +50,9 @@ Each folder is processed with all its subfolders. Folders whose names start with
 | `--previews` | off | draw the raw detections (outlines, faces, skeletons) into `_reframed\_preview\` |
 | `--people` | off | draw the people with their measurements into `_reframed\_people\` |
 | `--redetect` | off | run the detection again, without the cache |
+| `--threads N` | 4 | number of parallel workers, 1 to 32 |
+
+**Speed.** Detection runs one photo at a time on the GPU, because the models cannot run from two threads at once. Decoding, measuring and previews for other photos run in parallel threads meanwhile. The output files are written by parallel worker processes instead of threads, because the library that does the lossless JPEG crop can crash the program when it runs next to other threads. On 29 phone photos of 12 megapixels, a first run takes about 13 seconds with 4 workers and 24 seconds with 1, and a second run reuses the detections.
 
 The aspect ratios are k2prep's: 9:16, 2:3, 4:5, 1:1, 5:4, 3:2 and 16:9.
 
