@@ -3,10 +3,13 @@
 Reframe photos of people: trim wasted space around the subject (one person or a
 group), leave passers-by out, and crop to one of the k2prep aspect ratios.
 
-Phases 1-2 (this version): detection and per-person measurements. Every
-image is analysed with three models; the detections are merged into one list
-of people, each person is measured, and everything is cached. --previews draws
-the detections, --people draws the merged people with their measurements.
+Phases 1-4 (this version): detection, per-person measurements and subject
+selection. Every image is analysed with three models; the detections are
+merged into one list of people, each person is measured, and the subject group
+is chosen, or the photo is marked to stay unchanged (crowd, no clear subject).
+Results go to <out>/plan.json. --previews draws the detections, --people the
+measurements, --verdicts the subject choice with numbered people.
+Per-photo corrections: <folder>/overrides.txt, see OVERRIDES_NAME.
   person outlines : yolo26x-seg.pt   (ultralytics assets, COCO class "person")
   faces           : face_yolov8m.pt  (Bingsu/adetailer, Hugging Face)
   pose keypoints  : yolo26x-pose.pt  (ultralytics assets)
@@ -34,8 +37,17 @@ OUT_DIRNAME = "_reframed"
 DETECTIONS_NAME = "detections.json"
 PREVIEW_DIRNAME = "_preview"
 CACHE_VERSION = 1
-PEOPLE_VERSION = 3           # bump when build_people or measure_people changes
+PEOPLE_VERSION = 4           # bump when build_people or measure_people changes
 PEOPLE_PREVIEW_DIRNAME = "_people"
+VERDICT_PREVIEW_DIRNAME = "_verdicts"
+PLAN_NAME = "plan.json"
+# One line per photo, path relative to the folder, then an action:
+#   photo.jpg keep          leave the photo unchanged
+#   photo.jpg crop          crop to the chosen group even if the rules say no
+#   photo.jpg people=0,3,5  the subject is exactly these people (numbers from
+#                           the --verdicts previews)
+# Lines starting with # are comments. A path with spaces goes in quotes.
+OVERRIDES_NAME = "overrides.txt"
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 
@@ -170,7 +182,12 @@ def detect(models: dict, img: Image.Image) -> dict:
 
 KP = {n: i for i, n in enumerate(KP_NAMES)}
 KP_OK = 0.5                   # keypoint confidence that counts as visible
-MATCH_MIN = 0.35              # outline-to-skeleton match score needed to merge
+# An outline joins a skeleton if their boxes overlap by MATCH_IOU or most
+# keypoints (MATCH_KP) lie inside the outline. Not both: the outline model cuts
+# lower legs and feet off, so a correct outline can miss the ankle keypoints.
+MATCH_IOU = 0.45
+MATCH_KP = 0.6
+DUPLICATE_IOU = 0.7           # a leftover outline this close to a person is the same person
 FACE_MATCH_MAX = 0.8          # face centre to head keypoints, in face sizes
 EDGE_MARGIN = 0.004           # a person within this share of the long side touches an edge
 FOCUS_MIN_SIDE = 32           # smaller head regions give no focus value
@@ -250,16 +267,22 @@ def build_people(det: dict) -> list:
         for j, o in enumerate(outlines):
             iou = box_iou(p["box"], o["box"])
             if iou > 0.1:
-                cand.append((0.5 * iou + 0.5 * kp_inside(p["kp"], o["poly"]), i, j))
+                inside = kp_inside(p["kp"], o["poly"])
+                if iou >= MATCH_IOU or inside >= MATCH_KP:
+                    cand.append((iou + inside, i, j))
     used_p, used_o = set(), set()
     for score, i, j in sorted(cand, reverse=True):
-        if score >= MATCH_MIN and i not in used_p and j not in used_o:
+        if i not in used_p and j not in used_o:
             used_p.add(i)
             used_o.add(j)
             people[i].update(poly=outlines[j]["poly"], seg_box=outlines[j]["box"], seg_conf=outlines[j]["conf"])
     for j, o in enumerate(outlines):
-        if j not in used_o:
-            people.append({"poly": o["poly"], "seg_box": o["box"], "seg_conf": o["conf"]})
+        if j in used_o:
+            continue
+        if any(box_iou(o["box"], pe.get("seg_box") or pe["pose_box"]) >= DUPLICATE_IOU for pe in people
+               if "pose_box" in pe or "seg_box" in pe):
+            continue                                  # the same person, detected twice
+        people.append({"poly": o["poly"], "seg_box": o["box"], "seg_conf": o["conf"]})
 
     # faces to people: by head keypoints, else inside the upper part of the outline
     cand = []
@@ -431,6 +454,197 @@ def people_for(det: dict, img: Image.Image | None) -> list:
 
 
 # ---------------------------------------------------------------------------
+# Subject selection
+# ---------------------------------------------------------------------------
+#
+# Calibrated on 29 personal photos labelled by eye (27 decidable): all 27
+# agree. Every threshold below can move by 20% with at most two photos
+# changing, except MIN_SCORE upward and MIN_HEAD_SHARE.
+
+CAND_MIN_REL = 0.40           # candidates: head at least this share of the largest head
+FACE_BONUS = {1.0: 0.30, 0.8: 0.25, 0.4: 0.05, 0.0: -0.35}   # by facing
+SIDE_EDGE_PENALTY = 0.35      # touching the left or right image edge
+SIDE_EDGE_KEEP_REL = 0.75     # a side-edge person stays a candidate only if this large ...
+SIDE_EDGE_KEEP_FACING = 0.8   # ... and facing the camera at least this much
+CENTRE_FREE = 0.22            # no position penalty within this distance of the middle
+CENTRE_WEIGHT = 1.0
+GROUP_HEAD_RATIO = 1.8        # same depth: heads within this factor
+GROUP_FOOT_TOL = 0.12         # same depth: feet within this share of the image height
+GROUP_GAP_HEADS = 3.0         # close together: box gap at most this many head sizes
+ABSORB_OVERLAP = 0.5          # an outline-only person this much inside a member joins
+MIN_SCORE = 1.0               # the best group must reach this score
+MIN_HEAD_SHARE = 0.034        # its largest head over the image's short side
+CROWD_PEOPLE = 10             # this many candidates ...
+CROWD_DOMINANCE = 2.0         # ... and no head this much larger than the rest = crowd
+SINGLE_CENTRE = 0.2           # a lone subject further off-centre is a passer-by
+TIE_MARGIN = 0.1              # a second group this close in score is kept too, and flagged
+
+
+def box_gap(a, b) -> float:
+    dx = max(0.0, max(a[0], b[0]) - min(a[2], b[2]))
+    dy = max(0.0, max(a[1], b[1]) - min(a[3], b[3]))
+    return math.hypot(dx, dy)
+
+
+def share_inside(a, b) -> float:
+    """Share of box a that lies inside box b."""
+    x0, y0, x1, y1 = max(a[0], b[0]), max(a[1], b[1]), min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0.0, x1 - x0) * max(0.0, y1 - y0)
+    return inter / max(1.0, (a[2] - a[0]) * (a[3] - a[1]))
+
+
+def touches_side(pe) -> bool:
+    return "l" in pe["edges"] or "r" in pe["edges"]
+
+
+def person_score(pe, maxhead) -> float:
+    """Head size relative to the largest head, plus facing, minus edge and
+    off-centre penalties. Size alone does not decide: a passer-by close to the
+    camera has the largest head but is turned away or cut by the frame."""
+    s = pe["head"] / maxhead + FACE_BONUS.get(pe["facing"], 0.0)
+    if touches_side(pe):
+        s -= SIDE_EDGE_PENALTY
+    s -= CENTRE_WEIGHT * max(0.0, abs(pe["centre"][0] - 0.5) - CENTRE_FREE)
+    return s
+
+
+def is_candidate(pe, maxhead) -> bool:
+    rel = pe["head"] / maxhead
+    if rel < CAND_MIN_REL:
+        return False
+    if pe["facing"] == 0.0 and pe["edges"]:
+        return False             # turned away and cut by the frame: a passer-by, or a shadow
+    if touches_side(pe) and (rel < SIDE_EDGE_KEEP_REL or (pe["facing"] or 0.0) < SIDE_EDGE_KEEP_FACING):
+        return False
+    return True
+
+
+def same_group(a, b, h) -> bool:
+    """Same depth (head size, foot line) and close together, or overlapping."""
+    if max(a["head"], b["head"]) / min(a["head"], b["head"]) > GROUP_HEAD_RATIO:
+        return False
+    g = box_gap(a["box"], b["box"])
+    if g == 0:
+        return True
+    if a["feet"] and b["feet"] and abs(a["foot"] - b["foot"]) > GROUP_FOOT_TOL * h:
+        return False
+    return g <= GROUP_GAP_HEADS * (a["head"] + b["head"]) / 2
+
+
+def absorb(people, members) -> list:
+    """Add outline-only people that lie mostly inside a member: duplicates of a
+    member, or someone partly hidden behind one. Cropping through them would
+    cut a person."""
+    out = set(members)
+    for k, pe in enumerate(people):
+        if k not in out and "kp" not in pe and "face" not in pe and \
+                any(share_inside(pe["box"], people[m]["box"]) >= ABSORB_OVERLAP for m in members):
+            out.add(k)
+    return sorted(out)
+
+
+def select_subject(det: dict, override: tuple | None = None) -> dict:
+    """-> {"verdict": "crop" | "keep", "members": [...], "reason": str, "flags": [...]}
+
+    "keep" leaves the photo unchanged. members are indexes into det["people"];
+    for "keep" they are the best group, for the previews.
+    """
+    people, w, h = det["people"], det["w"], det["h"]
+    flags = []
+    if override and override[0] == "people":
+        ids = [k for k in override[1] if 0 <= k < len(people)]
+        if len(ids) != len(override[1]):
+            flags.append("override names people that do not exist")
+        if not ids:
+            return {"verdict": "keep", "members": [], "reason": "override: no valid people", "flags": flags}
+        return {"verdict": "crop", "members": absorb(people, ids), "reason": "override: people", "flags": flags}
+
+    def result(verdict, members, reason):
+        if override and override[0] == "keep":
+            verdict, reason = "keep", f"override: keep ({reason})"
+        elif override and override[0] == "crop" and members:
+            verdict, reason = "crop", f"override: crop ({reason})"
+        return {"verdict": verdict, "members": members, "reason": reason, "flags": flags}
+
+    real = [k for k, pe in enumerate(people) if "kp" in pe or "face" in pe]   # people with a head
+    if not real:
+        return result("keep", [], "no people")
+    maxhead = max(people[k]["head"] for k in real)
+    score = {k: person_score(people[k], maxhead) for k in real}
+    cand = [k for k in real if is_candidate(people[k], maxhead)]
+    if not cand:
+        return result("keep", [], "no subject candidates")
+
+    parent = {k: k for k in cand}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+    for i in cand:
+        for j in cand:
+            if i < j and same_group(people[i], people[j], h):
+                parent[find(i)] = find(j)
+    groups = {}
+    for k in cand:
+        groups.setdefault(find(k), []).append(k)
+    ranked = sorted(groups.values(), key=lambda g: -max(score[k] for k in g))
+    best = list(ranked[0])
+    best_score = max(score[k] for k in best)
+    tied = [g for g in ranked[1:] if max(score[k] for k in g) >= best_score - TIE_MARGIN]
+    for g in tied:
+        best += g
+    if tied:
+        flags.append(f"tie: {len(tied) + 1} groups score the same, all kept")
+    head_in = max(people[k]["head"] for k in best)
+    head_out = max((people[k]["head"] for k in real if k not in best), default=0.0)
+    members = absorb(people, best)
+    n_cand = sum(1 for k in real if people[k]["head"] / maxhead >= CAND_MIN_REL)
+
+    if best_score < MIN_SCORE:
+        return result("keep", members, f"no clear subject (score {best_score:.2f})")
+    if head_in / min(w, h) < MIN_HEAD_SHARE:
+        return result("keep", members, f"people too small (head {head_in / min(w, h):.3f} of the short side)")
+    if n_cand >= CROWD_PEOPLE and (not head_out or head_in / head_out < CROWD_DOMINANCE):
+        return result("keep", members, f"crowd ({n_cand} similar people)")
+    if len(best) == 1 and abs(people[best[0]]["centre"][0] - 0.5) > SINGLE_CENTRE:
+        return result("keep", members, "lone person off-centre")
+    return result("crop", members, f"subject: {len(best)} person(s), score {best_score:.2f}")
+
+
+def read_overrides(root: Path) -> dict:
+    """{relative path (lower case, forward slashes): (action, [people])}"""
+    import shlex
+    path = root / OVERRIDES_NAME
+    out = {}
+    if not path.is_file():
+        return out
+    for n, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            parts = shlex.split(line, posix=True)
+        except ValueError:
+            parts = []
+        if len(parts) != 2:
+            print(f"  {OVERRIDES_NAME} line {n} ignored: {line}")
+            continue
+        rel, action = parts[0].replace("\\", "/").lower(), parts[1].lower()
+        if action in ("keep", "crop"):
+            out[rel] = (action, [])
+        elif action.startswith("people="):
+            try:
+                out[rel] = ("people", [int(x) for x in action[7:].split(",") if x.strip()])
+            except ValueError:
+                print(f"  {OVERRIDES_NAME} line {n} ignored: {line}")
+        else:
+            print(f"  {OVERRIDES_NAME} line {n} ignored: {line}")
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Previews
 # ---------------------------------------------------------------------------
 
@@ -498,6 +712,48 @@ def draw_people(img: Image.Image, people: list, dest: Path) -> None:
     prev.save(dest, quality=85)
 
 
+def draw_verdict(img: Image.Image, det: dict, sel: dict, dest: Path) -> None:
+    """The subject choice: members green, passers-by red, the area the crop must
+    contain dashed white, every person numbered for overrides.txt."""
+    from PIL import ImageFont
+    people = det["people"]
+    s = PREVIEW_SIDE / max(img.size)
+    prev = img.resize((max(1, round(img.width * s)), max(1, round(img.height * s))), Image.LANCZOS).convert("RGBA")
+    over = Image.new("RGBA", prev.size, (0, 0, 0, 0))
+    d = ImageDraw.Draw(over)
+    try:
+        font = ImageFont.truetype("arialbd.ttf", 20)
+        big = ImageFont.truetype("arialbd.ttf", 30)
+    except OSError:
+        font = big = ImageFont.load_default()
+    members = set(sel["members"])
+    crop = sel["verdict"] == "crop"
+    for k, pe in enumerate(people):
+        b = [v * s for v in pe["box"]]
+        col = (0, 230, 90) if k in members and crop else (150, 150, 150) if k in members else (255, 50, 50)
+        d.rectangle(b, outline=col + (230,), width=3 if k in members else 2)
+        label = str(k)
+        tw = d.textlength(label, font=font)
+        d.rectangle((b[0], b[1], b[0] + tw + 8, b[1] + 24), fill=col + (220,))
+        d.text((b[0] + 4, b[1] + 1), label, font=font, fill=(0, 0, 0, 255))
+    if crop and members:
+        u = [v * s for v in union_box([people[k]["box"] for k in members])]
+        for i in range(0, int(u[2] - u[0]), 16):
+            for y in (u[1], u[3]):
+                d.line((u[0] + i, y, min(u[0] + i + 8, u[2]), y), fill=(255, 255, 255, 255), width=3)
+        for i in range(0, int(u[3] - u[1]), 16):
+            for x in (u[0], u[2]):
+                d.line((x, u[1] + i, x, min(u[1] + i + 8, u[3])), fill=(255, 255, 255, 255), width=3)
+    title = ("CROP  " if crop else "UNCHANGED  ") + sel["reason"]
+    if sel["flags"]:
+        title += "  [" + "; ".join(sel["flags"]) + "]"
+    d.rectangle((0, 0, prev.width, 42), fill=(0, 0, 0, 180))
+    d.text((8, 5), title, font=big, fill=(0, 230, 90, 255) if crop else (255, 200, 0, 255))
+    out = Image.alpha_composite(prev, over).convert("RGB")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    out.save(dest, quality=85)
+
+
 # ---------------------------------------------------------------------------
 # Scanning and cache
 # ---------------------------------------------------------------------------
@@ -550,6 +806,8 @@ def main(argv=None) -> int:
     ap.add_argument("--previews", action="store_true", help="draw the detections into <out>/_preview")
     ap.add_argument("--people", action="store_true",
                     help="draw the merged people and their measurements into <out>/_people")
+    ap.add_argument("--verdicts", action="store_true",
+                    help="draw the subject choice, with numbered people, into <out>/_verdicts")
     ap.add_argument("--redetect", action="store_true", help="ignore the detection cache")
     ap.add_argument("--fetch-models", action="store_true", help="download the models and load them once")
     args = ap.parse_args(argv)
@@ -576,9 +834,13 @@ def main(argv=None) -> int:
         cache_path = out_dir / DETECTIONS_NAME
         cache = {} if args.redetect else load_cache(cache_path)
         files = scan(root)
-        print(f"{root}: {len(files)} image(s)")
+        overrides = read_overrides(root)
+        known = {path.relative_to(root).as_posix().lower() for path in files}
+        for rel in sorted(set(overrides) - known):
+            print(f"  {OVERRIDES_NAME}: no such photo: {rel}")
+        print(f"{root}: {len(files)} image(s)" + (f", {len(overrides)} override(s)" if overrides else ""))
         t0, n_new = time.time(), 0
-        results = {}
+        results, plan = {}, {}
         for k, path in enumerate(files, 1):
             rel = path.relative_to(root).as_posix()
             st = path.stat()
@@ -605,16 +867,24 @@ def main(argv=None) -> int:
             if args.people:
                 img = img or load_image(path)
                 draw_people(img, det["people"], out_dir / PEOPLE_PREVIEW_DIRNAME / (rel + ".jpg"))
-            srcs = {}
-            for pe in det["people"]:
-                key = "+".join(pe["sources"])
-                srcs[key] = srcs.get(key, 0) + 1
-            print(f"[{k}/{len(files)}] {rel}: {len(det['people'])} people ("
-                  + ", ".join(f"{v} {k2}" for k2, v in sorted(srcs.items())) + ")"
-                  + ("" if fresh else " (cached detections)"), flush=True)
+            sel = select_subject(det, overrides.get(rel.lower()))
+            plan[rel] = sel
+            if args.verdicts:
+                img = img or load_image(path)
+                draw_verdict(img, det, sel, out_dir / VERDICT_PREVIEW_DIRNAME / (rel + ".jpg"))
+            print(f"[{k}/{len(files)}] {rel}: {len(det['people'])} people; "
+                  f"{'CROP' if sel['verdict'] == 'crop' else 'unchanged'}, {sel['reason']}"
+                  + "".join(f" [{f}]" for f in sel["flags"])
+                  + ("" if fresh else " (cached)"), flush=True)
         write_json(cache_path, {"version": CACHE_VERSION, "models": models_signature(),
                                 "written": datetime.now().isoformat(timespec="seconds"), "files": results})
-        print(f"{n_new} detected, {len(files) - n_new} from cache, {time.time() - t0:.0f}s -> {cache_path}")
+        write_json(out_dir / PLAN_NAME, {"written": datetime.now().isoformat(timespec="seconds"),
+                                         "people_version": PEOPLE_VERSION, "photos": plan})
+        n_crop = sum(1 for v in plan.values() if v["verdict"] == "crop")
+        n_flag = sum(1 for v in plan.values() if v["flags"])
+        print(f"{n_new} detected, {len(files) - n_new} from cache, {time.time() - t0:.0f}s; "
+              f"{n_crop} to crop, {len(plan) - n_crop} unchanged" + (f", {n_flag} flagged" if n_flag else "")
+              + f" -> {out_dir / PLAN_NAME}")
     return 0
 
 
