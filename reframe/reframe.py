@@ -3,12 +3,15 @@
 Reframe photos of people: trim wasted space around the subject (one person or a
 group), leave passers-by out, and crop to one of the k2prep aspect ratios.
 
-Phases 1-4 (this version): detection, per-person measurements and subject
-selection. Every image is analysed with three models; the detections are
+Phases 1-5 (this version): detection, per-person measurements, subject
+selection and crop planning. Every image is analysed with three models; the detections are
 merged into one list of people, each person is measured, and the subject group
 is chosen, or the photo is marked to stay unchanged (crowd, no clear subject).
-Results go to <out>/plan.json. --previews draws the detections, --people the
-measurements, --verdicts the subject choice with numbered people.
+The crop holds the subject with margins, in one of the k2prep aspect ratios.
+JPEG crops are planned for a lossless crop (whole DCT blocks, no re-encoding)
+unless --reencode is given. Results go to <out>/plan.json. --previews draws the
+detections, --people the measurements, --verdicts the subject choice and the
+planned crop.
 Per-photo corrections: <folder>/overrides.txt, see OVERRIDES_NAME.
   person outlines : yolo26x-seg.pt   (ultralytics assets, COCO class "person")
   faces           : face_yolov8m.pt  (Bingsu/adetailer, Hugging Face)
@@ -20,6 +23,7 @@ Usage:    python reframe.py <folder> [<folder> ...] [--out DIR] [--previews]
 import argparse
 import json
 import math
+from functools import lru_cache
 import os
 import sys
 import time
@@ -645,6 +649,287 @@ def read_overrides(root: Path) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Crop planning
+# ---------------------------------------------------------------------------
+
+# Aspect-ratio families and buckets, copied from k2prep.py
+# (T:/claude/github2/k2prep), which ports musubi-tuner's BucketSelector.
+AR_FAMILIES = ["9:16", "2:3", "4:5", "1:1", "5:4", "3:2", "16:9"]
+AR_NOMINAL = [0.5647, 0.6667, 0.8028, 1.0000, 1.2456, 1.5000, 1.7708]
+UPSCALE_TOLERANCE = 1.15
+RESO_STEPS = 16
+
+# Margins around the subject group, in head sizes of its largest head.
+HEADROOM = 0.7                # above the top of the highest member
+SIDE_MARGIN = 0.5             # left and right
+FOOT_MARGIN = 0.3             # below the feet, when the feet are visible
+LOOK_ROOM = 0.6               # extra room on the side a lone subject looks to (times |yaw|)
+HEAD_LINE = 1 / 3             # where the highest head goes, as a share of the crop height
+MIN_SAVING = 0.10             # leave the photo unchanged if the crop keeps more than 90%
+FIT_MIN_COVER = 0.98          # without margins, a ratio must keep this share of the group
+CUT_MIN, CUT_MAX = 0.03, 0.97  # a person with this share of the box inside the crop is cut
+
+
+@lru_cache(maxsize=None)
+def generate_buckets(resolution: int, steps: int = RESO_STEPS):
+    area = resolution * resolution
+    sqrt_size = int(math.sqrt(area))
+    min_size = sqrt_size // 2 - (sqrt_size // 2) % steps
+    out = []
+    for bw in range(min_size, sqrt_size + steps, steps):
+        bh = (area // bw) - (area // bw) % steps
+        out.append((bw, bh))
+        out.append((bh, bw))
+    return sorted(set(out))
+
+
+@lru_cache(maxsize=None)
+def bucket_for(tier: int, family: str):
+    nominal = AR_NOMINAL[AR_FAMILIES.index(family)]
+    return min(generate_buckets(tier), key=lambda b: abs(b[0] / b[1] - nominal))
+
+
+def image_header(path: Path) -> dict:
+    """Format, EXIF orientation, stored size and JPEG MCU size, from the header only."""
+    with Image.open(path) as im:
+        try:
+            orientation = im.getexif().get(274, 1) or 1
+        except Exception:  # noqa: BLE001
+            orientation = 1
+        head = {"format": im.format or "", "orientation": orientation if orientation in range(1, 9) else 1,
+                "stored": list(im.size)}
+        layer = getattr(im, "layer", None)
+        if im.format == "JPEG" and layer:
+            head["mcu"] = [8 * max(c[1] for c in layer), 8 * max(c[2] for c in layer)]
+            head["components"] = len(layer)
+    return head
+
+
+def display_to_stored(box, orientation, sw, sh):
+    """A box in upright (display) pixels -> the same box in stored pixels.
+
+    Edges are continuous coordinates: a box [x0, x1) of display pixels maps to
+    the stored pixels that EXIF orientation puts there.
+    """
+    x0, y0, x1, y1 = box
+    if orientation == 2:
+        return [sw - x1, y0, sw - x0, y1]
+    if orientation == 3:
+        return [sw - x1, sh - y1, sw - x0, sh - y0]
+    if orientation == 4:
+        return [x0, sh - y1, x1, sh - y0]
+    if orientation == 5:
+        return [y0, x0, y1, x1]
+    if orientation == 6:
+        return [y0, sh - x1, y1, sh - x0]
+    if orientation == 7:
+        return [sw - y1, sh - x1, sw - y0, sh - x0]
+    if orientation == 8:
+        return [sw - y1, x0, sw - y0, x1]
+    return [x0, y0, x1, y1]
+
+
+def stored_to_display(box, orientation, sw, sh):
+    """Inverse of display_to_stored."""
+    x0, y0, x1, y1 = box
+    if orientation == 2:
+        return [sw - x1, y0, sw - x0, y1]
+    if orientation == 3:
+        return [sw - x1, sh - y1, sw - x0, sh - y0]
+    if orientation == 4:
+        return [x0, sh - y1, x1, sh - y0]
+    if orientation == 5:
+        return [y0, x0, y1, x1]
+    if orientation == 6:
+        return [sh - y1, x0, sh - y0, x1]
+    if orientation == 7:
+        return [sh - y1, sw - x1, sh - y0, sw - x0]
+    if orientation == 8:
+        return [y0, sw - x1, y1, sw - x0]
+    return [x0, y0, x1, y1]
+
+
+def align_lossless(box, head):
+    """Move a display crop so that its stored origin sits on the MCU grid.
+
+    The origin moves up and left in stored pixels (the crop only grows, so the
+    subject stays inside); the far edge of the shorter-grown side then extends
+    to restore the aspect ratio, clipped to the image. -> (display box, stored box)
+    """
+    o = head["orientation"]
+    sw, sh = head["stored"]
+    mw, mh = head["mcu"]
+    rot = o in (5, 6, 7, 8)
+    ratio = (box[2] - box[0]) / (box[3] - box[1])
+    sratio = 1 / ratio if rot else ratio                 # width / height in stored pixels
+    x0, y0, x1, y1 = display_to_stored(box, o, sw, sh)
+    x0, y0 = (x0 // mw) * mw, (y0 // mh) * mh
+    w, h = x1 - x0, y1 - y0
+    if w / h < sratio:
+        w = min(sw - x0, round(h * sratio))
+        h = min(sh - y0, round(w / sratio))
+    else:
+        h = min(sh - y0, round(w / sratio))
+        w = min(sw - x0, round(h * sratio))
+    stored = [int(x0), int(y0), int(x0 + w), int(y0 + h)]
+    return [int(v) for v in stored_to_display(stored, o, sw, sh)], stored
+
+
+def subject_area(people, members, w, h):
+    """The group's box plus margins, and the box without margins, both clipped."""
+    heads = [people[k]["head"] for k in members if "kp" in people[k] or "face" in people[k]] or \
+        [people[k]["head"] for k in members]
+    hs = max(heads)
+    bare = union_box([people[k]["box"] for k in members])
+    x0, y0, x1, y1 = bare[0] - SIDE_MARGIN * hs, bare[1] - HEADROOM * hs, bare[2] + SIDE_MARGIN * hs, bare[3]
+    bottom = 0.0
+    for k in members:
+        pe = people[k]
+        if pe["feet"]:
+            bottom = max(bottom, pe["foot"] + FOOT_MARGIN * hs, pe["box"][3])
+        elif "kp" in pe and not pe["box"][3] >= h - EDGE_MARGIN * max(w, h):
+            # a skeleton without visible feet that stops above the bottom edge:
+            # the body goes on below the detection (hidden legs, long clothing)
+            bottom = float(h)
+        else:
+            bottom = max(bottom, pe["box"][3] + FOOT_MARGIN * hs)
+    y1 = max(y1, bottom)
+    real = [k for k in members if "kp" in people[k] or "face" in people[k]]
+    if len(real) == 1 and people[real[0]]["yaw"] is not None:
+        yaw = people[real[0]]["yaw"]
+        if yaw > 0:
+            x1 += LOOK_ROOM * hs * yaw
+        else:
+            x0 += LOOK_ROOM * hs * yaw
+    clip = (lambda b: [max(0.0, b[0]), max(0.0, b[1]), min(float(w), b[2]), min(float(h), b[3])])
+    return clip([x0, y0, x1, y1]), clip(bare), hs
+
+
+def head_line_y(people, members):
+    ys = []
+    for k in members:
+        pe = people[k]
+        if "face" in pe:
+            ys.append((pe["face"][1] + pe["face"][3]) / 2)
+        elif "kp" in pe and head_point(pe["kp"]) is not None:
+            ys.append(head_point(pe["kp"])[1])
+    return min(ys) if ys else None
+
+
+def cut_cost(crop, others):
+    cost = 0.0
+    for pe in others:
+        share = share_inside(pe["box"], crop)
+        if CUT_MIN < share < CUT_MAX:
+            cost += pe["area"]
+    return cost
+
+
+def place_axis(pref, lo, hi, size, others, crop_of):
+    """Best origin on one axis: fewest cut passers-by (by area), then nearest
+    the preferred origin. crop_of(origin) builds the crop box."""
+    cands = {min(max(pref, lo), hi), lo, hi}
+    for pe in others:
+        b = pe["box"]
+        a0, a1 = (b[0], b[2]) if crop_of(0)[1] == crop_of(1)[1] else (b[1], b[3])
+        for c in (a0 - size, a1, a0, a1 - size):
+            cands.add(min(max(c, lo), hi))
+    return min(cands, key=lambda c: (round(cut_cost(crop_of(c), others), 6), abs(c - pref)))
+
+
+def plan_crop(det: dict, sel: dict, head: dict, families, lossless: bool) -> dict:
+    """-> {"verdict": "crop", "box": display box, "family", "flags": [...], ...}
+    or {"verdict": "keep", "reason": ...}"""
+    people, w, h = det["people"], det["w"], det["h"]
+    members = sel["members"]
+    area, bare, hs = subject_area(people, members, w, h)
+    flags = []
+    aw, ah = area[2] - area[0], area[3] - area[1]
+
+    # 1. the tightest ratio that holds the group with its margins
+    best = None
+    for fam in families:
+        r = AR_NOMINAL[AR_FAMILIES.index(fam)]
+        cw, ch = (ah * r, ah) if aw / ah < r else (aw, aw / r)
+        if cw <= w + 0.5 and ch <= h + 0.5:
+            key = (cw * ch, abs(math.log(r) - math.log(aw / ah)))
+            if best is None or key < best[0]:
+                best = (key, fam, min(cw, w), min(ch, h))
+    if best is None:
+        # 2. no ratio holds the margins: the largest crop of each ratio, placed
+        # over the group; keep it if it holds almost all of the group itself
+        opts = []
+        for fam in families:
+            r = AR_NOMINAL[AR_FAMILIES.index(fam)]
+            cw, ch = (h * r, h) if w / h > r else (w, w / r)
+            x0 = min(max((bare[0] + bare[2]) / 2 - cw / 2, 0), w - cw)
+            y0 = min(max((bare[1] + bare[3]) / 2 - ch / 2, 0), h - ch)
+            cover = share_inside(bare, [x0, y0, x0 + cw, y0 + ch])
+            opts.append((cover, -cw * ch, fam, cw, ch))
+        cover, _, fam, cw, ch = max(opts)
+        if cover < FIT_MIN_COVER:
+            return {"verdict": "keep", "reason": f"the group does not fit any ratio (best {fam} keeps {cover:.0%})"}
+        flags.append("tight: no room for margins" if cover >= 0.999 else f"cuts {1 - cover:.1%} of the group")
+        best = (None, fam, cw, ch)
+    _, fam, cw, ch = best
+    r = AR_NOMINAL[AR_FAMILIES.index(fam)]
+
+    # 3. size floor: never smaller than k2prep needs for its 512 bucket
+    bkt = bucket_for(512, fam)
+    need = bkt[0] * bkt[1] / UPSCALE_TOLERANCE ** 2
+    if cw * ch < need:
+        g = math.sqrt(need / (cw * ch))
+        cw, ch = cw * g, ch * g
+        if cw > w + 0.5 or ch > h + 0.5:
+            return {"verdict": "keep", "reason": f"too small for a 512 crop at {fam}"}
+        flags.append("grown to the 512 size floor")
+
+    # 4. placement: the group inside, the top head near the upper third,
+    # centred sideways; then move to avoid cutting passers-by in half
+    lo_x, hi_x = max(0.0, area[2] - cw), min(area[0], w - cw)
+    lo_y, hi_y = max(0.0, area[3] - ch), min(area[1], h - ch)
+    if lo_x > hi_x:                                  # crop narrower than the margins (case 2)
+        lo_x, hi_x = max(0.0, bare[2] - cw), min(bare[0], w - cw)
+        if lo_x > hi_x:
+            lo_x = hi_x = min(max((bare[0] + bare[2]) / 2 - cw / 2, 0.0), w - cw)
+    if lo_y > hi_y:
+        lo_y, hi_y = max(0.0, bare[3] - ch), min(bare[1], h - ch)
+        if lo_y > hi_y:
+            lo_y = hi_y = min(max((bare[1] + bare[3]) / 2 - ch / 2, 0.0), h - ch)
+    pref_x = (area[0] + area[2]) / 2 - cw / 2
+    hy = head_line_y(people, members)
+    pref_y = hy - HEAD_LINE * ch if hy is not None else (area[1] + area[3]) / 2 - ch / 2
+    others = [pe for k, pe in enumerate(people) if k not in set(members) and pe["area"] >= 0.0008]
+    x0 = min(max(pref_x, lo_x), hi_x)
+    y0 = min(max(pref_y, lo_y), hi_y)
+    for _ in range(2):
+        x0 = place_axis(pref_x, lo_x, hi_x, cw, others, lambda c: [c, y0, c + cw, y0 + ch])
+        y0 = place_axis(pref_y, lo_y, hi_y, ch, others, lambda c: [x0, c, x0 + cw, c + ch])
+    box = [x0, y0, x0 + cw, y0 + ch]
+    if cut_cost(box, others) > 0:
+        flags.append("cuts a passer-by")
+
+    # 5. integer pixels; lossless JPEG alignment
+    box = [int(math.floor(box[0])), int(math.floor(box[1])), int(math.ceil(box[2])), int(math.ceil(box[3]))]
+    box = [max(0, box[0]), max(0, box[1]), min(w, box[2]), min(h, box[3])]
+    out = {"verdict": "crop", "family": fam, "flags": flags}
+    if lossless and head.get("mcu"):
+        box, stored = align_lossless(box, head)
+        out["stored_box"] = stored
+        out["lossless"] = True
+    else:
+        out["lossless"] = False
+    out["box"] = box
+    bw, bh = box[2] - box[0], box[3] - box[1]
+    out["size"] = [bw, bh]
+    out["ratio_error"] = round(bw / bh / r - 1, 4)
+    out["keeps"] = round(bw * bh / (w * h), 3)
+    if bw * bh > (1 - MIN_SAVING) * w * h:
+        return {"verdict": "keep", "reason": f"the crop keeps {bw * bh / (w * h):.0%} of the photo"}
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Previews
 # ---------------------------------------------------------------------------
 
@@ -712,43 +997,47 @@ def draw_people(img: Image.Image, people: list, dest: Path) -> None:
     prev.save(dest, quality=85)
 
 
-def draw_verdict(img: Image.Image, det: dict, sel: dict, dest: Path) -> None:
-    """The subject choice: members green, passers-by red, the area the crop must
-    contain dashed white, every person numbered for overrides.txt."""
+def draw_verdict(img: Image.Image, det: dict, sel: dict, dest: Path, plan: dict | None = None) -> None:
+    """The subject choice and the planned crop: members green, passers-by red,
+    the area outside the crop darkened, every person numbered for overrides.txt."""
     from PIL import ImageFont
     people = det["people"]
     s = PREVIEW_SIDE / max(img.size)
     prev = img.resize((max(1, round(img.width * s)), max(1, round(img.height * s))), Image.LANCZOS).convert("RGBA")
-    over = Image.new("RGBA", prev.size, (0, 0, 0, 0))
-    d = ImageDraw.Draw(over)
     try:
         font = ImageFont.truetype("arialbd.ttf", 20)
         big = ImageFont.truetype("arialbd.ttf", 30)
     except OSError:
         font = big = ImageFont.load_default()
+    cropping = plan is not None and plan.get("verdict") == "crop"
+    if cropping:
+        c = [v * s for v in plan["box"]]
+        shade = Image.new("RGBA", prev.size, (0, 0, 0, 130))
+        ImageDraw.Draw(shade).rectangle(c, fill=(0, 0, 0, 0))
+        prev = Image.alpha_composite(prev, shade)
+    over = Image.new("RGBA", prev.size, (0, 0, 0, 0))
+    d = ImageDraw.Draw(over)
     members = set(sel["members"])
-    crop = sel["verdict"] == "crop"
     for k, pe in enumerate(people):
         b = [v * s for v in pe["box"]]
-        col = (0, 230, 90) if k in members and crop else (150, 150, 150) if k in members else (255, 50, 50)
+        col = (0, 230, 90) if k in members and cropping else (150, 150, 150) if k in members else (255, 50, 50)
         d.rectangle(b, outline=col + (230,), width=3 if k in members else 2)
         label = str(k)
         tw = d.textlength(label, font=font)
         d.rectangle((b[0], b[1], b[0] + tw + 8, b[1] + 24), fill=col + (220,))
         d.text((b[0] + 4, b[1] + 1), label, font=font, fill=(0, 0, 0, 255))
-    if crop and members:
-        u = [v * s for v in union_box([people[k]["box"] for k in members])]
-        for i in range(0, int(u[2] - u[0]), 16):
-            for y in (u[1], u[3]):
-                d.line((u[0] + i, y, min(u[0] + i + 8, u[2]), y), fill=(255, 255, 255, 255), width=3)
-        for i in range(0, int(u[3] - u[1]), 16):
-            for x in (u[0], u[2]):
-                d.line((x, u[1] + i, x, min(u[1] + i + 8, u[3])), fill=(255, 255, 255, 255), width=3)
-    title = ("CROP  " if crop else "UNCHANGED  ") + sel["reason"]
-    if sel["flags"]:
-        title += "  [" + "; ".join(sel["flags"]) + "]"
+    if cropping:
+        d.rectangle(c, outline=(255, 255, 0, 255), width=4)
+        d.text((c[0] + 8, c[3] - 30), f"{plan['family']}  {plan['size'][0]}x{plan['size'][1]}"
+               + ("  lossless" if plan.get("lossless") else ""), font=font, fill=(255, 255, 0, 255))
+        title = "CROP  " + sel["reason"]
+    else:
+        title = "UNCHANGED  " + (plan["reason"] if plan is not None else sel["reason"])
+    flags = sel["flags"] + ((plan or {}).get("flags") or [])
+    if flags:
+        title += "  [" + "; ".join(flags) + "]"
     d.rectangle((0, 0, prev.width, 42), fill=(0, 0, 0, 180))
-    d.text((8, 5), title, font=big, fill=(0, 230, 90, 255) if crop else (255, 200, 0, 255))
+    d.text((8, 5), title, font=big, fill=(0, 230, 90, 255) if cropping else (255, 200, 0, 255))
     out = Image.alpha_composite(prev, over).convert("RGB")
     dest.parent.mkdir(parents=True, exist_ok=True)
     out.save(dest, quality=85)
@@ -808,6 +1097,10 @@ def main(argv=None) -> int:
                     help="draw the merged people and their measurements into <out>/_people")
     ap.add_argument("--verdicts", action="store_true",
                     help="draw the subject choice, with numbered people, into <out>/_verdicts")
+    ap.add_argument("--ratios", default=",".join(AR_FAMILIES),
+                    help="aspect ratios to choose from, comma-separated (default: all seven k2prep ratios)")
+    ap.add_argument("--reencode", action="store_true",
+                    help="plan JPEG crops for re-encoding instead of a lossless DCT crop")
     ap.add_argument("--redetect", action="store_true", help="ignore the detection cache")
     ap.add_argument("--fetch-models", action="store_true", help="download the models and load them once")
     args = ap.parse_args(argv)
@@ -827,6 +1120,10 @@ def main(argv=None) -> int:
             ap.error(f"not a folder: {r}")
     if args.out and len(roots) > 1:
         ap.error("--out works with one folder only")
+    families = [r.strip() for r in args.ratios.split(",") if r.strip()]
+    bad = [r for r in families if r not in AR_FAMILIES]
+    if bad or not families:
+        ap.error(f"unknown ratio(s) {', '.join(bad) or '(none)'}; choose from {', '.join(AR_FAMILIES)}")
 
     models = None
     for root in roots:
@@ -868,20 +1165,29 @@ def main(argv=None) -> int:
                 img = img or load_image(path)
                 draw_people(img, det["people"], out_dir / PEOPLE_PREVIEW_DIRNAME / (rel + ".jpg"))
             sel = select_subject(det, overrides.get(rel.lower()))
-            plan[rel] = sel
+            crop = None
+            if sel["verdict"] == "crop":
+                crop = plan_crop(det, sel, image_header(path), families, lossless=not args.reencode)
+            plan[rel] = dict(sel, crop=crop)
             if args.verdicts:
                 img = img or load_image(path)
-                draw_verdict(img, det, sel, out_dir / VERDICT_PREVIEW_DIRNAME / (rel + ".jpg"))
-            print(f"[{k}/{len(files)}] {rel}: {len(det['people'])} people; "
-                  f"{'CROP' if sel['verdict'] == 'crop' else 'unchanged'}, {sel['reason']}"
-                  + "".join(f" [{f}]" for f in sel["flags"])
+                draw_verdict(img, det, sel, out_dir / VERDICT_PREVIEW_DIRNAME / (rel + ".jpg"), crop)
+            if crop and crop["verdict"] == "crop":
+                what = (f"CROP {crop['family']} {crop['size'][0]}x{crop['size'][1]} "
+                        f"(keeps {crop['keeps']:.0%}{', lossless' if crop['lossless'] else ''})")
+            elif crop:
+                what = f"unchanged, {crop['reason']}"
+            else:
+                what = f"unchanged, {sel['reason']}"
+            print(f"[{k}/{len(files)}] {rel}: {len(det['people'])} people; {what}"
+                  + "".join(f" [{f}]" for f in sel["flags"] + (crop or {}).get("flags", []))
                   + ("" if fresh else " (cached)"), flush=True)
         write_json(cache_path, {"version": CACHE_VERSION, "models": models_signature(),
                                 "written": datetime.now().isoformat(timespec="seconds"), "files": results})
         write_json(out_dir / PLAN_NAME, {"written": datetime.now().isoformat(timespec="seconds"),
                                          "people_version": PEOPLE_VERSION, "photos": plan})
-        n_crop = sum(1 for v in plan.values() if v["verdict"] == "crop")
-        n_flag = sum(1 for v in plan.values() if v["flags"])
+        n_crop = sum(1 for v in plan.values() if v["crop"] and v["crop"]["verdict"] == "crop")
+        n_flag = sum(1 for v in plan.values() if v["flags"] or (v["crop"] or {}).get("flags"))
         print(f"{n_new} detected, {len(files) - n_new} from cache, {time.time() - t0:.0f}s; "
               f"{n_crop} to crop, {len(plan) - n_crop} unchanged" + (f", {n_flag} flagged" if n_flag else "")
               + f" -> {out_dir / PLAN_NAME}")
