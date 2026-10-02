@@ -4,3 +4,4 @@ ultralytics>=8.3
 huggingface_hub>=0.23
 pillow>=10.0
 numpy>=2.0
+jpeglib>=1.0
