@@ -8,7 +8,9 @@ features (ORB) show the same picture under another crop, border, scale or a
 mock-up. Copies connected through such matches form one group. In each group the
 best copy stays; every other copy, and its .txt caption, moves to
 <root>/_duplicates/<same relative path>, where <root> is the folder given on the
-command line that contains it. No prompt.
+command line that contains it. If the kept copy has no caption and a moved copy
+has one, that caption is also copied next to the kept copy, under its name.
+No prompt.
 
 Quality is judged the k2prep way: each copy is scored as the trainer would see it,
 cropped and resized to the 512, 768 or 1024 bucket it reaches. A copy that reaches
@@ -793,6 +795,25 @@ def describe(it):
             "bytes": it.size}
 
 
+def caption_source(keeper, losers, items):
+    """The moved copy whose caption the kept copy inherits, or None.
+
+    Only when the kept copy has no caption. The best captioned copy by the same
+    ranking (tier, score), then the oldest file.
+    """
+    if items[keeper].caption is not None:
+        return None
+    captioned = [items[i] for i in losers if items[i].caption is not None and items[i].caption.exists()]
+    if not captioned:
+        return None
+    return min(captioned, key=lambda it: (-it.data["score_info"]["tier"], -it.data["score_info"]["score"],
+                                          it.mtime, it.root_idx, it.rel.casefold()))
+
+
+def file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 # ---------------------------------------------------------------------------
 # Undo
 # ---------------------------------------------------------------------------
@@ -808,6 +829,16 @@ def undo(roots) -> int:
         entries = [json.loads(ln) for ln in log.read_text(encoding="utf-8").splitlines() if ln.strip()]
         for e in reversed(entries):
             src, dst = Path(e["from"]), Path(e["to"])
+            if e.get("action") == "copy":
+                # A caption the tool copied to a kept image: remove it, but only
+                # if nobody has edited it since.
+                if dst.exists() and file_sha256(dst) == e.get("sha256"):
+                    dst.unlink()
+                    restored += 1
+                elif dst.exists():
+                    skipped += 1
+                    print(f"  copied caption was edited since, left in place: {dst}")
+                continue
             if dst.exists() and not src.exists():
                 move_file(dst, src)
                 restored += 1
@@ -921,10 +952,14 @@ def main(argv=None) -> int:
     moving = {i for _, losers, _, _ in groups for i in losers}
     plan = {"written": datetime.now().isoformat(timespec="seconds"), "match": args.match,
             "folders": [str(r) for r in roots], "groups": []}
-    caption_lost = []
+    caption_copies = []
     for keeper, losers, reason, steps in sorted(groups, key=lambda g: (good[g[0]].root_idx, good[g[0]].rel)):
         k = good[keeper]
         entry = {"keep": describe(k), "reason": reason, "move": []}
+        src = caption_source(keeper, losers, good)
+        if src is not None:
+            entry["copy_caption"] = {"from": str(src.caption), "to": str(k.path.with_suffix(".txt"))}
+            caption_copies.append((src, k))
         for i in losers:
             it = good[i]
             p = int(bin(int(k.data["phash"], 16) ^ int(it.data["phash"], 16)).count("1"))
@@ -936,8 +971,6 @@ def main(argv=None) -> int:
                                   "match": direct[0] if direct else "through other copies",
                                   **({"features": {x: direct[1][x] for x in ("inliers", "cover", "ncc")
                                                    if x in direct[1]}} if direct and "inliers" in direct[1] else {})})
-            if it.caption is not None and k.caption is None:
-                caption_lost.append((k, it))
         plan["groups"].append(entry)
     for root in roots:
         write_json(root / OUT_DIRNAME / PLAN_NAME, plan)
@@ -954,13 +987,9 @@ def main(argv=None) -> int:
     guarded = [g for g in groups if g[2].startswith("guard")]
     if guarded:
         print(f"{len(guarded)} group(s) keep a smaller copy because the larger one scores much lower")
-    if caption_lost:
-        print(f"{len(caption_lost)} moved cop{'y' if len(caption_lost) == 1 else 'ies'} take a caption "
-              f"along while the kept image has none:")
-        for k, it in caption_lost[:20]:
-            print(f"   {it.path}  (kept: {k.path})")
-        if len(caption_lost) > 20:
-            print(f"   ... see {PLAN_NAME}")
+    if caption_copies:
+        print(f"{len(caption_copies)} kept image(s) without a caption get a copy of the caption "
+              f"of a moved copy")
 
     if args.dry_run:
         print(f"Dry run: nothing moved. Plan: {roots[0] / OUT_DIRNAME / PLAN_NAME}")
@@ -970,10 +999,31 @@ def main(argv=None) -> int:
         return 0
 
     # 4. move
-    moved = {r: [0, 0, 0] for r in roots}          # images, captions, bytes
+    moved = {r: [0, 0, 0, 0] for r in roots}       # images, captions, bytes, captions copied
     logs = {}
+
+    def log_for(root):
+        if root not in logs:
+            (root / OUT_DIRNAME).mkdir(parents=True, exist_ok=True)
+            logs[root] = open(root / OUT_DIRNAME / MOVES_NAME, "a", encoding="utf-8")
+        return logs[root]
+
     try:
         for keeper, losers, reason, _ in groups:
+            k = good[keeper]
+            src = caption_source(keeper, losers, good)
+            if src is not None and k.path.exists():
+                cdst = k.path.with_suffix(".txt")
+                if not cdst.exists():                # never overwrite a caption
+                    shutil.copy2(src.caption, cdst)
+                    log = log_for(k.root)
+                    log.write(json.dumps({"time": datetime.now().isoformat(timespec="seconds"),
+                                          "action": "copy", "from": str(src.caption), "to": str(cdst),
+                                          "sha256": file_sha256(cdst),
+                                          "reason": "kept image had no caption"}, ensure_ascii=False) + "\n")
+                    log.flush()
+                    k.caption = cdst
+                    moved[k.root][3] += 1
             for i in losers:
                 it = good[i]
                 if not it.path.exists():
@@ -982,9 +1032,7 @@ def main(argv=None) -> int:
                 out = it.root / OUT_DIRNAME
                 cap = it.caption if it.caption and it.caption.exists() and not caption_shared(it, good, moving) else None
                 dst = free_dest(out / it.rel, (out / it.rel).with_suffix(".txt") if cap else None)
-                log = logs.get(it.root)
-                if log is None:
-                    log = logs[it.root] = open(out / MOVES_NAME, "a", encoding="utf-8")
+                log = log_for(it.root)
                 stamp = datetime.now().isoformat(timespec="seconds")
                 move_file(it.path, dst)
                 log.write(json.dumps({"time": stamp, "from": str(it.path), "to": str(dst),
@@ -1004,9 +1052,9 @@ def main(argv=None) -> int:
         for log in logs.values():
             log.close()
 
-    for root, (n_img, n_cap, n_b) in moved.items():
+    for root, (n_img, n_cap, n_b, n_copied) in moved.items():
         print(f"{root}: moved {n_img} image(s) and {n_cap} caption(s), {n_b / 1e6:.1f} MB "
-              f"-> {root / OUT_DIRNAME}")
+              f"-> {root / OUT_DIRNAME}" + (f"; copied {n_copied} caption(s) to kept images" if n_copied else ""))
     print(f"Done in {time.time() - t0:.0f}s. Undo with --undo.")
     return 0
 

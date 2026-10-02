@@ -2,7 +2,7 @@
 
 `dedup.py` finds copies of the same picture in one or more image folders and moves the worse copies out. It is for raw downloads, where the same picture often arrives several times: as other scans, at other sizes, with borders or watermarks, cropped, or as a shop mock-up on a wall or in a frame.
 
-All folders that you give, with all their subfolders, form one pool. In each group of copies the best copy stays. Every other copy, with its `.txt` caption, moves to a `_duplicates` folder. Nothing is deleted, and `--undo` puts the files back.
+All folders that you give, with all their subfolders, form one pool. In each group of copies the best copy stays. Every other copy, with its `.txt` caption, moves to a `_duplicates` folder. If the copy that stays has no caption and a moved copy has one, that caption is also copied next to the copy that stays. Nothing is deleted, and `--undo` puts the files back.
 
 ## Install
 
@@ -34,7 +34,7 @@ You can also drop a folder onto `run.bat` in Explorer. There is no prompt: the t
 |---|---|---|
 | `--match` | `loose` | `loose`: hashes plus a feature check; finds other scans, crops, borders, frames, mock-ups and watermarks. `strict`: resized and recompressed copies, hashes only. `exact`: identical files only. |
 | `--dry-run` | off | write `hashes.json` and `plan.json`, move nothing |
-| `--undo` | off | move the files of the last run back to where they were |
+| `--undo` | off | move the files of the last run back to where they were, and remove the captions it copied (a copied caption that was edited since stays) |
 | `--exclude NAME` | none | also skip folders with this name; can be given more than once |
 | `--workers N` | CPU count - 1 | number of worker processes |
 
@@ -48,6 +48,8 @@ Each copy that moves keeps its path relative to the folder that you gave. For ex
 
 A name that is already taken in `_duplicates` gets ` (1)`, ` (2)` and so on. A caption stays in place if another image with the same name (for example `a.png` next to `a.jpg`) stays in the folder.
 
+If the copy that stays has no caption, the tool copies the caption of a moved copy next to it and renames it to match: for `b.jpg` that stays and `a.jpg` that moves, `a.txt` is copied to `b.txt`. If several moved copies have captions, the caption of the best of them is used (same ranking as below, then the oldest file). An existing caption is never overwritten. The moved copy keeps its own caption in `_duplicates`.
+
 Each `_duplicates` folder also holds:
 
 | file | content |
@@ -55,7 +57,7 @@ Each `_duplicates` folder also holds:
 | `hashes.json` | hashes and scores of every image of that folder; a second run reads them and processes only new or changed files |
 | `verified.json` | feature-check results, keyed by the content of both images |
 | `plan.json` | every group: the kept copy, the moved copies, the reason, the tier and score of each, and the match details |
-| `moves.jsonl` | one line per moved file; `--undo` reads it |
+| `moves.jsonl` | one line per moved file and per copied caption; `--undo` reads it |
 
 ## How it decides
 
@@ -79,7 +81,7 @@ Quality is measured the k2prep way: each copy is cropped and resized to the buck
 3. Exception: a copy from a smaller bucket stays if it scores 3 or more points higher than the larger copy. A badly compressed large copy then loses to a clean smaller one.
 4. Scores less than 0.1 apart count as equal. Then the copy with a `.txt` caption stays; if both or neither have one, the oldest file (modification time) stays; then the first folder on the command line, then the first path in alphabetical order.
 
-At the end, the tool lists every moved copy that takes a caption with it while the kept copy has none, so that you can copy the caption over if you want it.
+A caption does not make a copy win: quality decides. The caption is copied instead, as described in [Where the files go](#where-the-files-go).
 
 ## Speed
 
