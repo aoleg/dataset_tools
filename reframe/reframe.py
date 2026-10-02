@@ -479,7 +479,8 @@ def people_for(det: dict, img: Image.Image | None) -> list:
 # ---------------------------------------------------------------------------
 #
 # Calibrated on 29 personal photos labelled by eye (27 decidable): all 27
-# agree. Every threshold below can move by 20% with at most two photos
+# agree. CROWD_GROUP/CROWD_TOTAL were added after a check on 12 further photos
+# (a crowd seen from above); the other 11 verdicts there were reasonable. Every threshold below can move by 20% with at most two photos
 # changing, except MIN_SCORE upward and MIN_HEAD_SHARE.
 
 CAND_MIN_REL = 0.40           # candidates: head at least this share of the largest head
@@ -497,6 +498,9 @@ MIN_SCORE = 1.0               # the best group must reach this score
 MIN_HEAD_SHARE = 0.034        # its largest head over the image's short side
 CROWD_PEOPLE = 10             # this many candidates ...
 CROWD_DOMINANCE = 2.0         # ... and no head this much larger than the rest = crowd
+CROWD_GROUP = 8               # a group this large ...
+CROWD_TOTAL = 30              # ... among this many people is part of a crowd (seen from above,
+                              # the nearest visitors are much larger than the rest)
 SINGLE_CENTRE = 0.2           # a lone subject further off-centre is a passer-by
 TIE_MARGIN = 0.1              # a second group this close in score is kept too, and flagged
 
@@ -629,6 +633,8 @@ def select_subject(det: dict, override: tuple | None = None) -> dict:
         return result("keep", members, f"people too small (head {head_in / min(w, h):.3f} of the short side)")
     if n_cand >= CROWD_PEOPLE and (not head_out or head_in / head_out < CROWD_DOMINANCE):
         return result("keep", members, f"crowd ({n_cand} similar people)")
+    if len(best) >= CROWD_GROUP and len(real) >= CROWD_TOTAL:
+        return result("keep", members, f"crowd ({len(best)} of {len(real)} people form the group)")
     if len(best) == 1 and abs(people[best[0]]["centre"][0] - 0.5) > SINGLE_CENTRE:
         return result("keep", members, "lone person off-centre")
     return result("crop", members, f"subject: {len(best)} person(s), score {best_score:.2f}")
@@ -713,10 +719,13 @@ def image_header(path: Path) -> dict:
             orientation = im.getexif().get(274, 1) or 1
         except Exception:  # noqa: BLE001
             orientation = 1
-        head = {"format": im.format or "", "orientation": orientation if orientation in range(1, 9) else 1,
-                "stored": list(im.size)}
+        # MPO is a JPEG with more images appended (iPhone depth and gain maps):
+        # the first image is an ordinary JPEG and is cropped as one
+        fmt = "JPEG" if im.format == "MPO" else (im.format or "")
+        head = {"format": fmt, "orientation": orientation if orientation in range(1, 9) else 1,
+                "stored": list(im.size), "mpo": im.format == "MPO"}
         layer = getattr(im, "layer", None)
-        if im.format == "JPEG" and layer:
+        if fmt == "JPEG" and layer:
             head["mcu"] = [8 * max(c[1] for c in layer), 8 * max(c[2] for c in layer)]
             head["components"] = len(layer)
     return head
@@ -1041,6 +1050,9 @@ def write_lossless(src: Path, dst: Path, stored_box) -> None:
         bw, bh = math.ceil(w * hh / maxh / 8), math.ceil(h * v / maxv / 8)
         setattr(im, name, arr[by0:by0 + bh, bx0:bx0 + bw].copy())
     im.width, im.height = w, h
+    # The MPF index (APP2) of an MPO points at appended images that a crop does
+    # not carry (libjpeg stops at the first image), so it goes.
+    im.markers = [m for m in im.markers if not (m.type == jpeglib.MarkerType.JPEG_APP2 and bytes(m.content[:4]) == b"MPF\x00")]
     for m in im.markers:
         if m.type == jpeglib.JPEG_APP1 and bytes(m.content[:6]) == b"Exif\x00\x00":
             new = exif_for_output(bytes(m.content), w, h, keep_orientation=True)
@@ -1057,7 +1069,7 @@ def write_reencoded(src: Path, dst: Path, box) -> None:
     quantization tables and chroma subsampling, so the quality stays as it was."""
     from PIL import JpegImagePlugin
     with Image.open(src) as im:
-        fmt = im.format or ""
+        fmt = "JPEG" if im.format == "MPO" else (im.format or "")
         info = dict(im.info)
         qtables = getattr(im, "quantization", None)
         sampling = JpegImagePlugin.get_sampling(im) if fmt == "JPEG" else -1
