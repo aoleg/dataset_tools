@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import base64
 import copy
+import filecmp
 import hashlib
 import io
 import json
@@ -1934,13 +1935,15 @@ def find_stale_sorted(prep_dir: Path, results: list[Result]) -> list[str]:
 # its .txt sidecar. shutil.copy2 copies bytes and keeps the mtime: nothing is
 # decoded or re-encoded on the way.
 #
-# The source is read-only here as everywhere else. The target is the user's
+# The source is read-only here as everywhere else, unless --move asks for the
+# selected originals to leave it (place_move). The target is the user's
 # folder, not k2prep's, so nothing in it is ever deleted, and a file that
 # differs from the one this run would copy is reported, not overwritten, unless
 # --force. Copies left by an earlier run that this run no longer selects are
 # listed and left alone.
 
 COPY_COPIED = "copied"
+COPY_MOVED = "moved"
 COPY_PRESENT = "already there"
 COPY_CONFLICT = "conflict"
 COPY_FAILED = "failed"
@@ -2041,6 +2044,104 @@ def place_copy(res: Result, target: Path, force: bool, dry_run: bool) -> None:
         res.error = f"{type(exc).__name__}: {exc}"
         return
     res.copy_action = COPY_COPIED
+
+
+def place_move(res: Result, target: Path, force: bool, dry_run: bool,
+               keep_caption: bool) -> None:
+    """--move: move one source image, and its caption, to its mirrored place.
+
+    What stays in the source is what was not selected, for a person to review.
+    The guards are the copy's plus these, because this removes originals:
+
+    - shutil.move renames within a volume and copies before it unlinks across
+      volumes, so a file is in the target before it leaves the source.
+    - The image and its caption leave together. If the second move fails, the
+      first is moved back, so an image never ends up without its caption.
+    - A target file that matches by size and mtime is the copy an earlier
+      --copy-to made. That is enough to skip a copy but not to delete the only
+      source, so here the bytes are compared, and the source is removed only
+      when they agree. If they differ, it is a conflict.
+    - keep_caption: another image still in the source uses this caption (x.jpg
+      and x.png share x.txt), so it is copied, not moved.
+    """
+    dest_dir = copy_dest_dir(target, res.dataset)
+    pairs = [(res.path, dest_dir / res.path.name, True)]
+    if res.caption_src is not None:
+        pairs.append((res.caption_src, dest_dir / res.caption_src.name,
+                      not keep_caption))
+    res.copy_dest = pairs[0][1]
+
+    try:
+        states = []
+        for src, dst, _take in pairs:
+            st = _target_state(src, dst)
+            if st == "same" and not filecmp.cmp(src, dst, shallow=False):
+                st = "different"
+            states.append(st)
+    except OSError as exc:
+        res.copy_action = COPY_FAILED
+        res.error = f"{type(exc).__name__}: {exc}"
+        return
+    clash = [dst for (_s, dst, _t), st in zip(pairs, states) if st == "different"]
+    if clash and not force:
+        res.copy_action = COPY_CONFLICT
+        res.error = f"{clash[0].name} already exists in the target and differs"
+        return
+    if dry_run:
+        res.copy_action = COPY_MOVED
+        return
+
+    moved: list[tuple[Path, Path]] = []
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        for (src, dst, take), st in zip(pairs, states):
+            if st == "same":
+                continue
+            if not take:
+                shutil.copy2(src, dst)
+                continue
+            if st == "different":                 # --force, checked above
+                dst.unlink()
+            shutil.move(str(src), str(dst))
+            moved.append((src, dst))
+    except Exception as exc:
+        # Across volumes, or when Windows refuses the rename of a file that is
+        # open elsewhere, shutil.move copies and then unlinks; if the unlink
+        # fails, the copy is left in the target beside an intact source. That
+        # copy is only a duplicate, and only then is it removed.
+        for (src, dst, take), st in zip(pairs, states):
+            if not take or st != "absent" or (src, dst) in moved:
+                continue
+            try:
+                if (src.is_file() and dst.is_file()
+                        and filecmp.cmp(src, dst, shallow=False)):
+                    dst.unlink()
+            except OSError:
+                pass
+        stranded = []
+        for src, dst in reversed(moved):
+            try:
+                shutil.move(str(dst), str(src))
+            except Exception:
+                stranded.append(dst.name)
+        res.copy_action = COPY_FAILED
+        res.error = f"{type(exc).__name__}: {exc}"
+        if stranded:
+            res.error += (f"; {', '.join(stranded)} reached the target and "
+                          f"could not be moved back")
+        return
+
+    # A byte-identical file already in the target stands in for the move.
+    try:
+        for (src, _dst, take), st in zip(pairs, states):
+            if st == "same" and take:
+                src.unlink()
+    except OSError as exc:
+        res.copy_action = COPY_FAILED
+        res.error = (f"{type(exc).__name__}: {exc}; the target holds an "
+                     f"identical copy, the source was not removed")
+        return
+    res.copy_action = COPY_MOVED
 
 
 def already_correct(path: Path, bucket: tuple[int, int]) -> bool:
@@ -2821,13 +2922,15 @@ def build_copy_report(args, folder: Path, target: Path, results: list[Result],
               if r.status == ST_ERROR or r.copy_action == COPY_FAILED]
     name_w = max([26] + [len(r.name) for r in results]) + 2
     min_res = args.min_res
-    copied = "would copy" if args.report else "copied"
+    mode = "move" if args.move else "copy"
+    done_action = COPY_MOVED if args.move else COPY_COPIED
+    done_word = f"would {mode}" if args.report else done_action
 
-    w("k2prep copy report")
+    w(f"k2prep {mode} report")
     w("=" * 66)
     w(f"folder      : {folder}")
     w(f"target      : {target}")
-    w(f"run         : {'copy / dry run, nothing copied' if args.report else 'copy'}")
+    w(f"run         : {f'{mode} / dry run, nothing {done_action}' if args.report else mode}")
     w(f"started     : {started:%Y-%m-%d %H:%M:%S}")
     w(f"finished    : {finished:%Y-%m-%d %H:%M:%S}")
     w(f"options     : threshold={args.threshold} min-res={min_res} "
@@ -2846,8 +2949,18 @@ def build_copy_report(args, folder: Path, target: Path, results: list[Result],
     w(f"scoring     : every image is judged at the {SORT_TIER} tier, as in --sort,")
     w("              so scores compare across folders. An image already at or")
     w(f"              below the {SORT_TIER} tier is scored as it is, never upscaled.")
-    w("policy      : originals and their .txt captions are copied byte for byte,")
-    w("              mirroring the source tree. The source is not modified.")
+    if args.move:
+        w("policy      : --move REMOVES each selected original and its .txt")
+        w("              caption from the source, into the target, mirroring the")
+        w("              source tree. What stays in the source is NOT SELECTED,")
+        w("              for review. Each file reaches the target before it")
+        w("              leaves the source, an image and its caption move")
+        w("              together or not at all, and a caption an image left")
+        w("              behind still uses is copied instead. A file already in")
+        w("              the target removes its source only if the bytes match.")
+    else:
+        w("policy      : originals and their .txt captions are copied byte for byte,")
+        w("              mirroring the source tree. The source is not modified.")
     w("              Nothing in the target is deleted, and a different file")
     w("              already there is not overwritten without --force.")
     for note in notes:
@@ -2869,7 +2982,7 @@ def build_copy_report(args, folder: Path, target: Path, results: list[Result],
     if selected:
         w(head + "action")
     for r in sorted(selected, key=lambda r: r.name):
-        action = copied if r.copy_action == COPY_COPIED else r.copy_action
+        action = done_word if r.copy_action == done_action else r.copy_action
         cap = "" if r.caption_src is not None else "  (no caption)"
         w(row(r, action + cap))
     if selected:
@@ -2880,6 +2993,8 @@ def build_copy_report(args, folder: Path, target: Path, results: list[Result],
 
     w(f"NOT SELECTED  ({_fmt_int(len(rejected))} images)")
     w("-" * 66)
+    if rejected and args.move:
+        w(f"Still in {folder}, for review.")
     if rejected:
         w(head + "reason")
     for r in sorted(rejected, key=lambda r: r.name):
@@ -2920,7 +3035,8 @@ def build_copy_report(args, folder: Path, target: Path, results: list[Result],
     w(f"ERRORS  ({_fmt_int(len(errors))})")
     w("-" * 66)
     if errors:
-        w("Not copied.")
+        w(f"Not {done_action}. The files are where they were, unless the line")
+        w("says otherwise.")
     for r in errors:
         w(f"{r.name:<{name_w}}{r.error}")
     w("")
@@ -3136,7 +3252,7 @@ def parse_args(argv=None):
         description="Crop and resize a folder of photographs onto musubi-tuner's "
                     "exact bucket dimensions for Krea 2 LoRA training.",
     )
-    p.add_argument("folder", help="Input folder. Never modified. One dataset, "
+    p.add_argument("folder", help="Input folder. Never modified, except by --move. One dataset, "
                                   "unless --recursive.")
     p.add_argument("--report", action="store_true",
                    help="Dry run: analyse and write a report, write no images.")
@@ -3200,10 +3316,15 @@ def parse_args(argv=None):
                         "pixels, measured as area: 1024 is the pixel budget of "
                         "the 1024 bucket, so 1536x768 passes and 1200x800 "
                         "does not. Default 0, no resolution gate.")
+    p.add_argument("--move-to", metavar="TARGET", dest="move_to",
+                   help="--copy-to TARGET --move: move the selected originals "
+                        "and their captions out of the source, leaving only "
+                        "what was not selected, for review.")
     p.add_argument("--move", action="store_true",
-                   help="With --sort, move the originals instead of copying "
-                        "them. This is the only k2prep option that removes "
-                        "anything from the source folder.")
+                   help="With --sort or --copy-to, move the originals and "
+                        "their captions instead of copying them. This is the "
+                        "only k2prep option that removes anything from the "
+                        "source folder.")
     p.add_argument("--vl", metavar="CRITERIA",
                    help=f"With --sort, also ask a local vision-language model "
                         f"to rate each image on your own criteria, given as a "
@@ -3226,6 +3347,11 @@ def parse_args(argv=None):
                         f"and all.")
     p.add_argument("--version", action="version", version=f"k2prep {__version__}")
     args = p.parse_args(argv)
+    if args.move_to is not None:
+        if args.copy_to is not None:
+            p.error("--move-to and --copy-to both name a target; give one")
+        args.copy_to = args.move_to
+        args.move = True
     if args.recursive and args.sort is not None:
         p.error("--sort cannot be combined with --recursive: sorting triages "
                 "one folder into quality folders under its own _prep, and what "
@@ -3244,9 +3370,9 @@ def parse_args(argv=None):
     if args.min_res and args.copy_to is None:
         p.error("--min-res is only available with --copy-to; a dataset run "
                 "already assigns each image the largest tier it fills")
-    if args.move and args.sort is None:
-        p.error("--move is only available with --sort; on its own it would have "
-                "nothing to move and would still delete your originals")
+    if args.move and args.sort is None and args.copy_to is None:
+        p.error("--move is only available with --sort or --copy-to; on its "
+                "own it would have nowhere to move to")
     if args.vl is not None and args.sort is None:
         p.error("--vl is only available with --sort. A model's opinion is not "
                 "reproducible, and --threshold has to mean the same thing on "
@@ -3564,11 +3690,34 @@ def run_copy(args, folder: Path, target: Path, prep_dir: Path,
         else:
             r.status = ST_BELOW
 
-    # -- copy, sequentially: the disk is the bottleneck, not the CPU ----------
+    # -- copy or move, sequentially: the disk is the bottleneck, not the CPU --
     selected = [r for r in results if r.status == ST_ACCEPTED]
-    for r in tqdm(selected, desc="copying  " if not args.report else "planning ",
-                  unit="img", disable=not selected):
-        place_copy(r, target, args.force, args.report)
+    # x.jpg and x.png share x.txt. Under --move a shared caption leaves the
+    # source only with the last selected image that uses it, and never while
+    # an image staying behind for review still needs it.
+    cap_users: dict[Path, int] = defaultdict(int)
+    stays: set[Path] = set()
+    if args.move:
+        for r in results:
+            cap = r.caption_src or caption_for(r.path)
+            if cap is None:
+                continue
+            if r.status == ST_ACCEPTED:
+                cap_users[cap] += 1
+            else:
+                stays.add(cap)
+    desc = ("planning " if args.report else
+            "moving   " if args.move else "copying  ")
+    for r in tqdm(selected, desc=desc, unit="img", disable=not selected):
+        if not args.move:
+            place_copy(r, target, args.force, args.report)
+            continue
+        cap = r.caption_src
+        keep = False
+        if cap is not None:
+            cap_users[cap] -= 1
+            keep = cap in stays or cap_users[cap] > 0
+        place_move(r, target, args.force, args.report, keep)
     left_over = [r for r in results if r.status in (ST_BELOW, ST_SMALL)
                  and (copy_dest_dir(target, r.dataset) / r.path.name).exists()]
 
@@ -3578,7 +3727,8 @@ def run_copy(args, folder: Path, target: Path, prep_dir: Path,
         print(f"note: {note}")
 
     reports_dir.mkdir(parents=True, exist_ok=True)
-    kind = "copy-scan" if args.report else "copy"
+    mode = "move" if args.move else "copy"
+    kind = f"{mode}-scan" if args.report else mode
     report_path = _free_path(reports_dir, f"{kind}-{started:%Y%m%d-%H%M%S}", ".txt")
     report_path.write_text(
         build_copy_report(args, folder, target, results, unknown, left_over,
@@ -3595,14 +3745,15 @@ def run_copy(args, folder: Path, target: Path, prep_dir: Path,
     below = sum(1 for r in results if r.status == ST_BELOW)
 
     print()
-    print(f"k2prep copy{' (dry run)' if args.report else ''}: "
+    print(f"k2prep {mode}{' (dry run)' if args.report else ''}: "
           f"{len(results)} images in {_hms(elapsed)}")
     res_rule = (f">= {args.min_res}x{args.min_res} px" if args.min_res
                 else "any resolution")
     print(f"  selected    {len(selected):>7}   "
           f"(score >= {args.threshold}, {res_rule})")
-    verb = "would copy " if args.report else "copied     "
-    print(f"  {verb}{counts[COPY_COPIED]:>7}")
+    done = counts[COPY_MOVED] if args.move else counts[COPY_COPIED]
+    verb = f"would {mode}" if args.report else ("moved" if args.move else "copied")
+    print(f"  {verb:<12}{done:>7}")
     print(f"  already     {counts[COPY_PRESENT]:>7}")
     if counts[COPY_CONFLICT]:
         print(f"  conflicts   {counts[COPY_CONFLICT]:>7}   "
@@ -3615,6 +3766,9 @@ def run_copy(args, folder: Path, target: Path, prep_dir: Path,
     if left_over:
         print(f"  left over   {len(left_over):>7}   "
               f"(in the target from an earlier run, not selected now)")
+    if args.move:
+        print(f"  for review  {small + below:>7}   (not selected, still in "
+              f"{folder})")
     print(f"  target      {target}")
     print(f"  report      {report_path}")
     return 1 if errors or counts[COPY_CONFLICT] else 0

@@ -748,7 +748,6 @@ def test_copy_to_option_rules():
     assert _rejects(["f", "--min-res", "1024"])           # needs --copy-to
     assert _rejects(["f", "--copy-to", "t", "--min-res", "-1"])
     assert _rejects(["f", "--copy-to", "t", "--min-res", "1024x768"])
-    assert _rejects(["f", "--copy-to", "t", "--move"])
     args = k.parse_args(["f", "--copy-to", "t", "--min-res", "1024", "--recursive"])
     assert (args.copy_to, args.min_res, args.recursive) == ("t", 1024, True)
 
@@ -864,6 +863,85 @@ def test_each_runs_every_first_level_folder_and_keeps_bangs():
             assert (folder / k.PREP_DIRNAME / "1024").is_dir(), folder
         for folder in (root / "_side", root / ".hid"):
             assert not (folder / k.PREP_DIRNAME).exists(), folder
+
+
+def test_move_options():
+    assert _rejects(["f", "--move-to", "t", "--copy-to", "u"])
+    assert _rejects(["f", "--move"])                    # nowhere to move to
+    assert _rejects(["f", "--move-to", "t", "-R"])
+    args = k.parse_args(["f", "--move-to", "t"])
+    assert (args.copy_to, args.move) == ("t", True)
+    args = k.parse_args(["f", "--copy-to", "t", "--move"])
+    assert (args.copy_to, args.move) == ("t", True)
+
+
+def test_move_to_end_to_end():
+    """The selected originals leave with their captions and the rest stay for
+    review; a caption a staying image shares is copied; a dry run moves
+    nothing; an earlier --copy-to's identical copies stand in for the move,
+    and a target file that only looks identical is a conflict."""
+    import contextlib, io, os, tempfile
+    from pathlib import Path
+    with tempfile.TemporaryDirectory() as tmp:
+        src, out = Path(tmp) / "src", Path(tmp) / "out"
+        _detailed_image(src / "good.jpg", 1600, 1200)
+        (src / "good.txt").write_text("good", encoding="utf-8")
+        _detailed_image(src / "a" / "keep.jpg", 2000, 1500)
+        (src / "a" / "keep.txt").write_text("keep", encoding="utf-8")
+        _detailed_image(src / "a" / "tiny.jpg", 640, 480)        # stays
+        (src / "a" / "tiny.txt").write_text("tiny", encoding="utf-8")
+        _write_image(src / "a" / "flat.jpg", 2000, 2000)         # stays: score 1
+        _detailed_image(src / "a" / "pair.jpg", 1600, 1600)      # selected
+        _detailed_image(src / "a" / "pair.png", 600, 600)        # stays, shares pair.txt
+        (src / "a" / "pair.txt").write_text("pair", encoding="utf-8")
+        gates = ["--recursive", "--min-res", "1024", "--threshold", "5",
+                 "--threads", "1"]
+        good_bytes = (src / "good.jpg").read_bytes()
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert k.main([str(src), "--move-to", str(out), "--report"] + gates) == 0
+        assert not out.exists() and (src / "good.jpg").is_file()
+
+        # An earlier --copy-to left identical copies. Then good.txt in the
+        # target is edited to different text of the same length and given the
+        # source's mtime, so only a byte comparison can tell them apart.
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert k.main([str(src), "--copy-to", str(out)] + gates) == 0
+        (out / "good.txt").write_text("GOOD", encoding="utf-8")
+        st = (src / "good.txt").stat()
+        os.utime(out / "good.txt", ns=(st.st_atime_ns, st.st_mtime_ns))
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert k.main([str(src), "--move-to", str(out)] + gates) == 1
+        # the conflicting pair stayed whole in the source
+        assert (src / "good.jpg").read_bytes() == good_bytes
+        assert (src / "good.txt").read_text(encoding="utf-8") == "good"
+        assert (out / "good.txt").read_text(encoding="utf-8") == "GOOD"
+        # the identical ones left the source; the shared caption stayed
+        left = sorted(p.relative_to(src).as_posix() for p in src.rglob("*")
+                      if p.is_file() and k.PREP_DIRNAME not in p.parts)
+        assert left == ["a/flat.jpg", "a/pair.png", "a/pair.txt", "a/tiny.jpg",
+                        "a/tiny.txt", "good.jpg", "good.txt"], left
+        for rel in ("a/keep.jpg", "a/keep.txt", "a/pair.jpg", "a/pair.txt"):
+            assert (out / rel).is_file(), rel
+
+
+def test_move_puts_the_image_back_when_its_caption_cannot_follow():
+    import contextlib, io, tempfile
+    from pathlib import Path
+    with tempfile.TemporaryDirectory() as tmp:
+        src, out = Path(tmp) / "src", Path(tmp) / "out"
+        _detailed_image(src / "good.jpg", 1600, 1200)
+        (src / "good.txt").write_text("good", encoding="utf-8")
+        before = (src / "good.jpg").read_bytes()
+        # An open handle stops Windows from renaming or deleting the file.
+        with open(src / "good.txt", "rb"), contextlib.redirect_stdout(io.StringIO()):
+            code = k.main([str(src), "--move-to", str(out), "--threads", "1"])
+        assert code == 1
+        assert (src / "good.jpg").read_bytes() == before
+        assert (src / "good.txt").is_file()
+        assert not (out / "good.jpg").exists()
+        assert not (out / "good.txt").exists()     # no stray duplicate
 
 
 def test_selection_grid_counts_every_combination():

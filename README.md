@@ -2,7 +2,7 @@
 
 k2prep takes a messy folder of mixed photographs and produces a small, clean, bucket-tight training set for musubi-tuner's Krea 2 trainer: every accepted image is cropped and resized onto one of 7 aspect ratios across 3 resolution tiers, and buckets too small to form a real batch are then consolidated into their nearest healthy neighbour — so instead of the 15+ buckets an ordinary photo folder scatters across, the trainer typically sees two or three per tier.
 
-The output is a **filtered subset**, not a transformation of the whole folder. Images that fail the quality threshold or are too small are skipped entirely, and the source folder is never written to, moved within, or deleted from — the report is the only record of a rejection. (The single exception is `--sort --move`, which exists to move originals and says so.)
+The output is a **filtered subset**, not a transformation of the whole folder. Images that fail the quality threshold or are too small are skipped entirely, and the source folder is never written to, moved within, or deleted from — the report is the only record of a rejection. (The exceptions are `--sort --move` and `--move-to`, which exist to move originals and say so.)
 
 It can also just [sort a folder by quality](#sorting-a-folder-by-quality) and build nothing, or [copy the best originals of a whole tree](#copying-the-best-originals-to-another-folder) into another folder.
 
@@ -52,9 +52,10 @@ k2prep.py <folder> [options]
 | `--no-merge` | off | Skip bucket consolidation; leave every image in the bucket its own aspect ratio picks. |
 | `--single-pass` | off | Score the source and reject before rendering, instead of scoring the rendered result. |
 | `--sort [N]` | off | Triage mode: score every image and file the **original** by quality. Builds no dataset. Bare `--sort` uses absolute bands (`score1`…`score10`, 10 best); `--sort N` (2–10) cuts N populated tiers from this folder (`quality1` best). |
-| `--move` | off | With `--sort` only: move the originals instead of copying them. |
+| `--move` | off | With `--sort` or `--copy-to`: move the originals and their captions instead of copying them. |
 | `--vl CRITERIA` | off | With `--sort` only: also have a local vision model rate each image on your own comma-separated criteria, blended with the measured score. |
 | `--copy-to TARGET` | off | Selection mode: copy the **original** of every image that passes `--threshold` and `--min-res`, with its caption, into `TARGET`, mirroring the source tree. Builds no dataset. See [below](#copying-the-best-originals-to-another-folder). |
+| `--move-to TARGET` | off | `--copy-to TARGET --move`: move the selected originals out of the source and leave the rest for review. See [below](#moving-instead-of-copying). |
 | `--min-res N` | 0 | With `--copy-to` only: copy only images with at least N×N pixels, measured as area. 0 is no resolution gate. |
 
 `--report` and `--threshold` compose: `--report --threshold 7` shows what a threshold-7 run *would* do without writing anything.
@@ -256,7 +257,7 @@ Everything degrades rather than failing: a missing or malformed `.env`, an endpo
 run.bat "L:\train\photos" --sort --move
 ```
 
-**This is the only thing in k2prep that removes anything from your source folder.** Everywhere else the input folder is strictly read-only, and that has not changed — but `--move` is asked for by name and does exactly what it says: each image and its caption leave the source folder for their score folder.
+**`--move` is the only thing in k2prep that removes anything from your source folder**, here and with [`--copy-to`](#moving-instead-of-copying). Everywhere else the input folder is strictly read-only, and that has not changed — but `--move` is asked for by name and does exactly what it says: each image and its caption leave the source folder for their score folder.
 
 What it will not do:
 
@@ -264,7 +265,7 @@ What it will not do:
 - Leave a hole. Each destination is written before its source is unlinked, so an interruption leaves a duplicate to clean up, never a missing file.
 - Delete a stale copy. If an earlier run filed the same image under a different score — including a run in the other naming scheme — that copy is listed under `DUPLICATES IN OTHER SCORE FOLDERS` and left alone; under `--move` it may be the only copy in existence. Clear those by hand.
 
-`--move` without `--sort` is rejected outright.
+`--move` without `--sort` or `--copy-to` is rejected outright.
 
 ## Copying the best originals to another folder
 
@@ -307,6 +308,25 @@ The target is your folder, not k2prep's, so k2prep never deletes anything in it:
 - A copy made by an earlier run that this run does not select, for example after you raise `--threshold`, stays where it is. The report lists it under `IN THE TARGET BUT NOT SELECTED`. Delete it yourself if you do not want it.
 
 `--copy-to` cannot be combined with `--sort`. `--png`, `--single-pass` and `--no-merge` have no effect on it, and the report says so if you give them.
+
+### Moving instead of copying
+
+`--move-to` does the same selection as `--copy-to` but **moves** the selected originals and their captions into the target. What stays in the source is exactly what was not selected, so a person can go through it for anything usable. `--copy-to TARGET --move` is the same thing spelled out.
+
+```bash
+run.bat "L:\photos" --recursive --move-to "L:\selected" --min-res 1024 --threshold 6
+```
+
+Step 1 is the same `--report` survey as before; `--report` never moves anything. Under `--move` the report is named `move-*.txt`, its `NOT SELECTED` list is the review list, and the console counts what is left `for review`.
+
+Because this removes originals from the source, it is careful about how:
+
+- A file reaches the target before it leaves the source. Within one drive it is renamed; across drives it is copied first and deleted after.
+- An image and its caption move together or not at all. If the caption cannot be moved, for example because another program has it open, the image is moved back and the pair is listed under `ERRORS`.
+- A caption shared by two images (`x.jpg` and `x.png` both use `x.txt`) is copied, not moved, while an image that stays in the source still uses it.
+- A file already in the target from an earlier `--copy-to` run counts as moved, and its source is removed, only when the two are **byte-identical**. If they differ, that is a conflict and the pair stays in the source, as it does for any other conflict.
+
+Re-running with a lower `--threshold` moves the next layer out. Folders that end up empty in the source are left in place.
 
 ## Why the output dimensions look arbitrary
 
