@@ -834,7 +834,13 @@ def free_dest(dest: Path, stem_peer: Path | None = None) -> Path:
 
 def move_file(src: Path, dst: Path) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(src), str(dst))
+    try:
+        shutil.move(str(src), str(dst))
+    except PermissionError:
+        # across volumes shutil.move copies and then deletes the source, which
+        # fails for a read-only file
+        os.chmod(src, 0o666)
+        shutil.move(str(src), str(dst))
 
 
 def caption_shared(it, items, moving) -> bool:
@@ -1140,6 +1146,7 @@ def undo(roots) -> int:
                 # A caption the tool copied to a kept image: remove it, but only
                 # if nobody has edited it since.
                 if dst.exists() and file_sha256(dst) == e.get("sha256"):
+                    os.chmod(dst, 0o666)             # a copy of a read-only file is read-only too
                     dst.unlink()
                     restored += 1
                 elif dst.exists():
