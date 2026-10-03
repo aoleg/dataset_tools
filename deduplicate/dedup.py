@@ -15,10 +15,18 @@ No prompt.
 Quality is judged the k2prep way: each copy is scored as the trainer would see it,
 cropped and resized to the 512, 768 or 1024 bucket it reaches. A copy that reaches
 a larger bucket wins, unless it scores GUARD or more points lower. Equal copies:
-the one with a caption wins, then the oldest file (modification time).
+one in a sorted folder wins, then the one with a caption, then the oldest file.
 
-Usage:    python dedup.py <folder> [<folder> ...] [--match loose|strict|exact]
-          [--dry-run] [--undo] [--exclude NAME] [--workers N]
+Sorted folders (--sorted) are curated trees. A better unsorted copy moves into the
+sorted copy's place under the sorted name (promotion), when it is a bucket up or
+PROMOTE_MARGIN points better and matches by hash. Sorted captions are never moved
+or overwritten. The same picture in several sorted folders keeps every folder's
+slot and gives each the best copy (--sorted-copies keep), or keeps one (one).
+Copies that match by features only are listed for review and left alone.
+
+Usage:    python dedup.py <folder> [<folder> ...] [--sorted FOLDER] [--sorted-copies keep|one]
+          [--promote-margin X] [--match loose|strict|exact] [--dry-run] [--undo]
+          [--exclude NAME] [--workers N]
 Install:  pip install Pillow numpy imagehash opencv-python-headless
 """
 import argparse
@@ -75,7 +83,13 @@ CAND_PER_IMAGE = 30
 # at MIN_NCC or more. The last test rejects identical mock-up templates (frames,
 # walls, shop labels) holding different pictures: their matches lie on the
 # template and the centres do not agree. Calibration: false template matches
-# 0.02-0.27, true copies 0.74 and up. MIN_NCC also vetoes hash-rule matches.
+# 0.02-0.27, true copies 0.74 and up. MIN_NCC also vetoes hash-rule matches,
+# and so does a feature check that finds no homography at all: two pictures
+# that hash alike but share no geometry are two pictures (on 2,000 downloaded
+# posters all nine such pairs were, for example different state emblems
+# printed on one card template). An unwarped centre NCC cannot replace the homography: it
+# reached 0.81 on different emblems and fell to 0.26 on a true copy with a
+# small border.
 FEATURE_SIDE = 640
 ORB_FEATURES = 1500
 MIN_INLIERS = 40
@@ -91,6 +105,13 @@ COLOUR_RATIO = 0.25
 # --- ranking -----------------------------------------------------------------
 GUARD = 3.0              # a lower-tier copy wins if it scores this much higher
 TIE = 0.1                # scores closer than this are equal
+# Sorted folders (--sorted): an unsorted copy displaces a sorted copy of the same
+# picture only when it reaches a larger bucket, or scores PROMOTE_MARGIN or more
+# higher in the same bucket, and only on an exact or hash match. Calibrated on
+# 59 mixed groups of one real collection: at 1.0, 23 promotions, 18 of them a
+# bucket step; the same-bucket cases below 1.0 were resolution bumps inside the
+# 1024 bucket that the bucketed score cannot see. Reporting only until phase 1.
+PROMOTE_MARGIN = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -353,20 +374,23 @@ def hash_file(path: str) -> dict:
 # ---------------------------------------------------------------------------
 
 class Item:
-    __slots__ = ("idx", "root_idx", "root", "rel", "path", "size", "mtime", "caption", "data")
+    __slots__ = ("idx", "root_idx", "root", "rel", "path", "size", "mtime", "caption", "data", "role")
 
-    def __init__(self, idx, root_idx, root, rel, path, size, mtime):
+    def __init__(self, idx, root_idx, root, rel, path, size, mtime, role=0):
         self.idx, self.root_idx, self.root, self.rel, self.path = idx, root_idx, root, rel, path
         self.size, self.mtime = size, mtime
         self.caption = None
         self.data = {}
+        self.role = role                 # 0 unsorted (raw downloads), 1 sorted (curated tree)
 
 
-def scan(roots, excludes):
-    """All images under the roots; folders starting with "_" and excluded names are skipped."""
+def scan(roots, excludes, roles=None):
+    """All images under the roots; folders starting with "_" and excluded names are skipped.
+    roles: one entry per root, 0 unsorted or 1 sorted; all unsorted when None."""
     items = []
     excl = {e.casefold() for e in excludes}
     for ri, root in enumerate(roots):
+        role = roles[ri] if roles else 0
         for dirpath, dirnames, filenames in os.walk(root):
             dirnames[:] = sorted(d for d in dirnames
                                  if not d.startswith("_") and d.casefold() not in excl)
@@ -384,7 +408,7 @@ def scan(roots, excludes):
                 except OSError:
                     continue
                 rel = p.relative_to(root).as_posix()
-                it = Item(len(items), ri, root, rel, p, st.st_size, st.st_mtime_ns)
+                it = Item(len(items), ri, root, rel, p, st.st_size, st.st_mtime_ns, role)
                 txt = stems.get(os.path.splitext(fn)[0].casefold(), {}).get("txt")
                 it.caption = Path(dirpath) / txt if txt else None
                 items.append(it)
@@ -431,13 +455,34 @@ def save_verified(roots, items, cache) -> None:
                    {"version": CACHE_VERSION, "tool": "dedup.py", "pairs": pairs})
 
 
+def write_cache(root: Path, files: dict) -> None:
+    write_json(root / OUT_DIRNAME / HASHES_NAME,
+               {"version": CACHE_VERSION, "tool": "dedup.py",
+                "written": datetime.now().isoformat(timespec="seconds"), "files": files})
+
+
 def save_caches(roots, items) -> None:
     for ri, root in enumerate(roots):
-        files = {it.rel: {"size": it.size, "mtime_ns": it.mtime, **it.data}
-                 for it in items if it.root_idx == ri and it.data}
-        write_json(root / OUT_DIRNAME / HASHES_NAME,
-                   {"version": CACHE_VERSION, "tool": "dedup.py",
-                    "written": datetime.now().isoformat(timespec="seconds"), "files": files})
+        write_cache(root, {it.rel: {"size": it.size, "mtime_ns": it.mtime, **it.data}
+                           for it in items if it.root_idx == ri and it.data})
+
+
+def carry_cache(root: Path, entries) -> int:
+    """Add cache entries for files that a run placed under `root` (promoted and
+    synced copies), so the next run does not hash and score them again.
+    entries: (path, data) pairs; data is the hashed item's data."""
+    files = load_cache(root)
+    n = 0
+    for path, data in entries:
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        files[path.relative_to(root).as_posix()] = {"size": st.st_size, "mtime_ns": st.st_mtime_ns, **data}
+        n += 1
+    if n:
+        write_cache(root, files)
+    return n
 
 
 class Progress:
@@ -661,17 +706,26 @@ def find_edges(items, mode, cache, workers):
     print(f"{len(cands)} candidate pair(s) from the hashes")
     if features:
         verify_pairs(items, [(i, j) for i, j, _, _ in cands], cache, workers)
+    vetoed = {"no shared geometry": 0, "centres disagree": 0}
     for i, j, p, d in cands:
         v = cache.get(pair_key(items[i], items[j])) if features else None
         details = {"phash": p, "dhash": d}
         if v is not None:
             details.update(inliers=v[0], cover=v[1], ncc=v[2])
-        if v is not None and v[2] is not None and v[2] < MIN_NCC:
-            continue                                  # the centres disagree: not the same picture
+        if v is not None and (v[2] is None or v[2] < MIN_NCC):
+            # No homography at all, or the centres disagree: not the same
+            # picture, however close the hashes are.
+            if hash_rule_ok(p, d, rules):
+                vetoed["no shared geometry" if v[2] is None else "centres disagree"] += 1
+            continue
         if hash_rule_ok(p, d, rules):
             edges[(i, j)] = ("hash", details)
-        elif v is not None and v[0] >= MIN_INLIERS and v[1] >= MIN_COVER and (v[2] or 0) >= MIN_NCC:
+        elif v is not None and v[0] >= MIN_INLIERS and v[1] >= MIN_COVER and v[2] >= MIN_NCC:
             edges[(i, j)] = ("features", details)
+    n_vetoed = sum(vetoed.values())
+    if n_vetoed:
+        print(f"{n_vetoed} hash match(es) vetoed by the feature check: "
+              + ", ".join(f"{n} {why}" for why, n in vetoed.items() if n))
     return edges
 
 
@@ -695,8 +749,9 @@ def components(nodes, adj):
 
 def pick_keeper(members, items):
     """Best copy: largest tier, then score; a lower-tier copy that scores GUARD
-    or more above wins instead. Ties (score within TIE): caption, then oldest
-    modification time, then path order. Returns (keeper, reason)."""
+    or more above wins instead. Ties (score within TIE): a copy in a sorted
+    folder, then caption, then oldest modification time, then path order.
+    Returns (keeper, reason)."""
     def s(i):
         return items[i].data["score_info"]
 
@@ -717,10 +772,12 @@ def pick_keeper(members, items):
     if len(ties) > 1:
         def tie_key(i):
             it = items[i]
-            return (it.caption is None, it.mtime, it.root_idx, it.rel.casefold())
+            return (it.role == 0, it.caption is None, it.mtime, it.root_idx, it.rel.casefold())
         top = min(ties, key=tie_key)
         others = [items[i] for i in ties if i != top]
-        if items[top].caption is not None and any(o.caption is None for o in others):
+        if items[top].role == 1 and any(o.role == 0 for o in others):
+            reason = "equal quality; in a sorted folder"
+        elif items[top].caption is not None and any(o.caption is None for o in others):
             reason = "equal quality; has a caption"
         else:
             reason = "equal quality; oldest file"
@@ -789,10 +846,74 @@ def caption_shared(it, items, moving) -> bool:
 
 def describe(it):
     s = it.data.get("score_info", {})
-    return {"path": str(it.path), "w": it.data.get("w"), "h": it.data.get("h"),
+    return {"path": str(it.path), "role": "sorted" if it.role == 1 else "unsorted",
+            "w": it.data.get("w"), "h": it.data.get("h"),
             "tier": s.get("tier"), "score": s.get("score"), "caption": it.caption is not None,
             "mtime": datetime.fromtimestamp(it.mtime / 1e9).isoformat(timespec="seconds"),
             "bytes": it.size}
+
+
+def role_report(keeper, losers, items, edges, margin):
+    """What the sorted/unsorted rules would do with this group. Reporting only
+    (phase 0 of the feature): nothing acts on the verdict yet.
+
+    Mixed groups: the quality deltas between the best copy of each role, the
+    match kind to the slot the keeper would take, and a verdict: promote,
+    within margin, sorted copy kept, or review. Sorted-only groups: whether
+    the copies share one directory, and whether every match is an exact or
+    hash match (slot sync would apply) or a feature match (review).
+    """
+    members = [keeper] + list(losers)
+    s = [i for i in members if items[i].role == 1]
+    u = [i for i in members if items[i].role == 0]
+    if not s:
+        return {"roles": "unsorted"}
+
+    def rank(i):
+        si = items[i].data["score_info"]
+        return (si["tier"], si["score"])
+
+    def kind(a, b):
+        e = edges.get((min(a, b), max(a, b)))
+        return e[0] if e else "indirect"
+
+    if not u:
+        dirs = {items[i].path.parent for i in members}
+        rep = {"roles": "sorted", "layout": "same directory" if len(dirs) == 1 else "cross directory"}
+        kinds = {kind(keeper, i) for i in losers}
+        if len(dirs) > 1 and kinds - {"exact", "hash"}:
+            rep["note"] = "framing differs" if "features" in kinds else "indirect match"
+        return rep
+
+    best_s = max(s, key=rank)
+    u_ref = keeper if items[keeper].role == 0 else max(u, key=rank)
+    (ts, ss), (tu, su) = rank(best_s), rank(u_ref)
+    rep = {"roles": "mixed", "best_sorted": str(items[best_s].path), "best_unsorted": str(items[u_ref].path),
+           "tier_delta": tu - ts, "score_delta": round(su - ss, 2)}
+    if items[keeper].role == 1:
+        rep.update(match=kind(keeper, u_ref), verdict="sorted copy kept")
+        return rep
+    # The slot the keeper would take: the best sorted copy it matches directly
+    # by hash or content; failing that, the best one it matches directly at all.
+    direct = {i: kind(keeper, i) for i in s}
+    clean = [i for i in s if direct[i] in ("exact", "hash")]
+    any_direct = [i for i in s if direct[i] != "indirect"]
+    slot = max(clean or any_direct or s, key=rank)
+    m = direct[slot]
+    rep.update(slot=str(items[slot].path), match=m)
+    if m == "indirect":
+        rep["verdict"] = "review: indirect match"
+    elif m == "features":
+        rep["verdict"] = "review: framing differs"
+    elif tu < ts:
+        rep["verdict"] = "review: guard keeper in a smaller bucket"
+    elif tu > ts:
+        rep["verdict"] = "promote: larger bucket"
+    elif su - ss >= margin:
+        rep["verdict"] = f"promote: score +{su - ss:.2f}"
+    else:
+        rep["verdict"] = "within margin"
+    return rep
 
 
 def caption_source(keeper, losers, items):
@@ -812,6 +933,192 @@ def caption_source(keeper, losers, items):
 
 def file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+class Names:
+    """The file system as it will be after the planned moves: names freed by
+    move-outs and names this plan has already given away. Destinations are
+    chosen against it, so the dry run shows the final names and the real run
+    uses the same ones."""
+
+    def __init__(self):
+        self.freed, self.taken = set(), set()
+        self.copies = {}                 # planned caption copy: destination -> source
+
+    def exists(self, p: Path) -> bool:
+        return p in self.taken or (p not in self.freed and p.exists())
+
+    def free_dest(self, dest: Path, stem_peer: Path | None = None) -> Path:
+        """dest, or dest with " (N)" before the extension if taken; the chosen
+        name and its peer are taken from then on."""
+        cand, peer, n = dest, stem_peer, 0
+        while self.exists(cand) or (peer is not None and self.exists(peer)):
+            n += 1
+            cand = dest.with_name(f"{dest.stem} ({n}){dest.suffix}")
+            peer = stem_peer.with_name(f"{dest.stem} ({n}){stem_peer.suffix}") if stem_peer else None
+        self.taken.add(cand)
+        if peer is not None:
+            self.taken.add(peer)
+        return cand
+
+
+def steps_from(start, members, edges):
+    """Steps from `start` to every member over the group's matches."""
+    adj = {m: set() for m in members}
+    for a, b in edges:
+        if a in adj and b in adj:
+            adj[a].add(b)
+            adj[b].add(a)
+    steps, frontier = {start: 0}, [start]
+    while frontier:
+        nxt = []
+        for x in frontier:
+            for y in adj[x]:
+                if y not in steps:
+                    steps[y] = steps[x] + 1
+                    nxt.append(y)
+        frontier = nxt
+    return steps
+
+
+def decide_group(group, items, edges, with_roles, margin, policy="keep"):
+    """What to do with one group. Without sorted folders: the keeper stays and
+    the losers move, as always. With them (see README, "Sorted folders"):
+
+    - the best copy of the group is the keeper by quality, except that an
+      unsorted keeper within the promotion margin of the best sorted copy, or
+      matching it by features only, does not displace it
+    - a review verdict (framing differs, indirect match, guard keeper) skips
+      the whole group: nothing moves
+    - sorted slots: with policy "keep", one slot per directory survives, the
+      best one there; with policy "one", a single slot survives in all sorted
+      folders. Non-surviving sorted copies move out like any loser.
+    - every surviving slot gets the best copy: the promoted unsorted keeper
+      moves into its primary slot, the other slots get a copy of the best
+      copy (slot sync) when their image matches it by hash. A slot whose image
+      is byte-identical, or matches by features only or indirectly, is left
+      as it is and reported.
+    - every unsorted copy except a promoted keeper moves out
+
+    Returns a dict: keeper (the best copy), losers (everything that moves out,
+    including replaced slot images), slot_like (losers whose caption stays for
+    the copy that replaces them), promote (the primary slot of a promoted
+    keeper), sync (slots that get a copy), slots (the report per sorted copy),
+    reason, steps, report, and skip (why nothing moves) for review groups.
+    """
+    keeper, losers, reason, steps = group
+    d = {"keeper": keeper, "losers": list(losers), "reason": reason, "steps": steps,
+         "report": {}, "skip": None, "promote": None, "sync": [], "slots": [], "slot_like": set()}
+    if not with_roles:
+        return d
+    rep = role_report(keeper, losers, items, edges, margin)
+    d["report"] = rep
+    if rep["roles"] == "unsorted":
+        return d
+    members = [keeper] + list(losers)
+    s = [i for i in members if items[i].role == 1]
+
+    def rank(i):
+        si = items[i].data["score_info"]
+        return (si["tier"], si["score"])
+
+    def kind(a, b):
+        e = edges.get((min(a, b), max(a, b)))
+        return e[0] if e else "indirect"
+
+    best, primary = keeper, None
+    if rep["roles"] == "mixed":
+        v = rep["verdict"]
+        if v.startswith("review"):
+            d["skip"] = v
+            return d
+        if v == "within margin":
+            best = max(s, key=rank)
+            d["reason"] = f"sorted copy kept; the unsorted copy is within the margin ({rep['score_delta']:+.2f})"
+        elif v.startswith("promote"):
+            primary = next(i for i in s if str(items[i].path) == rep["slot"])
+            d["promote"] = primary
+            d["reason"] = "promoted into the sorted folder: " + v.split(": ", 1)[1]
+    if policy == "one":
+        survivors = {primary if primary is not None else best}
+    else:
+        by_dir = {}
+        for i in s:
+            by_dir.setdefault(items[i].path.parent, []).append(i)
+        survivors = set()
+        for idxs in by_dir.values():
+            if primary in idxs:
+                survivors.add(primary)
+            elif best in idxs:
+                survivors.add(best)
+            else:
+                survivors.add(max(idxs, key=rank))
+    for i in sorted(s, key=lambda i: (items[i].root_idx, items[i].rel.casefold())):
+        if i == best:
+            action = "best copy; stays"
+        elif i == primary:
+            action = "takes the promoted copy"
+        elif i not in survivors:
+            action = "moves out: " + ("one slot per picture" if policy == "one" else "a better copy stays in this folder")
+        else:
+            k = kind(best, i)
+            if k == "exact":
+                action = "identical to the best copy; stays"
+            elif k == "hash":
+                action = "gets a copy of the best copy"
+                d["sync"].append(i)
+            else:
+                action = "left as it is: " + ("framing differs" if k == "features" else "indirect match")
+        d["slots"].append({"path": str(items[i].path), "action": action})
+    d["keeper"] = best
+    d["losers"] = sorted(i for i in members if i != best
+                         and (items[i].role == 0 or i not in survivors or i in d["sync"] or i == primary))
+    d["slot_like"] = set(d["sync"]) | ({primary} if primary is not None else set())
+    if best != keeper:
+        d["steps"] = steps_from(best, members, edges)
+    return d
+
+
+def plan_placement(best, slot, items, names, leaving, action, best_caption=None):
+    """Where the best copy goes for one slot: a move for the promoted keeper
+    (action "move"), a copy for slot sync (action "copy"). The slot's image is
+    already planned out, so its name is free unless another image of the same
+    stem stays. A caption that belongs to the slot is never moved or
+    overwritten; best_caption is the caption the best copy will have, for a
+    synced slot that has none."""
+    b, sl = items[best], items[slot]
+    dest = sl.path.parent / (sl.path.stem + b.path.suffix)
+    renamed = names.exists(dest)
+    if renamed:
+        dest = names.free_dest(dest, dest.with_suffix(".txt"))
+    else:
+        names.taken.add(dest)
+    slot_cap = sl.caption if sl.caption and sl.caption.exists() else None
+    captions = []
+    if slot_cap is not None and renamed:
+        captions.append({"action": "copy", "from": str(slot_cap), "to": str(dest.with_suffix(".txt")),
+                         "reason": "caption of the slot, under the new name"})
+    if action == "move":
+        own_cap = b.caption if b.caption and b.caption.exists() else None
+        own_shared = own_cap is not None and caption_shared(b, items, leaving)
+        if slot_cap is not None:
+            if own_cap is not None and not own_shared:
+                park = names.free_dest((b.root / OUT_DIRNAME / b.rel).with_suffix(".txt"))
+                captions.append({"action": "move", "from": str(own_cap), "to": str(park),
+                                 "reason": "caption of a promoted copy; the caption of the slot wins"})
+        elif own_cap is not None:
+            captions.append({"action": "copy" if own_shared else "move", "from": str(own_cap),
+                             "to": str(dest.with_suffix(".txt")), "reason": "caption of a promoted copy"})
+        has_caption = slot_cap is not None or own_cap is not None
+    else:
+        if slot_cap is None and best_caption is not None:
+            captions.append({"action": "copy", "from": str(best_caption), "to": str(dest.with_suffix(".txt")),
+                             "reason": "caption of the best copy, for a slot without one"})
+        has_caption = slot_cap is not None or best_caption is not None
+    if has_caption:
+        names.taken.add(dest.with_suffix(".txt"))
+    return {"action": action, "from": str(b.path), "to": str(dest), "renamed": renamed,
+            "slot_of": str(sl.path), "slot_idx": slot, "has_caption": has_caption, "captions": captions}
 
 
 # ---------------------------------------------------------------------------
@@ -862,7 +1169,20 @@ def main(argv=None) -> int:
         except AttributeError:
             pass
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("folders", nargs="+", help="folders to scan recursively; all form one pool")
+    ap.add_argument("folders", nargs="*", help="unsorted folders (raw downloads) to scan recursively; "
+                                               "all folders form one pool")
+    ap.add_argument("--sorted", action="append", default=[], metavar="FOLDER",
+                    help="a sorted (curated) folder; repeatable. A better unsorted copy moves into "
+                         "the sorted copy's place under its name; sorted captions are never touched; "
+                         "a sorted copy wins a tie. Copies that match by features only, and pictures "
+                         "held in several sorted folders, are listed for review and left alone")
+    ap.add_argument("--sorted-copies", choices=["keep", "one"], default="keep",
+                    help="the same picture in several sorted folders: keep (default) keeps every "
+                         "folder's copy and gives each the best copy; one keeps a single copy and "
+                         "moves the others out")
+    ap.add_argument("--promote-margin", type=float, default=PROMOTE_MARGIN, metavar="X",
+                    help=f"same-bucket score margin an unsorted copy needs to displace a sorted copy "
+                         f"(default {PROMOTE_MARGIN:g}); a larger bucket always qualifies")
     ap.add_argument("--match", choices=list(MATCH_RULES), default="loose",
                     help="loose (default): hashes plus a feature check; finds other scans, crops, "
                          "borders, frames, mock-ups and watermarks. strict: resized and recompressed "
@@ -876,12 +1196,16 @@ def main(argv=None) -> int:
                     help="worker processes (default: CPU count - 1)")
     args = ap.parse_args(argv)
 
-    roots = []
-    for f in args.folders:
-        p = Path(f).resolve()
-        if not p.is_dir():
-            ap.error(f"not a folder: {f}")
-        roots.append(p)
+    roots, roles = [], []
+    for role, folders in ((0, args.folders), (1, args.sorted)):
+        for f in folders:
+            p = Path(f).resolve()
+            if not p.is_dir():
+                ap.error(f"not a folder: {f}")
+            roots.append(p)
+            roles.append(role)
+    if not roots:
+        ap.error("give at least one folder")
     for a in roots:
         for b in roots:
             if a != b and b.is_relative_to(a):
@@ -893,8 +1217,10 @@ def main(argv=None) -> int:
         return undo(roots)
 
     t0 = time.time()
-    items = scan(roots, DEFAULT_EXCLUDES + args.exclude)
-    print(f"{len(items)} image(s) in {len(roots)} folder(s)")
+    items = scan(roots, DEFAULT_EXCLUDES + args.exclude, roles)
+    print(f"{len(items)} image(s) in {len(roots)} folder(s)"
+          + (f", {sum(1 for it in items if it.role == 1)} of them in {len(args.sorted)} sorted folder(s)"
+             if args.sorted else ""))
     if not items:
         return 0
 
@@ -948,58 +1274,167 @@ def main(argv=None) -> int:
     groups = plan_groups(good, edges, scorer)
     save_caches(roots, items)
 
-    # 3. plan
-    moving = {i for _, losers, _, _ in groups for i in losers}
-    plan = {"written": datetime.now().isoformat(timespec="seconds"), "match": args.match,
-            "folders": [str(r) for r in roots], "groups": []}
-    caption_copies = []
-    for keeper, losers, reason, steps in sorted(groups, key=lambda g: (good[g[0]].root_idx, good[g[0]].rel)):
-        k = good[keeper]
-        entry = {"keep": describe(k), "reason": reason, "move": []}
-        src = caption_source(keeper, losers, good)
-        if src is not None:
-            entry["copy_caption"] = {"from": str(src.caption), "to": str(k.path.with_suffix(".txt"))}
-            caption_copies.append((src, k))
-        for i in losers:
+    # 3. plan: decide every group, then choose every destination against the
+    #    planned state. Move-outs are planned before promotions, because they
+    #    run before them (a promotion may take a name a move-out frees).
+    with_roles = bool(args.sorted)
+    decisions = [decide_group(g, good, edges, with_roles, args.promote_margin, args.sorted_copies)
+                 for g in sorted(groups, key=lambda g: (good[g[0]].root_idx, good[g[0]].rel))]
+    acted = [d for d in decisions if d["skip"] is None]
+    moving = {i for d in acted for i in d["losers"]}
+    leaving = moving | {d["keeper"] for d in acted if d["promote"] is not None}
+    names = Names()
+    for d in acted:
+        d["moves"] = []
+        for i in d["losers"]:
             it = good[i]
-            p = int(bin(int(k.data["phash"], 16) ^ int(it.data["phash"], 16)).count("1"))
-            d = int(bin(int(k.data["dhash"], 16) ^ int(it.data["dhash"], 16)).count("1"))
-            direct = edges.get((min(keeper, i), max(keeper, i)))
-            entry["move"].append({**describe(it), "exact": it.data["sha256"] == k.data["sha256"],
-                                  "phash_distance": p, "dhash_distance": d,
-                                  "steps_from_kept": steps.get(i),
-                                  "match": direct[0] if direct else "through other copies",
-                                  **({"features": {x: direct[1][x] for x in ("inliers", "cover", "ncc")
-                                                   if x in direct[1]}} if direct and "inliers" in direct[1] else {})})
+            cap = it.caption if it.caption and it.caption.exists() else None
+            if cap is None:
+                mode = None
+            elif i in d["slot_like"]:
+                mode = "copy"                       # the slot keeps its caption for the copy that replaces it
+            elif caption_shared(it, good, leaving):
+                mode = None                         # stays with the image of the same stem
+            else:
+                mode = "move"
+            out = it.root / OUT_DIRNAME / it.rel
+            # Two slot images that share one caption may share its copy too.
+            peer = out.with_suffix(".txt") if mode and names.copies.get(out.with_suffix(".txt")) != cap else None
+            dst = names.free_dest(out, peer)
+            names.freed.add(it.path)
+            if mode == "move":
+                names.freed.add(cap)
+            elif mode == "copy":
+                names.copies[dst.with_suffix(".txt")] = cap
+            d["moves"].append({"idx": i, "to": dst, "cap": cap if mode else None, "cap_mode": mode,
+                               "cap_to": dst.with_suffix(".txt") if mode else None})
+    for d in acted:
+        k = good[d["keeper"]]
+        d["promotion"] = (plan_placement(d["keeper"], d["promote"], good, names, leaving, "move")
+                          if d["promote"] is not None else None)
+        final = Path(d["promotion"]["to"]) if d["promotion"] else k.path
+        has_caption = d["promotion"]["has_caption"] if d["promotion"] else (k.caption is not None and k.caption.exists())
+        d["copy_caption"] = None
+        if not has_caption:
+            src = caption_source(d["keeper"], d["losers"], good)
+            if src is not None:
+                d["copy_caption"] = (src, final.with_suffix(".txt"))
+                names.taken.add(final.with_suffix(".txt"))
+                has_caption = True
+        best_caption = final.with_suffix(".txt") if has_caption else None
+        d["syncs"] = []
+        for i in d["sync"]:
+            pc = plan_placement(d["keeper"], i, good, names, leaving, "copy", best_caption)
+            pc["from"] = str(final)
+            d["syncs"].append(pc)
+
+    plan = {"written": datetime.now().isoformat(timespec="seconds"), "match": args.match,
+            "folders": [str(r) for r, ro in zip(roots, roles) if ro == 0],
+            "sorted_folders": [str(r) for r, ro in zip(roots, roles) if ro == 1],
+            "promote_margin": args.promote_margin, "sorted_copies": args.sorted_copies, "groups": []}
+    verdicts, layouts = {}, {}
+
+    def copy_info(k, i, steps):
+        it = good[i]
+        p = int(bin(int(k.data["phash"], 16) ^ int(it.data["phash"], 16)).count("1"))
+        dd = int(bin(int(k.data["dhash"], 16) ^ int(it.data["dhash"], 16)).count("1"))
+        direct = edges.get((min(k.idx, i), max(k.idx, i)))
+        return {**describe(it), "exact": it.data["sha256"] == k.data["sha256"],
+                "phash_distance": p, "dhash_distance": dd, "steps_from_kept": steps.get(i),
+                "match": direct[0] if direct else "through other copies",
+                **({"features": {x: direct[1][x] for x in ("inliers", "cover", "ncc") if x in direct[1]}}
+                   if direct and "inliers" in direct[1] else {})}
+
+    for d in decisions:
+        k = good[d["keeper"]]
+        entry = {"keep": describe(k), "reason": d["reason"], **d["report"]}
+        rep = d["report"]
+        if rep.get("roles") == "mixed":
+            v = rep["verdict"].split(":")[0]
+            verdicts[v] = verdicts.get(v, 0) + 1
+        elif rep.get("roles") == "sorted":
+            lay = rep["layout"] + (" (a slot left as it is)" if "note" in rep else "")
+            layouts[lay] = layouts.get(lay, 0) + 1
+        if d["skip"] is not None:
+            entry["review"] = d["skip"]
+            entry["members"] = [copy_info(k, i, d["steps"]) for i in d["losers"]]
+        else:
+            if d["slots"]:
+                entry["slots"] = d["slots"]
+            if d["promotion"]:
+                entry["promote"] = {x: v for x, v in d["promotion"].items() if x not in ("action", "slot_idx")}
+            if d["syncs"]:
+                entry["sync"] = [{x: v for x, v in pc.items() if x not in ("action", "slot_idx")} for pc in d["syncs"]]
+            if d["copy_caption"]:
+                src, cdst = d["copy_caption"]
+                entry["copy_caption"] = {"from": str(src.caption), "to": str(cdst)}
+            entry["move"] = [{**copy_info(k, m["idx"], d["steps"]), "to": str(m["to"]),
+                              **({"caption_to": str(m["cap_to"]), "caption_action": m["cap_mode"]} if m["cap_mode"] else {})}
+                             for m in d["moves"]]
         plan["groups"].append(entry)
-    for root in roots:
-        write_json(root / OUT_DIRNAME / PLAN_NAME, plan)
 
     n_moves = len(moving)
     n_bytes = sum(good[i].size for i in moving)
+    skipped = [d for d in decisions if d["skip"] is not None]
+    promotions = [d for d in acted if d["promotion"]]
+    caption_copies = [d for d in acted if d["copy_caption"]]
+    n_ren = sum(1 for d in promotions if d["promotion"]["renamed"])
+    n_sync = sum(len(d["syncs"]) for d in acted)
+    n_left = sum(1 for d in acted for sl in d["slots"] if sl["action"].startswith("left"))
+    n_out = sum(1 for d in acted for sl in d["slots"] if sl["action"].startswith("moves out"))
+    plan["summary"] = {"groups": len(groups), "copies_to_move": n_moves, "bytes_to_move": n_bytes,
+                       "review_groups": len(skipped), "captions_copied_to_kept": len(caption_copies),
+                       **({"mixed_verdicts": verdicts, "sorted_only_layouts": layouts,
+                           "promotions": len(promotions), "promotions_renamed": n_ren, "slots_synced": n_sync,
+                           "slots_left_as_they_are": n_left, "sorted_copies_out": n_out} if with_roles else {})}
+    for root in roots:
+        write_json(root / OUT_DIRNAME / PLAN_NAME, plan)
     print(f"{len(groups)} group(s); {n_moves} worse cop{'y' if n_moves == 1 else 'ies'} to move, "
-          f"{n_bytes / 1e6:.1f} MB")
+          f"{n_bytes / 1e6:.1f} MB"
+          + (f"; {len(skipped)} group(s) left for review, nothing moves there" if skipped else ""))
     sizes = {}
     for g in groups:
         sizes[len(g[1]) + 1] = sizes.get(len(g[1]) + 1, 0) + 1
     if sizes:
         print("copies per group: " + ", ".join(f"{n} x{c}" for n, c in sorted(sizes.items())))
-    guarded = [g for g in groups if g[2].startswith("guard")]
+    guarded = [d for d in acted if d["reason"].startswith("guard")]
     if guarded:
         print(f"{len(guarded)} group(s) keep a smaller copy because the larger one scores much lower")
     if caption_copies:
         print(f"{len(caption_copies)} kept image(s) without a caption get a copy of the caption "
               f"of a moved copy")
+    if with_roles:
+        n_mixed = sum(verdicts.values())
+        print(f"sorted/unsorted: {n_mixed} group(s) with copies in both"
+              + (": " + ", ".join(f"{n} {v}" for v, n in sorted(verdicts.items())) if n_mixed else "")
+              + f" (margin {args.promote_margin:g})")
+        n_sorted = sum(layouts.values())
+        print(f"  {n_sorted} group(s) inside sorted folders only"
+              + (": " + ", ".join(f"{n} {v}" for v, n in sorted(layouts.items())) if n_sorted else ""))
+        if promotions:
+            print(f"  {len(promotions)} unsorted cop{'y moves' if len(promotions) == 1 else 'ies move'} "
+                  f"into sorted folders" + (f", {n_ren} under a new name" if n_ren else ""))
+        if n_sync:
+            print(f"  {n_sync} slot(s) in other sorted folders get a copy of the best copy "
+                  f"(policy {args.sorted_copies})")
+        if n_left:
+            print(f"  {n_left} sorted slot(s) left as they are: framing differs or indirect match")
+        if n_out:
+            print(f"  {n_out} sorted cop{'y moves' if n_out == 1 else 'ies move'} out"
+                  + (" (one slot per picture)" if args.sorted_copies == "one" else " (a better copy stays in the same folder)"))
 
     if args.dry_run:
         print(f"Dry run: nothing moved. Plan: {roots[0] / OUT_DIRNAME / PLAN_NAME}")
         return 0
-    if not groups:
+    if not acted:
         print(f"Nothing to move. Done in {time.time() - t0:.0f}s.")
         return 0
 
-    # 4. move
-    moved = {r: [0, 0, 0, 0] for r in roots}       # images, captions, bytes, captions copied
+    # 4. move, in passes: captions copied to kept images, move-outs, promotions,
+    #    then the caption actions of the promotions. A promotion is logged in the
+    #    sorted root's log, after the move-out it depends on, so --undo replays
+    #    the sequence in the right order.
+    moved = {r: [0, 0, 0, 0, 0, 0] for r in roots}  # images, captions, bytes, captions copied, promoted in, synced
     logs = {}
 
     def log_for(root):
@@ -1008,53 +1443,120 @@ def main(argv=None) -> int:
             logs[root] = open(root / OUT_DIRNAME / MOVES_NAME, "a", encoding="utf-8")
         return logs[root]
 
+    def log(root, **entry):
+        f = log_for(root)
+        f.write(json.dumps({"time": datetime.now().isoformat(timespec="seconds"), **entry},
+                           ensure_ascii=False) + "\n")
+        f.flush()
+
+    def copy_caption(src: Path, dst: Path, root: Path, reason: str) -> bool:
+        if dst.exists() or not src.exists():        # never overwrite a caption
+            return False
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+        log(root, action="copy", **{"from": str(src), "to": str(dst)}, sha256=file_sha256(dst), reason=reason)
+        return True
+
+    def final_path(d):
+        return d["promotion"]["to"] if d["promotion"] else str(good[d["keeper"]].path)
+
     try:
-        for keeper, losers, reason, _ in groups:
-            k = good[keeper]
-            src = caption_source(keeper, losers, good)
-            if src is not None and k.path.exists():
-                cdst = k.path.with_suffix(".txt")
-                if not cdst.exists():                # never overwrite a caption
-                    shutil.copy2(src.caption, cdst)
-                    log = log_for(k.root)
-                    log.write(json.dumps({"time": datetime.now().isoformat(timespec="seconds"),
-                                          "action": "copy", "from": str(src.caption), "to": str(cdst),
-                                          "sha256": file_sha256(cdst),
-                                          "reason": "kept image had no caption"}, ensure_ascii=False) + "\n")
-                    log.flush()
-                    k.caption = cdst
-                    moved[k.root][3] += 1
-            for i in losers:
-                it = good[i]
+        for d in acted:                                            # pass 0: captions for kept images
+            if d["copy_caption"]:
+                src, cdst = d["copy_caption"]
+                root = next(r for r, ro in zip(roots, roles) if cdst.is_relative_to(r))
+                if copy_caption(src.caption, cdst, root, "kept image had no caption"):
+                    moved[root][3] += 1
+        for d in acted:                                            # pass 1: move-outs
+            kept = final_path(d)
+            for m in d["moves"]:
+                it = good[m["idx"]]
                 if not it.path.exists():
                     print(f"  gone before the move, skipped: {it.path}")
                     continue
-                out = it.root / OUT_DIRNAME
-                cap = it.caption if it.caption and it.caption.exists() and not caption_shared(it, good, moving) else None
-                dst = free_dest(out / it.rel, (out / it.rel).with_suffix(".txt") if cap else None)
-                log = log_for(it.root)
-                stamp = datetime.now().isoformat(timespec="seconds")
+                dst = m["to"]
+                if dst.exists():
+                    dst = free_dest(dst, dst.with_suffix(".txt") if m["cap_mode"] else None)
+                    print(f"  planned name was taken, used {dst.name}: {it.path}")
                 move_file(it.path, dst)
-                log.write(json.dumps({"time": stamp, "from": str(it.path), "to": str(dst),
-                                      "kept": str(good[keeper].path), "reason": reason},
-                                     ensure_ascii=False) + "\n")
+                log(it.root, **{"from": str(it.path), "to": str(dst)}, kept=kept, reason=d["reason"])
                 moved[it.root][0] += 1
                 moved[it.root][2] += it.size
-                if cap:
-                    cdst = dst.with_suffix(".txt")
-                    move_file(cap, cdst)
-                    log.write(json.dumps({"time": stamp, "from": str(cap), "to": str(cdst),
-                                          "kept": str(good[keeper].path), "reason": "caption of a moved copy"},
-                                         ensure_ascii=False) + "\n")
+                if m["cap_mode"] == "move" and m["cap"].exists():
+                    move_file(m["cap"], dst.with_suffix(".txt"))
+                    log(it.root, **{"from": str(m["cap"]), "to": str(dst.with_suffix(".txt"))}, kept=kept,
+                        reason="caption of a moved copy")
                     moved[it.root][1] += 1
-                log.flush()
+                elif m["cap_mode"] == "copy":
+                    copy_caption(m["cap"], dst.with_suffix(".txt"), it.root,
+                                 "caption of the slot; a copy for the moved image")
+        for d in acted:                                            # pass 2: promotions
+            if not d["promotion"]:
+                continue
+            k, slot = good[d["keeper"]], good[d["promote"]]
+            src, dst = Path(d["promotion"]["from"]), Path(d["promotion"]["to"])
+            if not src.exists():
+                print(f"  GONE before the move, slot left empty, run --undo: {src} -> {dst}")
+                continue
+            if dst.exists():
+                dst = free_dest(dst, dst.with_suffix(".txt"))
+                print(f"  planned name was taken, used {dst.name}: {src}")
+            move_file(src, dst)
+            log(slot.root, action="promote", **{"from": str(src), "to": str(dst)}, slot_of=str(slot.path),
+                reason=d["reason"])
+            moved[slot.root][4] += 1
+            d["promotion"]["to"] = str(dst)
+        for d in acted:                                            # pass 3: captions of promotions
+            if not d["promotion"]:
+                continue
+            slot = good[d["promote"]]
+            for c in d["promotion"]["captions"]:
+                src, dst = Path(c["from"]), Path(c["to"])
+                if c["action"] == "copy":
+                    copy_caption(src, dst, slot.root, c["reason"])
+                elif src.exists() and not dst.exists():
+                    move_file(src, dst)
+                    log(slot.root, **{"from": str(src), "to": str(dst)}, kept=d["promotion"]["to"],
+                        reason=c["reason"])
+        for d in acted:                                            # pass 4: slot sync copies
+            for pc in d["syncs"]:
+                slot = good[pc["slot_idx"]]
+                src, dst = Path(d["promotion"]["to"] if d["promotion"] else pc["from"]), Path(pc["to"])
+                if not src.exists():
+                    print(f"  GONE before the copy, slot left empty, run --undo: {src} -> {dst}")
+                    continue
+                if dst.exists():
+                    dst = free_dest(dst, dst.with_suffix(".txt"))
+                    print(f"  planned name was taken, used {dst.name}: {dst}")
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+                log(slot.root, action="copy", **{"from": str(src), "to": str(dst)}, sha256=file_sha256(dst),
+                    slot_of=str(slot.path), reason="slot sync: the best copy of this picture")
+                moved[slot.root][5] += 1
+                pc["to"] = str(dst)
+                for c in pc["captions"]:
+                    copy_caption(Path(c["from"]), Path(c["to"]), slot.root, c["reason"])
     finally:
-        for log in logs.values():
-            log.close()
+        for f in logs.values():
+            f.close()
 
-    for root, (n_img, n_cap, n_b, n_copied) in moved.items():
+    # 5. the hashes and scores of promoted and synced files are known: carry
+    #    them to the cache of the folder they now live in
+    carried = {}
+    for d in acted:
+        data = good[d["keeper"]].data
+        if d["promotion"]:
+            carried.setdefault(good[d["promote"]].root, []).append((Path(d["promotion"]["to"]), data))
+        for pc in d["syncs"]:
+            carried.setdefault(good[pc["slot_idx"]].root, []).append((Path(pc["to"]), data))
+    for root, entries in carried.items():
+        carry_cache(root, entries)
+
+    for root, (n_img, n_cap, n_b, n_copied, n_in, n_sync) in moved.items():
         print(f"{root}: moved {n_img} image(s) and {n_cap} caption(s), {n_b / 1e6:.1f} MB "
-              f"-> {root / OUT_DIRNAME}" + (f"; copied {n_copied} caption(s) to kept images" if n_copied else ""))
+              f"-> {root / OUT_DIRNAME}" + (f"; copied {n_copied} caption(s) to kept images" if n_copied else "")
+              + (f"; {n_in} image(s) promoted into it" if n_in else "")
+              + (f"; {n_sync} slot(s) synced" if n_sync else ""))
     print(f"Done in {time.time() - t0:.0f}s. Undo with --undo.")
     return 0
 
