@@ -48,6 +48,40 @@ Folders whose names start with `_` (for example `_duplicates`, or k2prep's `_pre
 
 `run.bat` pauses at the end when it is started by double-click or drag-and-drop, or when the script fails. Set `NOPAUSE=1` to prevent this.
 
+## Deduplicate curated collections
+
+This is the workflow for a curated collection that receives new downloads. The rules are in [Sorted folders](#sorted-folders).
+
+1. **Install once.** Run `install.bat` in this folder. It needs Python 3.10 or newer and creates the `venv` folder. Nothing else to configure.
+
+2. **Dry run first.** Give the raw download folders as plain arguments and each curated collection with `--sorted`:
+
+   ```
+   run.bat D:\data\downloads1 D:\data\downloads2 --sorted D:\data\collection --dry-run
+   ```
+
+   Nothing moves. The summary at the end tells you how many copies would move, how many raw copies would move into the collection, how many slots would be synced, and how many groups are left for review.
+
+3. **Read the plan.** `plan.json` in the first folder's `_duplicates` opens with a `summary` block. Below it, each group shows the kept copy, every destination, and for collections the `slots`, `promote` and `sync` entries. Groups with a `review` field are the ones the tool refuses to decide, usually because a border, a frame or a footer differs. Those files stay where they are for you to look at. Two things are worth a glance before a real run: the `promote` entries, because they replace files in your collection, and raw sources that carry printed catalogue footers, because a footer passes on a hash match.
+
+4. **Run.** The same command without `--dry-run`. There is no prompt. Nothing is deleted. Every moved file goes to the `_duplicates` folder of its own root, under its original relative path, and every action is logged in `moves.jsonl`.
+
+5. **Undo if needed.** The same folders, the same `--sorted` folders, plus `--undo`:
+
+   ```
+   run.bat D:\data\downloads1 D:\data\downloads2 --sorted D:\data\collection --undo
+   ```
+
+   It puts everything back, including the copies it placed into the collection, and skips any copied caption you have edited since.
+
+For larger datasets:
+
+- The feature check is the slow step and grows with the number of images. About 2,000 images take around a minute cold. A second run reuses the three cache files in `_duplicates` and finishes in seconds, so run the dry run and the real run back to back.
+- The same picture in several collection folders keeps every folder's copy and gives each the best one. If you want a single copy instead, add `--sorted-copies one`.
+- The promotion margin defaults to 1.0 score points in the same bucket. Raise it with `--promote-margin` if too many near-equal copies move in, or lower it if you want every improvement.
+- Folders whose names start with `_` are never scanned, so `_duplicates` is safe to leave in place between runs.
+- Delete the `_duplicates` folders only when you no longer want to undo.
+
 ## Where the files go
 
 Each copy that moves keeps its path relative to the folder that you gave. For example, with `run.bat D:\data`, the file `D:\data\set2\a.jpg` moves to `D:\data\_duplicates\set2\a.jpg`, and `D:\data\set2\a.txt` moves with it. If you give several folders, each one gets its own `_duplicates` folder for its own files, but copies are found across all of them. The one exception is a copy that moves into a sorted folder, described in [Sorted folders](#sorted-folders).
