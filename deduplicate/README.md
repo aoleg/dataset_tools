@@ -84,11 +84,13 @@ For larger datasets:
 
 ## Check the result by eye
 
-`compare.py` shows which files were judged copies of which, from the plan of the last run:
+`compare.bat` shows which files were judged copies of which, from the plan of the last run:
 
 ```
-venv\Scripts\python compare.py D:\data\downloads --skip-exact
+compare.bat D:\data\downloads --skip-exact
 ```
+
+You can also drop a folder onto `compare.bat` in Explorer.
 
 It reads `D:\data\downloads\_duplicates\plan.json` and writes `_duplicates\compare\pairs.txt`, one block per group with the kept file, every moved copy, where that copy is now, the match kind and the sizes, and one JPG sheet per group with the kept copy and the moved copies side by side, labelled. Groups that matched by features come first, because a border, a crop, a frame or a footer differed there and they are the ones to look at. `--skip-exact` leaves out groups whose moved copies are byte-identical to the kept one, and `--only features` keeps only the feature-match groups. Nothing is moved or changed. If a copy should not have moved, move it back from `_duplicates` by hand, or undo the whole run.
 
