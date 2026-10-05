@@ -451,13 +451,15 @@ def embed_root(root: Path, items: list[ImageItem], encoder: Encoder, cache: Embe
         done = 0
         since_flush = 0
         last_print = time.time()
-        with ProcessPoolExecutor(max_workers=threads) as pool:
+        pool = ProcessPoolExecutor(max_workers=threads) if threads > 1 else None
+        try:
             for w0 in range(0, len(todo), WINDOW):
                 window = todo[w0:w0 + WINDOW]
                 args = [(str(it.path), cache.patches) for it in window]
                 pending_items: list[ImageItem] = []
                 pending_arrays: list[np.ndarray] = []
-                for it, (arr, err) in zip(window, pool.map(decode_one, args, chunksize=8)):
+                decoded = pool.map(decode_one, args, chunksize=8) if pool else map(decode_one, args)
+                for it, (arr, err) in zip(window, decoded):
                     if arr is None:
                         failed[it.rel] = err
                         continue
@@ -483,8 +485,11 @@ def embed_root(root: Path, items: list[ImageItem], encoder: Encoder, cache: Embe
                     since_flush = 0
                 if time.time() - last_print > 5 or done == len(todo):
                     el = time.time() - t0
-                    print(f"  {done}/{len(todo)} embedded, {done / el:.0f} img/s", flush=True)
+                    print(f"  {done}/{len(todo)} embedded, {done / max(el, 1e-6):.0f} img/s", flush=True)
                     last_print = time.time()
+        finally:
+            if pool:
+                pool.shutdown()
         cache.save(keep={it.rel for it in items})
     else:
         # Drop stale entries for files that are gone.
@@ -499,7 +504,7 @@ def embed_root(root: Path, items: list[ImageItem], encoder: Encoder, cache: Embe
 # Classifier: probe + neighbour vote
 # ----------------------------------------------------------------------------
 
-PROBE_C_GRID = (0.1, 1.0, 10.0)
+PROBE_C_GRID = (0.1, 1.0, 10.0, 100.0)
 KNN_K = 10
 VOTE_MIN_SHARE = 0.3   # fewer neighbours than this in the predicted class -> _unsure
 ISOLATION_K = 10
@@ -542,26 +547,36 @@ def build_training_set(classes: list[SampleClass], vectors: dict[str, np.ndarray
 
 
 class Probe:
-    """Standardised features, multinomial logistic regression over sub-classes."""
+    """Multinomial logistic regression over sub-classes.
+
+    Features are centred and divided by one global scale (the standard deviation
+    over all entries), not standardised per dimension: per-dimension scaling
+    would blow up dimensions that carry almost no signal.
+    """
 
     def __init__(self, C: float):
         from sklearn.linear_model import LogisticRegression
-        from sklearn.pipeline import make_pipeline
-        from sklearn.preprocessing import StandardScaler
         self.C = C
-        self.pipe = make_pipeline(StandardScaler(), LogisticRegression(C=C, max_iter=3000, class_weight="balanced"))
+        self.lr = LogisticRegression(C=C, max_iter=3000, class_weight="balanced")
         self.n_sub = 0
+        self.mean = None
+        self.scale = 1.0
+
+    def _transform(self, X: np.ndarray) -> np.ndarray:
+        return (X - self.mean) / self.scale
 
     def fit(self, X: np.ndarray, y_sub: np.ndarray, n_sub: int) -> "Probe":
         self.n_sub = n_sub
-        self.pipe.fit(X, y_sub)
+        self.mean = X.mean(axis=0)
+        self.scale = float((X - self.mean).std()) or 1.0
+        self.lr.fit(self._transform(X), y_sub)
         return self
 
     def proba_sub(self, X: np.ndarray) -> np.ndarray:
         """(N, n_sub) probabilities, with zero columns for sub-classes absent from the fit."""
-        p = self.pipe.predict_proba(X)
+        p = self.lr.predict_proba(self._transform(X))
         out = np.zeros((X.shape[0], self.n_sub), np.float32)
-        out[:, self.pipe.classes_] = p
+        out[:, self.lr.classes_] = p
         return out
 
 
@@ -605,18 +620,23 @@ def cross_validate(ts: TrainingSet) -> CVResult:
     # folds cannot be; fall back to class-level stratification then.
     strat = ts.y_sub if np.bincount(ts.y_sub).min() >= CV_FOLDS else ts.y_class
     folds = min(CV_FOLDS, np.bincount(strat).min())
+    # C is chosen by held-out log-loss, not accuracy: the probabilities feed the
+    # confidence gate, so calibration is what matters, and accuracy ties on
+    # separable classes and would pick the softest model.
     best = None
     for C in PROBE_C_GRID:
         pred = np.full(len(ts.y_sub), -1)
+        logloss = 0.0
         skf = StratifiedKFold(n_splits=folds, shuffle=True, random_state=0)
         for tr, te in skf.split(ts.X, strat):
             probe = Probe(C).fit(ts.X[tr], ts.y_sub[tr], n_sub)
             p = class_proba(probe.proba_sub(ts.X[te]), ts.sub_to_class, n_classes)
             pred[te] = p.argmax(axis=1)
+            logloss -= float(np.log(np.clip(p[np.arange(len(te)), ts.y_class[te]], 1e-6, 1.0)).sum())
         acc = float((pred == ts.y_class).mean())
-        if best is None or acc > best[0] + 1e-9:
-            best = (acc, C, pred)
-    acc, C, pred = best
+        if best is None or logloss < best[0] - 1e-9:
+            best = (logloss, acc, C, pred)
+    _, acc, C, pred = best
     conf = np.zeros((n_classes, n_classes), np.int64)
     np.add.at(conf, (ts.y_class, pred), 1)
     counts = conf.sum(axis=1)
@@ -917,6 +937,121 @@ def report_decisions(rep: Report, decisions: list[Decision], stats: dict, ts: Tr
 
 
 # ----------------------------------------------------------------------------
+# Execute and undo
+# ----------------------------------------------------------------------------
+
+MOVES_NAME = "moves.jsonl"
+
+
+def output_is_empty(output: Path) -> bool:
+    """True when the output root does not exist or holds nothing but its _classify folder."""
+    if not output.exists():
+        return True
+    return not any(p.name != RUN_DIRNAME for p in output.iterdir())
+
+
+def sidecar_dest_name(dest_name: str, sidecar_rel: str) -> str:
+    return os.path.splitext(dest_name)[0] + os.path.splitext(sidecar_rel)[1]
+
+
+@dataclass
+class ExecResult:
+    placed: int = 0
+    sidecars: int = 0
+    vanished: int = 0
+
+
+def execute(decisions: list[Decision], output: Path, folders: list[str], move: bool, log_path: Path,
+            report=print) -> ExecResult:
+    """Copy or move every planned file, one log line per placement, written before the next one."""
+    import shutil
+    output.mkdir(parents=True, exist_ok=True)
+    for f in folders:
+        (output / f).mkdir(exist_ok=True)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    # A sidecar shared by several images (a.jpg and a.png) is copied for all but its
+    # last reference, so that in move mode it is still there for every image.
+    refs: dict[Path, int] = {}
+    for d in decisions:
+        for sc in d.item.sidecars:
+            p = d.item.root / sc
+            refs[p] = refs.get(p, 0) + 1
+    res = ExecResult()
+    with open(log_path, "w", encoding="utf-8") as log:
+        def place(src: Path, dst: Path, as_move: bool, sidecar: bool) -> bool:
+            if not src.is_file():
+                return False
+            size = src.stat().st_size
+            if as_move:
+                shutil.move(str(src), str(dst))
+            else:
+                shutil.copy2(str(src), str(dst))
+            log.write(json.dumps({"action": "move" if as_move else "copy", "from": str(src), "to": str(dst),
+                                  "sidecar": sidecar, "size": size}, ensure_ascii=False) + "\n")
+            log.flush()
+            return True
+
+        for d in decisions:
+            src = d.item.path
+            dst = output / d.folder / d.dest_name
+            if not place(src, dst, move, False):
+                res.vanished += 1
+                report(f"  gone before placement, skipped: {src}")
+                continue
+            res.placed += 1
+            for sc in d.item.sidecars:
+                sp = d.item.root / sc
+                refs[sp] -= 1
+                as_move = move and refs[sp] == 0
+                if place(sp, output / d.folder / sidecar_dest_name(d.dest_name, sc), as_move, True):
+                    res.sidecars += 1
+    return res
+
+
+def undo(output: Path, report=print) -> int:
+    """Delete the copies or move the moved files back, from the log of the last run, in reverse."""
+    import shutil
+    log_path = output / RUN_DIRNAME / MOVES_NAME
+    if not log_path.is_file():
+        report(f"{log_path} not found, nothing to undo")
+        return 1
+    entries = [json.loads(ln) for ln in log_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    undone = refused = missing = 0
+    for e in reversed(entries):
+        src, dst = Path(e["from"]), Path(e["to"])
+        if not dst.is_file():
+            missing += 1
+            continue
+        if dst.stat().st_size != e.get("size", dst.stat().st_size):
+            refused += 1
+            report(f"  size changed since the run, left in place: {dst}")
+            continue
+        if e["action"] == "copy":
+            dst.unlink()
+        else:
+            if src.exists():
+                refused += 1
+                report(f"  source exists again, left in place: {dst}")
+                continue
+            src.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(dst), str(src))
+        undone += 1
+    log_path.rename(log_path.with_name(f"moves-undone-{datetime_stamp()}.jsonl"))
+    removed = 0
+    for p in sorted(output.iterdir()):
+        if p.is_dir() and p.name != RUN_DIRNAME and not any(p.iterdir()):
+            p.rmdir()
+            removed += 1
+    report(f"Undo: {undone} files put back or deleted, {missing} already gone, {refused} left in place, "
+           f"{removed} empty folders removed")
+    return 0 if refused == 0 else 1
+
+
+def datetime_stamp() -> str:
+    return time.strftime("%Y%m%d-%H%M%S")
+
+
+# ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
 
@@ -975,9 +1110,14 @@ def main(argv=None) -> int:
     if args.fetch_models:
         return fetch_models()
     if args.undo:
-        sys.exit("--undo is not implemented yet")
+        if not args.output:
+            sys.exit("--undo needs -o <output root>")
+        return undo(Path(args.output).resolve())
     datasets, samples, output = check_folders(args)
     sidecars = sidecar_set(args.sidecars)
+    if not args.dry_run and not args.embed_only and not output_is_empty(output):
+        sys.exit(f"the output root {output} is not empty. Delete its folders, or run --undo for a moved run, "
+                 f"or use --dry-run.")
 
     t_all = time.time()
     classes = discover_samples(samples, sidecars)
@@ -1043,7 +1183,16 @@ def main(argv=None) -> int:
     if args.dry_run:
         rep("Dry run, nothing copied.")
         return 0
-    sys.exit("placing the files is not implemented yet (phase 4); use --dry-run")
+    if not output_is_empty(output):
+        sys.exit(f"the output root {output} is not empty any more, nothing placed")
+    t0 = time.time()
+    folders = ts.class_names + [UNSURE_DIRNAME]
+    res = execute(decisions, output, folders, args.move, run_dir / MOVES_NAME, report=rep)
+    verb = "moved" if args.move else "copied"
+    rep(f"{res.placed} images and {res.sidecars} sidecars {verb} in {time.time() - t0:.0f}s"
+        + (f", {res.vanished} sources were gone" if res.vanished else "") + f". Undo with: -o {output} --undo")
+    rep.save(run_dir / "report.txt")
+    return 0
 
 
 if __name__ == "__main__":
