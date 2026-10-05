@@ -1,0 +1,8 @@
+# torch and torchvision are installed by install.bat from the PyTorch CUDA index,
+# not from PyPI. Everything else comes from PyPI.
+transformers>=4.56
+scikit-learn>=1.5
+huggingface_hub>=0.30
+Pillow>=10.0
+numpy>=2.0
+pillow-avif-plugin>=1.4
