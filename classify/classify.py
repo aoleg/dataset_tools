@@ -708,6 +708,8 @@ class Decision:
     isolation: float
     reason: str
     dest_name: str = ""    # file name in the output folder, set by assign_names
+    share: float = 0.0     # share of the nearest examples in the predicted class
+    pass_no: int = 1       # 1: first pass; 2: re-scored by the retrained probe (--retrain)
 
 
 def destination_stem(it: ImageItem) -> str:
@@ -778,14 +780,16 @@ def decide(dataset_items: list[tuple[Path, list[ImageItem]]], vectors: list[dict
                 reason = REASON_EXAMPLE
                 stats["example_matches"] += 1
                 stats["matched_hashes"].add(h)
+        share = float(shares[i, cls_i])
         if reason == "":
-            if shares[i, cls_i] < VOTE_MIN_SHARE:
+            if share < VOTE_MIN_SHARE:
                 folder, reason = UNSURE_DIRNAME, REASON_DISAGREE
             elif confidence < min_confidence:
                 folder, reason = UNSURE_DIRNAME, REASON_CONFIDENCE
             elif iso[i] > iso_cut:
                 folder, reason = UNSURE_DIRNAME, REASON_ISOLATED
-        decisions.append(Decision(it, folder, cls_name, sub_name, confidence, vote_name, float(iso[i]), reason))
+        decisions.append(Decision(it, folder, cls_name, sub_name, confidence, vote_name, float(iso[i]), reason,
+                                  share=share))
     stats["confidences"] = conf
     stats["iso_cut"] = float(iso_cut) if np.isfinite(iso_cut) else None
     return decisions, stats
@@ -796,11 +800,84 @@ def write_plan(path: Path, decisions: list[Decision], output: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["source", "destination", "class", "subclass", "confidence", "vote", "isolation", "reason", "sidecars"])
+        w.writerow(["source", "destination", "class", "subclass", "confidence", "share", "vote", "isolation",
+                    "reason", "pass", "sidecars"])
         for d in decisions:
             dest = output / d.folder / d.dest_name
-            w.writerow([str(d.item.path), str(dest), d.cls, d.sub, f"{d.confidence:.4f}", d.vote,
-                        f"{d.isolation:.4f}", d.reason, ";".join(d.item.sidecars)])
+            w.writerow([str(d.item.path), str(dest), d.cls, d.sub, f"{d.confidence:.4f}", f"{d.share:.2f}", d.vote,
+                        f"{d.isolation:.4f}", d.reason, d.pass_no, ";".join(d.item.sidecars)])
+
+
+# ----------------------------------------------------------------------------
+# Retrain (--retrain): self-training on the confident first-pass placements
+# ----------------------------------------------------------------------------
+
+PSEUDO_MIN_SHARE = 0.5     # a first-pass placement trains only with at least half its neighbours in its class
+PSEUDO_CAP_FACTOR = 5      # and at most this many per hand example of the class
+
+
+def select_pseudo_labels(decisions: list[Decision], ts: TrainingSet, min_share: float = PSEUDO_MIN_SHARE,
+                         cap_factor: int = PSEUDO_CAP_FACTOR) -> list[Decision]:
+    """First-pass placements fit to train on, best confidence first, capped per class.
+
+    Hand examples found by hash are left out (they are in the training set already).
+    """
+    hand = np.bincount(ts.y_class, minlength=len(ts.class_names))
+    by_class: dict[str, list[Decision]] = {}
+    for d in decisions:
+        if d.folder == UNSURE_DIRNAME or d.reason or d.share < min_share:
+            continue
+        by_class.setdefault(d.cls, []).append(d)
+    out: list[Decision] = []
+    for ci, name in enumerate(ts.class_names):
+        cap = cap_factor * int(hand[ci])
+        out.extend(sorted(by_class.get(name, []), key=lambda d: -d.confidence)[:cap])
+    return out
+
+
+def expand_training_set(ts: TrainingSet, pseudo: list[Decision], vec_of) -> TrainingSet:
+    """The hand examples plus the pseudo-labelled images, labelled with their predicted sub-class."""
+    sub_index = {n: i for i, n in enumerate(ts.sub_names)}
+    if not pseudo:
+        return ts
+    X = np.concatenate([ts.X, np.stack([vec_of(d) for d in pseudo]).astype(np.float32)])
+    y = np.concatenate([ts.y_sub, np.asarray([sub_index[d.sub] for d in pseudo])])
+    return TrainingSet(X, y, ts.sub_names, ts.sub_to_class, ts.class_names, ts.outliers_class, ts.items)
+
+
+def rescore_unsure(decisions: list[Decision], vec_of, ts2: TrainingSet, probe2: Probe,
+                   min_confidence: float) -> tuple[int, int]:
+    """Second pass over the unsure images with the retrained probe. Returns (rescored, placed).
+
+    Only images unsure by the vote or the confidence are re-scored; undecodable and
+    isolated ones stay. A re-scored image that passes the gates takes its class folder
+    as its final destination, so it is placed once, never via _unsure.
+    """
+    todo = [d for d in decisions if d.folder == UNSURE_DIRNAME and d.reason in (REASON_DISAGREE, REASON_CONFIDENCE)]
+    if not todo:
+        return 0, 0
+    X = np.stack([vec_of(d) for d in todo]).astype(np.float32)
+    n_classes = len(ts2.class_names)
+    p_sub = probe2.proba_sub(X)
+    p_cls = class_proba(p_sub, ts2.sub_to_class, n_classes)
+    shares = knn_shares(ts2.X, ts2.y_class, X, n_classes)
+    placed = 0
+    for i, d in enumerate(todo):
+        ci = int(p_cls[i].argmax())
+        d.cls = ts2.class_names[ci]
+        d.sub = ts2.sub_names[int(p_sub[i].argmax())]
+        d.confidence = float(p_cls[i, ci])
+        d.vote = ts2.class_names[int(shares[i].argmax())]
+        d.share = float(shares[i, ci])
+        d.pass_no = 2
+        if d.share < VOTE_MIN_SHARE:
+            d.reason = REASON_DISAGREE
+        elif d.confidence < min_confidence:
+            d.reason = REASON_CONFIDENCE
+        else:
+            d.folder, d.reason = d.cls, ""
+            placed += 1
+    return len(todo), placed
 
 
 # ----------------------------------------------------------------------------
@@ -853,12 +930,14 @@ def write_sheets(decisions: list[Decision], ts: TrainingSet, sheets_dir: Path) -
     for d in decisions:
         by_folder.setdefault(d.folder, []).append(d)
     for folder in ts.class_names:
-        ds = [d for d in by_folder.get(folder, []) if d.reason != REASON_EXAMPLE]
-        if not ds:
-            continue
-        sample = rng.sample(ds, min(SHEET_PER_GROUP, len(ds)))
-        lowest = sorted(ds, key=lambda d: d.confidence)[:SHEET_PER_GROUP]
-        write_sheet(sheets_dir / f"{folder}.jpg", folder, [("random", sample), ("lowest confidence", lowest)])
+        for pass_no, suffix in ((1, ""), (2, "-pass2")):
+            ds = [d for d in by_folder.get(folder, []) if d.reason != REASON_EXAMPLE and d.pass_no == pass_no]
+            if not ds:
+                continue
+            sample = rng.sample(ds, min(SHEET_PER_GROUP, len(ds)))
+            lowest = sorted(ds, key=lambda d: d.confidence)[:SHEET_PER_GROUP]
+            write_sheet(sheets_dir / f"{folder}{suffix}.jpg", f"{folder}{': pass 2' if pass_no == 2 else ''}",
+                        [("random", sample), ("lowest confidence", lowest)])
     unsure = by_folder.get(UNSURE_DIRNAME, [])
     for reason in (REASON_DISAGREE, REASON_CONFIDENCE, REASON_ISOLATED, REASON_UNDECODABLE):
         ds = [d for d in unsure if d.reason == reason]
@@ -906,7 +985,7 @@ def report_decisions(rep: Report, decisions: list[Decision], stats: dict, ts: Tr
                      min_confidence: float, isolation_pct: float | None) -> None:
     conf = stats.get("confidences")
     if conf is not None and len(conf):
-        rep("Confidence histogram of the dataset (probe probability of the chosen class):")
+        rep("Confidence histogram of the dataset, first pass (probe probability of the chosen class):")
         hist, edges = np.histogram(conf, bins=10, range=(0.0, 1.0))
         peak = max(hist.max(), 1)
         for h, lo in zip(hist, edges[:-1]):
@@ -1059,11 +1138,15 @@ def parse_args(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dataset", action="append", default=[], metavar="PATH", help="dataset root; may repeat")
     ap.add_argument("--samples", metavar="PATH", help="samples root with one folder per class")
-    ap.add_argument("-o", "--output", metavar="PATH", help="output root; must be empty apart from _classify")
+    ap.add_argument("-o", "--output", metavar="PATH",
+                    help="output root; must be empty apart from _classify (default: <dataset>_classified next to the dataset)")
     ap.add_argument("--dry-run", action="store_true", help="write the plan, report and sheets; copy nothing")
     ap.add_argument("--move", action="store_true", help="move dataset images instead of copying them")
     ap.add_argument("--undo", action="store_true", help="undo the last run from <output>/_classify/moves.jsonl")
     ap.add_argument("--min-confidence", type=float, default=0.7, metavar="X", help="below this an image goes to _unsure (default 0.7)")
+    ap.add_argument("--retrain", type=float, nargs="?", const=0.9, default=None, metavar="X",
+                    help="two passes: first at confidence X (default 0.9), then retrain on the confident placements "
+                         "and re-score the unsure images at --min-confidence")
     ap.add_argument("--isolation-pct", type=float, default=0.0, metavar="X", help="the X%% most isolated images go to _unsure (default 0, off)")
     ap.add_argument("--sidecars", default=DEFAULT_SIDECARS, metavar="EXT,EXT", help="sidecar extensions (default .txt)")
     ap.add_argument("--sheets", action="store_true", help="write contact sheets per output folder")
@@ -1086,12 +1169,22 @@ def sidecar_set(spec: str) -> set[str]:
     return out
 
 
+def default_output(datasets: list[Path]) -> Path:
+    """<dataset>_classified next to the dataset; only for a single dataset root below a drive root."""
+    if len(datasets) != 1:
+        sys.exit("-o is required with several dataset roots")
+    d = datasets[0]
+    if d.parent == d:
+        sys.exit("-o is required for a dataset root at the top of a drive")
+    return d.parent / f"{d.name}_classified"
+
+
 def check_folders(args) -> tuple[list[Path], Path, Path]:
-    if not args.dataset or not args.samples or not args.output:
-        sys.exit("--dataset, --samples and -o are required (or -o with --undo)")
+    if not args.dataset or not args.samples:
+        sys.exit("--dataset and --samples are required")
     datasets = [Path(d).resolve() for d in args.dataset]
     samples = Path(args.samples).resolve()
-    output = Path(args.output).resolve()
+    output = Path(args.output).resolve() if args.output else default_output(datasets)
     for d in datasets:
         if not d.is_dir():
             sys.exit(f"dataset root not found: {d}")
@@ -1110,9 +1203,11 @@ def main(argv=None) -> int:
     if args.fetch_models:
         return fetch_models()
     if args.undo:
-        if not args.output:
-            sys.exit("--undo needs -o <output root>")
-        return undo(Path(args.output).resolve())
+        if args.output:
+            return undo(Path(args.output).resolve())
+        if args.dataset:
+            return undo(default_output([Path(d).resolve() for d in args.dataset]))
+        sys.exit("--undo needs -o <output root> or --dataset <dataset root>")
     datasets, samples, output = check_folders(args)
     sidecars = sidecar_set(args.sidecars)
     if not args.dry_run and not args.embed_only and not output_is_empty(output):
@@ -1154,7 +1249,9 @@ def main(argv=None) -> int:
     for d in datasets:
         rep(f"  dataset: {d}")
     rep(f"  output:  {output}")
-    rep(f"  min-confidence {args.min_confidence:g}, isolation {f'{args.isolation_pct:g}%' if args.isolation_pct > 0 else 'off'}, patches {args.patches}")
+    strict = max(args.retrain, args.min_confidence) if args.retrain is not None else None
+    rep(f"  min-confidence {args.min_confidence:g}, isolation {f'{args.isolation_pct:g}%' if args.isolation_pct > 0 else 'off'}, "
+        f"patches {args.patches}" + (f", retrain: first pass at {strict:g}" if strict is not None else ""))
     rep()
     ts = build_training_set(classes, sample_res.vectors)
     if sample_res.failed:
@@ -1167,10 +1264,37 @@ def main(argv=None) -> int:
     rep()
     example_hashes = hash_examples(ts)
     decisions, stats = decide(dataset_items, [r.vectors for r in results], [r.failed for r in results], ts, probe,
-                              example_hashes, args.min_confidence, args.isolation_pct if args.isolation_pct > 0 else None)
+                              example_hashes, strict if strict is not None else args.min_confidence,
+                              args.isolation_pct if args.isolation_pct > 0 else None)
     decisions.sort(key=lambda d: (str(d.item.root), d.item.rel))
+    if strict is not None:
+        vectors_by_key = {(str(root), rel): v for (root, _), res in zip(dataset_items, results)
+                          for rel, v in res.vectors.items()}
+        vec_of = lambda d: vectors_by_key[(str(d.item.root), d.item.rel)]  # noqa: E731
+        t0 = time.time()
+        pseudo = select_pseudo_labels(decisions, ts)
+        ts2 = expand_training_set(ts, pseudo, vec_of)
+        probe2 = Probe(cv.C).fit(ts2.X, ts2.y_sub, len(ts2.sub_names))
+        rescored, placed2 = rescore_unsure(decisions, vec_of, ts2, probe2, args.min_confidence)
+        rep(f"Retrain: {len(pseudo)} first-pass placements (confidence >= {strict:g}, share >= {PSEUDO_MIN_SHARE:g}, "
+            f"at most {PSEUDO_CAP_FACTOR} per hand example) added to the {len(ts.items)} examples, "
+            f"trained in {time.time() - t0:.1f}s")
+        w = max(len(n) for n in ts.class_names)
+        per_pseudo = {n: 0 for n in ts.class_names}
+        per_pass2 = {n: 0 for n in ts.class_names}
+        for d in pseudo:
+            per_pseudo[d.cls] += 1
+        for d in decisions:
+            if d.pass_no == 2 and d.folder != UNSURE_DIRNAME:
+                per_pass2[d.folder] += 1
+        rep(f"  {'class':<{w}}  {'added':>6}  {'pass 2':>6}")
+        for n in ts.class_names:
+            rep(f"  {n:<{w}}  {per_pseudo[n]:>6}  {per_pass2[n]:>6}")
+        rep(f"Pass 2 at min-confidence {args.min_confidence:g}: {placed2} of {rescored} unsure images placed")
+        rep()
     assign_names(decisions)
-    report_decisions(rep, decisions, stats, ts, args.min_confidence, args.isolation_pct if args.isolation_pct > 0 else None)
+    report_decisions(rep, decisions, stats, ts, strict if strict is not None else args.min_confidence,
+                     args.isolation_pct if args.isolation_pct > 0 else None)
     run_dir = output / RUN_DIRNAME
     write_plan(run_dir / "plan.csv", decisions, output)
     rep.save(run_dir / "report.txt")

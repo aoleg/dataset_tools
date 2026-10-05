@@ -19,19 +19,23 @@ After the install, the tool does not use the network. If the download fails, the
 ## Usage
 
 ```
-run.bat --dataset <folder> [--dataset <folder> ...] --samples <folder> -o <folder> [options]
+run.bat --dataset <folder> [--dataset <folder> ...] --samples <folder> [-o <folder>] [options]
+run.bat --dataset <folder> --undo
 run.bat -o <folder> --undo
 ```
 
 Examples:
 
 ```
-run.bat --dataset D:\photos\raw --samples D:\photos\samples -o D:\photos\sorted --dry-run --sheets
-run.bat --dataset D:\photos\raw --samples D:\photos\samples -o D:\photos\sorted
-run.bat -o D:\photos\sorted --undo
+run.bat --dataset D:\photos\raw --samples D:\photos\samples --dry-run --sheets
+run.bat --dataset D:\photos\raw --samples D:\photos\samples
+run.bat --dataset D:\photos\raw --samples D:\photos\samples --retrain
+run.bat --dataset D:\photos\raw --undo
 ```
 
-The first command embeds, trains, classifies and writes the plan, the report and the contact sheets, without copying anything. The second copies the images into the category folders. The third deletes the copies again.
+The first command embeds, trains, classifies and writes the plan, the report and the contact sheets into `D:\photos\raw_classified`, without copying anything. The second copies the images into the category folders there. The third does the same in two passes, see below. The fourth deletes the copies again.
+
+Without `-o`, the output folder is `<dataset>_classified` next to the dataset folder. With several `--dataset` folders, `-o` is required.
 
 ## The samples folder
 
@@ -85,6 +89,18 @@ The confidence threshold is yours to choose from the histogram and the sheets. T
 
 The sheets show 48 random images and the 48 lowest-confidence images of each category folder, and for `_unsure` 48 random images per reason, with the predicted category on each tile. A category whose sheet looks wrong needs more or better examples. An image on an `_unsure` sheet that belongs to a category can be copied into the samples folder, and the next run places it and its kind.
 
+## Two passes with `--retrain`
+
+Hand-picked examples tend to be the clearest images of each category, so the first classifier draws narrow categories, and the typical images of the dataset fall between them. `--retrain` widens the categories with the dataset's own images:
+
+1. The first pass runs at a strict confidence, 0.9 by default (`--retrain 0.95` sets another value). Only clear cases reach a category folder.
+2. The first-pass placements that have at least half their nearest examples in their category join the examples as training images, at most 5 per hand example of the category, best confidence first. The cap keeps a large category from drowning your 40 examples in its own first-pass opinion.
+3. The classifier is trained again on the enlarged set and scores the unsure images once more, now at `--min-confidence`. The ones that pass go to their category folder.
+
+Every image is still placed once, at its final destination; the second pass happens in memory before anything is copied. The plan has a `pass` column, the report lists what was added per category and how many unsure images the second pass placed, and the sheets add one per category for the second-pass placements. Look at those sheets: the second pass is the classifier agreeing with itself, and its errors sit on the same borders as before. The cross-validation table stays a check of your hand examples only.
+
+On the dataset of historical photographs with the draft samples, the second pass placed about half of the first-pass unsure images, and the unsure share went from 36 to 28 percent.
+
 ## Output
 
 ```
@@ -116,11 +132,12 @@ The output is a function of the dataset, the samples and the threshold. To run a
 |---|---|---|
 | `--dataset PATH` | required | a dataset folder; repeat the option for several |
 | `--samples PATH` | required | the samples folder |
-| `-o PATH`, `--output PATH` | required | the output folder; must be empty apart from `_classify` |
+| `-o PATH`, `--output PATH` | `<dataset>_classified` | the output folder; must be empty apart from `_classify` |
 | `--dry-run` | off | write the plan, the report and the sheets, copy nothing |
 | `--move` | off | move the dataset images instead of copying them |
-| `--undo` | off | undo the last run from `<output>\_classify\moves.jsonl`; needs only `-o` |
+| `--undo` | off | undo the last run from `<output>\_classify\moves.jsonl`; needs only `-o` or `--dataset` |
 | `--min-confidence X` | 0.7 | images below this confidence go to `_unsure` |
+| `--retrain [X]` | off | two passes: the first at confidence X (0.9 without a value), then retrain on the confident placements and score the unsure images again at `--min-confidence` |
 | `--isolation-pct X` | 0 | also send the X percent of images that are farthest from all others to `_unsure` (reason `isolated`); off at 0 |
 | `--sidecars EXT,EXT` | `.txt` | the extensions that travel with an image |
 | `--sheets` | off | write the contact sheets |
