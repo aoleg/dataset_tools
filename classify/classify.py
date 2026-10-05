@@ -150,16 +150,22 @@ def discover_samples(samples_root: Path, sidecar_exts: set[str]) -> list[SampleC
     samples_root = samples_root.resolve()
     items = scan_root(samples_root, sidecar_exts)
     classes: dict[str, SampleClass] = {}
+    ignored: set[str] = set()
     for it in items:
         parts = it.rel.split("/")
         if len(parts) < 2:
             continue  # an image directly in the samples root belongs to no class
         cls = parts[0]
+        if cls.startswith("_"):
+            ignored.add(cls)  # names starting with "_" are reserved for the tool's own folders
+            continue
         sub = parts[1] if len(parts) >= 3 else cls
         if len(parts) > 3:
             sub = parts[1]  # deeper levels fold into the first sub-class level
         sc = classes.setdefault(cls, SampleClass(cls, {}))
         sc.subclasses.setdefault(sub, []).append(it)
+    for name in sorted(ignored):
+        print(f"  samples folder {name} ignored: names starting with '_' are reserved")
     ordered = sorted(classes.values(), key=lambda c: natural_key(c.name))
     return ordered
 
@@ -490,6 +496,427 @@ def embed_root(root: Path, items: list[ImageItem], encoder: Encoder, cache: Embe
 
 
 # ----------------------------------------------------------------------------
+# Classifier: probe + neighbour vote
+# ----------------------------------------------------------------------------
+
+PROBE_C_GRID = (0.1, 1.0, 10.0)
+KNN_K = 10
+VOTE_MIN_SHARE = 0.3   # fewer neighbours than this in the predicted class -> _unsure
+ISOLATION_K = 10
+CV_FOLDS = 5
+RECALL_WARN = 0.5
+
+
+@dataclass
+class TrainingSet:
+    X: np.ndarray                 # (N, D) float32, L2-normalised
+    y_sub: np.ndarray             # (N,) sub-class index
+    sub_names: list[str]          # sub-class index -> "class/sub" or "class"
+    sub_to_class: np.ndarray      # sub-class index -> class index
+    class_names: list[str]        # class index -> folder name
+    outliers_class: int | None    # class index of the outliers class, if any
+    items: list[ImageItem]
+
+    @property
+    def y_class(self) -> np.ndarray:
+        return self.sub_to_class[self.y_sub]
+
+
+def build_training_set(classes: list[SampleClass], vectors: dict[str, np.ndarray]) -> TrainingSet:
+    X, y, items = [], [], []
+    sub_names, sub_to_class, class_names = [], [], []
+    outliers = None
+    for ci, c in enumerate(classes):
+        class_names.append(c.name)
+        if c.is_outliers:
+            outliers = ci
+        for sub, its in c.subclasses.items():
+            si = len(sub_names)
+            sub_names.append(c.name if sub == c.name else f"{c.name}/{sub}")
+            sub_to_class.append(ci)
+            for it in its:
+                if it.rel in vectors:
+                    X.append(vectors[it.rel]); y.append(si); items.append(it)
+    return TrainingSet(np.asarray(X, np.float32), np.asarray(y), sub_names, np.asarray(sub_to_class),
+                       class_names, outliers, items)
+
+
+class Probe:
+    """Standardised features, multinomial logistic regression over sub-classes."""
+
+    def __init__(self, C: float):
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.pipeline import make_pipeline
+        from sklearn.preprocessing import StandardScaler
+        self.C = C
+        self.pipe = make_pipeline(StandardScaler(), LogisticRegression(C=C, max_iter=3000, class_weight="balanced"))
+        self.n_sub = 0
+
+    def fit(self, X: np.ndarray, y_sub: np.ndarray, n_sub: int) -> "Probe":
+        self.n_sub = n_sub
+        self.pipe.fit(X, y_sub)
+        return self
+
+    def proba_sub(self, X: np.ndarray) -> np.ndarray:
+        """(N, n_sub) probabilities, with zero columns for sub-classes absent from the fit."""
+        p = self.pipe.predict_proba(X)
+        out = np.zeros((X.shape[0], self.n_sub), np.float32)
+        out[:, self.pipe.classes_] = p
+        return out
+
+
+def class_proba(p_sub: np.ndarray, sub_to_class: np.ndarray, n_classes: int) -> np.ndarray:
+    out = np.zeros((p_sub.shape[0], n_classes), np.float32)
+    for si, ci in enumerate(sub_to_class):
+        out[:, ci] += p_sub[:, si]
+    return out
+
+
+def knn_shares(X_train: np.ndarray, y_class: np.ndarray, X: np.ndarray, n_classes: int, k: int = KNN_K,
+               exclude_self: bool = False) -> np.ndarray:
+    """(N, n_classes) share of the k nearest training examples (cosine) per class."""
+    sims = X @ X_train.T
+    if exclude_self:
+        np.fill_diagonal(sims, -np.inf)
+    k = min(k, X_train.shape[0] - (1 if exclude_self else 0))
+    idx = np.argpartition(-sims, k - 1, axis=1)[:, :k]
+    votes = np.zeros((X.shape[0], n_classes), np.float32)
+    for j in range(k):
+        np.add.at(votes, (np.arange(X.shape[0]), y_class[idx[:, j]]), 1.0)
+    return votes / k
+
+
+@dataclass
+class CVResult:
+    C: float
+    accuracy: float
+    confusion: np.ndarray          # (n_classes, n_classes) true x predicted
+    precision: np.ndarray
+    recall: np.ndarray
+    counts: np.ndarray
+
+
+def cross_validate(ts: TrainingSet) -> CVResult:
+    """Pick C by 5-fold accuracy and return the class-level confusion matrix at that C."""
+    from sklearn.model_selection import StratifiedKFold
+    n_classes = len(ts.class_names)
+    n_sub = len(ts.sub_names)
+    # Folds must be stratified on the sub-class, but a sub-class with fewer members than
+    # folds cannot be; fall back to class-level stratification then.
+    strat = ts.y_sub if np.bincount(ts.y_sub).min() >= CV_FOLDS else ts.y_class
+    folds = min(CV_FOLDS, np.bincount(strat).min())
+    best = None
+    for C in PROBE_C_GRID:
+        pred = np.full(len(ts.y_sub), -1)
+        skf = StratifiedKFold(n_splits=folds, shuffle=True, random_state=0)
+        for tr, te in skf.split(ts.X, strat):
+            probe = Probe(C).fit(ts.X[tr], ts.y_sub[tr], n_sub)
+            p = class_proba(probe.proba_sub(ts.X[te]), ts.sub_to_class, n_classes)
+            pred[te] = p.argmax(axis=1)
+        acc = float((pred == ts.y_class).mean())
+        if best is None or acc > best[0] + 1e-9:
+            best = (acc, C, pred)
+    acc, C, pred = best
+    conf = np.zeros((n_classes, n_classes), np.int64)
+    np.add.at(conf, (ts.y_class, pred), 1)
+    counts = conf.sum(axis=1)
+    tp = np.diag(conf).astype(np.float64)
+    precision = np.divide(tp, conf.sum(axis=0), out=np.zeros(n_classes), where=conf.sum(axis=0) > 0)
+    recall = np.divide(tp, counts, out=np.zeros(n_classes), where=counts > 0)
+    return CVResult(C, acc, conf, precision, recall, counts)
+
+
+def isolation_scores(X: np.ndarray, k: int = ISOLATION_K, block: int = 4096) -> np.ndarray:
+    """Mean cosine distance of every row to its k nearest other rows. GPU when available."""
+    import torch
+    n = X.shape[0]
+    if n <= 1:
+        return np.zeros(n, np.float32)
+    k = min(k, n - 1)
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    Xt = torch.from_numpy(X).to(dev)
+    out = np.zeros(n, np.float32)
+    for s in range(0, n, block):
+        e = min(n, s + block)
+        sims = Xt[s:e] @ Xt.T
+        sims[torch.arange(e - s), torch.arange(s, e)] = -2.0  # exclude self
+        top = sims.topk(k, dim=1).values
+        out[s:e] = (1.0 - top.mean(dim=1)).float().cpu().numpy()
+    return out
+
+
+# ----------------------------------------------------------------------------
+# Example hashing
+# ----------------------------------------------------------------------------
+
+def file_sha256(path: Path) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def hash_examples(ts: TrainingSet) -> dict[str, int]:
+    """sha256 -> class index for every example."""
+    out = {}
+    for it, si in zip(ts.items, ts.y_sub):
+        out[file_sha256(it.path)] = int(ts.sub_to_class[si])
+    return out
+
+
+# ----------------------------------------------------------------------------
+# Prediction, gates, plan
+# ----------------------------------------------------------------------------
+
+REASON_EXAMPLE = "example"
+REASON_UNDECODABLE = "undecodable"
+REASON_DISAGREE = "disagree"
+REASON_CONFIDENCE = "confidence"
+REASON_ISOLATED = "isolated"
+
+
+@dataclass
+class Decision:
+    item: ImageItem
+    folder: str            # output folder name: class folder or _unsure
+    cls: str               # predicted class folder name ("" if undecodable)
+    sub: str
+    confidence: float
+    vote: str
+    isolation: float
+    reason: str
+    dest_name: str = ""    # file name in the output folder, set by assign_names
+
+
+def destination_stem(it: ImageItem) -> str:
+    """Relative path with separators as '__', without the extension."""
+    return os.path.splitext(it.rel)[0].replace("/", "__")
+
+
+def assign_names(decisions: list[Decision]) -> None:
+    """Final file names per output folder; a residual collision gets -2, -3, ..."""
+    taken: dict[tuple[str, str], int] = {}  # (folder, stem) -> count
+    for d in decisions:
+        stem = destination_stem(d.item)
+        ext = os.path.splitext(d.item.rel)[1]
+        key = (d.folder, stem.lower())
+        n = taken.get(key, 0) + 1
+        taken[key] = n
+        d.dest_name = f"{stem}{ext}" if n == 1 else f"{stem}-{n}{ext}"
+
+
+def decide(dataset_items: list[tuple[Path, list[ImageItem]]], vectors: list[dict[str, np.ndarray]],
+           failed: list[dict[str, str]], ts: TrainingSet, probe: Probe, example_hashes: dict[str, int],
+           min_confidence: float, isolation_pct: float | None) -> tuple[list[Decision], dict]:
+    n_classes = len(ts.class_names)
+    example_sizes = {it.size for it in ts.items}
+    stats = {"example_matches": 0, "matched_hashes": set()}
+
+    # Gather everything with an embedding, in one block, for prediction and isolation.
+    rows: list[tuple[ImageItem, np.ndarray]] = []
+    undecodable: list[ImageItem] = []
+    for (root, items), vecs, fail in zip(dataset_items, vectors, failed):
+        for it in items:
+            if it.rel in vecs:
+                rows.append((it, vecs[it.rel]))
+            else:
+                undecodable.append(it)
+    decisions: list[Decision] = []
+    for it in undecodable:
+        decisions.append(Decision(it, UNSURE_DIRNAME, "", "", 0.0, "", 0.0, REASON_UNDECODABLE))
+    if not rows:
+        return decisions, stats
+
+    X = np.stack([v for _, v in rows]).astype(np.float32)
+    p_sub = probe.proba_sub(X)
+    p_cls = class_proba(p_sub, ts.sub_to_class, n_classes)
+    pred_cls = p_cls.argmax(axis=1)
+    pred_sub = p_sub.argmax(axis=1)
+    conf = p_cls[np.arange(len(rows)), pred_cls]
+    shares = knn_shares(ts.X, ts.y_class, X, n_classes)
+    vote = shares.argmax(axis=1)
+    iso = isolation_scores(X) if isolation_pct is not None else np.zeros(len(rows), np.float32)
+    iso_cut = np.percentile(iso, 100.0 - isolation_pct) if isolation_pct is not None and isolation_pct > 0 else np.inf
+
+    for i, (it, _) in enumerate(rows):
+        cls_i = int(pred_cls[i])
+        cls_name = ts.class_names[cls_i]
+        sub_name = ts.sub_names[int(pred_sub[i])]
+        vote_name = ts.class_names[int(vote[i])]
+        reason = ""
+        folder = cls_name
+        confidence = float(conf[i])
+        if it.size in example_sizes:
+            h = file_sha256(it.path)
+            if h in example_hashes:
+                cls_i = example_hashes[h]
+                cls_name = folder = ts.class_names[cls_i]
+                sub_name = cls_name
+                confidence = 1.0
+                reason = REASON_EXAMPLE
+                stats["example_matches"] += 1
+                stats["matched_hashes"].add(h)
+        if reason == "":
+            if shares[i, cls_i] < VOTE_MIN_SHARE:
+                folder, reason = UNSURE_DIRNAME, REASON_DISAGREE
+            elif confidence < min_confidence:
+                folder, reason = UNSURE_DIRNAME, REASON_CONFIDENCE
+            elif iso[i] > iso_cut:
+                folder, reason = UNSURE_DIRNAME, REASON_ISOLATED
+        decisions.append(Decision(it, folder, cls_name, sub_name, confidence, vote_name, float(iso[i]), reason))
+    stats["confidences"] = conf
+    stats["iso_cut"] = float(iso_cut) if np.isfinite(iso_cut) else None
+    return decisions, stats
+
+
+def write_plan(path: Path, decisions: list[Decision], output: Path) -> None:
+    import csv
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["source", "destination", "class", "subclass", "confidence", "vote", "isolation", "reason", "sidecars"])
+        for d in decisions:
+            dest = output / d.folder / d.dest_name
+            w.writerow([str(d.item.path), str(dest), d.cls, d.sub, f"{d.confidence:.4f}", d.vote,
+                        f"{d.isolation:.4f}", d.reason, ";".join(d.item.sidecars)])
+
+
+# ----------------------------------------------------------------------------
+# Contact sheets
+# ----------------------------------------------------------------------------
+
+SHEET_COLS = 8
+SHEET_TILE = 180
+SHEET_PER_GROUP = 48
+
+
+def write_sheet(path: Path, title: str, groups: list[tuple[str, list[Decision]]]) -> None:
+    """One JPEG: for each (label, decisions) group a header row and a grid of tiles."""
+    from PIL import Image, ImageDraw
+    t = SHEET_TILE
+    header = 22
+    total_rows = sum(math.ceil(len(ds) / SHEET_COLS) for _, ds in groups)
+    height = header + sum(header for _ in groups) + total_rows * t
+    sheet = Image.new("RGB", (SHEET_COLS * t, max(height, header)), "white")
+    draw = ImageDraw.Draw(sheet)
+    draw.text((4, 4), title, fill="black")
+    y = header
+    for label, ds in groups:
+        draw.text((4, y + 4), f"{label} ({len(ds)})", fill="red")
+        y += header
+        for j, d in enumerate(ds):
+            x = (j % SHEET_COLS) * t
+            yy = y + (j // SHEET_COLS) * t
+            try:
+                with Image.open(d.item.path) as im:
+                    im = im.convert("RGB")
+                    im.thumbnail((t - 4, t - 16))
+                    sheet.paste(im, (x + 2, yy + 2))
+            except Exception:  # noqa: BLE001
+                draw.rectangle((x + 2, yy + 2, x + t - 2, yy + t - 16), outline="red")
+            name = os.path.basename(d.item.rel)
+            label = f"{d.confidence:.2f} {name[:22]}"
+            if d.folder == UNSURE_DIRNAME and d.cls:
+                label = f"{d.confidence:.2f} {strip_prefix(d.cls)[:16]} {name[:12]}"
+            draw.text((x + 2, yy + t - 13), label, fill="black")
+        y += math.ceil(len(ds) / SHEET_COLS) * t
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sheet.save(path, quality=82)
+
+
+def write_sheets(decisions: list[Decision], ts: TrainingSet, sheets_dir: Path) -> None:
+    import random
+    rng = random.Random(0)
+    by_folder: dict[str, list[Decision]] = {}
+    for d in decisions:
+        by_folder.setdefault(d.folder, []).append(d)
+    for folder in ts.class_names:
+        ds = [d for d in by_folder.get(folder, []) if d.reason != REASON_EXAMPLE]
+        if not ds:
+            continue
+        sample = rng.sample(ds, min(SHEET_PER_GROUP, len(ds)))
+        lowest = sorted(ds, key=lambda d: d.confidence)[:SHEET_PER_GROUP]
+        write_sheet(sheets_dir / f"{folder}.jpg", folder, [("random", sample), ("lowest confidence", lowest)])
+    unsure = by_folder.get(UNSURE_DIRNAME, [])
+    for reason in (REASON_DISAGREE, REASON_CONFIDENCE, REASON_ISOLATED, REASON_UNDECODABLE):
+        ds = [d for d in unsure if d.reason == reason]
+        if not ds:
+            continue
+        sample = rng.sample(ds, min(SHEET_PER_GROUP, len(ds)))
+        groups = [("random", sample)]
+        if reason == REASON_DISAGREE:
+            groups.append(("highest confidence", sorted(ds, key=lambda d: -d.confidence)[:SHEET_PER_GROUP]))
+        write_sheet(sheets_dir / f"{UNSURE_DIRNAME}-{reason}.jpg", f"{UNSURE_DIRNAME}: {reason}", groups)
+
+
+# ----------------------------------------------------------------------------
+# Report
+# ----------------------------------------------------------------------------
+
+class Report:
+    def __init__(self):
+        self.lines: list[str] = []
+
+    def __call__(self, text: str = "") -> None:
+        print(text, flush=True)
+        self.lines.append(text)
+
+    def save(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(self.lines) + "\n", encoding="utf-8")
+
+
+def report_cv(rep: Report, ts: TrainingSet, cv: CVResult) -> None:
+    names = ts.class_names
+    w = max(len(n) for n in names)
+    rep(f"Cross-validation ({CV_FOLDS}-fold) on the examples, C={cv.C:g}: accuracy {cv.accuracy:.3f}")
+    rep(f"  {'class':<{w}}  {'n':>4}  {'precision':>9}  {'recall':>6}")
+    for i, n in enumerate(names):
+        flag = "   warning: recall below 0.5" if cv.recall[i] < RECALL_WARN else ""
+        rep(f"  {n:<{w}}  {cv.counts[i]:>4}  {cv.precision[i]:>9.2f}  {cv.recall[i]:>6.2f}{flag}")
+    rep("  Confusion matrix (rows: true class, columns: predicted, in the order above):")
+    cw = max(3, len(str(cv.confusion.max())))
+    for i, n in enumerate(names):
+        rep(f"  {n:<{w}}  " + " ".join(f"{v:>{cw}}" for v in cv.confusion[i]))
+
+
+def report_decisions(rep: Report, decisions: list[Decision], stats: dict, ts: TrainingSet,
+                     min_confidence: float, isolation_pct: float | None) -> None:
+    conf = stats.get("confidences")
+    if conf is not None and len(conf):
+        rep("Confidence histogram of the dataset (probe probability of the chosen class):")
+        hist, edges = np.histogram(conf, bins=10, range=(0.0, 1.0))
+        peak = max(hist.max(), 1)
+        for h, lo in zip(hist, edges[:-1]):
+            bar = "#" * int(round(40 * h / peak))
+            mark = " <- --min-confidence" if lo <= min_confidence < lo + 0.1 else ""
+            rep(f"  {lo:.1f}-{lo + 0.1:.1f}  {h:>6}  {bar}{mark}")
+    rep("Placement:")
+    folders = ts.class_names + [UNSURE_DIRNAME]
+    w = max(len(f) for f in folders)
+    counts = {f: 0 for f in folders}
+    reasons: dict[str, int] = {}
+    for d in decisions:
+        counts[d.folder] = counts.get(d.folder, 0) + 1
+        if d.reason:
+            reasons[d.reason] = reasons.get(d.reason, 0) + 1
+    for f in folders:
+        rep(f"  {f:<{w}}  {counts[f]:>6}")
+    rep(f"  {'total':<{w}}  {len(decisions):>6}")
+    rep("Reasons:")
+    for r in (REASON_EXAMPLE, REASON_UNDECODABLE, REASON_DISAGREE, REASON_CONFIDENCE, REASON_ISOLATED):
+        if r in reasons:
+            rep(f"  {r:<12} {reasons[r]:>6}")
+    n_ex = len(ts.items)
+    matched = len(stats.get("matched_hashes", ()))
+    rep(f"Examples found in the dataset: {matched} of {n_ex}" + ("" if matched == n_ex else f"  ({n_ex - matched} examples have no dataset copy and will not be in the output)"))
+    if isolation_pct is not None and stats.get("iso_cut") is not None:
+        rep(f"Isolation cut at {stats['iso_cut']:.4f} mean cosine distance to {ISOLATION_K} neighbours (top {isolation_pct:g}%)")
+
+
+# ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
 
@@ -502,8 +929,7 @@ def parse_args(argv=None):
     ap.add_argument("--move", action="store_true", help="move dataset images instead of copying them")
     ap.add_argument("--undo", action="store_true", help="undo the last run from <output>/_classify/moves.jsonl")
     ap.add_argument("--min-confidence", type=float, default=0.7, metavar="X", help="below this an image goes to _unsure (default 0.7)")
-    ap.add_argument("--isolation-pct", type=float, default=3.0, metavar="X", help="the X%% most isolated images go to _unsure (default 3)")
-    ap.add_argument("--no-isolation", action="store_true", help="disable the isolation gate")
+    ap.add_argument("--isolation-pct", type=float, default=0.0, metavar="X", help="the X%% most isolated images go to _unsure (default 0, off)")
     ap.add_argument("--sidecars", default=DEFAULT_SIDECARS, metavar="EXT,EXT", help="sidecar extensions (default .txt)")
     ap.add_argument("--sheets", action="store_true", help="write contact sheets per output folder")
     ap.add_argument("--patches", type=int, default=576, metavar="N", help="NaFlex patch budget per image (default 576)")
@@ -581,7 +1007,43 @@ def main(argv=None) -> int:
     print(f"Embedding done in {time.time() - t_all:.0f}s total")
     if args.embed_only:
         return 0
-    sys.exit("classification is not implemented yet (phase 2)")
+
+    rep = Report()
+    rep(f"classify run {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    rep(f"  samples: {samples}")
+    for d in datasets:
+        rep(f"  dataset: {d}")
+    rep(f"  output:  {output}")
+    rep(f"  min-confidence {args.min_confidence:g}, isolation {f'{args.isolation_pct:g}%' if args.isolation_pct > 0 else 'off'}, patches {args.patches}")
+    rep()
+    ts = build_training_set(classes, sample_res.vectors)
+    if sample_res.failed:
+        rep(f"  {len(sample_res.failed)} examples could not be decoded and are ignored")
+    t0 = time.time()
+    cv = cross_validate(ts)
+    report_cv(rep, ts, cv)
+    probe = Probe(cv.C).fit(ts.X, ts.y_sub, len(ts.sub_names))
+    rep(f"  trained in {time.time() - t0:.1f}s")
+    rep()
+    example_hashes = hash_examples(ts)
+    decisions, stats = decide(dataset_items, [r.vectors for r in results], [r.failed for r in results], ts, probe,
+                              example_hashes, args.min_confidence, args.isolation_pct if args.isolation_pct > 0 else None)
+    decisions.sort(key=lambda d: (str(d.item.root), d.item.rel))
+    assign_names(decisions)
+    report_decisions(rep, decisions, stats, ts, args.min_confidence, args.isolation_pct if args.isolation_pct > 0 else None)
+    run_dir = output / RUN_DIRNAME
+    write_plan(run_dir / "plan.csv", decisions, output)
+    rep.save(run_dir / "report.txt")
+    rep()
+    rep(f"Plan written to {run_dir / 'plan.csv'}, report to {run_dir / 'report.txt'}")
+    if args.sheets:
+        t0 = time.time()
+        write_sheets(decisions, ts, run_dir / "sheets")
+        rep(f"Sheets written to {run_dir / 'sheets'} in {time.time() - t0:.0f}s")
+    if args.dry_run:
+        rep("Dry run, nothing copied.")
+        return 0
+    sys.exit("placing the files is not implemented yet (phase 4); use --dry-run")
 
 
 if __name__ == "__main__":
