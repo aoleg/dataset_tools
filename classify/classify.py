@@ -509,6 +509,7 @@ KNN_K = 10
 VOTE_MIN_SHARE = 0.3   # fewer neighbours than this in the predicted class -> _unsure
 ISOLATION_K = 10
 CV_FOLDS = 5
+CV_MAX_PER_SUB = 100   # cross-validation runs on at most this many examples per sub-class
 RECALL_WARN = 0.5
 
 
@@ -609,11 +610,36 @@ class CVResult:
     precision: np.ndarray
     recall: np.ndarray
     counts: np.ndarray
+    n_used: int = 0                # examples the cross-validation ran on
+    n_all: int = 0
 
 
-def cross_validate(ts: TrainingSet) -> CVResult:
-    """Pick C by 5-fold accuracy and return the class-level confusion matrix at that C."""
+def cv_subsample(y_sub: np.ndarray, cap: int = CV_MAX_PER_SUB, seed: int = 0) -> np.ndarray:
+    """Indices of at most cap examples per sub-class, chosen at random with a fixed seed.
+
+    A fit costs seconds per thousand examples and the search runs 20 of them, so a
+    samples folder with thousands of images would otherwise take many minutes.
+    """
+    rng = np.random.default_rng(seed)
+    keep = []
+    for si in np.unique(y_sub):
+        idx = np.flatnonzero(y_sub == si)
+        if len(idx) > cap:
+            idx = rng.choice(idx, cap, replace=False)
+        keep.append(idx)
+    return np.sort(np.concatenate(keep))
+
+
+def cross_validate(ts_all: TrainingSet) -> CVResult:
+    """Pick C by 5-fold log-loss and return the class-level confusion matrix at that C.
+
+    Runs on at most CV_MAX_PER_SUB examples per sub-class; the caller fits the final
+    probe on every example.
+    """
     from sklearn.model_selection import StratifiedKFold
+    sel = cv_subsample(ts_all.y_sub)
+    ts = TrainingSet(ts_all.X[sel], ts_all.y_sub[sel], ts_all.sub_names, ts_all.sub_to_class, ts_all.class_names,
+                     ts_all.outliers_class, [ts_all.items[i] for i in sel])
     n_classes = len(ts.class_names)
     n_sub = len(ts.sub_names)
     # Folds must be stratified on the sub-class, but a sub-class with fewer members than
@@ -643,7 +669,7 @@ def cross_validate(ts: TrainingSet) -> CVResult:
     tp = np.diag(conf).astype(np.float64)
     precision = np.divide(tp, conf.sum(axis=0), out=np.zeros(n_classes), where=conf.sum(axis=0) > 0)
     recall = np.divide(tp, counts, out=np.zeros(n_classes), where=counts > 0)
-    return CVResult(C, acc, conf, precision, recall, counts)
+    return CVResult(C, acc, conf, precision, recall, counts, n_used=len(sel), n_all=len(ts_all.y_sub))
 
 
 def isolation_scores(X: np.ndarray, k: int = ISOLATION_K, block: int = 4096) -> np.ndarray:
@@ -977,7 +1003,8 @@ class Report:
 def report_cv(rep: Report, ts: TrainingSet, cv: CVResult) -> None:
     names = ts.class_names
     w = max(len(n) for n in names)
-    rep(f"Cross-validation ({CV_FOLDS}-fold) on the examples, C={cv.C:g}: accuracy {cv.accuracy:.3f}")
+    used = f" on {cv.n_used} of {cv.n_all} examples (at most {CV_MAX_PER_SUB} per sub-class)" if cv.n_used < cv.n_all else " on the examples"
+    rep(f"Cross-validation ({CV_FOLDS}-fold){used}, C={cv.C:g}: accuracy {cv.accuracy:.3f}")
     rep(f"  {'class':<{w}}  {'n':>4}  {'precision':>9}  {'recall':>6}")
     for i, n in enumerate(names):
         flag = "   warning: recall below 0.5" if cv.recall[i] < RECALL_WARN else ""
@@ -1207,10 +1234,15 @@ def check_folders(args) -> tuple[list[Path], Path, Path]:
     return datasets, samples, output
 
 
+BLAS_THREADS = 8   # OpenBLAS with every hyperthread (24 here) makes a probe fit 50 times slower than with 8
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
     if args.fetch_models:
         return fetch_models()
+    from threadpoolctl import threadpool_limits  # a scikit-learn dependency
+    threadpool_limits(limits=BLAS_THREADS)
     if args.undo:
         if args.output:
             return undo(Path(args.output).resolve())

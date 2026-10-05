@@ -155,6 +155,10 @@ The isolation gate marks images that have no look-alikes in the dataset. On a da
 
 **Speed.** The encoder is the limit. On an RTX 5090 it embeds about 180 images per second at the default patch budget, so 40,000 images take under four minutes when the files are in the disk cache and about seven when they are not. Training, prediction and the plan take seconds; copying takes the time of copying. `--patches 256` is about twice as fast at the cost of resolution.
 
+Training stays fast with large samples folders: the search for the regularisation strength runs on at most 100 examples per category or sub-category, and the final classifier is then trained on all of them. A samples folder of 9,500 images trains in about 15 seconds. The tool also limits the BLAS library to 8 threads, because with every hardware thread of a 24-thread CPU the same training took 50 times longer.
+
+**How many examples.** More hand-sorted examples help up to a few hundred per category, and examples that sit on the borders between categories help most. Copying a classified output back into the samples folder adds thousands of images but no information: they carry the classifier's own guesses, which is what `--retrain` already does with a cap. Copy the images you have checked, above all the ones from `_unsure` that you sorted by hand.
+
 `run.bat` pauses at the end when it is started by double-click, or when the script fails. Set `NOPAUSE=1` to prevent this.
 
 ## Tests
