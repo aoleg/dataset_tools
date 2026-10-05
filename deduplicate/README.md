@@ -43,6 +43,13 @@ You can also drop a folder onto `run.bat` in Explorer. There is no prompt: the t
 | `--promote-margin X` | 1.0 | the score margin a copy from an unsorted folder needs, in the same bucket, to replace a copy in a sorted folder; a larger bucket always qualifies |
 | `--exclude NAME` | none | also skip folders with this name; can be given more than once |
 | `--workers N` | CPU count - 1 | number of worker processes |
+| `--review` | off | after the run, open the review tool full screen to check the groups by eye and change the kept copy. See [Review full screen](#review-full-screen-and-change-the-kept-copy). Not after `--dry-run`, because nothing has moved. |
+
+Example of a run followed by the review:
+
+```
+run.bat D:\data\downloads --sorted D:\data\collection --review
+```
 
 Folders whose names start with `_` (for example `_duplicates`, or k2prep's `_prep`) are always skipped. So are folders named `masks` and `faces`, because the face mask tool writes near-identical images there.
 
@@ -64,7 +71,7 @@ This is the workflow for a curated collection that receives new downloads. The r
 
 3. **Read the plan.** `plan.json` in the first folder's `_duplicates` opens with a `summary` block. Below it, each group shows the kept copy, every destination, and for collections the `slots`, `promote` and `sync` entries. Groups with a `review` field are the ones the tool refuses to decide, usually because a border, a frame or a footer differs. Those files stay where they are for you to look at. Two things are worth a glance before a real run: the `promote` entries, because they replace files in your collection, and raw sources that carry printed catalogue footers, because a footer passes on a hash match.
 
-4. **Run.** The same command without `--dry-run`. There is no prompt. Nothing is deleted. Every moved file goes to the `_duplicates` folder of its own root, under its original relative path, and every action is logged in `moves.jsonl`.
+4. **Run.** The same command without `--dry-run`. There is no prompt. Nothing is deleted. Every moved file goes to the `_duplicates` folder of its own root, under its original relative path, and every action is logged in `moves.jsonl`. Add `--review` to open the groups full screen right after the run and correct the tool's choices by eye, or run `compare.bat` later for sheets and a text list; see [Check the result by eye](#check-the-result-by-eye).
 
 5. **Undo if needed.** The same folders, the same `--sorted` folders, plus `--undo`:
 
@@ -92,7 +99,45 @@ compare.bat D:\data\downloads --skip-exact
 
 You can also drop a folder onto `compare.bat` in Explorer.
 
-It reads `D:\data\downloads\_duplicates\plan.json` and writes `_duplicates\compare\pairs.txt`, one block per group with the kept file, every moved copy, where that copy is now, the match kind and the sizes, and one JPG sheet per group with the kept copy and the moved copies side by side, labelled. Groups that matched by features come first, because a border, a crop, a frame or a footer differed there and they are the ones to look at. `--skip-exact` leaves out groups whose moved copies are byte-identical to the kept one, and `--only features` keeps only the feature-match groups. Nothing is moved or changed. If a copy should not have moved, move it back from `_duplicates` by hand, or undo the whole run.
+It reads `D:\data\downloads\_duplicates\plan.json` (any folder of the run will do, the plan is the same in each) and writes `_duplicates\compare\pairs.txt`, one block per group with the kept file, every moved copy, where that copy is now, the match kind and the sizes, and one JPG sheet per group with the kept copy and the moved copies side by side, labelled. Groups that matched by features come first, because a border, a crop, a frame or a footer differed there and they are the ones to look at. Nothing is moved or changed.
+
+| option | default | meaning |
+|---|---|---|
+| `--skip-exact` | off | leave out groups whose moved copies are byte-identical to the kept one; there is nothing to see there |
+| `--only hash` or `--only features` | all | only groups with at least one moved copy of this match kind; `features` is the kind to check first |
+| `--height N` | 360 | tile height of the sheets in pixels |
+| `--out DIR` | `_duplicates\compare` | write the list and the sheets somewhere else |
+| `--review` | off | then open the review tool on the same groups |
+
+The sheets are for a quick look in Explorer. To judge quality, and to correct a choice, use the review tool below.
+
+### Review full screen and change the kept copy
+
+`review.bat` opens the groups of the last run full screen, one group per screen, drawn from the files themselves. It does not need the sheets. There are three ways to open it:
+
+```
+review.bat D:\data\downloads
+run.bat D:\data\downloads --sorted D:\data\collection --review
+compare.bat D:\data\downloads --skip-exact --review
+```
+
+The first opens the review of the last run in that folder at any time. The second runs the tool and opens the review right after it. The third builds the sheets and the list first, then opens the review.
+
+Each screen shows the kept copy with a green frame and every moved copy, labelled with name, size, bucket, score, match kind and folder. Click a copy to choose it as the kept one; the frame turns yellow. When you move on to another group, the chosen copy returns to its place and the old kept copy moves to `_duplicates`, with its caption, like any other copy. Press `B` after the click to keep both instead: the copy returns and the kept copy stays. Every move is appended to `moves.jsonl`, so `--undo` of the run still puts everything back, including your changes.
+
+| key | action |
+|---|---|
+| Right, Space | next group, applies your choice |
+| Left | previous group, applies your choice |
+| Home, End | first and last group |
+| click | choose a copy as the kept one; click the kept copy to clear the choice |
+| B | keep both: the chosen copy returns, the kept copy stays |
+| U | clear the choice on this group |
+| 1 to 9 | show one copy alone full screen; the same key or Esc returns |
+| H | hide and show the help at the top |
+| Esc | exit; the choice on the current group is discarded |
+
+The help is shown at the top until you hide it. Your position and your decisions are saved in `_duplicates\compare\review.json` of the first folder of the run, and the next launch resumes at the group you left. A group with a promotion or a slot sync (sorted folders) is shown but locked: undo the run to change it. A file that is no longer where the plan says is shown as a grey tile and cannot be chosen.
 
 ## Where the files go
 

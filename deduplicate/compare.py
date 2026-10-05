@@ -11,7 +11,7 @@ run) and writes to <folder>/_duplicates/compare/:
                       side by side, labelled
 
 Usage:    python compare.py <folder> [--skip-exact] [--only hash|features]
-                            [--height N] [--out DIR]
+                            [--height N] [--out DIR] [--review]
   --skip-exact   leave out groups whose moved copies are all byte-identical to
                  the kept copy; there is nothing to look at there
   --only KIND    only groups with at least one moved copy of this match kind;
@@ -58,6 +58,7 @@ def main(argv=None) -> int:
     ap.add_argument("--only", choices=["hash", "features"])
     ap.add_argument("--height", type=int, default=360)
     ap.add_argument("--out")
+    ap.add_argument("--review", action="store_true", help="then open the review tool (review.py) on the groups")
     args = ap.parse_args(argv)
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -120,6 +121,9 @@ def main(argv=None) -> int:
         sheet.save(out / f"{n:04d}_{stem}.jpg", quality=85)
     (out / "pairs.txt").write_text("\n".join(lines), encoding="utf-8")
     print(f"{len(groups)} group(s): {out / 'pairs.txt'} and {len(groups)} sheet(s) in {out}")
+    if args.review:
+        import subprocess
+        return subprocess.call([sys.executable, str(Path(__file__).with_name("review.py")), str(folder)])
     return 0
 
 

@@ -1195,6 +1195,9 @@ def main(argv=None) -> int:
                          "borders, frames, mock-ups and watermarks. strict: resized and recompressed "
                          "copies, hashes only. exact: identical files only")
     ap.add_argument("--dry-run", action="store_true", help="write hashes.json and plan.json, move nothing")
+    ap.add_argument("--review", action="store_true",
+                    help="after the run, open the review tool (review.py) on the groups: check them by eye "
+                         "and change the kept copy; not after --dry-run, because nothing has moved")
     ap.add_argument("--undo", action="store_true", help="move the files of the last run back")
     ap.add_argument("--exclude", action="append", default=[], metavar="NAME",
                     help=f"skip folders with this name (repeatable); always skipped: names starting "
@@ -1432,6 +1435,8 @@ def main(argv=None) -> int:
 
     if args.dry_run:
         print(f"Dry run: nothing moved. Plan: {roots[0] / OUT_DIRNAME / PLAN_NAME}")
+        if args.review:
+            print("--review needs a real run; nothing has moved yet")
         return 0
     if not acted:
         print(f"Nothing to move. Done in {time.time() - t0:.0f}s.")
@@ -1565,6 +1570,9 @@ def main(argv=None) -> int:
               + (f"; {n_in} image(s) promoted into it" if n_in else "")
               + (f"; {n_sync} slot(s) synced" if n_sync else ""))
     print(f"Done in {time.time() - t0:.0f}s. Undo with --undo.")
+    if args.review:
+        import subprocess
+        return subprocess.call([sys.executable, str(Path(__file__).with_name("review.py")), str(roots[0])])
     return 0
 
 
