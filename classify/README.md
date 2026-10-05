@@ -109,6 +109,10 @@ sorted\
   2_postcards_art\
   ...
   _unsure\
+    1_posters\
+    2_postcards_art\
+    ...
+    undecodable\
   _classify\
     plan.csv
     report.txt
@@ -116,7 +120,7 @@ sorted\
     sheets\
 ```
 
-The category folders are flat. An image keeps its name with its path inside the dataset folder in front, separators replaced by two underscores: `album17\000304.jpg` becomes `album17__000304.jpg`. Datasets with many subfolders usually repeat the same names in each, and this keeps every image traceable to its source. A caption is renamed together with its image. A name that still collides, which happens only with two dataset folders, gets `-2`, `-3` and so on before the extension.
+The category folders are flat. `_unsure` has one subfolder per predicted category, so you can sort the held-back images a category at a time, with the classifier's guess in front of you; images that could not be decoded go to `undecodable`. Copy the ones that belong somewhere into your samples folder, by your own judgement, not by the subfolder they are in. An image keeps its name with its path inside the dataset folder in front, separators replaced by two underscores: `album17\000304.jpg` becomes `album17__000304.jpg`. Datasets with many subfolders usually repeat the same names in each, and this keeps every image traceable to its source. A caption is renamed together with its image. A name that still collides, which happens only with two dataset folders, gets `-2`, `-3` and so on before the extension.
 
 Point a trainer at the category folders, not at the output folder: `_classify\sheets\` holds JPEG files that are not training images.
 

@@ -711,6 +711,13 @@ class Decision:
     share: float = 0.0     # share of the nearest examples in the predicted class
     pass_no: int = 1       # 1: first pass; 2: re-scored by the retrained probe (--retrain)
 
+    @property
+    def dest_dir(self) -> str:
+        """Output folder relative to the output root: the class folder, or _unsure/<predicted class>."""
+        if self.folder != UNSURE_DIRNAME:
+            return self.folder
+        return f"{UNSURE_DIRNAME}/{self.cls or 'undecodable'}"
+
 
 def destination_stem(it: ImageItem) -> str:
     """Relative path with separators as '__', without the extension."""
@@ -723,7 +730,7 @@ def assign_names(decisions: list[Decision]) -> None:
     for d in decisions:
         stem = destination_stem(d.item)
         ext = os.path.splitext(d.item.rel)[1]
-        key = (d.folder, stem.lower())
+        key = (d.dest_dir, stem.lower())
         n = taken.get(key, 0) + 1
         taken[key] = n
         d.dest_name = f"{stem}{ext}" if n == 1 else f"{stem}-{n}{ext}"
@@ -803,7 +810,7 @@ def write_plan(path: Path, decisions: list[Decision], output: Path) -> None:
         w.writerow(["source", "destination", "class", "subclass", "confidence", "share", "vote", "isolation",
                     "reason", "pass", "sidecars"])
         for d in decisions:
-            dest = output / d.folder / d.dest_name
+            dest = output / d.dest_dir / d.dest_name
             w.writerow([str(d.item.path), str(dest), d.cls, d.sub, f"{d.confidence:.4f}", f"{d.share:.2f}", d.vote,
                         f"{d.isolation:.4f}", d.reason, d.pass_no, ";".join(d.item.sidecars)])
 
@@ -1072,7 +1079,8 @@ def execute(decisions: list[Decision], output: Path, folders: list[str], move: b
 
         for d in decisions:
             src = d.item.path
-            dst = output / d.folder / d.dest_name
+            dst = output / d.dest_dir / d.dest_name
+            dst.parent.mkdir(parents=True, exist_ok=True)
             if not place(src, dst, move, False):
                 res.vanished += 1
                 report(f"  gone before placement, skipped: {src}")
@@ -1082,7 +1090,7 @@ def execute(decisions: list[Decision], output: Path, folders: list[str], move: b
                 sp = d.item.root / sc
                 refs[sp] -= 1
                 as_move = move and refs[sp] == 0
-                if place(sp, output / d.folder / sidecar_dest_name(d.dest_name, sc), as_move, True):
+                if place(sp, output / d.dest_dir / sidecar_dest_name(d.dest_name, sc), as_move, True):
                     res.sidecars += 1
     return res
 
@@ -1117,8 +1125,9 @@ def undo(output: Path, report=print) -> int:
         undone += 1
     log_path.rename(log_path.with_name(f"moves-undone-{datetime_stamp()}.jsonl"))
     removed = 0
-    for p in sorted(output.iterdir()):
-        if p.is_dir() and p.name != RUN_DIRNAME and not any(p.iterdir()):
+    for p in sorted((q for q in output.rglob("*") if q.is_dir() and RUN_DIRNAME not in q.relative_to(output).parts),
+                    key=lambda q: -len(q.parts)):  # deepest first, so _unsure goes after its subfolders
+        if not any(p.iterdir()):
             p.rmdir()
             removed += 1
     report(f"Undo: {undone} files put back or deleted, {missing} already gone, {refused} left in place, "
