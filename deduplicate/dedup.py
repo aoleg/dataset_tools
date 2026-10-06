@@ -36,6 +36,7 @@ import math
 import os
 import shutil
 import sys
+import tempfile
 import time
 from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
@@ -572,37 +573,102 @@ def find_candidates(items, max_p, max_d, per_image):
 
 # --- feature check, run in worker processes --------------------------------
 
-_FEATURES = {}           # per-process cache: path -> (points, descriptors, gray)
-_FEATURES_MAX = 160
+# ---------------------------------------------------------------------------
+# Feature check. Features are extracted once per image, in a parallel pass, and
+# shared with the pair workers through memory-mapped files in a temporary
+# folder. The centre check needs the grey thumbnails, so it runs only for pairs
+# that can still become a match: hash rule met, or enough inliers and cover.
+# Each worker pins OpenCV to one thread; the pool provides the parallelism.
+# ---------------------------------------------------------------------------
 
-
-def image_features(path):
-    import cv2
-    hit = _FEATURES.pop(path, None)
-    if hit is not None:
-        _FEATURES[path] = hit                        # most recently used last
-        return hit
+def gray_thumb(path):
+    """The grey thumbnail (longest side FEATURE_SIDE) that features are computed on."""
     with Image.open(path) as im:
         im.draft("L", (FEATURE_SIDE * 2, FEATURE_SIDE * 2))
         img = to_rgb(ImageOps.exif_transpose(im)).convert("L")
     img.thumbnail((FEATURE_SIDE, FEATURE_SIDE), Image.LANCZOS)
-    gray = np.asarray(img)
+    return np.asarray(img)
+
+
+def extract_task(path):
+    """-> (points float32 [k, 2], descriptors uint8 [k, 32], (h, w)), or None when unreadable."""
+    import cv2
+    cv2.setNumThreads(1)
+    try:
+        gray = gray_thumb(path)
+    except Exception:  # noqa: BLE001
+        return None
     orb = cv2.ORB_create(nfeatures=ORB_FEATURES, scaleFactor=1.2, nlevels=8, fastThreshold=10)
     kp, des = orb.detectAndCompute(gray, None)
-    pts = np.array([k.pt for k in kp], dtype=np.float32) if kp else np.zeros((0, 2), np.float32)
-    feat = (pts, des, gray)
-    _FEATURES[path] = feat
-    while len(_FEATURES) > _FEATURES_MAX:
-        _FEATURES.pop(next(iter(_FEATURES)))
-    return feat
+    if des is None or len(kp) < 10:
+        return np.zeros((0, 2), np.float32), np.zeros((0, 32), np.uint8), gray.shape
+    return np.array([k.pt for k in kp], dtype=np.float32), des, gray.shape
 
 
-def compare_features(fa, fb):
-    """-> [inliers, cover, ncc]; ncc is None when no homography could be fitted."""
+class FeatureStore:
+    """Keypoints and descriptors of the images in the feature check, written by
+    the parent into files that every pair worker maps read-only."""
+
+    def __init__(self, folder: Path, n: int):
+        self.folder = folder
+        self.pts = np.lib.format.open_memmap(folder / "pts.npy", mode="w+", dtype=np.float32,
+                                             shape=(n, ORB_FEATURES, 2))
+        self.des = np.lib.format.open_memmap(folder / "des.npy", mode="w+", dtype=np.uint8,
+                                             shape=(n, ORB_FEATURES, 32))
+        self.meta = np.full((n, 3), -1, np.int32)        # count (-1: unreadable), height, width
+
+    def put(self, k: int, feat) -> None:
+        pts, des, (h, w) = feat
+        c = min(len(pts), ORB_FEATURES)
+        self.pts[k, :c] = pts[:c]
+        self.des[k, :c] = des[:c]
+        self.meta[k] = (c, h, w)
+
+    def finish(self, paths) -> None:
+        self.pts.flush()
+        self.des.flush()
+        del self.pts, self.des
+        np.save(self.folder / "meta.npy", self.meta)
+        (self.folder / "paths.json").write_text(json.dumps(paths, ensure_ascii=False), encoding="utf-8")
+
+
+_STORE = None            # per worker: (pts, des, meta, paths), mapped read-only
+_GRAYS = {}              # per worker: store index -> grey thumbnail, most recently used last
+_GRAYS_MAX = 64
+
+
+def _open_store(folder):
+    global _STORE
     import cv2
-    (pa, da, ga), (pb, db, gb) = fa, fb
-    if da is None or db is None or len(pa) < 10 or len(pb) < 10:
+    cv2.setNumThreads(1)
+    folder = Path(folder)
+    _STORE = (np.load(folder / "pts.npy", mmap_mode="r"), np.load(folder / "des.npy", mmap_mode="r"),
+              np.load(folder / "meta.npy"), json.loads((folder / "paths.json").read_text(encoding="utf-8")))
+
+
+def gray_of(k: int):
+    hit = _GRAYS.pop(k, None)
+    if hit is None:
+        hit = gray_thumb(_STORE[3][k])
+    _GRAYS[k] = hit
+    while len(_GRAYS) > _GRAYS_MAX:
+        _GRAYS.pop(next(iter(_GRAYS)))
+    return hit
+
+
+def compare_indexed(a: int, b: int, need_ncc: bool):
+    """-> [inliers, cover, ncc] for two store indices, or None when an image was
+    unreadable (no verdict). ncc is None when no homography could be fitted, or
+    when the pair cannot become a match anyway and the centre check was skipped."""
+    import cv2
+    pts, des, meta, _ = _STORE
+    (ca, ha, wa), (cb, hb, wb) = meta[a], meta[b]
+    if ca < 0 or cb < 0:
+        return None
+    if ca < 10 or cb < 10:
         return [0, 0.0, None]
+    pa, da = np.asarray(pts[a, :ca]), np.ascontiguousarray(des[a, :ca])
+    pb, db = np.asarray(pts[b, :cb]), np.ascontiguousarray(des[b, :cb])
     good = [m[0] for m in cv2.BFMatcher(cv2.NORM_HAMMING).knnMatch(da, db, k=2)
             if len(m) == 2 and m[0].distance < 0.75 * m[1].distance]
     if len(good) < 8:
@@ -615,14 +681,17 @@ def compare_features(fa, fb):
     inl = mask.ravel().astype(bool)
     n = int(inl.sum())
 
-    def cover(pts, gray):
-        if len(pts) < 2:
+    def cover(p, h, w):
+        if len(p) < 2:
             return 0.0
-        (x0, y0), (x1, y1) = pts.min(0), pts.max(0)
-        return float((x1 - x0) * (y1 - y0) / (gray.shape[0] * gray.shape[1]))
-    cov = min(cover(src[inl], ga), cover(dst[inl], gb))
+        (x0, y0), (x1, y1) = p.min(0), p.max(0)
+        return float((x1 - x0) * (y1 - y0) / (h * w))
+    cov = min(cover(src[inl], ha, wa), cover(dst[inl], hb, wb))
+    if not need_ncc and not (n >= MIN_INLIERS and cov >= MIN_COVER):
+        return [n, round(cov, 3), None]           # cannot become a match: no centre check needed
 
     # Warp A onto B and correlate the central half of B where A lands.
+    ga, gb = gray_of(a), gray_of(b)
     h, w = gb.shape
     warped = cv2.warpPerspective(ga, H, (w, h))
     valid = cv2.warpPerspective(np.full_like(ga, 255), H, (w, h)) > 0
@@ -640,17 +709,13 @@ def compare_features(fa, fb):
 
 
 def verify_task(task):
-    """(anchor path, [(other path, key), ...]) -> [(key, [inliers, cover, ncc]), ...]"""
+    """(anchor index, [(other index, key, need_ncc), ...]) -> [(key, [inliers, cover, ncc] or None), ...]"""
     anchor, others = task
     out = []
-    try:
-        fa = image_features(anchor)
-    except Exception:  # noqa: BLE001 - unreadable here: no verdict, the hash rule decides
-        return [(key, None) for _, key in others]
-    for path, key in others:
+    for k, key, need in others:
         try:
-            out.append((key, compare_features(fa, image_features(path))))
-        except Exception:  # noqa: BLE001
+            out.append((key, compare_indexed(anchor, k, need)))
+        except Exception:  # noqa: BLE001 - no verdict: the hash rule decides
             out.append((key, None))
     return out
 
@@ -660,27 +725,44 @@ def pair_key(a, b):
     return f"{x}|{y}"
 
 
-def verify_pairs(items, pairs, cache, workers):
-    """Feature check for (i, j) pairs; results cached by content in `cache`."""
+def verify_pairs(items, cands, rules, cache, workers):
+    """Feature check for candidate pairs (i, j, phash distance, dhash distance);
+    results are cached by content in `cache`."""
     todo = {}
-    for i, j in pairs:
+    for i, j, p, d in cands:
         key = pair_key(items[i], items[j])
         if key not in cache:
-            todo.setdefault(i, []).append((str(items[j].path), key))
+            todo.setdefault(i, []).append((j, key, hash_rule_ok(p, d, rules)))
     n_pairs = sum(len(v) for v in todo.values())
-    print(f"feature check: {n_pairs} pair(s), {len(pairs) - n_pairs} from cache")
+    print(f"feature check: {n_pairs} pair(s), {len(cands) - n_pairs} from cache")
     if not n_pairs:
         return
-    tasks = [(str(items[i].path), others) for i, others in sorted(todo.items())]
-    prog, done = Progress("checked", n_pairs), 0
-    with ProcessPoolExecutor(max_workers=workers) as ex:
-        for res in ex.map(verify_task, tasks, chunksize=1):
-            for key, v in res:
-                if v is not None:
-                    cache[key] = v
-            done += len(res)
-            prog.update(done)
-    prog.finish()
+    involved = sorted({i for i in todo} | {j for v in todo.values() for j, _, _ in v})
+    index = {i: k for k, i in enumerate(involved)}
+    tmp = Path(tempfile.mkdtemp(prefix="dedup-features-"))
+    try:
+        store = FeatureStore(tmp, len(involved))
+        feats = run_pool(extract_task, [items[i] for i in involved], workers, "features")
+        for k, f in enumerate(feats):
+            if f is not None:
+                store.put(k, f)
+        store.finish([str(items[i].path) for i in involved])
+        del feats
+        tasks = [(index[i], [(index[j], key, need) for j, key, need in others]) for i, others in sorted(todo.items())]
+        prog, done = Progress("checked", n_pairs), 0
+        with ProcessPoolExecutor(max_workers=workers, initializer=_open_store, initargs=(str(tmp),)) as ex:
+            for res in ex.map(verify_task, tasks, chunksize=1):
+                for key, v in res:
+                    if v is not None:
+                        cache[key] = v
+                done += len(res)
+                prog.update(done)
+        prog.finish()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        if tmp.exists():                             # a worker may still hold a map for a moment
+            time.sleep(1)
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 def find_edges(items, mode, cache, workers):
@@ -705,7 +787,7 @@ def find_edges(items, mode, cache, workers):
     cands = [c for c in cands if (c[0], c[1]) not in edges]
     print(f"{len(cands)} candidate pair(s) from the hashes")
     if features:
-        verify_pairs(items, [(i, j) for i, j, _, _ in cands], cache, workers)
+        verify_pairs(items, cands, rules, cache, workers)
     vetoed = {"no shared geometry": 0, "centres disagree": 0}
     for i, j, p, d in cands:
         v = cache.get(pair_key(items[i], items[j])) if features else None

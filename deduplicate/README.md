@@ -204,7 +204,7 @@ A caption does not make a copy win: quality decides. The caption is copied inste
 
 ## Speed
 
-On 690 images: hashing 3 seconds, feature check of 1,500 candidate pairs 15 seconds, scoring 2 seconds, with 7 worker processes. The feature check is the slow part, and it grows with the number of images, not with the number of pairs, because each image has at most 30 candidates. A second run reads the hashes, the feature checks and the scores from the JSON files and only processes new or changed images.
+On 11,561 photos with 67,108 candidate pairs, 23 worker processes: hashing 15 seconds, feature extraction 23 seconds, pair check 161 seconds, scoring 1 second. The pair check is the slow part. Features are extracted once per image and shared with the workers through memory-mapped files, and the centre check runs only for pairs that can still become a match; before that change the same pair check took 379 seconds. What remains is descriptor matching, about 16 ms per pair on one core, so the time grows with the number of candidate pairs, at most 30 per image. A second run reads the hashes, the feature checks and the scores from the JSON files and only processes new or changed images.
 
 ## Limits
 
