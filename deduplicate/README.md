@@ -52,7 +52,7 @@ Example of a run followed by the review:
 run.bat D:\data\downloads --sorted D:\data\collection --review
 ```
 
-Folders whose names start with `_` (for example `_duplicates`, or k2prep's `_prep`) are always skipped. So are folders named `masks` and `faces`, because the face mask tool writes near-identical images there.
+The output folders of the dataset tools are never scanned, at any depth: `_duplicates` (this tool), `_prep` (k2prep), `_classify` and `_embeddings` (classify), and `masks` and `faces` (face_masks, which writes near-identical images there). Every other folder is scanned whatever its name, so a collection folder called `_1_posters` is fine as a root or below one. `--exclude` adds names to the list.
 
 `run.bat` pauses at the end when it is started by double-click or drag-and-drop, or when the script fails. Set `NOPAUSE=1` to prevent this.
 
@@ -87,7 +87,7 @@ For larger datasets:
 - The feature check is the slow step and grows with the number of images. About 2,000 images take around a minute cold. A second run reuses the three cache files in `_duplicates` and finishes in seconds, so run the dry run and the real run back to back.
 - The same picture in several collection folders keeps every folder's copy and gives each the best one. If you want a single copy instead, add `--sorted-copies one`.
 - The promotion margin defaults to 1.0 score points in the same bucket. Raise it with `--promote-margin` if too many near-equal copies move in, or lower it if you want every improvement.
-- Folders whose names start with `_` are never scanned, so `_duplicates` is safe to leave in place between runs.
+- `_duplicates` folders are never scanned, so they are safe to leave in place between runs.
 - Delete the `_duplicates` folders only when you no longer want to undo.
 
 ## Check the result by eye

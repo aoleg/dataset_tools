@@ -56,7 +56,11 @@ MOVES_NAME = "moves.jsonl"
 CACHE_VERSION = 1
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".gif", ".avif"}
-DEFAULT_EXCLUDES = ["masks", "faces"]   # face_masks output: near-identical by design
+# Folders never scanned, at any depth: the output folders of the dataset tools.
+# _duplicates is this tool's own, _prep is k2prep's, _classify and _embeddings
+# are classify's, masks and faces are face_masks' (near-identical images by
+# design). Any other folder is scanned, whatever its name; --exclude adds names.
+DEFAULT_EXCLUDES = ["_duplicates", "_prep", "_classify", "_embeddings", "masks", "faces"]
 
 # --- matching, calibrated on 690 real poster and photo downloads -------------
 # pHash and dHash are 64-bit; distances are Hamming distances. pHash distances
@@ -386,15 +390,14 @@ class Item:
 
 
 def scan(roots, excludes, roles=None):
-    """All images under the roots; folders starting with "_" and excluded names are skipped.
+    """All images under the roots, at any depth; folders with an excluded name are skipped.
     roles: one entry per root, 0 unsorted or 1 sorted; all unsorted when None."""
     items = []
     excl = {e.casefold() for e in excludes}
     for ri, root in enumerate(roots):
         role = roles[ri] if roles else 0
         for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = sorted(d for d in dirnames
-                                 if not d.startswith("_") and d.casefold() not in excl)
+            dirnames[:] = sorted(d for d in dirnames if d.casefold() not in excl)
             stems = {}
             for fn in filenames:
                 stem, ext = os.path.splitext(fn)
@@ -1356,8 +1359,8 @@ def main(argv=None) -> int:
                          "and change the kept copy; not after --dry-run, because nothing has moved")
     ap.add_argument("--undo", action="store_true", help="move the files of the last run back")
     ap.add_argument("--exclude", action="append", default=[], metavar="NAME",
-                    help=f"skip folders with this name (repeatable); always skipped: names starting "
-                         f"with _ and {', '.join(DEFAULT_EXCLUDES)}")
+                    help=f"skip folders with this name, at any depth (repeatable); always skipped: "
+                         f"{', '.join(DEFAULT_EXCLUDES)}")
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1),
                     help="worker processes (default: CPU count - 1)")
     ap.add_argument("--gpu", action="store_true",
