@@ -43,6 +43,7 @@ You can also drop a folder onto `run.bat` in Explorer. There is no prompt: the t
 | `--promote-margin X` | 1.0 | the score margin a copy from an unsorted folder needs, in the same bucket, to replace a copy in a sorted folder; a larger bucket always qualifies |
 | `--exclude NAME` | none | also skip folders with this name; can be given more than once |
 | `--workers N` | CPU count - 1 | number of worker processes |
+| `--gpu` | off | match the feature descriptors on the GPU with torch. torch is not part of this tool's requirements; it is in the shared `venv` once one of the GPU tools has been installed. Without torch or without a CUDA device the CPU is used, with a note. The results are the same either way. |
 | `--review` | off | after the run, open the review tool full screen to check the groups by eye and change the kept copy. See [Review full screen](#review-full-screen-and-change-the-kept-copy). Not after `--dry-run`, because nothing has moved. |
 
 Example of a run followed by the review:
@@ -204,7 +205,7 @@ A caption does not make a copy win: quality decides. The caption is copied inste
 
 ## Speed
 
-On 11,561 photos with 67,108 candidate pairs, 23 worker processes: hashing 15 seconds, feature extraction 23 seconds, pair check 161 seconds, scoring 1 second. The pair check is the slow part. Features are extracted once per image and shared with the workers through memory-mapped files, and the centre check runs only for pairs that can still become a match; before that change the same pair check took 379 seconds. What remains is descriptor matching, about 16 ms per pair on one core, so the time grows with the number of candidate pairs, at most 30 per image. A second run reads the hashes, the feature checks and the scores from the JSON files and only processes new or changed images.
+On 11,561 photos with 67,108 candidate pairs, 23 worker processes: hashing 15 seconds, feature extraction 23 seconds, pair check 161 seconds on the CPU, scoring 1 second. With `--gpu` the pair check takes 12 seconds: 5 seconds of descriptor matching on the GPU and 7 seconds of RANSAC and centre checks in the workers, with results identical to the CPU path on every pair. Without a GPU the pair check is the slow part: descriptor matching costs about 16 ms per pair on one core, so the time grows with the number of candidate pairs, at most 30 per image. Features are extracted once per image and shared with the workers through memory-mapped files, and the centre check runs only for pairs that can still become a match. A second run reads the hashes, the feature checks and the scores from the JSON files and only processes new or changed images.
 
 ## Limits
 

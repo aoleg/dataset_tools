@@ -26,7 +26,7 @@ Copies that match by features only are listed for review and left alone.
 
 Usage:    python dedup.py <folder> [<folder> ...] [--sorted FOLDER] [--sorted-copies keep|one]
           [--promote-margin X] [--match loose|strict|exact] [--dry-run] [--undo]
-          [--exclude NAME] [--workers N]
+          [--exclude NAME] [--workers N] [--gpu] [--review]
 Install:  pip install Pillow numpy imagehash opencv-python-headless
 """
 import argparse
@@ -656,10 +656,12 @@ def gray_of(k: int):
     return hit
 
 
-def compare_indexed(a: int, b: int, need_ncc: bool):
+def compare_indexed(a: int, b: int, need_ncc: bool, matches=None):
     """-> [inliers, cover, ncc] for two store indices, or None when an image was
     unreadable (no verdict). ncc is None when no homography could be fitted, or
-    when the pair cannot become a match anyway and the centre check was skipped."""
+    when the pair cannot become a match anyway and the centre check was skipped.
+    matches: (query indices, train indices) already matched on the GPU, else
+    the descriptors are matched here."""
     import cv2
     pts, des, meta, _ = _STORE
     (ca, ha, wa), (cb, hb, wb) = meta[a], meta[b]
@@ -667,14 +669,19 @@ def compare_indexed(a: int, b: int, need_ncc: bool):
         return None
     if ca < 10 or cb < 10:
         return [0, 0.0, None]
-    pa, da = np.asarray(pts[a, :ca]), np.ascontiguousarray(des[a, :ca])
-    pb, db = np.asarray(pts[b, :cb]), np.ascontiguousarray(des[b, :cb])
-    good = [m[0] for m in cv2.BFMatcher(cv2.NORM_HAMMING).knnMatch(da, db, k=2)
-            if len(m) == 2 and m[0].distance < 0.75 * m[1].distance]
-    if len(good) < 8:
-        return [0, 0.0, None]
-    src = pa[[m.queryIdx for m in good]]
-    dst = pb[[m.trainIdx for m in good]]
+    pa, pb = np.asarray(pts[a, :ca]), np.asarray(pts[b, :cb])
+    if matches is None:
+        da, db = np.ascontiguousarray(des[a, :ca]), np.ascontiguousarray(des[b, :cb])
+        good = [m[0] for m in cv2.BFMatcher(cv2.NORM_HAMMING).knnMatch(da, db, k=2)
+                if len(m) == 2 and m[0].distance < 0.75 * m[1].distance]
+        if len(good) < 8:
+            return [0, 0.0, None]
+        q, t = [m.queryIdx for m in good], [m.trainIdx for m in good]
+    else:
+        q, t = matches
+        if len(q) < 8:
+            return [0, 0.0, None]
+    src, dst = pa[q], pb[t]
     H, mask = cv2.findHomography(src, dst, cv2.RANSAC, 6.0)
     if H is None:
         return [0, 0.0, None]
@@ -709,14 +716,65 @@ def compare_indexed(a: int, b: int, need_ncc: bool):
 
 
 def verify_task(task):
-    """(anchor index, [(other index, key, need_ncc), ...]) -> [(key, [inliers, cover, ncc] or None), ...]"""
+    """(anchor index, [(other index, key, need_ncc[, matches]), ...])
+    -> [(key, [inliers, cover, ncc] or None), ...]"""
     anchor, others = task
     out = []
-    for k, key, need in others:
+    for k, key, need, *rest in others:
         try:
-            out.append((key, compare_indexed(anchor, k, need)))
+            if rest and rest[0] is None:                 # matched on the GPU: fewer than 8 matches
+                out.append((key, [0, 0.0, None] if _STORE[2][anchor][0] >= 0 and _STORE[2][k][0] >= 0 else None))
+            else:
+                out.append((key, compare_indexed(anchor, k, need, rest[0] if rest else None)))
         except Exception:  # noqa: BLE001 - no verdict: the hash rule decides
             out.append((key, None))
+    return out
+
+
+def gpu_match(folder: Path, pairs, batch: int = 256):
+    """k=2 Hamming matching with the ratio test for every (a, b) store pair, on
+    the GPU with torch. Returns one (query indices, train indices) pair of int32
+    arrays per input pair, in order, or None when fewer than 8 matches remain.
+    The distances are exact: the descriptor bits become 0/1 values in fp16 and
+    every partial sum is a small integer. Needs about 50 KB of GPU memory per
+    image for the descriptors, plus the batch."""
+    import torch
+    des = np.load(folder / "des.npy")                # the whole array: [n, ORB_FEATURES, 32] uint8
+    meta = np.load(folder / "meta.npy")
+    dev = torch.device("cuda")
+    D = torch.from_numpy(des).to(dev)
+    counts = torch.from_numpy(np.maximum(meta[:, 0], 0)).to(dev)
+    shifts = torch.arange(8, device=dev, dtype=torch.uint8)
+    col = torch.arange(ORB_FEATURES, device=dev)
+
+    def bits(idx):
+        x = D[idx]                                                      # [B, F, 32]
+        return ((x.unsqueeze(-1) >> shifts) & 1).reshape(x.shape[0], ORB_FEATURES, 256).half()
+
+    out = []
+    prog = Progress("matched", len(pairs))
+    for s in range(0, len(pairs), batch):
+        chunk = pairs[s:s + batch]
+        ia = torch.tensor([a for a, _ in chunk], device=dev)
+        ib = torch.tensor([b for _, b in chunk], device=dev)
+        A, B = bits(ia), bits(ib)
+        # Hamming(a, b) = |a| + |b| - 2 a.b
+        dist = A.sum(-1, keepdim=True) + B.sum(-1)[:, None, :] - 2 * torch.bmm(A, B.transpose(1, 2))
+        ca, cb = counts[ia], counts[ib]
+        dist.masked_fill_(col[None, None, :] >= cb[:, None, None], 1000.0)   # padded train rows
+        d, idx = dist.topk(2, dim=2, largest=False)
+        ok = (d[..., 0] < 0.75 * d[..., 1]) & (col[None, :] < ca[:, None]) & (cb[:, None] >= 2)
+        nz = ok.nonzero()                                               # [M, 2]: (pair, query)
+        tr = idx[nz[:, 0], nz[:, 1], 0]
+        nz, tr = nz.cpu().numpy(), tr.cpu().numpy()
+        for k in range(len(chunk)):
+            sel = nz[:, 0] == k
+            q = nz[sel, 1].astype(np.int32)
+            out.append((q, tr[sel].astype(np.int32)) if len(q) >= 8 else None)
+        prog.update(min(s + batch, len(pairs)))
+    prog.finish()
+    del D, A, B, dist
+    torch.cuda.empty_cache()
     return out
 
 
@@ -725,9 +783,18 @@ def pair_key(a, b):
     return f"{x}|{y}"
 
 
-def verify_pairs(items, cands, rules, cache, workers):
+def verify_pairs(items, cands, rules, cache, workers, gpu=False):
     """Feature check for candidate pairs (i, j, phash distance, dhash distance);
-    results are cached by content in `cache`."""
+    results are cached by content in `cache`. With gpu, the descriptors are
+    matched on the GPU and the workers do the rest."""
+    if gpu:
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                raise RuntimeError("no CUDA device")
+        except Exception as e:  # noqa: BLE001
+            print(f"--gpu: torch with CUDA is not available in this venv ({e}); matching on the CPU")
+            gpu = False
     todo = {}
     for i, j, p, d in cands:
         key = pair_key(items[i], items[j])
@@ -748,7 +815,14 @@ def verify_pairs(items, cands, rules, cache, workers):
                 store.put(k, f)
         store.finish([str(items[i].path) for i in involved])
         del feats
-        tasks = [(index[i], [(index[j], key, need) for j, key, need in others]) for i, others in sorted(todo.items())]
+        anchors = sorted(todo.items())
+        if gpu:
+            flat = [(index[i], index[j]) for i, others in anchors for j, _, _ in others]
+            matched = iter(gpu_match(tmp, flat))
+            tasks = [(index[i], [(index[j], key, need, next(matched)) for j, key, need in others])
+                     for i, others in anchors]
+        else:
+            tasks = [(index[i], [(index[j], key, need) for j, key, need in others]) for i, others in anchors]
         prog, done = Progress("checked", n_pairs), 0
         with ProcessPoolExecutor(max_workers=workers, initializer=_open_store, initargs=(str(tmp),)) as ex:
             for res in ex.map(verify_task, tasks, chunksize=1):
@@ -765,7 +839,7 @@ def verify_pairs(items, cands, rules, cache, workers):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
-def find_edges(items, mode, cache, workers):
+def find_edges(items, mode, cache, workers, gpu=False):
     """{(i, j): (kind, details)} for every pair judged a copy."""
     edges = {}
     by_sha = {}
@@ -787,7 +861,7 @@ def find_edges(items, mode, cache, workers):
     cands = [c for c in cands if (c[0], c[1]) not in edges]
     print(f"{len(cands)} candidate pair(s) from the hashes")
     if features:
-        verify_pairs(items, cands, rules, cache, workers)
+        verify_pairs(items, cands, rules, cache, workers, gpu)
     vetoed = {"no shared geometry": 0, "centres disagree": 0}
     for i, j, p, d in cands:
         v = cache.get(pair_key(items[i], items[j])) if features else None
@@ -1286,6 +1360,9 @@ def main(argv=None) -> int:
                          f"with _ and {', '.join(DEFAULT_EXCLUDES)}")
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1),
                     help="worker processes (default: CPU count - 1)")
+    ap.add_argument("--gpu", action="store_true",
+                    help="match the feature descriptors on the GPU with torch; needs the torch that one of "
+                         "the GPU tools installed into the shared venv, else the CPU is used")
     args = ap.parse_args(argv)
 
     roots, roles = [], []
@@ -1337,7 +1414,7 @@ def main(argv=None) -> int:
     for k, it in enumerate(good):
         it.idx = k
     verified = load_verified(roots)
-    edges = find_edges(good, args.match, verified, args.workers)
+    edges = find_edges(good, args.match, verified, args.workers, args.gpu)
     if args.match == "loose":
         save_verified(roots, good, verified)
     kinds = {}

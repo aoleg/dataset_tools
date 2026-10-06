@@ -12,6 +12,17 @@ Tools that prepare image datasets for LoRA and fine-tune training, mainly with [
 | [reframe](reframe/README.md) | Crops photos of people to the subject (one person or a group, without passers-by) in a k2prep aspect ratio; lossless for JPEG, and with `--resize` straight into k2prep buckets. |
 | [classify](classify/README.md) | Sorts a dataset into category folders from a folder of hand-sorted examples per category: every image is embedded once with SigLIP 2, a classifier is trained on the examples, and each image is copied with its caption into its category folder, or into `_unsure` when the classifier is not confident. A dry run writes a report with a confusion matrix, a confidence histogram and contact sheets; `--undo` puts everything back. |
 
-All tools share one virtual environment, the `venv` folder in the repository root. Each tool's `install.bat` creates it when it is missing and installs only that tool's dependencies into it, so a tool that needs no GPU never pulls torch in; install the tools you need, in any order. `face_masks` is written for Windows and needs a CUDA GPU. `telegram_dataset` needs only Python. `ddg_images` needs Python, and the `ddgs` package for the Bing and DuckDuckGo backends; on Windows, its `install.bat` sets this up. `deduplicate` needs Python and runs on the CPU; its `install.bat` sets it up. `reframe` is written for Windows and needs a CUDA GPU; its `install.bat` sets it up. `classify` is written for Windows and needs a CUDA GPU; its `install.bat` sets it up and downloads the encoder, after which it runs offline.
+## Install
+
+All tools share one virtual environment: the `venv` folder in the repository root, next to the tool folders. It needs Python 3.10 or newer on Windows. To install a tool, run the `install.bat` in its folder. It creates the shared `venv` when it is missing and installs only that tool's dependencies into it, so a tool that needs no GPU never pulls torch in. Install the tools you need, in any order; running an `install.bat` again installs what is missing. Every `run.bat` uses the shared `venv`.
+
+| tool | needs |
+|---|---|
+| `telegram_dataset`, `taggui_captioning` | Python only, nothing to install |
+| `ddg_images` | the `ddgs` package for the Bing and DuckDuckGo backends; the SearXNG backend needs nothing |
+| `deduplicate` | Pillow, numpy, imagehash, OpenCV; runs on the CPU |
+| `face_masks`, `reframe`, `classify` | a CUDA GPU; their `install.bat` installs torch from the PyTorch CUDA index and downloads their models, after which they run offline |
+
+The three GPU tools install the same torch build, so they share it in the `venv`.
 
 MIT License.
