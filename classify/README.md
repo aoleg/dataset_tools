@@ -62,7 +62,7 @@ The samples folder is training material only. Nothing in it is written to the ou
 
 ## What a run does
 
-1. Scans the dataset folders with all their subfolders. Images are `.jpg`, `.jpeg`, `.png`, `.webp`, `.bmp`, `.tif`, `.tiff`, `.gif` and `.avif`. A `.txt` file with the same name as an image is its caption and travels with it. Folders named `_embeddings`, `_classify`, `_duplicates` and `_unsure` are skipped, and so is the output folder when it lies inside a dataset folder. Any other folder name is scanned, including names that start with `_`.
+1. Scans the dataset folders with all their subfolders. Images are `.jpg`, `.jpeg`, `.png`, `.webp`, `.bmp`, `.tif`, `.tiff`, `.gif` and `.avif`. A `.txt` file with the same name as an image is its caption and travels with it. Folders named `_embeddings`, `_classify`, `_duplicates`, `_unsure` and `_backup` are skipped, and so is the output folder when it lies inside a dataset folder. Any other folder name is scanned, including names that start with `_`.
 2. Embeds every image that is not in the cache. The cache is `_embeddings\` inside each dataset folder and inside the samples folder. A second run embeds only new or changed files, so retraining after a change to the samples takes seconds.
 3. Cross-validates the examples and prints a table with precision and recall per category and a confusion matrix. This is the first check of your samples: a category with low recall is not consistent, or it overlaps another.
 4. Trains the classifier on all examples and predicts a category and a confidence for every dataset image.

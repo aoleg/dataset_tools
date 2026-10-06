@@ -52,7 +52,7 @@ Example of a run followed by the review:
 run.bat D:\data\downloads --sorted D:\data\collection --review
 ```
 
-The output folders of the dataset tools are never scanned, at any depth: `_duplicates` (this tool), `_prep` (k2prep), `_classify` and `_embeddings` (classify), and `masks` and `faces` (face_masks, which writes near-identical images there). Every other folder is scanned whatever its name, so a collection folder called `_1_posters` is fine as a root or below one. `--exclude` adds names to the list.
+The output folders of the dataset tools are never scanned, at any depth: `_duplicates` (this tool), `_prep` (k2prep), `_classify` and `_embeddings` (classify), `masks` and `faces` (face_masks, which writes near-identical images there), and `_backup` (remove_borders, which keeps the originals of cropped images there). Every other folder is scanned whatever its name, so a collection folder called `_1_posters` is fine as a root or below one. `--exclude` adds names to the list.
 
 `run.bat` pauses at the end when it is started by double-click or drag-and-drop, or when the script fails. Set `NOPAUSE=1` to prevent this.
 

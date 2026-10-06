@@ -55,8 +55,9 @@ EMBED_DIRNAME = "_embeddings"
 RUN_DIRNAME = "_classify"
 UNSURE_DIRNAME = "_unsure"
 DEDUP_DIRNAME = "_duplicates"
+BACKUP_DIRNAME = "_backup"     # remove_borders: originals of cropped images
 # Skipped by exact name only. Dataset subfolders may start with "_" too.
-SKIP_DIRNAMES = {EMBED_DIRNAME, RUN_DIRNAME, UNSURE_DIRNAME, DEDUP_DIRNAME}
+SKIP_DIRNAMES = {EMBED_DIRNAME, RUN_DIRNAME, UNSURE_DIRNAME, DEDUP_DIRNAME, BACKUP_DIRNAME}
 
 CACHE_FLUSH_EVERY = 2000
 WINDOW = 1024  # images handed to the decode pool at a time

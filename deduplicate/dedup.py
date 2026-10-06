@@ -59,8 +59,9 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".gif",
 # Folders never scanned, at any depth: the output folders of the dataset tools.
 # _duplicates is this tool's own, _prep is k2prep's, _classify and _embeddings
 # are classify's, masks and faces are face_masks' (near-identical images by
-# design). Any other folder is scanned, whatever its name; --exclude adds names.
-DEFAULT_EXCLUDES = ["_duplicates", "_prep", "_classify", "_embeddings", "masks", "faces"]
+# design), _backup is remove_borders' (the originals of cropped images). Any
+# other folder is scanned, whatever its name; --exclude adds names.
+DEFAULT_EXCLUDES = ["_duplicates", "_prep", "_classify", "_embeddings", "masks", "faces", "_backup"]
 
 # --- matching, calibrated on 690 real poster and photo downloads -------------
 # pHash and dHash are 64-bit; distances are Hamming distances. pHash distances
