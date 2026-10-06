@@ -33,6 +33,7 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_compl
 from functools import lru_cache
 import os
 import sys
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -1075,29 +1076,48 @@ def rewrite_header(data: bytes, exif: bytes | None) -> bytes:
     return b"".join(out)
 
 
+def jpeglib_dir() -> Path:
+    """A new ASCII-only folder for jpeglib's files; the caller removes it.
+    libjpeg opens paths as narrow strings: a Cyrillic path fails to read, and a
+    write lands under a garbled name (UTF-8 bytes read as the ANSI code page)
+    instead of the target."""
+    base = Path(tempfile.gettempdir())
+    if not str(base).isascii():
+        base = Path(Path.cwd().anchor or "C:/")
+    return Path(tempfile.mkdtemp(prefix="reframe_", dir=base))
+
+
 def write_lossless(src: Path, dst: Path, stored_box) -> None:
     """Crop whole DCT blocks: no decoding, no re-encoding. The EXIF orientation
-    tag stays, since the stored pixels keep their orientation."""
+    tag stays, since the stored pixels keep their orientation. jpeglib only sees
+    ASCII paths in jpeglib_dir(); the result reaches dst through Python. Run in
+    worker processes only: jpeglib corrupts the heap when Pillow runs in other
+    threads."""
     import jpeglib
-    im = jpeglib.read_dct(str(src))
-    sf = np.asarray(im.samp_factor)                  # rows: (vertical, horizontal) per component
-    maxv, maxh = int(sf[:, 0].max()), int(sf[:, 1].max())
     x0, y0, x1, y1 = stored_box
     w, h = x1 - x0, y1 - y0
-    for i, name in enumerate(("Y", "Cb", "Cr", "K")):
-        arr = getattr(im, name, None)
-        if arr is None or i >= len(sf):
-            continue
-        v, hh = int(sf[i][0]), int(sf[i][1])
-        bx0, by0 = x0 * hh // maxh // 8, y0 * v // maxv // 8
-        bw, bh = math.ceil(w * hh / maxh / 8), math.ceil(h * v / maxv / 8)
-        setattr(im, name, arr[by0:by0 + bh, bx0:bx0 + bw].copy())
-    im.width, im.height = w, h
-    tmp = atomic_target(dst)
-    im.write_dct(str(tmp))
+    work = jpeglib_dir()
+    try:
+        shutil.copyfile(src, work / "in.jpg")
+        im = jpeglib.read_dct(str(work / "in.jpg"))
+        sf = np.asarray(im.samp_factor)              # rows: (vertical, horizontal) per component
+        maxv, maxh = int(sf[:, 0].max()), int(sf[:, 1].max())
+        for i, name in enumerate(("Y", "Cb", "Cr", "K")):
+            arr = getattr(im, name, None)
+            if arr is None or i >= len(sf):
+                continue
+            v, hh = int(sf[i][0]), int(sf[i][1])
+            bx0, by0 = x0 * hh // maxh // 8, y0 * v // maxv // 8
+            bw, bh = math.ceil(w * hh / maxh / 8), math.ceil(h * v / maxv / 8)
+            setattr(im, name, arr[by0:by0 + bh, bx0:bx0 + bw].copy())
+        im.width, im.height = w, h
+        im.write_dct(str(work / "out.jpg"))
+        data = (work / "out.jpg").read_bytes()
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
     # EXIF without the whole-photo thumbnail and with the new size; no MPF index
     # (an MPO's appended images are not in the crop: libjpeg reads the first only)
-    data = tmp.read_bytes()
+    tmp = atomic_target(dst)
     with Image.open(src) as orig:
         exif = exif_for_output(orig.info.get("exif"), w, h, keep_orientation=True)
     tmp.write_bytes(rewrite_header(data, exif))
