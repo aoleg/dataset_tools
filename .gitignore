@@ -1,1 +1,3 @@
 venv/
+# Test suites stay local, in every tool folder
+tests/
