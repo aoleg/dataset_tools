@@ -8,7 +8,7 @@ The tool is for old personal photos where the people fill only a small part of a
 
 On Windows, run `install.bat`. It needs Python 3.10 or newer and a CUDA GPU.
 
-It creates a `venv` folder and installs `torch` and `torchvision` from the PyTorch CUDA 13.2 index, never from PyPI, because the PyPI torch for Windows has no CUDA. Then it installs `requirements.txt` from PyPI, with the installed torch builds pinned so that `ultralytics` cannot replace them. Last, it downloads the three detection models:
+It creates the shared `..\venv` folder when it is missing and installs `torch` and `torchvision` from the PyTorch CUDA 13.2 index, never from PyPI, because the PyPI torch for Windows has no CUDA. Then it installs `requirements.txt` from PyPI, with the installed torch builds pinned so that `ultralytics` cannot replace them. Last, it downloads the three detection models:
 
 | model | source | use |
 |---|---|---|

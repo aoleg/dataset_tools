@@ -4,12 +4,19 @@ chcp 65001 >nul
 title Face Masks - install
 
 rem ============================================================
-rem  install.bat - creates the venv and installs dependencies.
+rem  install.bat - creates the shared venv when missing, installs the
+rem  dependencies of this tool into it.
 rem  torch comes from the PyTorch CUDA index, never from PyPI:
 rem  a PyPI torch on Windows is CPU only.
+rem  The venv is shared by all tools of this repository and lives in
+rem  ..\venv, next to the tool folders. Each tool's install.bat installs
+rem  only its own dependencies, so a tool that needs no GPU never pulls
+rem  torch in. Running install.bat again installs what is missing.
 rem ============================================================
 
 cd /d "%~dp0"
+set "VENV=..\venv"
+set "VPY=%VENV%\Scripts\python.exe"
 
 set "TORCH_SPEC=torch==2.13.0 torchvision"
 set "TORCH_INDEX=https://download.pytorch.org/whl/cu132"
@@ -38,17 +45,15 @@ if errorlevel 1 (
     exit /b 1
 )
 
-if not exist "venv\Scripts\python.exe" (
-    echo Creating the virtual environment...
-    %PYTHON% -m venv venv
+if not exist "%VPY%" (
+    echo Creating the shared virtual environment in %VENV% ...
+    %PYTHON% -m venv "%VENV%"
     if errorlevel 1 (
         echo [ERROR] Could not create the virtual environment.
         pause
         exit /b 1
     )
 )
-
-set "VPY=venv\Scripts\python.exe"
 
 echo Upgrading pip...
 "%VPY%" -m pip install --upgrade pip
@@ -59,14 +64,14 @@ echo Installing torch from %TORCH_INDEX% ...
 "%VPY%" -m pip install %TORCH_SPEC% --index-url %TORCH_INDEX%
 if errorlevel 1 goto :fail
 
-rem ultralytics depends on torch and torchvision. Pin the CUDA builds just
-rem installed so that pip cannot replace them with the CPU builds from PyPI.
-"%VPY%" -c "import importlib.metadata as m; print('\n'.join(f'{p}=={m.version(p)}' for p in ('torch', 'torchvision')))" > venv\torch-constraints.txt
+rem Pin the CUDA builds just installed so that pip cannot replace them with
+rem the CPU builds from PyPI while installing the rest.
+"%VPY%" -c "import importlib.metadata as m; print('\n'.join(f'{p}=={m.version(p)}' for p in ('torch', 'torchvision')))" > "%VENV%\torch-constraints.txt"
 if errorlevel 1 goto :fail
 
 echo.
 echo Installing the remaining dependencies...
-"%VPY%" -m pip install -r requirements.txt --constraint venv\torch-constraints.txt
+"%VPY%" -m pip install -r requirements.txt --constraint "%VENV%\torch-constraints.txt"
 if errorlevel 1 goto :fail
 
 echo.

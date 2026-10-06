@@ -8,7 +8,7 @@ A folder can also be a curated collection, given with `--sorted`. Then a better 
 
 ## Install
 
-On Windows, run `install.bat`. It needs Python 3.10 or newer. It creates a `venv` folder next to the script and installs Pillow, numpy, imagehash and OpenCV (`opencv-python-headless`). It needs no GPU.
+On Windows, run `install.bat`. It needs Python 3.10 or newer. It creates the shared `..\venv` folder when it is missing and installs Pillow, numpy, imagehash and OpenCV into it. It needs no GPU. The virtual environment is shared by all tools of this repository: it is the `venv` folder in the repository root, next to the tool folders, and each tool's `install.bat` installs only its own dependencies into it.
 
 Without `install.bat`:
 
@@ -59,7 +59,7 @@ Folders whose names start with `_` (for example `_duplicates`, or k2prep's `_pre
 
 This is the workflow for a curated collection that receives new downloads. The rules are in [Sorted folders](#sorted-folders).
 
-1. **Install once.** Run `install.bat` in this folder. It needs Python 3.10 or newer and creates the `venv` folder. Nothing else to configure.
+1. **Install once.** Run `install.bat` in this folder. It needs Python 3.10 or newer and creates the shared `..\venv` folder when it is missing. Nothing else to configure.
 
 2. **Dry run first.** Give the raw download folders as plain arguments and each curated collection with `--sorted`:
 
@@ -220,7 +220,7 @@ On 11,561 photos with 67,108 candidate pairs, 23 worker processes: hashing 15 se
 `tests/fixture_test.py` builds a small sorted and unsorted tree from synthetic pictures, runs the tool with `--sorted`, checks every case of the sorted-folder rules (rename on collision, each caption case, the margin, a feature match left for review, slot sync under both policies), runs again to confirm that nothing moves, and undoes, comparing both trees byte for byte with the originals.
 
 ```
-venv\Scripts\python tests\fixture_test.py
+..\venv\Scripts\python tests\fixture_test.py
 ```
 
 It writes to `tests\_fixture` unless another folder is given, and prints `ALL PASS` or the failed checks.

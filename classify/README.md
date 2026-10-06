@@ -8,7 +8,7 @@ The tool is for datasets of tens of thousands of images where a category label p
 
 On Windows, run `install.bat`. It needs Python 3.10 or newer and a CUDA GPU.
 
-It creates a `venv` folder and installs `torch` and `torchvision` from the PyTorch CUDA 13.2 index, never from PyPI, because the PyPI torch for Windows has no CUDA. Then it installs `requirements.txt` from PyPI, with the installed torch builds pinned so that nothing can replace them. Last, it downloads the encoder into `models\`:
+It creates the shared `..env` folder when it is missing and installs `torch` and `torchvision` from the PyTorch CUDA 13.2 index, never from PyPI, because the PyPI torch for Windows has no CUDA. Then it installs `requirements.txt` from PyPI, with the installed torch builds pinned so that nothing can replace them. Last, it downloads the encoder into `models\`:
 
 | model | source | size |
 |---|---|---|
@@ -164,8 +164,8 @@ Training stays fast with large samples folders: the search for the regularisatio
 ## Tests
 
 ```
-venv\Scripts\python -m pip install pytest
-venv\Scripts\python -m pytest tests
+..env\Scripts\python -m pip install pytest
+..env\Scripts\python -m pytest tests
 ```
 
 The tests replace the encoder with a fake that embeds the mean colour of an image, so they need no model and no GPU and run in a few seconds.

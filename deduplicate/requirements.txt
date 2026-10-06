@@ -1,4 +1,6 @@
 Pillow>=10.0
 numpy>=2.0
 imagehash>=4.3
-opencv-python-headless>=4.8
+# opencv-python, not the headless build: the venv is shared with tools whose
+# ultralytics needs opencv-python, and the two builds overwrite each other.
+opencv-python>=4.8

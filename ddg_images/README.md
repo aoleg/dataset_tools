@@ -4,7 +4,7 @@
 
 ## Install
 
-It needs Python 3.10 or newer. On Windows, run `install.bat`. It creates a `venv` folder next to the script and installs `requirements.txt` into it. Running it again updates the packages.
+It needs Python 3.10 or newer. On Windows, run `install.bat`. It creates the shared `..\venv` folder when it is missing and installs `requirements.txt` into it. The virtual environment is shared by all tools of this repository: it is the `venv` folder in the repository root, next to the tool folders, and each tool's `install.bat` installs only its own dependencies into it.
 
 Without `install.bat`, install the one package yourself:
 

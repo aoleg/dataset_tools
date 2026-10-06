@@ -25,13 +25,13 @@ With `--preview <dir>` it also writes a copy of each image with the masked area 
 
 Run `install.bat`. It needs Python 3.10 or newer on PATH (`python`, or `py -3.12` from the launcher).
 
-It creates a `venv` folder next to the script and installs `torch==2.13.0` and `torchvision` from the PyTorch CUDA 13.2 index (`https://download.pytorch.org/whl/cu132`). It does not install torch from PyPI, because the PyPI torch for Windows is CPU only. Next it installs `requirements.txt` from PyPI. While it does this, it pins the installed torch and torchvision builds as a pip constraint, so the torch dependency of `ultralytics` cannot replace them. Then it prints the torch and CUDA versions and fails if torch is not a CUDA build.
+It creates the shared `..\venv` folder when it is missing and installs `torch==2.13.0` and `torchvision` from the PyTorch CUDA 13.2 index (`https://download.pytorch.org/whl/cu132`). It does not install torch from PyPI, because the PyPI torch for Windows is CPU only. Next it installs `requirements.txt` from PyPI. While it does this, it pins the installed torch and torchvision builds as a pip constraint, so the torch dependency of `ultralytics` cannot replace them. Then it prints the torch and CUDA versions and fails if torch is not a CUDA build.
 
 Last, it downloads the default face detector `face_yolov8m.pt` from `Bingsu/adetailer` and loads it once as a check. The model goes into the Hugging Face cache (`%USERPROFILE%\.cache\huggingface\hub`, or `HF_HOME` if set). ADetailer uses the same cache, so a copy it already downloaded is reused. When `--model` names another file, the script downloads that file on its first run.
 
 After that, the scripts do not use the network. They look for the model in the cache first and contact Hugging Face only when the file is not there. They also set `YOLO_OFFLINE=1` before they load ultralytics, which stops its online check and the usage analytics it sends when it is online.
 
-Running `install.bat` again updates the packages in the existing venv.
+Running `install.bat` again installs what is missing. The virtual environment is shared by all tools of this repository: it is the `venv` folder in the repository root, next to the tool folders, and each tool's `install.bat` installs only its own dependencies into it.
 
 To use the AI Toolkit virtual environment instead and avoid a second copy of PyTorch, activate that environment and run `pip install -r requirements.txt`. The script only needs `ultralytics` and `huggingface_hub` on top of what AI Toolkit already has.
 
@@ -39,8 +39,8 @@ To use the AI Toolkit virtual environment instead and avoid a second copy of PyT
 
 | file | purpose |
 |---|---|
-| `install.bat` | creates the venv and installs the dependencies |
-| `activate.bat` | activates the venv in the current cmd window; started by double-click, it opens a new cmd window with the venv active |
+| `install.bat` | creates the shared `..\venv` when it is missing and installs the dependencies |
+| `activate.bat` | activates the shared venv in the current cmd window; started by double-click, it opens a new cmd window with the venv active |
 | `run.bat` | runs `make_face_masks.py` with the venv Python and passes all arguments through |
 | `extract.bat` | runs `face_extract.py` in the same way |
 | `make_face_masks.py` | the mask tool; also holds the detector code that `face_extract.py` uses |

@@ -4,12 +4,19 @@ chcp 65001 >nul
 title Image Search Downloader - install
 
 rem ============================================================
-rem  install.bat - creates the venv and installs dependencies.
+rem  install.bat - creates the shared venv when missing, installs the
+rem  dependencies of this tool into it.
 rem  Only the Bing and DuckDuckGo backends need a package (ddgs);
 rem  the SearXNG backend uses the standard library only.
+rem  The venv is shared by all tools of this repository and lives in
+rem  ..\venv, next to the tool folders. Each tool's install.bat installs
+rem  only its own dependencies, so a tool that needs no GPU never pulls
+rem  torch in. Running install.bat again installs what is missing.
 rem ============================================================
 
 cd /d "%~dp0"
+set "VENV=..\venv"
+set "VPY=%VENV%\Scripts\python.exe"
 
 set "PYTHON="
 where python >nul 2>nul && set "PYTHON=python"
@@ -35,9 +42,9 @@ if errorlevel 1 (
     exit /b 1
 )
 
-if not exist "venv\Scripts\python.exe" (
-    echo Creating the virtual environment...
-    %PYTHON% -m venv venv
+if not exist "%VPY%" (
+    echo Creating the shared virtual environment in %VENV% ...
+    %PYTHON% -m venv "%VENV%"
     if errorlevel 1 (
         echo [ERROR] Could not create the virtual environment.
         pause
@@ -45,15 +52,13 @@ if not exist "venv\Scripts\python.exe" (
     )
 )
 
-set "VPY=venv\Scripts\python.exe"
-
 echo Upgrading pip...
 "%VPY%" -m pip install --upgrade pip
 if errorlevel 1 goto :fail
 
 echo.
 echo Installing the dependencies...
-"%VPY%" -m pip install --upgrade -r requirements.txt
+"%VPY%" -m pip install -r requirements.txt
 if errorlevel 1 goto :fail
 
 echo.

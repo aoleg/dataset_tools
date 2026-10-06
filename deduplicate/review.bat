@@ -11,7 +11,7 @@ rem onto this file works too. review.bat --help lists the keys.
 set "PAUSE_AT_END="
 if not defined NOPAUSE echo %CMDCMDLINE% | find /i "%~nx0" >nul && set "PAUSE_AT_END=1"
 
-set "VPY=%~dp0venv\Scripts\python.exe"
+set "VPY=%~dp0..\venv\Scripts\python.exe"
 if not exist "%VPY%" (
     echo The virtual environment is missing. Run install.bat first.
     pause
