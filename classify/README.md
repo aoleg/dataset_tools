@@ -178,12 +178,3 @@ Training stays fast with large samples folders: the search for the regularisatio
 **How many examples.** More hand-sorted examples help up to a few hundred per category, and examples that sit on the borders between categories help most. Copying a classified output back into the samples folder adds thousands of images but no information: they carry the classifier's own guesses, which is what `--retrain` already does with a cap. Copy the images you have checked, above all the ones from `_unsure` that you sorted by hand.
 
 `run.bat` pauses at the end when it is started by double-click, or when the script fails. Set `NOPAUSE=1` to prevent this.
-
-## Tests
-
-```
-..\venv\Scripts\python -m pip install pytest
-..\venv\Scripts\python -m pytest tests
-```
-
-The tests replace the encoder with a fake that embeds the mean colour of an image, so they need no model and no GPU and run in a few seconds.
