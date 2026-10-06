@@ -82,7 +82,8 @@ class ImageItem:
         return self.root / self.rel
 
 
-def scan_root(root: Path, sidecar_exts: set[str], skip_abs: set[Path] = frozenset()) -> list[ImageItem]:
+def scan_root(root: Path, sidecar_exts: set[str], skip_abs: set[Path] = frozenset(),
+              skip_names: set[str] = SKIP_DIRNAMES) -> list[ImageItem]:
     """Walk root recursively and return its images with their sidecars.
 
     Folders are skipped by exact name (SKIP_DIRNAMES) or by absolute path
@@ -96,7 +97,7 @@ def scan_root(root: Path, sidecar_exts: set[str], skip_abs: set[Path] = frozense
         here = Path(dirpath)
         dirnames[:] = sorted(
             d for d in dirnames
-            if d not in SKIP_DIRNAMES and (here / d).resolve() not in skip_abs
+            if d not in skip_names and (here / d).resolve() not in skip_abs
         )
         by_stem: dict[str, list[str]] = {}
         for fn in filenames:
@@ -736,10 +737,13 @@ class Decision:
     dest_name: str = ""    # file name in the output folder, set by assign_names
     share: float = 0.0     # share of the nearest examples in the predicted class
     pass_no: int = 1       # 1: first pass; 2: re-scored by the retrained probe (--retrain)
+    dest_sub: str = ""     # --extract: the origin folder, placed under the class folder
 
     @property
     def dest_dir(self) -> str:
         """Output folder relative to the output root: the class folder, or _unsure/<predicted class>."""
+        if self.dest_sub:
+            return f"{self.folder}/{self.dest_sub}"
         if self.folder != UNSURE_DIRNAME:
             return self.folder
         return f"{UNSURE_DIRNAME}/{self.cls or 'undecodable'}"
@@ -922,6 +926,17 @@ SHEET_TILE = 180
 SHEET_PER_GROUP = 48
 
 
+def sheet_font():
+    """A TrueType font with Cyrillic glyphs when one is available; the default bitmap font has none."""
+    from PIL import ImageFont
+    for name in ("arial.ttf", "segoeui.ttf", "tahoma.ttf", "DejaVuSans.ttf"):
+        try:
+            return ImageFont.truetype(name, 11)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
 def write_sheet(path: Path, title: str, groups: list[tuple[str, list[Decision]]]) -> None:
     """One JPEG: for each (label, decisions) group a header row and a grid of tiles."""
     from PIL import Image, ImageDraw
@@ -931,6 +946,7 @@ def write_sheet(path: Path, title: str, groups: list[tuple[str, list[Decision]]]
     height = header + sum(header for _ in groups) + total_rows * t
     sheet = Image.new("RGB", (SHEET_COLS * t, max(height, header)), "white")
     draw = ImageDraw.Draw(sheet)
+    draw.font = sheet_font()
     draw.text((4, 4), title, fill="black")
     y = header
     for label, ds in groups:
@@ -1057,10 +1073,11 @@ MOVES_NAME = "moves.jsonl"
 
 
 def output_is_empty(output: Path) -> bool:
-    """True when the output root does not exist or holds nothing but its _classify folder."""
+    """True when the output root does not exist or holds nothing but the tool's own folders
+    (_classify, and the _embeddings cache an extraction leaves behind)."""
     if not output.exists():
         return True
-    return not any(p.name != RUN_DIRNAME for p in output.iterdir())
+    return not any(p.name not in (RUN_DIRNAME, EMBED_DIRNAME) for p in output.iterdir())
 
 
 def sidecar_dest_name(dest_name: str, sidecar_rel: str) -> str:
@@ -1125,10 +1142,11 @@ def execute(decisions: list[Decision], output: Path, folders: list[str], move: b
 def undo(output: Path, report=print) -> int:
     """Delete the copies or move the moved files back, from the log of the last run, in reverse."""
     import shutil
-    log_path = output / RUN_DIRNAME / MOVES_NAME
-    if not log_path.is_file():
-        report(f"{log_path} not found, nothing to undo")
+    log_path = latest_log(output)
+    if log_path is None:
+        report(f"no moves*.jsonl in {output / RUN_DIRNAME}, nothing to undo")
         return 1
+    report(f"Undoing {log_path.name}")
     entries = [json.loads(ln) for ln in log_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
     undone = refused = missing = 0
     for e in reversed(entries):
@@ -1150,7 +1168,7 @@ def undo(output: Path, report=print) -> int:
             src.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(dst), str(src))
         undone += 1
-    log_path.rename(log_path.with_name(f"moves-undone-{datetime_stamp()}.jsonl"))
+    log_path.rename(log_path.with_name(f"{log_path.stem}-undone-{datetime_stamp()}.jsonl"))
     removed = 0
     for p in sorted((q for q in output.rglob("*") if q.is_dir() and RUN_DIRNAME not in q.relative_to(output).parts),
                     key=lambda q: -len(q.parts)):  # deepest first, so _unsure goes after its subfolders
@@ -1164,6 +1182,18 @@ def undo(output: Path, report=print) -> int:
 
 def datetime_stamp() -> str:
     return time.strftime("%Y%m%d-%H%M%S")
+
+
+def latest_log(output: Path) -> Path | None:
+    """The most recent operation's log: moves.jsonl for the classification, moves-extract-<stamp>.jsonl
+    for an extraction. Each --undo peels one operation, newest first."""
+    run_dir = output / RUN_DIRNAME
+    if not run_dir.is_dir():
+        return None
+    logs = [p for p in run_dir.glob("moves*.jsonl") if "undone" not in p.name]
+    if not logs:
+        return None
+    return max(logs, key=lambda p: p.stat().st_mtime_ns)
 
 
 # ----------------------------------------------------------------------------
@@ -1180,6 +1210,10 @@ def parse_args(argv=None):
     ap.add_argument("--move", action="store_true", help="move dataset images instead of copying them")
     ap.add_argument("--undo", action="store_true", help="undo the last run from <output>/_classify/moves.jsonl")
     ap.add_argument("--min-confidence", type=float, default=0.7, metavar="X", help="below this an image goes to _unsure (default 0.7)")
+    ap.add_argument("--extract", action="append", default=[], metavar="CLASS",
+                    help="move the images of this class out of the other folders of an already classified output "
+                         "into <class>/<origin>/; may repeat; needs --samples and -o, no --dataset")
+    ap.add_argument("--no-unsure", action="store_true", help="with --extract: leave the _unsure folder alone")
     ap.add_argument("--retrain", type=float, nargs="?", const=0.9, default=None, metavar="X",
                     help="two passes: first at confidence X (default 0.9), then retrain on the confident placements "
                          "and re-score the unsure images at --min-confidence")
@@ -1237,6 +1271,34 @@ def check_folders(args) -> tuple[list[Path], Path, Path]:
 BLAS_THREADS = 8   # OpenBLAS with every hyperthread (24 here) makes a probe fit 50 times slower than with 8
 
 
+def load_encoder(args) -> Encoder:
+    print("Loading the encoder...")
+    t0 = time.time()
+    encoder = Encoder(patches=args.patches)
+    print(f"  loaded in {time.time() - t0:.1f}s on {encoder.device}, attention {encoder.model.config._attn_implementation}")
+    return encoder
+
+
+def embed_samples(samples: Path, classes: list[SampleClass], encoder: Encoder, args) -> EmbedResult:
+    sample_items = [it for c in classes for v in c.subclasses.values() for it in v]
+    cache = EmbeddingCache(samples, encoder.model_id, args.patches)
+    return embed_root(samples, sample_items, encoder, cache, args.threads, args.batch, args.reembed, "Samples")
+
+
+def fit_probe(classes: list[SampleClass], sample_res: EmbedResult, rep: Report):
+    """Training set, cross-validation report, fitted probe and the example hashes."""
+    ts = build_training_set(classes, sample_res.vectors)
+    if sample_res.failed:
+        rep(f"  {len(sample_res.failed)} examples could not be decoded and are ignored")
+    t0 = time.time()
+    cv = cross_validate(ts)
+    report_cv(rep, ts, cv)
+    probe = Probe(cv.C).fit(ts.X, ts.y_sub, len(ts.sub_names))
+    rep(f"  trained in {time.time() - t0:.1f}s")
+    rep()
+    return ts, cv, probe, hash_examples(ts)
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
     if args.fetch_models:
@@ -1249,6 +1311,8 @@ def main(argv=None) -> int:
         if args.dataset:
             return undo(default_output([Path(d).resolve() for d in args.dataset]))
         sys.exit("--undo needs -o <output root> or --dataset <dataset root>")
+    if args.extract:
+        return extract_main(args)
     datasets, samples, output = check_folders(args)
     sidecars = sidecar_set(args.sidecars)
     if not args.dry_run and not args.embed_only and not output_is_empty(output):
@@ -1265,14 +1329,8 @@ def main(argv=None) -> int:
         print(f"Dataset {d}: {len(items)} images, {n_cap} with sidecars")
         dataset_items.append((d, items))
 
-    print("Loading the encoder...")
-    t0 = time.time()
-    encoder = Encoder(patches=args.patches)
-    print(f"  loaded in {time.time() - t0:.1f}s on {encoder.device}, attention {encoder.model.config._attn_implementation}")
-
-    sample_items = [it for c in classes for v in c.subclasses.values() for it in v]
-    sample_cache = EmbeddingCache(samples, encoder.model_id, args.patches)
-    sample_res = embed_root(samples, sample_items, encoder, sample_cache, args.threads, args.batch, args.reembed, "Samples")
+    encoder = load_encoder(args)
+    sample_res = embed_samples(samples, classes, encoder, args)
     results = []
     for d, items in dataset_items:
         cache = EmbeddingCache(d, encoder.model_id, args.patches)
@@ -1294,16 +1352,7 @@ def main(argv=None) -> int:
     rep(f"  min-confidence {args.min_confidence:g}, isolation {f'{args.isolation_pct:g}%' if args.isolation_pct > 0 else 'off'}, "
         f"patches {args.patches}" + (f", retrain: first pass at {strict:g}" if strict is not None else ""))
     rep()
-    ts = build_training_set(classes, sample_res.vectors)
-    if sample_res.failed:
-        rep(f"  {len(sample_res.failed)} examples could not be decoded and are ignored")
-    t0 = time.time()
-    cv = cross_validate(ts)
-    report_cv(rep, ts, cv)
-    probe = Probe(cv.C).fit(ts.X, ts.y_sub, len(ts.sub_names))
-    rep(f"  trained in {time.time() - t0:.1f}s")
-    rep()
-    example_hashes = hash_examples(ts)
+    ts, cv, probe, example_hashes = fit_probe(classes, sample_res, rep)
     decisions, stats = decide(dataset_items, [r.vectors for r in results], [r.failed for r in results], ts, probe,
                               example_hashes, strict if strict is not None else args.min_confidence,
                               args.isolation_pct if args.isolation_pct > 0 else None)
@@ -1357,6 +1406,138 @@ def main(argv=None) -> int:
     rep(f"{res.placed} images and {res.sidecars} sidecars {verb} in {time.time() - t0:.0f}s"
         + (f", {res.vanished} sources were gone" if res.vanished else "") + f". Undo with: -o {output} --undo")
     rep.save(run_dir / "report.txt")
+    return 0
+
+
+# ----------------------------------------------------------------------------
+# --extract: re-sort one or more classes inside an already classified output
+# ----------------------------------------------------------------------------
+
+def origin_of(it: ImageItem) -> str:
+    """The folder an output image came from, relative to the output root, separators as '__'."""
+    rel_dir = os.path.dirname(it.rel)
+    return rel_dir.replace("/", "__") if rel_dir else "root"
+
+
+def write_extract_plan(path: Path, candidates: list[Decision], output: Path) -> None:
+    import csv
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["source", "destination", "class", "confidence", "share", "vote", "reason", "action", "sidecars"])
+        for d in candidates:
+            moved = d.folder == d.cls
+            dest = output / d.dest_dir / d.dest_name if moved else d.item.path
+            w.writerow([str(d.item.path), str(dest), d.cls, f"{d.confidence:.4f}", f"{d.share:.2f}", d.vote,
+                        d.reason, "move" if moved else "stay", ";".join(d.item.sidecars)])
+
+
+def extract_main(args) -> int:
+    if args.dataset:
+        sys.exit("--extract works inside the classified output given with -o; do not give --dataset")
+    if not args.samples or not args.output:
+        sys.exit("--extract needs --samples and -o <classified output>")
+    if args.retrain is not None or args.move:
+        sys.exit("--retrain and --move do not apply to --extract (it always moves, within the output)")
+    samples = Path(args.samples).resolve()
+    output = Path(args.output).resolve()
+    if not samples.is_dir():
+        sys.exit(f"samples root not found: {samples}")
+    if not output.is_dir() or output_is_empty(output):
+        sys.exit(f"{output} is not a classified output (empty or missing)")
+    if samples == output or samples in output.parents or output in samples.parents:
+        sys.exit("the samples root and the output must not contain each other")
+    sidecars = sidecar_set(args.sidecars)
+    classes = discover_samples(samples, sidecars)
+    check_samples(classes)
+    names = {c.name for c in classes}
+    extract = list(dict.fromkeys(args.extract))
+    missing = [e for e in extract if e not in names]
+    if missing:
+        sys.exit("not a class folder in the samples root: " + ", ".join(missing))
+
+    skip_names = {EMBED_DIRNAME, RUN_DIRNAME, DEDUP_DIRNAME} | ({UNSURE_DIRNAME} if args.no_unsure else set())
+    items = scan_root(output, sidecars, skip_abs={output / e for e in extract}, skip_names=skip_names)
+    print(f"Output {output}: {len(items)} images outside the extracted class folders"
+          + (" (_unsure left alone)" if args.no_unsure else ""))
+
+    encoder = load_encoder(args)
+    sample_res = embed_samples(samples, classes, encoder, args)
+    cache = EmbeddingCache(output, encoder.model_id, args.patches)
+    res = embed_root(output, items, encoder, cache, args.threads, args.batch, args.reembed, "Output")
+
+    rep = Report()
+    rep(f"classify extract run {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    rep(f"  samples: {samples}")
+    rep(f"  output:  {output}")
+    rep(f"  extract: {', '.join(extract)}; min-confidence {args.min_confidence:g}; "
+        f"_unsure {'left alone' if args.no_unsure else 'included'}")
+    rep()
+    ts, cv, probe, example_hashes = fit_probe(classes, sample_res, rep)
+    decisions, stats = decide([(output, items)], [res.vectors], [res.failed], ts, probe, example_hashes,
+                              args.min_confidence, None)
+    decisions.sort(key=lambda d: d.item.rel)
+    extract_set = set(extract)
+    candidates = [d for d in decisions if d.cls in extract_set]
+    for d in candidates:
+        if d.folder == d.cls:
+            d.dest_sub = origin_of(d.item)
+            d.dest_name = os.path.basename(d.item.rel)
+
+    conf = np.array([d.confidence for d in candidates if d.reason != REASON_EXAMPLE], np.float32)
+    if len(conf):
+        rep("Confidence histogram of the images the probe assigns to an extracted class:")
+        hist, edges = np.histogram(conf, bins=10, range=(0.0, 1.0))
+        peak = max(hist.max(), 1)
+        for h, lo in zip(hist, edges[:-1]):
+            mark = " <- --min-confidence" if lo <= args.min_confidence < lo + 0.1 else ""
+            rep(f"  {lo:.1f}-{lo + 0.1:.1f}  {h:>6}  {'#' * int(round(40 * h / peak))}{mark}")
+    for e in extract:
+        ds = [d for d in candidates if d.cls == e]
+        moved = [d for d in ds if d.folder == e]
+        held = [d for d in ds if d.folder != e]
+        rep(f"{e}: {len(moved)} to move, {len(held)} held back"
+            + (f" ({sum(d.reason == REASON_EXAMPLE for d in moved)} of the moves are examples found by hash)" if moved else ""))
+        origins: dict[str, int] = {}
+        for d in moved:
+            origins[d.dest_sub] = origins.get(d.dest_sub, 0) + 1
+        for o, n in sorted(origins.items(), key=lambda kv: -kv[1]):
+            rep(f"  from {o:<32} {n:>6}")
+        reasons: dict[str, int] = {}
+        for d in held:
+            reasons[d.reason] = reasons.get(d.reason, 0) + 1
+        for r, n in sorted(reasons.items()):
+            rep(f"  held by {r:<29} {n:>6}")
+    rep()
+    run_dir = output / RUN_DIRNAME
+    stamp = datetime_stamp()
+    write_extract_plan(run_dir / f"extract-{stamp}-plan.csv", candidates, output)
+    rep.save(run_dir / f"extract-{stamp}-report.txt")
+    rep(f"Plan written to {run_dir / f'extract-{stamp}-plan.csv'}")
+    if args.sheets:
+        import random
+        rng = random.Random(0)
+        for e in extract:
+            moved = [d for d in candidates if d.cls == e and d.folder == e and d.reason != REASON_EXAMPLE]
+            held = [d for d in candidates if d.cls == e and d.folder != e]
+            if moved:
+                write_sheet(run_dir / "sheets" / f"extract-{e}.jpg", f"extract {e}: moved",
+                            [("random", rng.sample(moved, min(SHEET_PER_GROUP, len(moved)))),
+                             ("lowest confidence", sorted(moved, key=lambda d: d.confidence)[:SHEET_PER_GROUP])])
+            if held:
+                write_sheet(run_dir / "sheets" / f"extract-{e}-held.jpg", f"extract {e}: held back",
+                            [("highest confidence", sorted(held, key=lambda d: -d.confidence)[:SHEET_PER_GROUP])])
+        rep(f"Sheets written to {run_dir / 'sheets'}")
+    if args.dry_run:
+        rep("Dry run, nothing moved.")
+        return 0
+    to_move = [d for d in candidates if d.folder == d.cls]
+    t0 = time.time()
+    result = execute(to_move, output, extract, True, run_dir / f"moves-extract-{stamp}.jsonl", report=rep)
+    rep(f"{result.placed} images and {result.sidecars} sidecars moved in {time.time() - t0:.0f}s"
+        + (f", {result.vanished} sources were gone" if result.vanished else "")
+        + f". Undo this extraction with: -o {output} --undo")
+    rep.save(run_dir / f"extract-{stamp}-report.txt")
     return 0
 
 

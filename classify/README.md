@@ -8,7 +8,7 @@ The tool is for datasets of tens of thousands of images where a category label p
 
 On Windows, run `install.bat`. It needs Python 3.10 or newer and a CUDA GPU.
 
-It creates the shared `..env` folder when it is missing and installs `torch` and `torchvision` from the PyTorch CUDA 13.2 index, never from PyPI, because the PyPI torch for Windows has no CUDA. Then it installs `requirements.txt` from PyPI, with the installed torch builds pinned so that nothing can replace them. Last, it downloads the encoder into `models\`:
+It creates the shared `..\venv` folder when it is missing and installs `torch` and `torchvision` from the PyTorch CUDA 13.2 index, never from PyPI, because the PyPI torch for Windows has no CUDA. Then it installs `requirements.txt` from PyPI, with the installed torch builds pinned so that nothing can replace them. Last, it downloads the encoder into `models\`:
 
 | model | source | size |
 |---|---|---|
@@ -101,6 +101,22 @@ Every image is still placed once, at its final destination; the second pass happ
 
 On the dataset of historical photographs with the draft samples, the second pass placed about half of the first-pass unsure images, and the unsure share went from 36 to 28 percent.
 
+## Adding a category afterwards with `--extract`
+
+When a classified folder exists and you want a new category, or want to re-sort one category with better examples, there is no need to classify everything again. Add the category folder to the samples folder, fill it, and run:
+
+```
+run.bat --extract 12_group_photo_children --extract 13_group_photo_adult --samples D:\photos\samples -o D:\photos\raw_classified
+```
+
+There is no `--dataset`: the classified folder is read and changed in place. The classifier is trained on the whole samples folder, every image in the classified folder is scored, and only the images predicted as one of the extracted categories are acted on. Those that pass the usual gates move to `<category>\<origin>\`, where origin is the folder they came from, so `13_group_photo_adult\7_people_adult\` holds the group photos that were in people_adult. Captions move along. Everything predicted as anything else stays where it is, whatever the retrained classifier thinks about it. Images already inside an extracted category folder stay too.
+
+`_unsure` is included by default, since the border cases live there; `--no-unsure` leaves it alone. Your examples for the new category are usually copies of files in the classified folder, and the hash match moves them for certain.
+
+The report lists, per extracted category, how many images move from which origin and how many are held back by which gate, with a confidence histogram of the candidates. `--sheets` adds a sheet of the moved images and one of the held-back ones per category. Two sibling categories, such as children's and adults' group photos, compete with each other: a mixed group can fall under the threshold for both while clearly being a group, and stays. Lower `--min-confidence` for the extraction, add such images to the examples, or use one category with two sub-folders if the group border matters more than the age border.
+
+Moving a few images back is a drag from `<category>\<origin>\` to `<origin>\`. The extraction writes its own log, `moves-extract-<date>.jsonl`, and `--undo` peels the newest operation first: the first undo reverts the extraction, the next one the classification.
+
 ## Output
 
 ```
@@ -142,6 +158,8 @@ The output is a function of the dataset, the samples and the threshold. To run a
 | `--undo` | off | undo the last run from `<output>\_classify\moves.jsonl`; needs only `-o` or `--dataset` |
 | `--min-confidence X` | 0.7 | images below this confidence go to `_unsure` |
 | `--retrain [X]` | off | two passes: the first at confidence X (0.9 without a value), then retrain on the confident placements and score the unsure images again at `--min-confidence` |
+| `--extract CLASS` | off | move the images of this category out of the other folders of a classified output into `<category>\<origin>\`; repeat for several; needs `--samples` and `-o`, no `--dataset` |
+| `--no-unsure` | off | with `--extract`: leave the `_unsure` folder alone |
 | `--isolation-pct X` | 0 | also send the X percent of images that are farthest from all others to `_unsure` (reason `isolated`); off at 0 |
 | `--sidecars EXT,EXT` | `.txt` | the extensions that travel with an image |
 | `--sheets` | off | write the contact sheets |
@@ -164,8 +182,8 @@ Training stays fast with large samples folders: the search for the regularisatio
 ## Tests
 
 ```
-..env\Scripts\python -m pip install pytest
-..env\Scripts\python -m pytest tests
+..\venv\Scripts\python -m pip install pytest
+..\venv\Scripts\python -m pytest tests
 ```
 
 The tests replace the encoder with a fake that embeds the mean colour of an image, so they need no model and no GPU and run in a few seconds.
