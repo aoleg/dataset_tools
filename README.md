@@ -11,6 +11,7 @@ Tools that prepare image datasets for LoRA and fine-tune training, mainly with [
 | [deduplicate](deduplicate/README.md) | Finds copies of the same picture across folders (hashes plus a feature check for crops, borders and mock-ups) and moves the worse copies, with their captions, to a `_duplicates` folder; a kept copy without a caption gets a copy of one. A curated collection given with `--sorted` receives the better copies from raw folders under its own names and keeps its captions. `compare.bat` shows which files were judged copies of which, side by side, for a check by eye; `review.bat` (or `--review` after a run) opens the groups full screen and lets you change the kept copy with a click. `--undo` puts everything back, including review changes. `--gpu` matches the image features on the GPU when torch is in the shared venv, which cuts the slow stage from minutes to seconds on large sets. |
 | [reframe](reframe/README.md) | Crops photos of people to the subject (one person or a group, without passers-by) in a k2prep aspect ratio; lossless for JPEG, and with `--resize` straight into k2prep buckets. |
 | [classify](classify/README.md) | Sorts a dataset into category folders from a folder of hand-sorted examples per category: every image is embedded once with SigLIP 2, a classifier is trained on the examples, and each image is copied with its caption into its category folder, or into `_unsure` when the classifier is not confident. A dry run writes a report with a confusion matrix, a confidence histogram and contact sheets; `--undo` puts everything back. |
+| [remove_borders](remove_borders/README.md) | Finds images with borders (light and dark frames, thin lines, slanted frames of rotated scans, banners with text at the bottom or top) and cuts the borders off in place; lossless for JPEG, exact for PNG and other lossless formats, lossy formats become PNG. Originals and captions go to a `_backup` folder first, an image too small after its crop moves there instead, and `--undo` puts everything back. A dry run writes a report and contact sheets with the cut lines magnified. |
 
 ## Install
 
@@ -21,6 +22,7 @@ All tools share one virtual environment: the `venv` folder in the repository roo
 | `telegram_dataset`, `taggui_captioning` | Python only, nothing to install |
 | `ddg_images` | the `ddgs` package for the Bing and DuckDuckGo backends; the SearXNG backend needs nothing |
 | `deduplicate` | Pillow, numpy, imagehash, OpenCV; runs on the CPU. With `--gpu` it uses the torch of the GPU tools when one of them is installed, and falls back to the CPU otherwise. |
+| `remove_borders` | Pillow, numpy, jpeglib, OpenCV; runs on the CPU |
 | `face_masks`, `reframe`, `classify` | a CUDA GPU; their `install.bat` installs torch from the PyTorch CUDA index and downloads their models, after which they run offline |
 
 The three GPU tools install the same torch build, so they share it in the `venv`.
