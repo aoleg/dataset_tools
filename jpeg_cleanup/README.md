@@ -2,7 +2,7 @@
 
 `jpeg_cleanup.py` finds heavily compressed images in a large dataset with [FBCNN](https://github.com/jiaxi-jiang/FBCNN), a network that predicts the JPEG quality factor (QF) of an image from its pixels. It sees through re-saves: video frames whose JPEG header says quality 85 read 56 to 66 because they were compressed harder before, and a PNG made from a JPEG reads about the quality of that JPEG.
 
-The tool is built in phases. `extract.bat` measures every image and copies the poor ones into one folder per quality band, outside the dataset, so the threshold for the cleanup can be chosen by eye. `run.bat --dry-run` restores the images under the threshold in memory and writes a report and contact sheets with each image before and after. Neither changes the dataset. The real run (the restorations written in place, the originals to `_backup`) comes in the next version.
+The tool is built in phases. `extract.bat` measures every image and copies the poor ones into one folder per quality band, outside the dataset, so the threshold for the cleanup can be chosen by eye. `run.bat --dry-run` restores the images under the threshold in memory, decides for each whether the restoration removes enough to be worth saving, and writes a report and contact sheets with each image before and after. Neither changes the dataset. The real run (the restorations written in place, the originals to `_backup`) comes in the next version.
 
 ## Install
 
@@ -12,8 +12,8 @@ It creates the shared `..\venv` folder when it is missing, installs torch from t
 
 | file | used for |
 |---|---|
-| `fbcnn_color.pth` | colour images |
-| `fbcnn_gray_double.pth` | black-and-white images, also those saved as RGB |
+| `fbcnn_color.pth` | the QF of colour images, and the fix of every image |
+| `fbcnn_gray_double.pth` | the QF of black-and-white images, also those saved as RGB; the fix uses the colour model for them too |
 
 `network_fbcnn.py` is the FBCNN network from the FBCNN repository, under the Apache 2.0 licence in `LICENSE-FBCNN`.
 
@@ -89,12 +89,14 @@ run.bat D:\photos --dry-run --sheet-offsets 0,20
 run.bat D:\photos --dry-run --threshold 70 --no-sheets
 ```
 
-The first command restores every image of `D:\photos` with a QF under 80 in memory and writes the report and the contact sheets into `D:\photos\_backup\_jpeg_cleanup\`. The second shows two more restorations on the sheets, at offsets 0 and 20, next to the default one, to choose `--qf-offset` by eye. The third uses another threshold and writes the report only.
+The first command restores every image of `D:\photos` with a QF under 80 in memory, decides for each whether the restoration is worth saving, and writes the report and the contact sheets into `D:\photos\_backup\_jpeg_cleanup\`. The second shows two more restorations on the sheets, at offsets 0 and 20, next to the default one, to choose `--qf-offset` by eye. The third uses another threshold and writes the report only.
 
 | option | what it does |
 |---|---|
 | `--threshold QF` | fix the images with a QF under this (default 80) |
 | `--qf-offset N` | added to the predicted QF that FBCNN is told (default 10); see below |
+| `--min-block-drop X` | a restoration is worth saving when the blockiness drops by at least X (default 0.10) |
+| `--min-qf-gain N` | ... or when the QF rises by at least N on an image with a visible JPEG grid (default 25) |
 | `--sheet-offsets LIST` | more offsets shown side by side on the sheets, comma-separated |
 | `--no-sheets` | the report only |
 | `--quality Q` | the JPEG quality a restored JPEG is saved with (default 97) |
@@ -103,19 +105,31 @@ The first command restores every image of `D:\photos` with a QF under 80 in memo
 
 What a dry run does with each image under the threshold:
 
-1. Restores the stored pixels (before EXIF rotation) with FBCNN; a black-and-white image with the gray model. FBCNN is told the quality of the image: its predicted QF plus `--qf-offset`. Told a higher quality, it removes less, so a positive offset keeps more film grain and fine texture, at the price of a little more of the artifacts. The effect is mild: from +0 to +20 the fine detail kept rises from about 78% to 87% of the original's.
+1. Restores the stored pixels (before EXIF rotation) with the colour model of FBCNN. A black-and-white image goes in as three equal channels, and only the luma of the result is kept, so no colour can appear. The gray model is not used for the fix: on this kind of dataset it smoothed the film grain of black-and-white photos away and hardly reacted to `--qf-offset`, where the colour model kept the grain and removed the blocks as well. FBCNN is told the quality of the image: the QF the colour model predicts, plus `--qf-offset`. Told a higher quality, it removes less, so a positive offset keeps more film grain and fine texture, at the price of a little more of the artifacts. The effect is mild: from +0 to +20 the fine detail kept rises from about 78% to 87% of the original's.
 2. Encodes the result as it would be written: a JPEG source as JPEG at `--quality` with full-resolution colour (4:4:4, so the re-save adds no colour bleeding), a PNG, BMP, TIFF or lossless WebP source in its own format. The JPEG re-save at 97 differs from the restoration by 46 to 51 dB PSNR, far below the artifacts removed.
-3. Measures the QF of the result again (`qf_after`) and its mean change from the original.
+3. Measures the QF of the result again (`qf_after`), the blockiness before and after, and the mean change from the original.
+4. Decides whether the restoration is worth saving (section [Enough benefit](#enough-benefit)). Only those would be written by the real run; the others stay as they are, and their originals never go to `_backup`.
 
 Images at or above the threshold are kept as they are. The dry run writes no image. An extract folder can be given instead of the dataset: its copies hold the bytes of their sources, so the report and the sheets show what a run on the dataset would do. The dry run then writes into the `_backup` folder of the extract, which a re-sort of the extract leaves alone.
 
+### Enough benefit
+
+A restoration always changes the image a little; it is saved only when it removes enough of the JPEG artifacts to be worth a re-saved file. Two measures decide, and film grain fakes neither:
+
+- **Blockiness**: the mean luma step across the edges of the 8 x 8 JPEG blocks, divided by the mean step between other neighbouring pixels. About 1.0 when no block grid shows; 1.1 to 1.5 on the blocky images of a typical dataset. Grain and fine texture raise both steps alike and leave it near 1.0. A drop of at least `--min-block-drop` (0.10) means the grid visibly fades.
+- **QF gain**: how much FBCNN's own QF rises from the original to the result. It also sees ringing and mosquito noise around edges, which blockiness misses; an image at QF 45 whose ringing goes reads 90 afterwards. A dithered or screened print fools it (such a print reads QF 40 with no JPEG damage at all), so a gain of at least `--min-qf-gain` (25) counts only on an image whose blockiness is at least 1.05.
+
+The mean change of the pixels is no measure of benefit: on scanned prints it mostly counts the grain a restoration takes away.
+
+On a dataset of 10,000 photos, mostly scans of old prints that had been re-saved several times (3,258 under QF 80), the rule saved 1,774 restorations: 68 of 75 under QF 60, 349 of 424 at 60 to 69, 975 of 1,750 at 70 to 74 and 382 of 1,009 at 75 to 79. By eye, the restorations with a blockiness drop under 0.03 were indistinguishable from their originals, those at 0.06 to 0.10 showed small gains at 3x, and those from 0.15 up removed visible blocks.
+
 ### The contact sheets
 
-`_backup\_jpeg_cleanup\sheets\sheet_NNNN_qLO-HI.jpg`, 8 images per sheet, in QF order, the QF range in the name. Each row has a thumbnail with the crop marked in red; a 256 x 256 crop at 100%, first the original, then each restoration; and the most changed 96 x 96 part of that crop, magnified 3 times, in the same order. The crop sits where the restoration changed the image most: on a blocky image that is where the blocks were, on a grainy one where the most grain went. Judge both: the artifacts should be gone, and the grain of a film photo or the dots of a printed one should not be smoothed into plastic. The sheets are JPEG at quality 95 with 4:4:4 colour, so their own compression stays far below what they show. A run deletes the sheets of the last one.
+`_backup\_jpeg_cleanup\sheets\fix_NNNN_qLO-HI.jpg` for the restorations worth saving and `nofix_NNNN_qLO-HI.jpg` for the ones left alone, 8 images per sheet, in QF order, the QF range in the name. The label of each row says SAVE with the reason, or LEAVE, and gives the QF, the blockiness and the change before and after. Each row has a thumbnail with the crop marked in red; a 256 x 256 crop at 100%, first the original, then each restoration; and the most changed 96 x 96 part of that crop, magnified 3 times, in the same order. The crop sits where the restoration changed the image most: on a blocky image that is where the blocks were, on a grainy one where the most grain went. Judge both: the artifacts should be gone, and the grain of a film photo or the dots of a printed one should not be smoothed into plastic. The sheets are JPEG at quality 95 with 4:4:4 colour, so their own compression stays far below what they show. A run deletes the sheets of the last one.
 
 ### The report
 
-`_backup\_jpeg_cleanup\report.csv`, one row per image: `path`, `format`, `mode`, `width`, `height`, `gray`, `header_q`, `qf`, `action` (fix, keep, or the skip reason), `model` (color or gray), `qf_used` (the QF FBCNN was told), `write` (jpeg, or the lossless format), `qf_after` (the QF of the result), `change` (the mean difference between the original and the result, in 8-bit levels).
+`_backup\_jpeg_cleanup\report.csv`, one row per image: `path`, `format`, `mode`, `width`, `height`, `gray`, `header_q`, `qf`, `action` (fix: worth saving; little benefit: restored but left alone; keep: at or above the threshold; or the skip reason), `benefit` (why a fix is worth saving), `qf_used` (the QF FBCNN was told), `write` (jpeg, or the lossless format), `qf_after` (the QF of the result), `change` (the mean difference between the original and the result, in 8-bit levels), `block_before` and `block_after` (the blockiness).
 
 ## Output
 

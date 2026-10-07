@@ -87,6 +87,9 @@ DEFAULT_THREADS = 8
 DEFAULT_THRESHOLD = 80            # the fix restores images with a QF under this
 DEFAULT_QF_OFFSET = 10            # added to the predicted QF given to the restoration: the gentle side
 DEFAULT_QUALITY = 97              # JPEG quality of a restored JPEG
+DEFAULT_MIN_BLOCK_DROP = 0.10     # a restoration is worth saving when the blockiness drops this much...
+DEFAULT_MIN_QF_GAIN = 25          # ...or the QF rises this much on an image with a JPEG grid
+GRID_MIN = 1.05                   # blockiness from which the 8 x 8 grid shows; dithered prints sit at 1.0
 
 MEASURE_VERSION = 1               # bump when a measurement changes meaning; the cache is then dropped
 GRAY_SPREAD = 2                   # an RGB image whose channels differ by at most this everywhere is gray
@@ -334,7 +337,8 @@ class QualityModel:
 def measure_one(model: QualityModel, d: dict) -> dict:
     """The measurement of a decoded image: its facts, qf_color, and for a gray
     image qf_gray; qf is the value that decides (the gray model's on a gray
-    image, since the fix will use that model)."""
+    image: the thresholds were set by eye on these values; the fix itself
+    restores every image with the colour model, at qf_color)."""
     m = {k: d[k] for k in ("format", "mode", "width", "height", "gray", "header_q", "skip")}
     if d["skip"]:
         return m
@@ -763,9 +767,11 @@ def write_summary(out: Path, lines) -> None:
 # A fix restores every image with a QF under --threshold with FBCNN, told the
 # image's own QF plus --qf-offset: the higher the QF it is given, the less it
 # smooths, so a positive offset keeps more grain and fine texture. A gray image
-# goes through the gray model. JPEG sources are saved as JPEG at --quality with
-# full-resolution colour (4:4:4); lossless sources keep their format. The dry
-# run does all of this in memory and writes the report and contact sheets only.
+# goes through the colour model too, and only the luma of the result is kept.
+# A restoration is saved only when it removes enough (see benefit). JPEG sources
+# are saved as JPEG at --quality with full-resolution colour (4:4:4); lossless
+# sources keep their format. The dry run does all of this in memory and writes
+# the report and contact sheets only.
 
 def fix_action(it, threshold: int, max_pixels: int) -> str:
     """fix, keep, or the skip reason."""
@@ -865,7 +871,7 @@ def clear_sheets(folder: Path) -> None:
     """Delete the sheets of the last run, so the folder never shows sheets that
     do not belong to the report next to it."""
     if folder.exists():
-        for p in folder.glob("sheet_*.jpg"):
+        for p in [*folder.glob("fix_*.jpg"), *folder.glob("nofix_*.jpg"), *folder.glob("sheet_*.jpg")]:
             p.unlink()
 
 
@@ -874,11 +880,10 @@ class SheetWriter:
     named by its number and the QF range it shows, with a header row naming the
     columns."""
 
-    def __init__(self, folder: Path, offsets: list[int]):
-        self.folder, self.offsets = folder, offsets
+    def __init__(self, folder: Path, offsets: list[int], prefix: str):
+        self.folder, self.offsets, self.prefix = folder, offsets, prefix
         self.tiles: list[tuple[float, Image.Image]] = []
         self.count = 0
-        clear_sheets(folder)
         folder.mkdir(parents=True, exist_ok=True)
 
     def add(self, qf: float, tile: Image.Image) -> None:
@@ -908,33 +913,73 @@ class SheetWriter:
             y += t.height + 6
         self.count += 1
         lo, hi = self.tiles[0][0], self.tiles[-1][0]
-        sheet.save(self.folder / f"sheet_{self.count:04d}_q{int(lo):02d}-{int(hi):02d}.jpg", "JPEG",
+        sheet.save(self.folder / f"{self.prefix}_{self.count:04d}_q{int(lo):02d}-{int(hi):02d}.jpg", "JPEG",
                    quality=SHEET_QUALITY, subsampling=0)
         self.tiles = []
 
 
-def fix_one(model: QualityModel, d: dict, qf: float, offsets: list[int], quality: int, sheet: bool) -> dict:
-    """Restore one decoded image at qf + offsets[0] (and the other offsets when
-    a tile is wanted). -> qf_used, write, qf_after, change, and "outs" (the
-    restorations as they would be written) when sheet is set."""
-    name, a = ("gray", d["luma"]) if d["gray"] else ("color", d["rgb"])
+def blockiness(a: np.ndarray) -> float:
+    """How much the 8 x 8 JPEG block grid shows: the mean luma step across
+    block edges divided by the mean step between other neighbouring pixels,
+    averaged over both directions. About 1.0 without blocking; film grain and
+    fine texture raise both steps alike and leave it near 1.0."""
+    g = (a.astype(np.float32) if a.ndim == 2 else a.astype(np.float32) @ np.float32([0.299, 0.587, 0.114]))
+    ratios = []
+    for dx in (np.abs(np.diff(g, axis=1)), np.abs(np.diff(g, axis=0)).T):
+        if dx.shape[1] < 16:
+            continue
+        edge = (np.arange(dx.shape[1]) % 8) == 7          # the step between pixel 8k-1 and 8k
+        inside = dx[:, ~edge].mean()
+        ratios.append(float(dx[:, edge].mean() / inside) if inside > 0 else 1.0)
+    return round(sum(ratios) / len(ratios), 3) if ratios else 1.0
+
+
+def benefit(m: dict, r: dict, min_block_drop: float, min_qf_gain: float) -> str:
+    """Why the restoration is worth saving, or "" when it is not. Two signals,
+    neither of which film grain can fake: the drop in blockiness (the 8 x 8
+    grid fading), and the rise of FBCNN's own QF, which also sees ringing and
+    mosquito noise but misreads dithered and screened prints; so the QF counts
+    only on an image whose grid shows. The mean change of the pixels is not a
+    signal: on scanned prints it mostly measures the grain taken away."""
+    drop = r["block_before"] - r["block_after"]
+    gain = r["qf_after"] - m["qf"]
+    if drop >= min_block_drop:
+        return f"blockiness -{drop:.2f}"
+    if gain >= min_qf_gain and r["block_before"] >= GRID_MIN:
+        return f"QF +{gain:.0f}"
+    return ""
+
+
+def fix_one(model: QualityModel, d: dict, m: dict, offsets: list[int], quality: int, sheet: bool) -> dict:
+    """Restore one decoded image with the colour model at its own predicted QF
+    plus offsets[0] (and the other offsets when a tile is wanted). A gray image
+    goes in as three equal channels and only the luma of the result is kept:
+    the gray model erased film grain and barely reacted to the offset, the
+    colour model keeps the grain, and the luma cannot carry colour noise.
+    -> qf_used, write, qf_after, change, block_before, block_after, and "outs"
+    (the restorations as they would be written) when sheet is set."""
+    orig = d["luma"] if d["gray"] else d["rgb"]
+    qf = m.get("qf_color", m["qf"])
     outs = []
     for o in (offsets if sheet else offsets[:1]):
-        y = model.restore(name, a, min(100.0, qf + o))
+        y = model.restore("color", d["rgb"], min(100.0, qf + o))
+        if d["gray"]:
+            y = np.asarray(Image.fromarray(y).convert("L"))
         if d["format"] in ("JPEG", "MPO"):
             y = np.array(Image.open(io.BytesIO(encode_jpeg(y, quality))))   # what the file will hold
         outs.append(y)
-    r = {"model": name, "qf_used": round(min(100.0, qf + offsets[0]), 1),
+    r = {"qf_used": round(min(100.0, qf + offsets[0]), 1),
          "write": "jpeg" if d["format"] in ("JPEG", "MPO") else d["format"].lower(),
-         "qf_after": round(model.qf(name, outs[0]), 1),
-         "change": round(float(np.abs(a.astype(np.int16) - outs[0]).mean()), 2)}
+         "qf_after": round(model.qf("color", as_rgb(outs[0])), 1),
+         "change": round(float(np.abs(orig.astype(np.int16) - outs[0]).mean()), 2),
+         "block_before": blockiness(orig), "block_after": blockiness(outs[0])}
     if sheet:
         r["outs"] = outs
     return r
 
 
-FIX_FIELDS = ["path", "format", "mode", "width", "height", "gray", "header_q", "qf", "action", "model", "qf_used",
-              "write", "qf_after", "change"]
+FIX_FIELDS = ["path", "format", "mode", "width", "height", "gray", "header_q", "qf", "action", "benefit",
+              "qf_used", "write", "qf_after", "change", "block_before", "block_after"]
 
 
 def write_report(root: Path, items) -> Path:
@@ -948,8 +993,9 @@ def write_report(root: Path, items) -> Path:
             m, r = it.m, it.fix
             w.writerow([it.rel, m.get("format", ""), m.get("mode", ""), m.get("width", 0), m.get("height", 0),
                         "" if m.get("gray") is None else int(m["gray"]), fmt_num(m.get("header_q")),
-                        fmt_num(m.get("qf")), it.status, r.get("model", ""), fmt_num(r.get("qf_used")),
-                        r.get("write", ""), fmt_num(r.get("qf_after")), fmt_num(r.get("change"))])
+                        fmt_num(m.get("qf")), it.status, r.get("benefit", ""), fmt_num(r.get("qf_used")),
+                        r.get("write", ""), fmt_num(r.get("qf_after")), fmt_num(r.get("change")),
+                        fmt_num(r.get("block_before")), fmt_num(r.get("block_after"))])
     os.replace(tmp, path)
     return path
 
@@ -967,9 +1013,10 @@ def fix_dry_run(root: Path, args, model_box: list) -> None:
     todo = sorted((it for it in items if it.status == "fix"), key=lambda it: (it.m["qf"], it.rel))
     offsets = [args.qf_offset] + [o for o in args.sheet_offsets if o != args.qf_offset]
     sheet_dir = root / BACKUP_DIRNAME / RUN_DIRNAME / SHEETS_DIRNAME
-    sheets = None if args.no_sheets else SheetWriter(sheet_dir, offsets)
-    if sheets is None:
-        clear_sheets(sheet_dir)
+    clear_sheets(sheet_dir)
+    # one set of sheets for the restorations worth saving, one for the rest
+    sheets = None if args.no_sheets else {True: SheetWriter(sheet_dir, offsets, "fix"),
+                                           False: SheetWriter(sheet_dir, offsets, "nofix")}
     if todo:
         if not model_box:
             model_box.append(QualityModel())
@@ -982,30 +1029,40 @@ def fix_dry_run(root: Path, args, model_box: list) -> None:
                 if d["skip"]:                     # changed since it was measured
                     it.status = d["skip"]
                     continue
-                r = fix_one(model, d, it.m["qf"], offsets, args.quality, sheets is not None)
+                r = fix_one(model, d, it.m, offsets, args.quality, sheets is not None)
                 outs = r.pop("outs", None)
+                r["benefit"] = benefit(it.m, r, args.min_block_drop, args.min_qf_gain)
                 it.fix = r
+                if not r["benefit"]:
+                    it.status = "little benefit"
                 if sheets is not None:
-                    label = (f"QF {it.m['qf']:.1f}, header {it.m.get('header_q') or '-'}, "
-                             f"{it.m['width']}x{it.m['height']}, {r['model']} model, change {r['change']:.2f}")
+                    label = (f"{'SAVE: ' + r['benefit'] if r['benefit'] else 'LEAVE: little benefit'}  |  "
+                             f"QF {it.m['qf']:.1f} > {r['qf_after']:.1f}, blockiness {r['block_before']:.2f} > "
+                             f"{r['block_after']:.2f}, change {r['change']:.2f}, header {it.m.get('header_q') or '-'}, "
+                             f"{it.m['width']}x{it.m['height']}{', gray' if d['gray'] else ''}")
                     orig = d["luma"] if d["gray"] else d["rgb"]
-                    pending.append((it.m["qf"], tiler.submit(make_tile, it.rel, label, orig, outs, d["orientation"])))
-                    while pending and (pending[0][1].done() or len(pending) > 8):
-                        q, fut = pending.popleft()
-                        sheets.add(q, fut.result())
+                    pending.append((bool(r["benefit"]), it.m["qf"],
+                                    tiler.submit(make_tile, it.rel, label, orig, outs, d["orientation"])))
+                    while pending and (pending[0][2].done() or len(pending) > 8):
+                        keep, q, fut = pending.popleft()
+                        sheets[keep].add(q, fut.result())
                 progress.step(n)
-            for q, fut in pending:
-                sheets.add(q, fut.result())
+            for keep, q, fut in pending:
+                sheets[keep].add(q, fut.result())
     if sheets is not None:
-        sheets.flush()
+        for s in sheets.values():
+            s.flush()
     report = write_report(root, items)
     count = {}
     for it in items:
-        k = it.status if it.status in ("fix", "keep") else "skipped"
+        k = it.status if it.status in ("fix", "little benefit", "keep") else "skipped"
         count[k] = count.get(k, 0) + 1
     print(f"{root}: {len(items):,} images, {clock(time.perf_counter() - t0)}")
-    print(f"  threshold QF {args.threshold}, offset {args.qf_offset:+d}: {count.get('fix', 0):,} to fix, "
-          f"{count.get('keep', 0):,} kept, {count.get('skipped', 0):,} skipped")
+    print(f"  threshold QF {args.threshold}, offset {args.qf_offset:+d}: "
+          f"{count.get('fix', 0) + count.get('little benefit', 0):,} restored in memory; "
+          f"{count.get('fix', 0):,} worth saving (blockiness -{args.min_block_drop:.2f} or QF +{args.min_qf_gain:g}), "
+          f"{count.get('little benefit', 0):,} left as they are (little benefit)")
+    print(f"  {count.get('keep', 0):,} at or above the threshold, {count.get('skipped', 0):,} skipped")
     fixed = [it for it in items if it.fix]
     if fixed:
         ch = sorted(it.fix["change"] for it in fixed)
@@ -1013,7 +1070,7 @@ def fix_dry_run(root: Path, args, model_box: list) -> None:
         print(f"  change (mean, 8-bit levels): median {ch[len(ch) // 2]:.2f}, max {ch[-1]:.2f}; "
               f"QF after the fix: median {qa[len(qa) // 2]:.1f}, min {qa[0]:.1f}")
     if sheets is not None:
-        print(f"  sheets:  {sheets.count} in {sheets.folder}")
+        print(f"  sheets:  {sheets[True].count} fix_*, {sheets[False].count} nofix_* in {sheet_dir}")
     print(f"  report:  {report}")
     print("  dry run: no image was changed")
 
@@ -1156,6 +1213,10 @@ def main(argv=None) -> int:
     ap.add_argument("--sheet-offsets", type=parse_offsets, default=[], metavar="LIST",
                     help="more offsets shown side by side on the contact sheets, comma-separated, e.g. 10,20")
     ap.add_argument("--no-sheets", action="store_true", help="no contact sheets")
+    ap.add_argument("--min-block-drop", type=float, default=DEFAULT_MIN_BLOCK_DROP, metavar="X",
+                    help=f"save a restoration whose blockiness drops this much (default {DEFAULT_MIN_BLOCK_DROP})")
+    ap.add_argument("--min-qf-gain", type=float, default=DEFAULT_MIN_QF_GAIN, metavar="N",
+                    help=f"...or whose QF rises this much, when the JPEG grid shows (default {DEFAULT_MIN_QF_GAIN})")
     ap.add_argument("--quality", type=qf_arg, default=DEFAULT_QUALITY, metavar="Q",
                     help=f"JPEG quality of a restored JPEG (default {DEFAULT_QUALITY})")
     ap.add_argument("--fetch-models", action="store_true", help="download the FBCNN models into models/ and check them")
