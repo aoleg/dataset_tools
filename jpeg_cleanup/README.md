@@ -1,6 +1,6 @@
 # JPEG cleanup
 
-Finds the images of a dataset that were saved with heavy JPEG compression, restores them with [FBCNN](https://github.com/jiaxi-jiang/FBCNN), and replaces only those where the restoration removes enough of the damage. Originals and captions go to `_backup`; `--undo` puts them back.
+Finds the images of a dataset that were saved with heavy JPEG compression, restores them with [FBCNN](https://github.com/jiaxi-jiang/FBCNN), and replaces only those where the restoration removes enough of the damage. Originals and captions go to `_backup`; `--review` draws them next to the restored files, and `--undo` puts them back.
 
 ## Why
 
@@ -37,6 +37,7 @@ A typical artifact-removal script runs the model over a folder and overwrites ev
 - **Shows the result first.** `--dry-run` writes a report and contact sheets with every image before and after, at 100% and magnified, split into the restorations it would save and the ones it would leave. A real run saves exactly what its dry run listed.
 - **Backs up before it writes.** The original and its captions go to `_backup` under the same relative path. A backup is never overwritten, and an earlier original from another tool keeps its place.
 - **Writes safely.** Each image is logged before it is touched. The restoration goes to a `.part` file and replaces the image in one step, with the original's name, times, read-only flag, EXIF block and ICC profile.
+- **Shows what it wrote.** `--review` draws the contact sheets of the last run from the originals in `_backup` and the files now in place.
 - **Undoes a run.** `--undo` puts back the last run, also one that was interrupted.
 - **Runs offline.** The models are downloaded once and checked against their SHA-256 sums.
 
@@ -45,7 +46,7 @@ A typical artifact-removal script runs the model over a folder and overwrites ev
 1. Run `install.bat` once.
 2. Run `extract.bat <dataset>` and look through the band folders in `<dataset>_jpeg_extract`, from the lowest up, to find the QF where the images stop looking compressed. New `--bands` re-sort the copies in seconds.
 3. Run `run.bat <dataset> --dry-run --threshold <QF>` and look through the contact sheets in `<dataset>\_backup\_jpeg_cleanup\sheets`. The `fix_*` sheets show what would be saved, the `nofix_*` sheets what would be left.
-4. Run `run.bat <dataset> --threshold <QF>`.
+4. Run `run.bat <dataset> --threshold <QF>`, then `run.bat <dataset> --review` to look at what was written.
 5. If you do not like the result, run `run.bat <dataset> --undo`.
 
 ## Install
@@ -121,6 +122,7 @@ When the folder given is an extract folder, it is re-sorted in place from its `e
 
 ```
 run.bat <folder> [<folder> ...] [--dry-run] [options]
+run.bat <folder> --review
 run.bat <folder> --undo
 ```
 
@@ -130,10 +132,11 @@ Examples:
 run.bat D:\photos --dry-run
 run.bat D:\photos --dry-run --sheet-offsets 0,20
 run.bat D:\photos
+run.bat D:\photos --review
 run.bat D:\photos --undo
 ```
 
-The first command restores every image of `D:\photos` with a QF under 80 in memory, judges each restoration, and writes the report and the contact sheets into `D:\photos\_backup\_jpeg_cleanup\`. The second also shows the restorations at offsets 0 and 20 on the sheets, to choose `--qf-offset` by eye. The third makes the fix. The fourth puts back what the last run changed.
+The first command restores every image of `D:\photos` with a QF under 80 in memory, judges each restoration, and writes the report and the contact sheets into `D:\photos\_backup\_jpeg_cleanup\`. The second also shows the restorations at offsets 0 and 20 on the sheets, to choose `--qf-offset` by eye. The third makes the fix. The fourth draws the contact sheets of that run from the backups. The fifth puts back what the last run changed.
 
 | option | what it does |
 |---|---|
@@ -146,6 +149,7 @@ The first command restores every image of `D:\photos` with a QF under 80 in memo
 | `--no-sheets` | with `--dry-run`: the report only |
 | `--sheets` | with a real run: the sheets too |
 | `--quality Q` | the JPEG quality of a restored JPEG (default 97) |
+| `--review` | draw the contact sheets of the last run: each original in `_backup` next to the file now in place |
 | `--undo` | put back what the last run of each folder changed |
 
 `--max-pixels`, `--exclude`, `--sidecars`, `--reanalyse` and `--threads` work as for `extract.bat`, and the QF measurements come from the same cache.
@@ -181,7 +185,7 @@ The original of a restored image goes to `_backup\<relative path>`, with copies 
 
 ### Contact sheets
 
-`fix_NNNN_qLO-HI.jpg` for the restorations worth saving and `nofix_NNNN_qLO-HI.jpg` for the ones left alone, 8 images per sheet in QF order, in `_backup\_jpeg_cleanup\sheets`. The label of each row says SAVE with the reason, or LEAVE, with the QF, blockiness and change. Each row has a thumbnail with the crop marked in red, a 256 x 256 crop at 100% (the original, then each restoration), and the most changed 96 x 96 part of that crop, magnified 3 times. The crop sits where the restoration changed the image most: on a blocky image where the blocks were, on a grainy one where the most grain went. Judge both: the artifacts should be gone, and the grain of a film photo or the dots of a print should stay. The sheets are JPEG at quality 95 with 4:4:4 colour. A run deletes the sheets of the last one.
+`fix_NNNN_qLO-HI.jpg` for the restorations worth saving and `nofix_NNNN_qLO-HI.jpg` for the ones left alone, 8 images per sheet in QF order, in `_backup\_jpeg_cleanup\sheets`. The label of each row says SAVE with the reason, or LEAVE, with the QF, blockiness and change. Each row has a thumbnail with the crop marked in red, a 256 x 256 crop at 100% (the original, then each restoration), and the most changed 96 x 96 part of that crop, magnified 3 times. The crop sits where the restoration changed the image most: on a blocky image where the blocks were, on a grainy one where the most grain went. Judge both: the artifacts should be gone, and the grain of a film photo or the dots of a print should stay. The sheets are JPEG at quality 95 with 4:4:4 colour. A run deletes the sheets of the last one. A real run draws sheets only with `--sheets`; `--review` draws them afterwards, from the log of the last run that is not undone: every image it wrote, the original from where the run kept it next to the file in place, with columns `original` and `written`. It reads files only, so it needs no GPU (417 images take about 10 seconds).
 
 ## Output
 

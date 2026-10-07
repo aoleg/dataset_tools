@@ -20,7 +20,8 @@ restoration that removes enough of the artifacts is saved. Its original and
 captions go to <folder>/_backup/<same relative path> first; the restoration
 then replaces the image under its own name. --dry-run does all of it but the
 writing and draws contact sheets (before and after, at 100% and magnified);
---undo puts back what the last run changed. The report, the log and the sheets
+--undo puts back what the last run changed; --review draws the sheets of the
+last run from the originals in _backup and the files in place. The report, the log and the sheets
 are in <folder>/_backup/_jpeg_cleanup.
 
 Usage:    python jpeg_cleanup.py --extract <folder> [<folder> ...] [--out DIR]
@@ -30,7 +31,7 @@ Usage:    python jpeg_cleanup.py --extract <folder> [<folder> ...] [--out DIR]
           [--qf-offset N] [--min-block-drop X] [--min-qf-gain N] [--sheet-offsets LIST]
           [--sheets | --no-sheets] [--quality Q] [--max-pixels N] [--exclude NAME]
           [--sidecars LIST] [--reanalyse] [--threads N]
-          python jpeg_cleanup.py <folder> [<folder> ...] --undo
+          python jpeg_cleanup.py <folder> [<folder> ...] --undo | --review
           python jpeg_cleanup.py --fetch-models
 Install:  install.bat (torch from the PyTorch CUDA index, Pillow, numpy)
 """
@@ -918,8 +919,9 @@ class SheetWriter:
     named by its number and the QF range it shows, with a header row naming the
     columns."""
 
-    def __init__(self, folder: Path, offsets: list[int], prefix: str):
+    def __init__(self, folder: Path, offsets: list[int], prefix: str, heads: list[str] | None = None):
         self.folder, self.offsets, self.prefix = folder, offsets, prefix
+        self.heads = heads or ["original"] + [f"QF {o:+d}" for o in offsets]
         self.tiles: list[tuple[float, Image.Image]] = []
         self.count = 0
         folder.mkdir(parents=True, exist_ok=True)
@@ -933,7 +935,7 @@ class SheetWriter:
         if not self.tiles:
             return
         width = max(t.width for _, t in self.tiles)
-        heads = ["original"] + [f"QF {o:+d}" for o in self.offsets]
+        heads = self.heads
         sheet = Image.new("RGB", (width, LABEL_H + sum(t.height + 6 for _, t in self.tiles)), "white")
         d = ImageDraw.Draw(sheet)
         font = tile_font()
@@ -1195,6 +1197,51 @@ def undo_root(root: Path) -> dict:
     return counts
 
 
+def review_root(root: Path, threads: int) -> tuple[int, int, int] | None:
+    """Contact sheets of the last run that is not undone: every image it wrote,
+    the original from where the run kept it next to the file now in place, in
+    QF order. Reads files only; no model. -> (sheets, images drawn, images
+    written by the run), or None when there is no run."""
+    run_id, recs = last_run(read_log(root))
+    if run_id is None:
+        return None
+    intents = {r["rel"]: r for r in recs if r.get("op") == "intent"}
+    done = sorted((r for r in recs if r.get("op") == "fix" and "error" not in r and r["rel"] in intents),
+                  key=lambda r: (r.get("qf", 0), r["rel"]))
+    sheet_dir = root / BACKUP_DIRNAME / RUN_DIRNAME / SHEETS_DIRNAME
+    clear_sheets(sheet_dir)
+    sheets = SheetWriter(sheet_dir, [], "fix", heads=["original", "written"])
+
+    def tile(rec):
+        a = decode(root / intents[rec["rel"]]["backup"], 1 << 62)
+        b = decode(root / rec["rel"], 1 << 62)
+        if a["skip"] or b["skip"]:
+            return None, "original: " + a["skip"] if a["skip"] else "written file: " + b["skip"]
+        orig = a["luma"] if a["gray"] else a["rgb"]
+        now = b["luma"] if b["gray"] else b["rgb"]
+        if orig.shape[:2] != now.shape[:2]:
+            return None, "the file in place has another size than its original"
+        if orig.ndim != now.ndim:
+            orig, now = as_rgb(orig), as_rgb(now)
+        change = float(np.abs(orig.astype(np.int16) - now).mean())
+        label = (f"SAVED: {rec.get('benefit', '')}  |  QF {rec.get('qf', '-')}, blockiness {blockiness(orig):.2f} > "
+                 f"{blockiness(now):.2f}, change {change:.2f}, {a['width']}x{a['height']}{', gray' if a['gray'] else ''}")
+        return make_tile(rec["rel"], label, orig, [now], a["orientation"]), ""
+
+    drawn = 0
+    progress = Progress(root.name, "drawn", len(done))
+    with ThreadPoolExecutor(max_workers=threads) as pool:
+        for n, (rec, (tl, why)) in enumerate(zip(done, bounded_map(pool, tile, done, threads * 2)), 1):
+            if tl is None:
+                print(f"  not drawn, {why}: {rec['rel']}")
+            else:
+                sheets.add(rec.get("qf", 0), tl)
+                drawn += 1
+            progress.step(n)
+    sheets.flush()
+    return sheets.count, drawn, len(done)
+
+
 # --- the fix of one folder --------------------------------------------------------------
 
 def fix_folder(root: Path, args, model_box: list) -> int:
@@ -1300,6 +1347,8 @@ def fix_folder(root: Path, args, model_box: list) -> int:
     else:
         print(f"  done:    {written:,} images restored in place, originals in {root / BACKUP_DIRNAME}"
               + (f"; {failed:,} failed (see the report)" if failed else ""))
+        if written and sheets is None:
+            print("  sheets:  none in a real run without --sheets; --review draws them from the backups")
     return failed
 
 
@@ -1441,6 +1490,18 @@ def undo(args) -> int:
     return 0
 
 
+def review(args) -> int:
+    for root in check_roots(args.folders):
+        res = review_root(root, args.threads)
+        if res is None:
+            print(f"{root}: no run to review")
+        else:
+            n, drawn, total = res
+            print(f"{root}: {drawn:,} of {total:,} restored images drawn on {n} sheets in "
+                  f"{root / BACKUP_DIRNAME / RUN_DIRNAME / SHEETS_DIRNAME}")
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Find heavily compressed images in a dataset with FBCNN, and restore them.")
     ap.add_argument("folders", nargs="*",
@@ -1450,6 +1511,8 @@ def main(argv=None) -> int:
     ap.add_argument("--dry-run", action="store_true",
                     help="the fix in memory: write the report and the contact sheets, change no image")
     ap.add_argument("--undo", action="store_true", help="put back what the last fix of each folder changed")
+    ap.add_argument("--review", action="store_true",
+                    help="contact sheets of the last fix: each original in _backup next to the file now in place")
     ap.add_argument("--threshold", type=qf_arg, default=DEFAULT_THRESHOLD, metavar="QF",
                     help=f"fix images with a QF under this (default {DEFAULT_THRESHOLD})")
     ap.add_argument("--qf-offset", type=int, default=DEFAULT_QF_OFFSET, metavar="N",
@@ -1487,10 +1550,12 @@ def main(argv=None) -> int:
         return 0
     if not args.folders:
         ap.error("give at least one dataset folder")
-    if sum((args.extract, args.dry_run, args.undo)) > 1:
-        ap.error("--extract, --dry-run and --undo do not go together")
+    if sum((args.extract, args.dry_run, args.undo, args.review)) > 1:
+        ap.error("--extract, --dry-run, --undo and --review do not go together")
     if args.undo:
         return undo(args)
+    if args.review:
+        return review(args)
     try:
         return extract(args) if args.extract else fix(args)
     except KeyboardInterrupt:
