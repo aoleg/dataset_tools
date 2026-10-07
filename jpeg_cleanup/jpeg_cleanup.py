@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Find heavily compressed images in a dataset with the FBCNN quality predictor.
+Find heavily compressed images in a dataset with the FBCNN quality predictor,
+and restore them with FBCNN.
 
-Phase 1 (this version) is --extract: every image of every folder given is
+--extract: every image of every folder given is
 scanned at any depth, its JPEG quality factor (QF) is predicted from the stored
 pixels, and each image under the highest band limit is copied with its sidecars
 into one folder per band, outside the dataset, so a threshold can be chosen by
@@ -13,15 +14,24 @@ An extract folder given instead of a dataset folder is sorted again in place,
 from its extract.csv and its manifest, without the dataset: new band limits
 move the copies between the band folders.
 
+--dry-run (the fix; its real run comes next): every image with a QF under
+--threshold is restored in memory, at its QF plus --qf-offset, and encoded as
+it would be written. The report and the contact sheets (before and after,
+at 100% and magnified) go to <folder>/_backup/_jpeg_cleanup; no image changes.
+
 Usage:    python jpeg_cleanup.py --extract <folder> [<folder> ...] [--out DIR]
           [--bands LIST] [--max-pixels N] [--exclude NAME] [--sidecars LIST]
           [--reanalyse] [--threads N]
+          python jpeg_cleanup.py <folder> [<folder> ...] --dry-run [--threshold QF]
+          [--qf-offset N] [--sheet-offsets LIST] [--no-sheets] [--quality Q]
+          [--max-pixels N] [--exclude NAME] [--reanalyse] [--threads N]
           python jpeg_cleanup.py --fetch-models
 Install:  install.bat (torch from the PyTorch CUDA index, Pillow, numpy)
 """
 import argparse
 import csv
 import hashlib
+import io
 import json
 import math
 import os
@@ -36,7 +46,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 Image.MAX_IMAGE_PIXELS = None     # large scans are normal input, not an attack
 
@@ -57,6 +67,8 @@ CACHE_NAME = "cache.json"         # measurements by file, reused while a file is
 EXTRACT_SUFFIX = "_jpeg_extract"  # default output: <dataset folder>_jpeg_extract next to it
 EXTRACT_CSV = "extract.csv"
 SUMMARY_NAME = "summary.txt"
+REPORT_NAME = "report.csv"        # inside _backup/_jpeg_cleanup: the fix, one row per image
+SHEETS_DIRNAME = "sheets"         # inside _backup/_jpeg_cleanup: the contact sheets of the last fix run
 MANIFEST_NAME = "manifest.json"   # the files the last extract copied, removed by the next one
 MOVES_NAME = "moves.json"         # the moves of a re-sort in progress; the next run finishes them
 PROGRESS_EVERY = 500              # images between progress lines
@@ -72,6 +84,9 @@ DEFAULT_SIDECARS = ".txt"
 DEFAULT_BANDS = "60,70,80,85"
 DEFAULT_MAX_PIXELS = 2048 * 2048  # larger images are skipped: the downscale to 1024^2 hides their artifacts
 DEFAULT_THREADS = 8
+DEFAULT_THRESHOLD = 80            # the fix restores images with a QF under this
+DEFAULT_QF_OFFSET = 10            # added to the predicted QF given to the restoration: the gentle side
+DEFAULT_QUALITY = 97              # JPEG quality of a restored JPEG
 
 MEASURE_VERSION = 1               # bump when a measurement changes meaning; the cache is then dropped
 GRAY_SPREAD = 2                   # an RGB image whose channels differ by at most this everywhere is gray
@@ -101,6 +116,7 @@ class Item:
     band: int | None = None
     status: str = ""
     copy: str = ""                            # the copy, relative to the output folder
+    fix: dict = field(default_factory=dict)   # the fix of the image (see fix_one)
 
 
 # --- scan ---------------------------------------------------------------------
@@ -165,11 +181,17 @@ def decode(path: Path, max_pixels: int) -> dict:
     stored pixels (no EXIF rotation, so the JPEG block grid stays aligned):
     "rgb" uint8 HxWx3 and, for a gray image, "luma" uint8 HxW. A skipped image
     gets "skip" with the reason. Runs in the decoder threads."""
-    d = {"format": "", "mode": "", "width": 0, "height": 0, "gray": None, "header_q": None, "skip": ""}
+    d = {"format": "", "mode": "", "width": 0, "height": 0, "gray": None, "header_q": None, "skip": "",
+         "orientation": 1}
     try:
         with Image.open(path) as im:
             fmt = im.format or ""
             d.update(format=fmt, mode=im.mode, width=im.size[0], height=im.size[1])
+            try:
+                o = im.getexif().get(274, 1) or 1
+                d["orientation"] = o if o in range(1, 9) else 1
+            except Exception:  # noqa: BLE001 - a damaged EXIF block is not fatal
+                pass
             if fmt in ("JPEG", "MPO"):
                 d["header_q"] = header_quality(im)
             if fmt not in MEASURED_FORMATS:
@@ -258,7 +280,7 @@ def fetch_models() -> None:
 class QualityModel:
     """The FBCNN quality predictors, loaded on first use from models/ only.
     The QF needs the encoder half of the network (head, three downsamplings,
-    body encoder, qf_pred), so the decoder never runs here."""
+    body encoder, qf_pred); the restoration runs the whole network."""
 
     def __init__(self):
         import torch                              # imported here: a cached run needs no torch
@@ -282,6 +304,19 @@ class QualityModel:
             m.load_state_dict(self.torch.load(path, map_location="cpu", weights_only=True), strict=True)
             self.nets[name] = m.eval().to(self.device, self.dtype)
         return self.nets[name]
+
+    def restore(self, name: str, a: np.ndarray, qf: float) -> np.ndarray:
+        """The FBCNN restoration of an HxWx3 (color) or HxW (gray) uint8 array,
+        told quality qf (0..100), as a uint8 array of the same shape."""
+        torch = self.torch
+        m = self.net(name)
+        with torch.inference_mode():
+            x = torch.from_numpy(np.ascontiguousarray(a)).to(self.device)
+            x = (x[None, None] if x.ndim == 2 else x.permute(2, 0, 1)[None]).to(self.dtype) / 255.0
+            q = torch.tensor([[1.0 - qf / 100.0]], device=self.device, dtype=self.dtype)
+            y, _ = m(x, q)
+            y = (y.float().clamp(0, 1) * 255.0).round().to(torch.uint8)[0]
+            return (y[0] if a.ndim == 2 else y.permute(1, 2, 0)).cpu().numpy()
 
     def qf(self, name: str, a: np.ndarray) -> float:
         """Predicted QF (0..100) of an HxWx3 (color) or HxW (gray) uint8 array."""
@@ -724,6 +759,265 @@ def write_summary(out: Path, lines) -> None:
         print(line)
 
 
+# --- fix: restoration, report and contact sheets ------------------------------------
+# A fix restores every image with a QF under --threshold with FBCNN, told the
+# image's own QF plus --qf-offset: the higher the QF it is given, the less it
+# smooths, so a positive offset keeps more grain and fine texture. A gray image
+# goes through the gray model. JPEG sources are saved as JPEG at --quality with
+# full-resolution colour (4:4:4); lossless sources keep their format. The dry
+# run does all of this in memory and writes the report and contact sheets only.
+
+def fix_action(it, threshold: int, max_pixels: int) -> str:
+    """fix, keep, or the skip reason."""
+    m = it.m
+    if m.get("skip"):
+        return m["skip"]
+    if m["width"] * m["height"] > max_pixels:
+        return "large"
+    return "fix" if m["qf"] < threshold else "keep"
+
+
+def encode_jpeg(a: np.ndarray, quality: int) -> bytes:
+    """The bytes a JPEG source is written as: 4:4:4, no chroma subsampling, so
+    the re-save adds no colour bleeding of its own."""
+    buf = io.BytesIO()
+    Image.fromarray(a).save(buf, "JPEG", quality=quality, subsampling=0, optimize=True)
+    return buf.getvalue()
+
+
+def best_window(diff: np.ndarray, size: int, step: int = 8) -> tuple[int, int]:
+    """Top-left corner of the size x size window with the largest sum of diff
+    (an integral image, so a large image costs one pass)."""
+    h, w = diff.shape
+    sh, sw = min(size, h), min(size, w)
+    ii = np.zeros((h + 1, w + 1), np.float64)
+    ii[1:, 1:] = diff.cumsum(0).cumsum(1)
+    ys = np.arange(0, h - sh + 1, step)
+    xs = np.arange(0, w - sw + 1, step)
+    sums = ii[ys[:, None] + sh, xs[None, :] + sw] - ii[ys[:, None], xs[None, :] + sw] \
+        - ii[ys[:, None] + sh, xs[None, :]] + ii[ys[:, None], xs[None, :]]
+    i, j = np.unravel_index(int(np.argmax(sums)), sums.shape)
+    return int(ys[i]), int(xs[j])
+
+
+THUMB = 256                       # px, the longest side of the thumbnail
+CROP = 256                        # px, the crop shown at 100%
+ZOOM_SRC = 96                     # px, the part of the crop shown magnified
+ZOOM = 3
+TILES_PER_SHEET = 8
+LABEL_H = 20
+SHEET_QUALITY = 95                # the sheets are JPEG 4:4:4 at this quality: their own artifacts stay far below the ones judged
+ORIENT = {2: [Image.Transpose.FLIP_LEFT_RIGHT], 3: [Image.Transpose.ROTATE_180], 4: [Image.Transpose.FLIP_TOP_BOTTOM],
+          5: [Image.Transpose.TRANSPOSE], 6: [Image.Transpose.ROTATE_270], 7: [Image.Transpose.TRANSVERSE],
+          8: [Image.Transpose.ROTATE_90]}
+
+
+def tile_font(size: int = 14):
+    for name in ("arial.ttf", "DejaVuSans.ttf"):
+        try:
+            return ImageFont.truetype(name, size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+def as_rgb(a: np.ndarray) -> np.ndarray:
+    return np.repeat(a[..., None], 3, axis=2) if a.ndim == 2 else a
+
+
+def make_tile(rel: str, label: str, orig: np.ndarray, outs: list[np.ndarray], orientation: int) -> Image.Image:
+    """One row of a sheet: the thumbnail (EXIF-rotated, the crop marked in red),
+    the crop at 100% before and after each restoration, and its most changed
+    part magnified before and after. The crop sits where the first restoration
+    changed the image most, which is where the artifacts (or the grain it took
+    away) are."""
+    o = as_rgb(orig)
+    diff = np.abs(o.astype(np.int16) - as_rgb(outs[0])).mean(axis=2, dtype=np.float32)
+    y, x = best_window(diff, CROP)
+    ch, cw = min(CROP, o.shape[0]), min(CROP, o.shape[1])
+    zy, zx = best_window(diff[y:y + ch, x:x + cw], ZOOM_SRC, step=4)
+    zh, zw = min(ZOOM_SRC, ch), min(ZOOM_SRC, cw)
+    thumb = Image.fromarray(o)
+    scale = THUMB / max(thumb.size)
+    thumb = thumb.resize((max(1, round(thumb.width * scale)), max(1, round(thumb.height * scale))), Image.LANCZOS)
+    ImageDraw.Draw(thumb).rectangle([x * scale, y * scale, (x + cw) * scale - 1, (y + ch) * scale - 1],
+                                    outline=(255, 0, 0), width=2)
+    for t in ORIENT.get(orientation, []):
+        thumb = thumb.transpose(t)
+    panels = [o] + [as_rgb(a) for a in outs]
+    width = THUMB + len(panels) * (CROP + ZOOM_SRC * ZOOM) + 2 * 8
+    tile = Image.new("RGB", (width, LABEL_H + max(THUMB, CROP, ZOOM_SRC * ZOOM)), "white")
+    ImageDraw.Draw(tile).text((4, 2), label + "   " + rel, fill="black", font=tile_font())
+    tile.paste(thumb, (0, LABEL_H))
+    cx = THUMB + 8
+    for a in panels:
+        tile.paste(Image.fromarray(a[y:y + ch, x:x + cw]), (cx, LABEL_H))
+        cx += CROP
+    cx += 8
+    for a in panels:
+        z = Image.fromarray(a[y + zy:y + zy + zh, x + zx:x + zx + zw]).resize((zw * ZOOM, zh * ZOOM), Image.NEAREST)
+        tile.paste(z, (cx, LABEL_H))
+        cx += ZOOM_SRC * ZOOM
+    return tile
+
+
+def clear_sheets(folder: Path) -> None:
+    """Delete the sheets of the last run, so the folder never shows sheets that
+    do not belong to the report next to it."""
+    if folder.exists():
+        for p in folder.glob("sheet_*.jpg"):
+            p.unlink()
+
+
+class SheetWriter:
+    """Collects tiles in QF order and writes a sheet of TILES_PER_SHEET each,
+    named by its number and the QF range it shows, with a header row naming the
+    columns."""
+
+    def __init__(self, folder: Path, offsets: list[int]):
+        self.folder, self.offsets = folder, offsets
+        self.tiles: list[tuple[float, Image.Image]] = []
+        self.count = 0
+        clear_sheets(folder)
+        folder.mkdir(parents=True, exist_ok=True)
+
+    def add(self, qf: float, tile: Image.Image) -> None:
+        self.tiles.append((qf, tile))
+        if len(self.tiles) == TILES_PER_SHEET:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self.tiles:
+            return
+        width = max(t.width for _, t in self.tiles)
+        heads = ["original"] + [f"QF {o:+d}" for o in self.offsets]
+        sheet = Image.new("RGB", (width, LABEL_H + sum(t.height + 6 for _, t in self.tiles)), "white")
+        d = ImageDraw.Draw(sheet)
+        font = tile_font()
+        cx = THUMB + 8
+        for h in heads:
+            d.text((cx + 4, 2), h + ", 100%", fill="black", font=font)
+            cx += CROP
+        cx += 8
+        for h in heads:
+            d.text((cx + 4, 2), h + f", {ZOOM}x", fill="black", font=font)
+            cx += ZOOM_SRC * ZOOM
+        y = LABEL_H
+        for _, t in self.tiles:
+            sheet.paste(t, (0, y))
+            y += t.height + 6
+        self.count += 1
+        lo, hi = self.tiles[0][0], self.tiles[-1][0]
+        sheet.save(self.folder / f"sheet_{self.count:04d}_q{int(lo):02d}-{int(hi):02d}.jpg", "JPEG",
+                   quality=SHEET_QUALITY, subsampling=0)
+        self.tiles = []
+
+
+def fix_one(model: QualityModel, d: dict, qf: float, offsets: list[int], quality: int, sheet: bool) -> dict:
+    """Restore one decoded image at qf + offsets[0] (and the other offsets when
+    a tile is wanted). -> qf_used, write, qf_after, change, and "outs" (the
+    restorations as they would be written) when sheet is set."""
+    name, a = ("gray", d["luma"]) if d["gray"] else ("color", d["rgb"])
+    outs = []
+    for o in (offsets if sheet else offsets[:1]):
+        y = model.restore(name, a, min(100.0, qf + o))
+        if d["format"] in ("JPEG", "MPO"):
+            y = np.array(Image.open(io.BytesIO(encode_jpeg(y, quality))))   # what the file will hold
+        outs.append(y)
+    r = {"model": name, "qf_used": round(min(100.0, qf + offsets[0]), 1),
+         "write": "jpeg" if d["format"] in ("JPEG", "MPO") else d["format"].lower(),
+         "qf_after": round(model.qf(name, outs[0]), 1),
+         "change": round(float(np.abs(a.astype(np.int16) - outs[0]).mean()), 2)}
+    if sheet:
+        r["outs"] = outs
+    return r
+
+
+FIX_FIELDS = ["path", "format", "mode", "width", "height", "gray", "header_q", "qf", "action", "model", "qf_used",
+              "write", "qf_after", "change"]
+
+
+def write_report(root: Path, items) -> Path:
+    path = root / BACKUP_DIRNAME / RUN_DIRNAME / REPORT_NAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".part")
+    with open(tmp, "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(FIX_FIELDS)
+        for it in items:
+            m, r = it.m, it.fix
+            w.writerow([it.rel, m.get("format", ""), m.get("mode", ""), m.get("width", 0), m.get("height", 0),
+                        "" if m.get("gray") is None else int(m["gray"]), fmt_num(m.get("header_q")),
+                        fmt_num(m.get("qf")), it.status, r.get("model", ""), fmt_num(r.get("qf_used")),
+                        r.get("write", ""), fmt_num(r.get("qf_after")), fmt_num(r.get("change"))])
+    os.replace(tmp, path)
+    return path
+
+
+def fix_dry_run(root: Path, args, model_box: list) -> None:
+    t0 = time.perf_counter()
+    sidecar_exts = [e if e.startswith(".") else "." + e for e in (s.strip() for s in args.sidecars.split(",")) if e]
+    items = scan(root, DEFAULT_EXCLUDES + args.exclude, sidecar_exts)
+    print(f"{root}: {len(items):,} images found", flush=True)
+    reused = measure_items(root, items, args.max_pixels, args.threads, args.reanalyse, model_box)
+    if reused:
+        print(f"  {root.name}: {reused:,} images unchanged since the last run, taken from the cache")
+    for it in items:
+        it.status, it.fix = fix_action(it, args.threshold, args.max_pixels), {}
+    todo = sorted((it for it in items if it.status == "fix"), key=lambda it: (it.m["qf"], it.rel))
+    offsets = [args.qf_offset] + [o for o in args.sheet_offsets if o != args.qf_offset]
+    sheet_dir = root / BACKUP_DIRNAME / RUN_DIRNAME / SHEETS_DIRNAME
+    sheets = None if args.no_sheets else SheetWriter(sheet_dir, offsets)
+    if sheets is None:
+        clear_sheets(sheet_dir)
+    if todo:
+        if not model_box:
+            model_box.append(QualityModel())
+        model = model_box[0]
+        progress = Progress(root.name, "restored", len(todo))
+        with ThreadPoolExecutor(max_workers=args.threads) as pool, ThreadPoolExecutor(max_workers=2) as tiler:
+            decoded = bounded_map(pool, lambda it: decode(it.path, args.max_pixels), todo, args.threads * 2)
+            pending = deque()
+            for n, (it, d) in enumerate(zip(todo, decoded), 1):
+                if d["skip"]:                     # changed since it was measured
+                    it.status = d["skip"]
+                    continue
+                r = fix_one(model, d, it.m["qf"], offsets, args.quality, sheets is not None)
+                outs = r.pop("outs", None)
+                it.fix = r
+                if sheets is not None:
+                    label = (f"QF {it.m['qf']:.1f}, header {it.m.get('header_q') or '-'}, "
+                             f"{it.m['width']}x{it.m['height']}, {r['model']} model, change {r['change']:.2f}")
+                    orig = d["luma"] if d["gray"] else d["rgb"]
+                    pending.append((it.m["qf"], tiler.submit(make_tile, it.rel, label, orig, outs, d["orientation"])))
+                    while pending and (pending[0][1].done() or len(pending) > 8):
+                        q, fut = pending.popleft()
+                        sheets.add(q, fut.result())
+                progress.step(n)
+            for q, fut in pending:
+                sheets.add(q, fut.result())
+    if sheets is not None:
+        sheets.flush()
+    report = write_report(root, items)
+    count = {}
+    for it in items:
+        k = it.status if it.status in ("fix", "keep") else "skipped"
+        count[k] = count.get(k, 0) + 1
+    print(f"{root}: {len(items):,} images, {clock(time.perf_counter() - t0)}")
+    print(f"  threshold QF {args.threshold}, offset {args.qf_offset:+d}: {count.get('fix', 0):,} to fix, "
+          f"{count.get('keep', 0):,} kept, {count.get('skipped', 0):,} skipped")
+    fixed = [it for it in items if it.fix]
+    if fixed:
+        ch = sorted(it.fix["change"] for it in fixed)
+        qa = sorted(it.fix["qf_after"] for it in fixed)
+        print(f"  change (mean, 8-bit levels): median {ch[len(ch) // 2]:.2f}, max {ch[-1]:.2f}; "
+              f"QF after the fix: median {qa[len(qa) // 2]:.1f}, min {qa[0]:.1f}")
+    if sheets is not None:
+        print(f"  sheets:  {sheets.count} in {sheets.folder}")
+    print(f"  report:  {report}")
+    print("  dry run: no image was changed")
+
+
 # --- command line -------------------------------------------------------------------
 
 def threads_arg(value: str) -> int:
@@ -817,12 +1111,53 @@ def extract(args) -> int:
     return 0
 
 
+def qf_arg(value: str) -> int:
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"a quality must be an integer, got {value!r}")
+    if not 1 <= n <= 100:
+        raise argparse.ArgumentTypeError(f"a quality must be 1..100, got {n}")
+    return n
+
+
+def parse_offsets(text: str) -> list[int]:
+    try:
+        return [int(x) for x in text.split(",") if x.strip()]
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"--sheet-offsets must be integers separated by commas, got {text!r}")
+
+
+def fix(args) -> int:
+    """The dry run of the fix. An extract folder is a valid input too: its
+    copies have the bytes of their sources, so the report and the sheets show
+    what a run on the dataset would do, and the dry run writes only into its
+    _backup folder, which a re-sort of the extract leaves alone."""
+    roots = check_roots(args.folders)
+    model_box: list = []
+    for root in roots:
+        fix_dry_run(root, args, model_box)
+    return 0
+
+
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description="Find heavily compressed images in a dataset with FBCNN.")
+    ap = argparse.ArgumentParser(description="Find heavily compressed images in a dataset with FBCNN, and restore them.")
     ap.add_argument("folders", nargs="*",
-                    help="dataset folders, scanned at any depth; or extract folders, sorted again in place")
+                    help="dataset folders, scanned at any depth; with --extract also extract folders, sorted again")
     ap.add_argument("--extract", action="store_true",
                     help="copy the images under each band limit into one folder per band, outside the dataset")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="the fix in memory: write the report and the contact sheets, change no image")
+    ap.add_argument("--threshold", type=qf_arg, default=DEFAULT_THRESHOLD, metavar="QF",
+                    help=f"fix images with a QF under this (default {DEFAULT_THRESHOLD})")
+    ap.add_argument("--qf-offset", type=int, default=DEFAULT_QF_OFFSET, metavar="N",
+                    help=f"added to the predicted QF given to the restoration; higher keeps more grain "
+                         f"(default {DEFAULT_QF_OFFSET})")
+    ap.add_argument("--sheet-offsets", type=parse_offsets, default=[], metavar="LIST",
+                    help="more offsets shown side by side on the contact sheets, comma-separated, e.g. 10,20")
+    ap.add_argument("--no-sheets", action="store_true", help="no contact sheets")
+    ap.add_argument("--quality", type=qf_arg, default=DEFAULT_QUALITY, metavar="Q",
+                    help=f"JPEG quality of a restored JPEG (default {DEFAULT_QUALITY})")
     ap.add_argument("--fetch-models", action="store_true", help="download the FBCNN models into models/ and check them")
     ap.add_argument("--out", metavar="DIR",
                     help=f"output folder (default <folder>{EXTRACT_SUFFIX} next to each dataset folder)")
@@ -843,12 +1178,14 @@ def main(argv=None) -> int:
     if args.fetch_models:
         fetch_models()
         return 0
-    if not args.extract:
-        ap.error("only --extract is implemented so far (use extract.bat)")
     if not args.folders:
         ap.error("give at least one dataset folder")
+    if args.extract and args.dry_run:
+        ap.error("--extract and --dry-run do not go together")
+    if not args.extract and not args.dry_run:
+        ap.error("the fix has only its --dry-run so far")
     try:
-        return extract(args)
+        return extract(args) if args.extract else fix(args)
     except KeyboardInterrupt:
         print("\nStopped. The measurements so far are in the cache; the next run continues from there.")
         return 130

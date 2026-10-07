@@ -2,7 +2,7 @@
 
 `jpeg_cleanup.py` finds heavily compressed images in a large dataset with [FBCNN](https://github.com/jiaxi-jiang/FBCNN), a network that predicts the JPEG quality factor (QF) of an image from its pixels. It sees through re-saves: video frames whose JPEG header says quality 85 read 56 to 66 because they were compressed harder before, and a PNG made from a JPEG reads about the quality of that JPEG.
 
-The tool is built in phases. This version has the first one, `extract.bat`: it measures every image and copies the poor ones into one folder per quality band, outside the dataset, so the threshold for the cleanup can be chosen by eye. The dataset is not changed. The cleanup itself (FBCNN restores the images in place, the originals go to `_backup`) comes in a later version.
+The tool is built in phases. `extract.bat` measures every image and copies the poor ones into one folder per quality band, outside the dataset, so the threshold for the cleanup can be chosen by eye. `run.bat --dry-run` restores the images under the threshold in memory and writes a report and contact sheets with each image before and after. Neither changes the dataset. The real run (the restorations written in place, the originals to `_backup`) comes in the next version.
 
 ## Install
 
@@ -75,6 +75,48 @@ An extract folder given instead of a dataset folder is sorted in place from its 
 
 `extract.csv` and `manifest.json` are written first, then the moves are made. When a run is stopped, the next run finishes its moves from `moves.json` before anything else.
 
+## The fix: dry run
+
+```
+run.bat <folder> [<folder> ...] --dry-run [options]
+```
+
+Examples:
+
+```
+run.bat D:\photos --dry-run
+run.bat D:\photos --dry-run --sheet-offsets 0,20
+run.bat D:\photos --dry-run --threshold 70 --no-sheets
+```
+
+The first command restores every image of `D:\photos` with a QF under 80 in memory and writes the report and the contact sheets into `D:\photos\_backup\_jpeg_cleanup\`. The second shows two more restorations on the sheets, at offsets 0 and 20, next to the default one, to choose `--qf-offset` by eye. The third uses another threshold and writes the report only.
+
+| option | what it does |
+|---|---|
+| `--threshold QF` | fix the images with a QF under this (default 80) |
+| `--qf-offset N` | added to the predicted QF that FBCNN is told (default 10); see below |
+| `--sheet-offsets LIST` | more offsets shown side by side on the sheets, comma-separated |
+| `--no-sheets` | the report only |
+| `--quality Q` | the JPEG quality a restored JPEG is saved with (default 97) |
+
+`--max-pixels`, `--exclude`, `--reanalyse` and `--threads` work as for `extract.bat`. The QF measurements come from the same cache, so after an extract the dry run starts restoring at once.
+
+What a dry run does with each image under the threshold:
+
+1. Restores the stored pixels (before EXIF rotation) with FBCNN; a black-and-white image with the gray model. FBCNN is told the quality of the image: its predicted QF plus `--qf-offset`. Told a higher quality, it removes less, so a positive offset keeps more film grain and fine texture, at the price of a little more of the artifacts. The effect is mild: from +0 to +20 the fine detail kept rises from about 78% to 87% of the original's.
+2. Encodes the result as it would be written: a JPEG source as JPEG at `--quality` with full-resolution colour (4:4:4, so the re-save adds no colour bleeding), a PNG, BMP, TIFF or lossless WebP source in its own format. The JPEG re-save at 97 differs from the restoration by 46 to 51 dB PSNR, far below the artifacts removed.
+3. Measures the QF of the result again (`qf_after`) and its mean change from the original.
+
+Images at or above the threshold are kept as they are. The dry run writes no image. An extract folder can be given instead of the dataset: its copies hold the bytes of their sources, so the report and the sheets show what a run on the dataset would do. The dry run then writes into the `_backup` folder of the extract, which a re-sort of the extract leaves alone.
+
+### The contact sheets
+
+`_backup\_jpeg_cleanup\sheets\sheet_NNNN_qLO-HI.jpg`, 8 images per sheet, in QF order, the QF range in the name. Each row has a thumbnail with the crop marked in red; a 256 x 256 crop at 100%, first the original, then each restoration; and the most changed 96 x 96 part of that crop, magnified 3 times, in the same order. The crop sits where the restoration changed the image most: on a blocky image that is where the blocks were, on a grainy one where the most grain went. Judge both: the artifacts should be gone, and the grain of a film photo or the dots of a printed one should not be smoothed into plastic. The sheets are JPEG at quality 95 with 4:4:4 colour, so their own compression stays far below what they show. A run deletes the sheets of the last one.
+
+### The report
+
+`_backup\_jpeg_cleanup\report.csv`, one row per image: `path`, `format`, `mode`, `width`, `height`, `gray`, `header_q`, `qf`, `action` (fix, keep, or the skip reason), `model` (color or gray), `qf_used` (the QF FBCNN was told), `write` (jpeg, or the lossless format), `qf_after` (the QF of the result), `change` (the mean difference between the original and the result, in 8-bit levels).
+
 ## Output
 
 ```
@@ -84,15 +126,17 @@ An extract folder given instead of a dataset folder is sorted in place from its 
   extract.csv              one row per image of the dataset
   summary.txt              counts per band, a QF histogram, the skipped images
   manifest.json            the files this run copied
-<folder>\_backup\_jpeg_cleanup\cache.json
-                           the measurements, reused while a file is unchanged
+<folder>\_backup\_jpeg_cleanup\
+  cache.json               the measurements, reused while a file is unchanged
+  report.csv               the fix of the last dry run, one row per image
+  sheets\                  its contact sheets
 ```
 
 `extract.csv` columns: `path` (relative to the dataset folder), `format`, `mode`, `width`, `height`, `megapixels`, `gray` (1 for a black-and-white image), `header_q` (the quality the JPEG header was saved with, estimated from its luminance table), `qf_color` and `qf_gray` (the QF of each model), `qf` (the one that decides), `band`, `copy` (the copy, relative to the output folder), `status` (copied, above, or the skip reason). The file is UTF-8 with a byte order mark, so Excel shows Cyrillic names correctly.
 
 `header_q` and `qf` agree within a few points on a JPEG saved once. A `qf` well under `header_q` means the image was compressed harder before its last save.
 
-The cache is the only file the tool writes into the dataset folder. The other dataset tools skip `_backup`.
+`_backup\_jpeg_cleanup` is the only folder the tool writes into the dataset folder. The other dataset tools skip `_backup`.
 
 ## Choosing the threshold
 
@@ -103,4 +147,4 @@ Look through the band folders from the lowest up and find the band where the ima
 
 ## Speed
 
-On an RTX 5090 a mix of 0.2 to 4 MP images is measured at about 35 images per second. A second run with other bands takes seconds.
+On an RTX 5090 a mix of 0.2 to 4 MP images is measured at about 35 images per second. A second run with other bands takes seconds. A dry run of the fix restores about 8 images per second with sheets, 10 without; each extra sheet offset costs one more restoration per image.
