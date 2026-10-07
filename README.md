@@ -13,6 +13,7 @@ Tools that prepare image datasets for LoRA and fine-tune training, mainly with [
 | [classify](classify/README.md) | Sorts a dataset into category folders from a folder of hand-sorted examples per category: every image is embedded once with SigLIP 2, a classifier is trained on the examples, and each image is copied with its caption into its category folder, or into `_unsure` when the classifier is not confident. A dry run writes a report with a confusion matrix, a confidence histogram and contact sheets; `--undo` puts everything back. |
 | [remove_borders](remove_borders/README.md) | Finds images with borders (light and dark frames, thin lines, slanted frames of rotated scans, banners with text at the bottom or top) and cuts the borders off in place; lossless for JPEG, exact for PNG and other lossless formats, lossy formats become PNG. Originals and captions go to a `_backup` folder first, an image too small after its crop moves there instead, and `--undo` puts everything back. A dry run writes a report and contact sheets with the cut lines magnified. |
 | [flatten_dataset](flatten_dataset/README.md) | Moves the images and captions of all subfolders into the dataset folder under normalised names (`<folder>__<subfolder>-datasetNNNNNN.ext`: transliterated, no spaces, at most 80 characters), always an image and its caption together. `--undo` puts every file back from the manifest in `_flatten_dataset`. |
+| [jpeg_cleanup](jpeg_cleanup/README.md) | Finds heavily compressed images with the FBCNN quality predictor, which also sees through re-saves. `extract.bat` copies the poor images with their captions into one folder per quality band (`60`, `70`, `80`, `85`), outside the dataset, so the threshold for the cleanup can be chosen by eye; the dataset is not changed. The in-place cleanup with FBCNN comes next. |
 
 ## Install
 
@@ -24,8 +25,8 @@ All tools share one virtual environment: the `venv` folder in the repository roo
 | `ddg_images` | the `ddgs` package for the Bing and DuckDuckGo backends; the SearXNG backend needs nothing |
 | `deduplicate` | Pillow, numpy, imagehash, OpenCV; runs on the CPU. With `--gpu` it uses the torch of the GPU tools when one of them is installed, and falls back to the CPU otherwise. |
 | `remove_borders` | Pillow, numpy, jpeglib, OpenCV; runs on the CPU |
-| `face_masks`, `reframe`, `classify` | a CUDA GPU; their `install.bat` installs torch from the PyTorch CUDA index and downloads their models, after which they run offline |
+| `face_masks`, `reframe`, `classify`, `jpeg_cleanup` | a CUDA GPU; their `install.bat` installs torch from the PyTorch CUDA index and downloads their models, after which they run offline |
 
-The three GPU tools install the same torch build, so they share it in the `venv`.
+The GPU tools install the same torch build, so they share it in the `venv`.
 
 MIT License.

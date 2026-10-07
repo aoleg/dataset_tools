@@ -1,0 +1,4 @@
+# torch is installed by install.bat from the PyTorch CUDA index, not from PyPI.
+# Everything else comes from PyPI.
+pillow>=10.0
+numpy>=2.0
