@@ -14,6 +14,7 @@ Tools that prepare image datasets for LoRA and fine-tune training, mainly with [
 | [remove_borders](remove_borders/README.md) | Finds images with borders (light and dark frames, thin lines, slanted frames of rotated scans, banners with text at the bottom or top) and cuts the borders off in place; lossless for JPEG, exact for PNG and other lossless formats, lossy formats become PNG. Originals and captions go to a `_backup` folder first, an image too small after its crop moves there instead, and `--undo` puts everything back. A dry run writes a report and contact sheets with the cut lines magnified. |
 | [flatten_dataset](flatten_dataset/README.md) | Moves the images and captions of all subfolders into the dataset folder under normalised names (`<folder>__<subfolder>-datasetNNNNNN.ext`: transliterated, no spaces, at most 80 characters), always an image and its caption together. `--undo` puts every file back from the manifest in `_flatten_dataset`. |
 | [jpeg_cleanup](jpeg_cleanup/README.md) | Finds heavily compressed images with the FBCNN quality predictor, which also sees through re-saves. `extract.bat` copies the poor images with their captions into one folder per quality band (`60`, `70`, `80`, `85`), outside the dataset, so the threshold for the cleanup can be chosen by eye. `run.bat` restores the images under the threshold with FBCNN and replaces only those whose restoration removes enough of the artifacts, with the originals and captions in a `_backup` folder; `--dry-run` writes a report and before/after contact sheets instead, and `--undo` puts everything back. |
+| [extract_keywords](extract_keywords/README.md) | Moves the images whose captions contain any of the keywords (or all of them, joined by `AND`) with their captions out of a dataset into `<dataset>_<first keyword>` next to it, in the same subfolders: one concept for its own training, or every image whose caption mentions a watermark. `--undo` moves them back. |
 
 ## Install
 
@@ -21,7 +22,7 @@ All tools share one virtual environment: the `venv` folder in the repository roo
 
 | tool | needs |
 |---|---|
-| `telegram_dataset`, `taggui_captioning`, `flatten_dataset` | Python only, nothing to install |
+| `telegram_dataset`, `taggui_captioning`, `flatten_dataset`, `extract_keywords` | Python only, nothing to install |
 | `ddg_images` | the `ddgs` package for the Bing and DuckDuckGo backends; the SearXNG backend needs nothing |
 | `deduplicate` | Pillow, numpy, imagehash, OpenCV; runs on the CPU. With `--gpu` it uses the torch of the GPU tools when one of them is installed, and falls back to the CPU otherwise. |
 | `remove_borders` | Pillow, numpy, jpeglib, OpenCV; runs on the CPU |
