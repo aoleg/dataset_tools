@@ -2,7 +2,7 @@
 
 `jpeg_cleanup.py` finds heavily compressed images in a large dataset with [FBCNN](https://github.com/jiaxi-jiang/FBCNN), a network that predicts the JPEG quality factor (QF) of an image from its pixels. It sees through re-saves: video frames whose JPEG header says quality 85 read 56 to 66 because they were compressed harder before, and a PNG made from a JPEG reads about the quality of that JPEG.
 
-The tool is built in phases. `extract.bat` measures every image and copies the poor ones into one folder per quality band, outside the dataset, so the threshold for the cleanup can be chosen by eye. `run.bat --dry-run` restores the images under the threshold in memory, decides for each whether the restoration removes enough to be worth saving, and writes a report and contact sheets with each image before and after. Neither changes the dataset. The real run (the restorations written in place, the originals to `_backup`) comes in the next version.
+`extract.bat` measures every image and copies the poor ones into one folder per quality band, outside the dataset, so the threshold for the cleanup can be chosen by eye. `run.bat` restores the images under the threshold with FBCNN, decides for each whether the restoration removes enough to be worth saving, and only then puts the original and its captions into a `_backup` folder and the restoration in its place, under the same name. `run.bat --dry-run` does all of that but the writing and draws contact sheets with each image before and after; `run.bat --undo` puts back what the last run changed.
 
 ## Install
 
@@ -75,10 +75,11 @@ An extract folder given instead of a dataset folder is sorted in place from its 
 
 `extract.csv` and `manifest.json` are written first, then the moves are made. When a run is stopped, the next run finishes its moves from `moves.json` before anything else.
 
-## The fix: dry run
+## The fix
 
 ```
-run.bat <folder> [<folder> ...] --dry-run [options]
+run.bat <folder> [<folder> ...] [--dry-run] [options]
+run.bat <folder> --undo
 ```
 
 Examples:
@@ -86,10 +87,11 @@ Examples:
 ```
 run.bat D:\photos --dry-run
 run.bat D:\photos --dry-run --sheet-offsets 0,20
-run.bat D:\photos --dry-run --threshold 70 --no-sheets
+run.bat D:\photos
+run.bat D:\photos --undo
 ```
 
-The first command restores every image of `D:\photos` with a QF under 80 in memory, decides for each whether the restoration is worth saving, and writes the report and the contact sheets into `D:\photos\_backup\_jpeg_cleanup\`. The second shows two more restorations on the sheets, at offsets 0 and 20, next to the default one, to choose `--qf-offset` by eye. The third uses another threshold and writes the report only.
+The first command restores every image of `D:\photos` with a QF under 80 in memory, decides for each whether the restoration is worth saving, and writes the report and the contact sheets into `D:\photos\_backup\_jpeg_cleanup\`; no image changes. The second shows two more restorations on the sheets, at offsets 0 and 20, next to the default one, to choose `--qf-offset` by eye. The third makes the fix: the restorations worth saving replace their images. The fourth puts back everything the last run changed.
 
 | option | what it does |
 |---|---|
@@ -98,19 +100,32 @@ The first command restores every image of `D:\photos` with a QF under 80 in memo
 | `--min-block-drop X` | a restoration is worth saving when the blockiness drops by at least X (default 0.10) |
 | `--min-qf-gain N` | ... or when the QF rises by at least N on an image with a visible JPEG grid (default 25) |
 | `--sheet-offsets LIST` | more offsets shown side by side on the sheets, comma-separated |
-| `--no-sheets` | the report only |
+| `--no-sheets` | with `--dry-run`: the report only |
+| `--sheets` | with a real run: the contact sheets too |
+| `--undo` | put back everything the last run of each folder changed |
 | `--quality Q` | the JPEG quality a restored JPEG is saved with (default 97) |
 
-`--max-pixels`, `--exclude`, `--reanalyse` and `--threads` work as for `extract.bat`. The QF measurements come from the same cache, so after an extract the dry run starts restoring at once.
+`--max-pixels`, `--exclude`, `--sidecars`, `--reanalyse` and `--threads` work as for `extract.bat`. The QF measurements come from the same cache, so after an extract the fix starts restoring at once.
 
-What a dry run does with each image under the threshold:
+What the fix does with each image under the threshold:
 
 1. Restores the stored pixels (before EXIF rotation) with the colour model of FBCNN. A black-and-white image goes in as three equal channels, and only the luma of the result is kept, so no colour can appear. The gray model is not used for the fix: on this kind of dataset it smoothed the film grain of black-and-white photos away and hardly reacted to `--qf-offset`, where the colour model kept the grain and removed the blocks as well. FBCNN is told the quality of the image: the QF the colour model predicts, plus `--qf-offset`. Told a higher quality, it removes less, so a positive offset keeps more film grain and fine texture, at the price of a little more of the artifacts. The effect is mild: from +0 to +20 the fine detail kept rises from about 78% to 87% of the original's.
 2. Encodes the result as it would be written: a JPEG source as JPEG at `--quality` with full-resolution colour (4:4:4, so the re-save adds no colour bleeding), a PNG, BMP, TIFF or lossless WebP source in its own format. The JPEG re-save at 97 differs from the restoration by 46 to 51 dB PSNR, far below the artifacts removed.
 3. Measures the QF of the result again (`qf_after`), the blockiness before and after, and the mean change from the original.
-4. Decides whether the restoration is worth saving (section [Enough benefit](#enough-benefit)). Only those would be written by the real run; the others stay as they are, and their originals never go to `_backup`.
+4. Decides whether the restoration is worth saving (section [Enough benefit](#enough-benefit)). If it is not, the image stays as it is and its original never goes to `_backup`.
+5. If it is, and this is not a dry run: logs the image, copies the original and its captions to `_backup` under the same relative path, writes the restoration to a `.part` file and puts it in place of the image in one step. The image keeps its name, its modification time and its read-only flag, its EXIF block (with the orientation) and its ICC profile; a gray result leaves out an RGB profile, which does not fit it.
 
-Images at or above the threshold are kept as they are. The dry run writes no image. An extract folder can be given instead of the dataset: its copies hold the bytes of their sources, so the report and the sheets show what a run on the dataset would do. The dry run then writes into the `_backup` folder of the extract, which a re-sort of the extract leaves alone.
+Images at or above the threshold are kept as they are. The restorations are computed deterministically, so a real run saves exactly the images its dry run listed as `fix`. A second run finds the restored images clean (their QF is now around 90) and leaves them alone.
+
+An extract folder can be given to a dry run instead of the dataset: its copies hold the bytes of their sources, so the report and the sheets show what a run on the dataset would do. The dry run then writes into the `_backup` folder of the extract, which a re-sort of the extract leaves alone. A real run refuses an extract folder.
+
+The restored JPEGs are larger than their originals: quality 97 with full-resolution colour takes about 2.6 times the space of the quality 70 to 80 files it replaces (417 images went from 45 to 119 MB). At `--quality 95` they are about 2 times the size of the originals, at 92 about 1.6 times.
+
+### Backup and undo
+
+The original of a restored image goes to `_backup\<relative path>`, with copies of its captions. When `_backup` holds an earlier, different original of the same path already (for example from `remove_borders`), that one stays, and this run's original goes to `_backup\_jpeg_cleanup\originals\<run>\<relative path>` instead. A backup that exists is never overwritten.
+
+`--undo` takes the last run that is not undone yet and puts every image it restored back from where the run kept its original, newest first; a backup the run made is removed, one that was there before stays. Caption copies the run made are removed when the caption in place is unchanged; a caption that went missing comes back. An interrupted run can be undone too, since every image is logged before it is touched. Each `--undo` goes one run further back. A run that wrote nothing logs no run.
 
 ### Enough benefit
 
@@ -129,7 +144,7 @@ On a dataset of 10,000 photos, mostly scans of old prints that had been re-saved
 
 ### The report
 
-`_backup\_jpeg_cleanup\report.csv`, one row per image: `path`, `format`, `mode`, `width`, `height`, `gray`, `header_q`, `qf`, `action` (fix: worth saving; little benefit: restored but left alone; keep: at or above the threshold; or the skip reason), `benefit` (why a fix is worth saving), `qf_used` (the QF FBCNN was told), `write` (jpeg, or the lossless format), `qf_after` (the QF of the result), `change` (the mean difference between the original and the result, in 8-bit levels), `block_before` and `block_after` (the blockiness).
+`_backup\_jpeg_cleanup\report.csv`, one row per image: `path`, `format`, `mode`, `width`, `height`, `gray`, `header_q`, `qf`, `action` (fix: worth saving; little benefit: restored but left alone; keep: at or above the threshold; or the skip reason), `benefit` (why a fix is worth saving), `qf_used` (the QF FBCNN was told), `write` (jpeg, or the lossless format), `qf_after` (the QF of the result), `change` (the mean difference between the original and the result, in 8-bit levels), `block_before` and `block_after` (the blockiness), `result` (in a real run: written, or the error).
 
 ## Output
 
@@ -140,17 +155,22 @@ On a dataset of 10,000 photos, mostly scans of old prints that had been re-saved
   extract.csv              one row per image of the dataset
   summary.txt              counts per band, a QF histogram, the skipped images
   manifest.json            the files this run copied
-<folder>\_backup\_jpeg_cleanup\
-  cache.json               the measurements, reused while a file is unchanged
-  report.csv               the fix of the last dry run, one row per image
-  sheets\                  its contact sheets
+<folder>\_backup\
+  <relative path>\<image>  the original of a restored image
+  <relative path>\<name>.txt  its captions
+  _jpeg_cleanup\
+    cache.json             the measurements, reused while a file is unchanged
+    report.csv             the fix of the last run (dry or real), one row per image
+    sheets\                its contact sheets
+    log.jsonl              every real run and undo, step by step
+    originals\<run>\       originals whose place in _backup was taken
 ```
 
 `extract.csv` columns: `path` (relative to the dataset folder), `format`, `mode`, `width`, `height`, `megapixels`, `gray` (1 for a black-and-white image), `header_q` (the quality the JPEG header was saved with, estimated from its luminance table), `qf_color` and `qf_gray` (the QF of each model), `qf` (the one that decides), `band`, `copy` (the copy, relative to the output folder), `status` (copied, above, or the skip reason). The file is UTF-8 with a byte order mark, so Excel shows Cyrillic names correctly.
 
 `header_q` and `qf` agree within a few points on a JPEG saved once. A `qf` well under `header_q` means the image was compressed harder before its last save.
 
-`_backup\_jpeg_cleanup` is the only folder the tool writes into the dataset folder. The other dataset tools skip `_backup`.
+`extract.bat` and a dry run write only into `_backup\_jpeg_cleanup`; a real run also writes the restored images and their originals in `_backup`. The other dataset tools skip `_backup`. When you are sure of the fix, delete the backup files to free the space; keep `_jpeg_cleanup` if you may want `--undo`.
 
 ## Choosing the threshold
 
@@ -161,4 +181,4 @@ Look through the band folders from the lowest up and find the band where the ima
 
 ## Speed
 
-On an RTX 5090 a mix of 0.2 to 4 MP images is measured at about 35 images per second. A second run with other bands takes seconds. A dry run of the fix restores about 8 images per second with sheets, 10 without; each extra sheet offset costs one more restoration per image.
+On an RTX 5090 a mix of 0.2 to 4 MP images is measured at about 35 images per second. A second run with other bands takes seconds. The fix restores about 8 images per second with sheets, 10 without; each extra sheet offset costs one more restoration per image.

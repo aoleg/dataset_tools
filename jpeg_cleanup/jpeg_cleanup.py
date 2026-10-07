@@ -14,22 +14,29 @@ An extract folder given instead of a dataset folder is sorted again in place,
 from its extract.csv and its manifest, without the dataset: new band limits
 move the copies between the band folders.
 
---dry-run (the fix; its real run comes next): every image with a QF under
---threshold is restored in memory, at its QF plus --qf-offset, and encoded as
-it would be written. The report and the contact sheets (before and after,
-at 100% and magnified) go to <folder>/_backup/_jpeg_cleanup; no image changes.
+The fix: every image with a QF under --threshold is restored in memory, at
+its QF plus --qf-offset, encoded as it would be written, and judged: only a
+restoration that removes enough of the artifacts is saved. Its original and
+captions go to <folder>/_backup/<same relative path> first; the restoration
+then replaces the image under its own name. --dry-run does all of it but the
+writing and draws contact sheets (before and after, at 100% and magnified);
+--undo puts back what the last run changed. The report, the log and the sheets
+are in <folder>/_backup/_jpeg_cleanup.
 
 Usage:    python jpeg_cleanup.py --extract <folder> [<folder> ...] [--out DIR]
           [--bands LIST] [--max-pixels N] [--exclude NAME] [--sidecars LIST]
           [--reanalyse] [--threads N]
-          python jpeg_cleanup.py <folder> [<folder> ...] --dry-run [--threshold QF]
-          [--qf-offset N] [--sheet-offsets LIST] [--no-sheets] [--quality Q]
-          [--max-pixels N] [--exclude NAME] [--reanalyse] [--threads N]
+          python jpeg_cleanup.py <folder> [<folder> ...] [--dry-run] [--threshold QF]
+          [--qf-offset N] [--min-block-drop X] [--min-qf-gain N] [--sheet-offsets LIST]
+          [--sheets | --no-sheets] [--quality Q] [--max-pixels N] [--exclude NAME]
+          [--sidecars LIST] [--reanalyse] [--threads N]
+          python jpeg_cleanup.py <folder> [<folder> ...] --undo
           python jpeg_cleanup.py --fetch-models
 Install:  install.bat (torch from the PyTorch CUDA index, Pillow, numpy)
 """
 import argparse
 import csv
+import filecmp
 import hashlib
 import io
 import json
@@ -69,6 +76,8 @@ EXTRACT_CSV = "extract.csv"
 SUMMARY_NAME = "summary.txt"
 REPORT_NAME = "report.csv"        # inside _backup/_jpeg_cleanup: the fix, one row per image
 SHEETS_DIRNAME = "sheets"         # inside _backup/_jpeg_cleanup: the contact sheets of the last fix run
+LOG_NAME = "log.jsonl"            # inside _backup/_jpeg_cleanup: every real run and undo; --undo reads it
+ORIGINALS_DIRNAME = "originals"   # inside _backup/_jpeg_cleanup: originals whose place in _backup was taken
 MANIFEST_NAME = "manifest.json"   # the files the last extract copied, removed by the next one
 MOVES_NAME = "moves.json"         # the moves of a re-sort in progress; the next run finishes them
 PROGRESS_EVERY = 500              # images between progress lines
@@ -195,6 +204,7 @@ def decode(path: Path, max_pixels: int) -> dict:
                 d["orientation"] = o if o in range(1, 9) else 1
             except Exception:  # noqa: BLE001 - a damaged EXIF block is not fatal
                 pass
+            d["exif"], d["icc"] = im.info.get("exif"), im.info.get("icc_profile")
             if fmt in ("JPEG", "MPO"):
                 d["header_q"] = header_quality(im)
             if fmt not in MEASURED_FORMATS:
@@ -291,6 +301,7 @@ class QualityModel:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.dtype = torch.float16 if self.device.type == "cuda" else torch.float32
         torch.backends.cudnn.benchmark = False    # every image has its own size; tuning would repeat
+        torch.backends.cudnn.deterministic = True  # a real run decides exactly as its dry run did
         self.nets = {}
         if self.device.type != "cuda":
             print("  [warning] no CUDA GPU: measuring on the CPU, which is much slower", flush=True)
@@ -377,6 +388,8 @@ def save_cache(root: Path, items, old: dict) -> None:
     gone from the dataset drop out."""
     files = {}
     for it in items:
+        if it.fix.get("result") == "written":
+            continue                              # a restored file is measured again next time
         if it.m and it.key and not it.m.get("skip", "").startswith("unreadable"):
             files[it.rel] = {"key": it.key, "m": it.m}
         elif it.rel in old:
@@ -791,6 +804,31 @@ def encode_jpeg(a: np.ndarray, quality: int) -> bytes:
     return buf.getvalue()
 
 
+def encode_output(y: np.ndarray, d: dict, quality: int) -> bytes:
+    """The bytes a restoration is written as, in the format of its source: JPEG
+    (also for MPO, whose extra images are dropped) at quality with 4:4:4
+    colour; PNG, lossless WebP, TIFF and BMP losslessly. The EXIF block (with
+    the orientation) and the ICC profile stay; an RGB profile is left out of a
+    gray result, which it does not fit."""
+    im = Image.fromarray(y)
+    fmt = d["format"]
+    kw = {}
+    if d.get("icc") and (y.ndim == 3 or d.get("mode") in ("L", "LA")):
+        kw["icc_profile"] = d["icc"]
+    if d.get("exif") and fmt in ("JPEG", "MPO", "PNG", "WEBP"):
+        kw["exif"] = d["exif"]
+    buf = io.BytesIO()
+    if fmt in ("JPEG", "MPO"):
+        im.save(buf, "JPEG", quality=quality, subsampling=0, optimize=True, **kw)
+    elif fmt == "WEBP":
+        im.save(buf, "WEBP", lossless=True, **kw)
+    elif fmt == "TIFF":
+        im.save(buf, "TIFF", compression="tiff_lzw", **kw)
+    else:
+        im.save(buf, fmt, **kw)
+    return buf.getvalue()
+
+
 def best_window(diff: np.ndarray, size: int, step: int = 8) -> tuple[int, int]:
     """Top-left corner of the size x size window with the largest sum of diff
     (an integral image, so a large image costs one pass)."""
@@ -956,19 +994,24 @@ def fix_one(model: QualityModel, d: dict, m: dict, offsets: list[int], quality: 
     goes in as three equal channels and only the luma of the result is kept:
     the gray model erased film grain and barely reacted to the offset, the
     colour model keeps the grain, and the luma cannot carry colour noise.
-    -> qf_used, write, qf_after, change, block_before, block_after, and "outs"
-    (the restorations as they would be written) when sheet is set."""
+    -> qf_used, write, qf_after, change, block_before, block_after, "data"
+    (the bytes to write) and, when sheet is set, "outs" (the restorations as
+    they would be read back from the file)."""
     orig = d["luma"] if d["gray"] else d["rgb"]
     qf = m.get("qf_color", m["qf"])
-    outs = []
-    for o in (offsets if sheet else offsets[:1]):
+    jpeg = d["format"] in ("JPEG", "MPO")
+    outs, data = [], b""
+    for i, o in enumerate(offsets if sheet else offsets[:1]):
         y = model.restore("color", d["rgb"], min(100.0, qf + o))
         if d["gray"]:
             y = np.asarray(Image.fromarray(y).convert("L"))
-        if d["format"] in ("JPEG", "MPO"):
-            y = np.array(Image.open(io.BytesIO(encode_jpeg(y, quality))))   # what the file will hold
+        if i == 0 or jpeg:
+            enc = encode_output(y, d, quality)
+            data = data or enc
+            if jpeg:
+                y = np.array(Image.open(io.BytesIO(enc)))                  # what the file will hold
         outs.append(y)
-    r = {"qf_used": round(min(100.0, qf + offsets[0]), 1),
+    r = {"data": data, "qf_used": round(min(100.0, qf + offsets[0]), 1),
          "write": "jpeg" if d["format"] in ("JPEG", "MPO") else d["format"].lower(),
          "qf_after": round(model.qf("color", as_rgb(outs[0])), 1),
          "change": round(float(np.abs(orig.astype(np.int16) - outs[0]).mean()), 2),
@@ -979,7 +1022,7 @@ def fix_one(model: QualityModel, d: dict, m: dict, offsets: list[int], quality: 
 
 
 FIX_FIELDS = ["path", "format", "mode", "width", "height", "gray", "header_q", "qf", "action", "benefit",
-              "qf_used", "write", "qf_after", "change", "block_before", "block_after"]
+              "qf_used", "write", "qf_after", "change", "block_before", "block_after", "result"]
 
 
 def write_report(root: Path, items) -> Path:
@@ -995,13 +1038,169 @@ def write_report(root: Path, items) -> Path:
                         "" if m.get("gray") is None else int(m["gray"]), fmt_num(m.get("header_q")),
                         fmt_num(m.get("qf")), it.status, r.get("benefit", ""), fmt_num(r.get("qf_used")),
                         r.get("write", ""), fmt_num(r.get("qf_after")), fmt_num(r.get("change")),
-                        fmt_num(r.get("block_before")), fmt_num(r.get("block_after"))])
+                        fmt_num(r.get("block_before")), fmt_num(r.get("block_after")), r.get("result", "")])
     os.replace(tmp, path)
     return path
 
 
-def fix_dry_run(root: Path, args, model_box: list) -> None:
+# --- writing, backup and undo ------------------------------------------------------
+# A real run logs every image before it touches it, so --undo can put back an
+# interrupted run too. The original goes to _backup/<relative path>, unless an
+# earlier original of that path is there already (from remove_borders, say);
+# then it goes to _backup/_jpeg_cleanup/originals/<run>/<relative path>, so the
+# undo returns exactly what this run started from and the earlier one stays.
+
+class RunLog:
+    """log.jsonl in the run folder: one JSON object per line, flushed as written."""
+
+    def __init__(self, root: Path):
+        self.path = root / BACKUP_DIRNAME / RUN_DIRNAME / LOG_NAME
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.f = open(self.path, "a", encoding="utf-8")
+
+    def write(self, obj: dict) -> None:
+        self.f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        self.f.flush()
+
+    def close(self) -> None:
+        self.f.close()
+
+
+def part_path(dst: Path) -> Path:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    return dst.with_name(dst.name + ".part")
+
+
+def same_bytes(a: Path, b: Path) -> bool:
+    try:
+        return a.stat().st_size == b.stat().st_size and filecmp.cmp(a, b, shallow=False)
+    except OSError:
+        return False
+
+
+def copy_keep(src: Path, dst: Path) -> str:
+    """Copy src to dst unless dst exists. -> copied, same (dst has these bytes
+    already) or kept (dst holds other bytes, left alone)."""
+    if dst.exists():
+        return "same" if same_bytes(src, dst) else "kept"
+    tmp = part_path(dst)
+    shutil.copy2(src, tmp)
+    os.replace(tmp, dst)
+    return "copied"
+
+
+def finish_write(tmp: Path, dst: Path, src_stat: os.stat_result) -> None:
+    """Move tmp over dst; dst keeps the original's times and read-only flag."""
+    make_writable(dst)
+    os.replace(tmp, dst)
+    os.utime(dst, ns=(src_stat.st_atime_ns, src_stat.st_mtime_ns))
+    if not src_stat.st_mode & stat.S_IWRITE:
+        os.chmod(dst, stat.S_IREAD)
+
+
+def backup_place(root: Path, it, run_id: str) -> Path:
+    bk = root / BACKUP_DIRNAME / it.rel
+    if bk.exists() and not same_bytes(it.path, bk):
+        bk = root / BACKUP_DIRNAME / RUN_DIRNAME / ORIGINALS_DIRNAME / run_id / it.rel
+    return bk
+
+
+def write_fix(root: Path, it, data: bytes, bk: Path) -> dict:
+    """Back up the original and its sidecars, then put the restoration in its
+    place under the same name. -> the log record."""
+    rec = {"op": "fix", "rel": it.rel}
+    tmp = None
+    try:
+        st = os.stat(it.path)
+        rec["image"] = copy_keep(it.path, bk)
+        rec["sidecars"] = {sc.relative_to(root).as_posix(): copy_keep(sc, root / BACKUP_DIRNAME / sc.relative_to(root))
+                           for sc in it.sidecars}
+        tmp = part_path(it.path)
+        tmp.write_bytes(data)
+        finish_write(tmp, it.path, st)
+    except Exception as e:  # noqa: BLE001 - one bad file is reported, not fatal
+        rec["error"] = f"{type(e).__name__}: {e}".strip()
+        if tmp is not None and tmp.exists():
+            tmp.unlink()
+    return rec
+
+
+def read_log(root: Path) -> list[dict]:
+    path = root / BACKUP_DIRNAME / RUN_DIRNAME / LOG_NAME
+    if not path.exists():
+        return []
+    out = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            out.append(json.loads(line))
+        except ValueError:                        # a line cut short by a crash
+            continue
+    return out
+
+
+def last_run(entries: list[dict]) -> tuple[str | None, list[dict]]:
+    """The id and records of the last run that was not undone."""
+    undone = {e["undo"] for e in entries if "undo" in e}
+    runs = [i for i, e in enumerate(entries) if "run" in e and e["run"] not in undone]
+    if not runs:
+        return None, []
+    i = runs[-1]
+    j = next((k for k in range(i + 1, len(entries)) if "run" in entries[k]), len(entries))
+    return entries[i]["run"], entries[i + 1:j]
+
+
+def undo_root(root: Path) -> dict:
+    """Put back what the last run of root changed, newest first. An image gets
+    its original back from where the run kept it; a backup this run made is
+    removed, one that was there before stays. A caption backup this run made
+    is removed when the caption in place has the same bytes. -> counts."""
+    run_id, recs = last_run(read_log(root))
+    counts = {"restored": 0, "no backup": 0}
+    if run_id is None:
+        return counts
+    done = {r["rel"]: r for r in recs if r.get("op") == "fix"}
+    bdir = root / BACKUP_DIRNAME
+    for intent in reversed([r for r in recs if r.get("op") == "intent"]):
+        rel, rec = intent["rel"], done.get(intent["rel"], {})
+        bk, dst = root / intent["backup"], root / rel
+        if not bk.exists():
+            counts["no backup"] += 1
+            print(f"  not restored, no backup: {rel}")
+            continue
+        make_writable(dst)
+        tmp = part_path(dst)
+        shutil.copy2(bk, tmp)
+        os.replace(tmp, dst)
+        if intent["fresh"]:
+            make_writable(bk)
+            bk.unlink()
+        counts["restored"] += 1
+        for sc in intent.get("sidecars", []):
+            b = bdir / sc
+            if not (root / sc).exists() and b.exists():
+                os.replace(b, root / sc)           # the caption went missing: put the copy back
+            elif (rec.get("sidecars") or {}).get(sc) == "copied" and b.exists() and same_bytes(b, root / sc):
+                make_writable(b)
+                b.unlink()
+    log = RunLog(root)
+    log.write({"undo": run_id, "time": time.strftime("%Y-%m-%d %H:%M:%S"), **counts})
+    log.close()
+    for dirpath, dirnames, filenames in os.walk(bdir, topdown=False):
+        d = Path(dirpath)
+        if d != bdir and d != bdir / RUN_DIRNAME:
+            try:
+                d.rmdir()
+            except OSError:
+                pass
+    return counts
+
+
+# --- the fix of one folder --------------------------------------------------------------
+
+def fix_folder(root: Path, args, model_box: list) -> int:
+    """Measure, restore, judge, and in a real run write. -> failed writes."""
     t0 = time.perf_counter()
+    dry = args.dry_run
     sidecar_exts = [e if e.startswith(".") else "." + e for e in (s.strip() for s in args.sidecars.split(",")) if e]
     items = scan(root, DEFAULT_EXCLUDES + args.exclude, sidecar_exts)
     print(f"{root}: {len(items):,} images found", flush=True)
@@ -1014,41 +1213,65 @@ def fix_dry_run(root: Path, args, model_box: list) -> None:
     offsets = [args.qf_offset] + [o for o in args.sheet_offsets if o != args.qf_offset]
     sheet_dir = root / BACKUP_DIRNAME / RUN_DIRNAME / SHEETS_DIRNAME
     clear_sheets(sheet_dir)
+    want_sheets = not args.no_sheets if dry else args.sheets
     # one set of sheets for the restorations worth saving, one for the rest
-    sheets = None if args.no_sheets else {True: SheetWriter(sheet_dir, offsets, "fix"),
-                                           False: SheetWriter(sheet_dir, offsets, "nofix")}
-    if todo:
-        if not model_box:
-            model_box.append(QualityModel())
-        model = model_box[0]
-        progress = Progress(root.name, "restored", len(todo))
-        with ThreadPoolExecutor(max_workers=args.threads) as pool, ThreadPoolExecutor(max_workers=2) as tiler:
-            decoded = bounded_map(pool, lambda it: decode(it.path, args.max_pixels), todo, args.threads * 2)
-            pending = deque()
-            for n, (it, d) in enumerate(zip(todo, decoded), 1):
-                if d["skip"]:                     # changed since it was measured
-                    it.status = d["skip"]
-                    continue
-                r = fix_one(model, d, it.m, offsets, args.quality, sheets is not None)
-                outs = r.pop("outs", None)
-                r["benefit"] = benefit(it.m, r, args.min_block_drop, args.min_qf_gain)
-                it.fix = r
-                if not r["benefit"]:
-                    it.status = "little benefit"
-                if sheets is not None:
-                    label = (f"{'SAVE: ' + r['benefit'] if r['benefit'] else 'LEAVE: little benefit'}  |  "
-                             f"QF {it.m['qf']:.1f} > {r['qf_after']:.1f}, blockiness {r['block_before']:.2f} > "
-                             f"{r['block_after']:.2f}, change {r['change']:.2f}, header {it.m.get('header_q') or '-'}, "
-                             f"{it.m['width']}x{it.m['height']}{', gray' if d['gray'] else ''}")
-                    orig = d["luma"] if d["gray"] else d["rgb"]
-                    pending.append((bool(r["benefit"]), it.m["qf"],
-                                    tiler.submit(make_tile, it.rel, label, orig, outs, d["orientation"])))
-                    while pending and (pending[0][2].done() or len(pending) > 8):
-                        keep, q, fut = pending.popleft()
-                        sheets[keep].add(q, fut.result())
-                progress.step(n)
-            for keep, q, fut in pending:
-                sheets[keep].add(q, fut.result())
+    sheets = {True: SheetWriter(sheet_dir, offsets, "fix"),
+              False: SheetWriter(sheet_dir, offsets, "nofix")} if want_sheets else None
+    log, run_id, written, failed = None, time.strftime("%Y%m%d-%H%M%S"), 0, 0
+    try:
+        if todo:
+            if not model_box:
+                model_box.append(QualityModel())
+            model = model_box[0]
+            progress = Progress(root.name, "restored", len(todo))
+            with ThreadPoolExecutor(max_workers=args.threads) as pool, ThreadPoolExecutor(max_workers=2) as tiler:
+                decoded = bounded_map(pool, lambda it: decode(it.path, args.max_pixels), todo, args.threads * 2)
+                pending = deque()
+                for n, (it, d) in enumerate(zip(todo, decoded), 1):
+                    if d["skip"]:                     # changed since it was measured
+                        it.status = d["skip"]
+                        continue
+                    r = fix_one(model, d, it.m, offsets, args.quality, sheets is not None)
+                    outs, data = r.pop("outs", None), r.pop("data")
+                    r["benefit"] = benefit(it.m, r, args.min_block_drop, args.min_qf_gain)
+                    it.fix = r
+                    if not r["benefit"]:
+                        it.status = "little benefit"
+                    elif not dry:
+                        if log is None:
+                            log = RunLog(root)
+                            log.write({"run": run_id, "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                       "threshold": args.threshold, "qf_offset": args.qf_offset})
+                        bk = backup_place(root, it, run_id)
+                        log.write({"op": "intent", "rel": it.rel, "backup": bk.relative_to(root).as_posix(),
+                                   "fresh": not bk.exists(),
+                                   "sidecars": [sc.relative_to(root).as_posix() for sc in it.sidecars]})
+                        rec = write_fix(root, it, data, bk)
+                        rec.update(qf=it.m["qf"], benefit=r["benefit"])
+                        log.write(rec)
+                        r["result"] = "error: " + rec["error"] if "error" in rec else "written"
+                        written += "error" not in rec
+                        failed += "error" in rec
+                    if sheets is not None:
+                        label = (f"{'SAVE: ' + r['benefit'] if r['benefit'] else 'LEAVE: little benefit'}  |  "
+                                 f"QF {it.m['qf']:.1f} > {r['qf_after']:.1f}, blockiness {r['block_before']:.2f} > "
+                                 f"{r['block_after']:.2f}, change {r['change']:.2f}, header {it.m.get('header_q') or '-'}, "
+                                 f"{it.m['width']}x{it.m['height']}{', gray' if d['gray'] else ''}")
+                        orig = d["luma"] if d["gray"] else d["rgb"]
+                        pending.append((bool(r["benefit"]), it.m["qf"],
+                                        tiler.submit(make_tile, it.rel, label, orig, outs, d["orientation"])))
+                        while pending and (pending[0][2].done() or len(pending) > 8):
+                            keep, q, fut = pending.popleft()
+                            sheets[keep].add(q, fut.result())
+                    progress.step(n)
+                for keep, q, fut in pending:
+                    sheets[keep].add(q, fut.result())
+    finally:
+        if log is not None:
+            log.write({"end": run_id, "written": written, "failed": failed})
+            log.close()
+        if written:
+            save_cache(root, items, {})           # the written files get new keys; drop their old QF
     if sheets is not None:
         for s in sheets.values():
             s.flush()
@@ -1072,7 +1295,12 @@ def fix_dry_run(root: Path, args, model_box: list) -> None:
     if sheets is not None:
         print(f"  sheets:  {sheets[True].count} fix_*, {sheets[False].count} nofix_* in {sheet_dir}")
     print(f"  report:  {report}")
-    print("  dry run: no image was changed")
+    if dry:
+        print("  dry run: no image was changed")
+    else:
+        print(f"  done:    {written:,} images restored in place, originals in {root / BACKUP_DIRNAME}"
+              + (f"; {failed:,} failed (see the report)" if failed else ""))
+    return failed
 
 
 # --- command line -------------------------------------------------------------------
@@ -1186,14 +1414,30 @@ def parse_offsets(text: str) -> list[int]:
 
 
 def fix(args) -> int:
-    """The dry run of the fix. An extract folder is a valid input too: its
+    """The fix of every folder. A dry run takes an extract folder too: its
     copies have the bytes of their sources, so the report and the sheets show
     what a run on the dataset would do, and the dry run writes only into its
-    _backup folder, which a re-sort of the extract leaves alone."""
+    _backup folder, which a re-sort of the extract leaves alone. A real run
+    does not: it would turn the copies into something their extract.csv no
+    longer describes."""
     roots = check_roots(args.folders)
+    if not args.dry_run:
+        for r in roots:
+            if is_extract_folder(r):
+                raise SystemExit(f"{r} is an extract folder; run the fix on the dataset folder, or use --dry-run")
     model_box: list = []
-    for root in roots:
-        fix_dry_run(root, args, model_box)
+    failed = sum(fix_folder(root, args, model_box) for root in roots)
+    return 1 if failed else 0
+
+
+def undo(args) -> int:
+    for root in check_roots(args.folders):
+        c = undo_root(root)
+        if not any(c.values()):
+            print(f"{root}: no run to undo")
+        else:
+            print(f"{root}: {c['restored']:,} images restored"
+                  + (f", {c['no backup']:,} without a backup (see above)" if c["no backup"] else ""))
     return 0
 
 
@@ -1205,6 +1449,7 @@ def main(argv=None) -> int:
                     help="copy the images under each band limit into one folder per band, outside the dataset")
     ap.add_argument("--dry-run", action="store_true",
                     help="the fix in memory: write the report and the contact sheets, change no image")
+    ap.add_argument("--undo", action="store_true", help="put back what the last fix of each folder changed")
     ap.add_argument("--threshold", type=qf_arg, default=DEFAULT_THRESHOLD, metavar="QF",
                     help=f"fix images with a QF under this (default {DEFAULT_THRESHOLD})")
     ap.add_argument("--qf-offset", type=int, default=DEFAULT_QF_OFFSET, metavar="N",
@@ -1212,7 +1457,8 @@ def main(argv=None) -> int:
                          f"(default {DEFAULT_QF_OFFSET})")
     ap.add_argument("--sheet-offsets", type=parse_offsets, default=[], metavar="LIST",
                     help="more offsets shown side by side on the contact sheets, comma-separated, e.g. 10,20")
-    ap.add_argument("--no-sheets", action="store_true", help="no contact sheets")
+    ap.add_argument("--no-sheets", action="store_true", help="with --dry-run: no contact sheets")
+    ap.add_argument("--sheets", action="store_true", help="with a real run: write the contact sheets too")
     ap.add_argument("--min-block-drop", type=float, default=DEFAULT_MIN_BLOCK_DROP, metavar="X",
                     help=f"save a restoration whose blockiness drops this much (default {DEFAULT_MIN_BLOCK_DROP})")
     ap.add_argument("--min-qf-gain", type=float, default=DEFAULT_MIN_QF_GAIN, metavar="N",
@@ -1241,14 +1487,16 @@ def main(argv=None) -> int:
         return 0
     if not args.folders:
         ap.error("give at least one dataset folder")
-    if args.extract and args.dry_run:
-        ap.error("--extract and --dry-run do not go together")
-    if not args.extract and not args.dry_run:
-        ap.error("the fix has only its --dry-run so far")
+    if sum((args.extract, args.dry_run, args.undo)) > 1:
+        ap.error("--extract, --dry-run and --undo do not go together")
+    if args.undo:
+        return undo(args)
     try:
         return extract(args) if args.extract else fix(args)
     except KeyboardInterrupt:
-        print("\nStopped. The measurements so far are in the cache; the next run continues from there.")
+        print("\nStopped. The measurements so far are in the cache; the next run continues from there."
+              + ("" if args.extract or args.dry_run else
+                 " The images restored so far are logged; --undo puts them back."))
         return 130
 
 

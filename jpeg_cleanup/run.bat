@@ -3,10 +3,13 @@ setlocal
 chcp 65001 >nul
 title JPEG cleanup
 
-rem Usage: run.bat <folder> [<folder> ...] --dry-run [options]
+rem Usage: run.bat <folder> [<folder> ...] [--dry-run] [options]
+rem        run.bat <folder> --undo
 rem The images of the folder with a QF under --threshold are restored with
-rem FBCNN in memory; the report and the contact sheets go to
-rem <folder>\_backup\_jpeg_cleanup. No image is changed. All arguments go to
+rem FBCNN; a restoration that removes enough of the artifacts replaces its
+rem image, and the original goes to <folder>\_backup first. --dry-run changes
+rem nothing and draws contact sheets; --undo puts back the last run. Report,
+rem log and sheets are in <folder>\_backup\_jpeg_cleanup. All arguments go to
 rem jpeg_cleanup.py unchanged; run.bat --help lists the options.
 
 rem Keep the window open at the end when started by double-click or drag-and-drop
