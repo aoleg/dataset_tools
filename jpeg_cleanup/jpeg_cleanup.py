@@ -9,6 +9,10 @@ into one folder per band, outside the dataset, so a threshold can be chosen by
 eye. The dataset itself is never changed; the only file written into it is the
 measurement cache in <folder>/_backup/_jpeg_cleanup/cache.json.
 
+An extract folder given instead of a dataset folder is sorted again in place,
+from its extract.csv and its manifest, without the dataset: new band limits
+move the copies between the band folders.
+
 Usage:    python jpeg_cleanup.py --extract <folder> [<folder> ...] [--out DIR]
           [--bands LIST] [--max-pixels N] [--exclude NAME] [--sidecars LIST]
           [--reanalyse] [--threads N]
@@ -54,6 +58,7 @@ EXTRACT_SUFFIX = "_jpeg_extract"  # default output: <dataset folder>_jpeg_extrac
 EXTRACT_CSV = "extract.csv"
 SUMMARY_NAME = "summary.txt"
 MANIFEST_NAME = "manifest.json"   # the files the last extract copied, removed by the next one
+MOVES_NAME = "moves.json"         # the moves of a re-sort in progress; the next run finishes them
 PROGRESS_EVERY = 500              # images between progress lines
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".jpe", ".jfif", ".png", ".webp", ".bmp", ".tif", ".tiff",
@@ -448,7 +453,7 @@ def assign(items, bands: list[int], max_pixels: int) -> None:
     band 70 holds 60 <= qf < 70 when the limit below is 60."""
     for it in items:
         m = it.m
-        it.band, it.copy = None, ""
+        it.band = None
         if m.get("skip"):
             it.status = m["skip"]
         elif m["width"] * m["height"] > max_pixels:
@@ -463,26 +468,41 @@ def make_writable(path: Path) -> None:
         os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
 
 
-def clear_previous(out: Path) -> int:
-    """Delete the files the last extract into out copied, and the band folders
-    it leaves empty. Files someone else put there stay. -> files deleted."""
-    path = out / MANIFEST_NAME
+def remove_empty_dirs(out: Path) -> None:
+    """Remove empty folders under out, deepest first."""
+    for dirpath, dirnames, filenames in os.walk(out, topdown=False):
+        if Path(dirpath) != out:
+            try:
+                os.rmdir(dirpath)
+            except OSError:
+                pass
+
+
+def read_manifest(out: Path) -> dict:
     try:
-        old = json.loads(path.read_text(encoding="utf-8"))
+        return json.loads((out / MANIFEST_NAME).read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return 0
+        return {}
+
+
+def write_manifest(out: Path, data: dict) -> None:
+    tmp = out / (MANIFEST_NAME + ".part")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    os.replace(tmp, out / MANIFEST_NAME)
+
+
+def clear_previous(out: Path) -> int:
+    """Delete the files the last extract into out listed in its manifest (also
+    the planned copies of a run that was stopped), and the folders that are
+    empty then. Files someone else put there stay. -> files deleted."""
     n = 0
-    for rel in old.get("files", []):
+    for rel in read_manifest(out).get("files", []):
         p = out / rel
         if p.is_file():
             make_writable(p)
             p.unlink()
             n += 1
-    for b in old.get("bands", []):
-        try:
-            (out / str(b)).rmdir()
-        except OSError:
-            pass
+    remove_empty_dirs(out)
     return n
 
 
@@ -494,31 +514,152 @@ def copy_file(src: Path, dst: Path) -> None:
     os.utime(dst, ns=(st.st_atime_ns, st.st_mtime_ns))
 
 
-def copy_items(out: Path, items) -> list[str]:
-    """Copy every item that has a band into out/<band>/ as q<QF>__<name>, with
-    its sidecars under the same stem; a taken name gets ~2, ~3. -> the files
-    written, relative to out."""
-    written, taken = [], set()
+def plan_copies(out: Path, items) -> list[tuple]:
+    """The copies of every item that has a band: out/<band>/q<QF>__<name>,
+    with its sidecars under the same stem; a taken name gets ~2, ~3. Sets
+    it.copy. -> (item, [(src, dst relative to out)])."""
+    plan, taken = [], set()
     for it in sorted((it for it in items if it.band is not None), key=lambda it: (it.m["qf"], it.rel)):
-        folder = out / str(it.band)
-        folder.mkdir(parents=True, exist_ok=True)
+        folder = str(it.band)
         base = f"q{int(math.floor(it.m['qf'])):03d}__{it.path.stem}"
         stem, n = base, 2
-        while (folder / stem).as_posix().casefold() in taken or (folder / (stem + it.path.suffix)).exists():
+        while f"{folder}/{stem}".casefold() in taken or (out / folder / (stem + it.path.suffix)).exists():
             stem, n = f"{base}~{n}", n + 1
-        taken.add((folder / stem).as_posix().casefold())
-        dst = folder / (stem + it.path.suffix)
+        taken.add(f"{folder}/{stem}".casefold())
+        it.copy = f"{folder}/{stem}{it.path.suffix}"
+        plan.append((it, [(it.path, it.copy)] + [(sc, f"{folder}/{stem}{sc.suffix}") for sc in it.sidecars]))
+    return plan
+
+
+def copy_items(out: Path, plan) -> None:
+    for it, files in plan:
         try:
-            copy_file(it.path, dst)
-            written.append(dst.relative_to(out).as_posix())
-            for sc in it.sidecars:
-                sdst = folder / (stem + sc.suffix)
-                copy_file(sc, sdst)
-                written.append(sdst.relative_to(out).as_posix())
-            it.copy, it.status = dst.relative_to(out).as_posix(), "copied"
+            for src, rel in files:
+                (out / rel).parent.mkdir(parents=True, exist_ok=True)
+                copy_file(src, out / rel)
+            it.status = "copied"
         except OSError as e:
-            it.status = f"copy failed: {e}"
-    return written
+            it.copy, it.status = "", f"copy failed: {e}"
+
+
+# --- re-sorting an extract folder -----------------------------------------------------
+# An extract folder holds everything needed to sort its copies again without
+# the dataset: extract.csv has the measurements, manifest.json the files. New
+# band limits move copies between bands and drop them; images that were above
+# the old highest limit were never copied and need a run on the dataset.
+
+def is_extract_folder(p: Path) -> bool:
+    return (p / MANIFEST_NAME).is_file() and (p / EXTRACT_CSV).is_file()
+
+
+def finish_moves(out: Path) -> int:
+    """Carry out the moves of a re-sort that was stopped. extract.csv and the
+    manifest were written before the first move, so they already describe the
+    result. -> files moved now."""
+    path = out / MOVES_NAME
+    try:
+        plan = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return 0
+    n = 0
+    for src, dst in plan.get("moves", []):
+        s, d = out / src, out / dst
+        if s.is_file() and not d.exists():
+            d.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(s, d)
+            n += 1
+    for rel in plan.get("deletes", []):
+        p = out / rel
+        if p.is_file():
+            make_writable(p)
+            p.unlink()
+            n += 1
+    remove_empty_dirs(out)
+    path.unlink()
+    return n
+
+
+def row_measure(r: dict) -> dict:
+    """The measurement of an image from its extract.csv row."""
+    def num(k, cast=float):
+        return cast(r[k]) if r.get(k) else None
+    m = {"format": r["format"], "mode": r["mode"], "width": int(r["width"] or 0), "height": int(r["height"] or 0),
+         "gray": None if r["gray"] == "" else r["gray"] == "1", "header_q": num("header_q", int), "skip": ""}
+    if r.get("qf"):
+        m["qf_color"], m["qf"] = num("qf_color"), num("qf")
+        if r.get("qf_gray"):
+            m["qf_gray"] = num("qf_gray")
+    else:
+        m["skip"] = r["status"] or "not measured"
+    return m
+
+
+def resort(out: Path, args) -> tuple[list, list[int], str]:
+    """Sort the copies of an extract folder into the bands asked for, by
+    moving them; copies in subfolders of a band (from an older version) move
+    up into the band folder. -> items, bands, dataset root."""
+    done = finish_moves(out)
+    if done:
+        print(f"  finished {done:,} moves of the last re-sort, which was stopped")
+    manifest = read_manifest(out)
+    root = manifest.get("root", "")
+    bands = args.bands or manifest.get("bands") or parse_bands(DEFAULT_BANDS)
+    with open(out / EXTRACT_CSV, encoding="utf-8-sig", newline="") as f:
+        rows = list(csv.DictReader(f))
+    items = []
+    for r in rows:
+        it = Item(root=Path(root), path=Path(root) / r["path"], rel=r["path"], m=row_measure(r))
+        it.copy = r.get("copy", "")
+        items.append(it)
+    old_copy = {it.rel: it.copy for it in items}
+    assign(items, bands, args.max_pixels)
+    missing = 0
+    for it in items:
+        if it.band is not None and not old_copy[it.rel]:
+            it.band, it.status = None, "not copied"
+            missing += 1
+    if missing:
+        print(f"  [note] {missing:,} images fall under the new band limits but were above the old ones and "
+              f"were never copied; run extract on the dataset folder to add them")
+
+    # The sidecar copies of an image copy: files of the manifest in its folder with its stem.
+    by_stem: dict[str, list[str]] = {}
+    for rel in manifest.get("files", []):
+        p = Path(rel)
+        by_stem.setdefault(f"{p.parent.as_posix()}/{p.stem}".casefold(), []).append(rel)
+    moves, deletes, files = [], [], []
+    for it in items:
+        oc = old_copy[it.rel]
+        if not oc:
+            continue
+        p = Path(oc)
+        group = by_stem.get(f"{p.parent.as_posix()}/{p.stem}".casefold(), [oc])
+        if it.band is None:
+            deletes += group
+            it.copy = ""
+            continue
+        folder = str(it.band)
+        it.copy, it.status = f"{folder}/{p.name}", "copied"
+        for rel in group:
+            new = f"{folder}/{Path(rel).name}"
+            files.append(new)
+            if new != rel:
+                moves.append([rel, new])
+    sources = {s.casefold() for s, _ in moves}
+    for _, dst in moves:
+        if (out / dst).exists() and dst.casefold() not in sources:
+            raise SystemExit(f"{out / dst} is in the way of a move; move it out of the extract folder first")
+    # extract.csv and the manifest describe the result before the first move;
+    # moves.json lets the next run finish the moves when this one is stopped.
+    write_manifest(out, {"root": root, "bands": bands, "files": files})
+    write_csv(out, items)
+    if moves or deletes:
+        tmp = out / (MOVES_NAME + ".part")
+        tmp.write_text(json.dumps({"moves": moves, "deletes": deletes}, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, out / MOVES_NAME)
+        n = finish_moves(out)
+        print(f"  {n:,} files moved or removed")
+    return items, bands, root
 
 
 # --- report ---------------------------------------------------------------------------
@@ -544,7 +685,7 @@ def write_csv(out: Path, items) -> Path:
     return path
 
 
-def summary(root: Path, out: Path, items, bands: list[int], max_pixels: int, seconds: float) -> list[str]:
+def summary(root, out: Path, items, bands: list[int], max_pixels: int, seconds: float) -> list[str]:
     measured = [it for it in items if "qf" in it.m and it.status != "large"]
     lines = [f"{root}: {len(items):,} images, {len(measured):,} measured "
              f"({sum(1 for it in measured if it.m.get('gray')):,} gray), {clock(seconds)}"]
@@ -575,6 +716,12 @@ def summary(root: Path, out: Path, items, bands: list[int], max_pixels: int, sec
         lines.append("  skipped: " + ", ".join(f"{k} {v:,}" for k, v in sorted(reasons.items(), key=lambda kv: -kv[1]))
                      + (f"   (large = over {max_pixels:,} pixels)" if "large" in reasons else ""))
     return lines
+
+
+def write_summary(out: Path, lines) -> None:
+    (out / SUMMARY_NAME).write_text("\n".join(lines) + "\n", encoding="utf-8")
+    for line in lines:
+        print(line)
 
 
 # --- command line -------------------------------------------------------------------
@@ -623,47 +770,64 @@ def output_dirs(roots: list[Path], out_arg: str | None) -> list[Path]:
     return outs
 
 
-def extract(args) -> int:
+def extract_dataset(root: Path, out: Path, args, model_box: list) -> None:
+    t0 = time.perf_counter()
+    bands = args.bands or parse_bands(DEFAULT_BANDS)
     sidecar_exts = [e if e.startswith(".") else "." + e for e in (s.strip() for s in args.sidecars.split(",")) if e]
-    roots = check_roots(args.folders)
-    outs = output_dirs(roots, args.out)
-    excludes = DEFAULT_EXCLUDES + args.exclude
+    items = scan(root, DEFAULT_EXCLUDES + args.exclude, sidecar_exts)
+    print(f"{root}: {len(items):,} images found", flush=True)
+    reused = measure_items(root, items, args.max_pixels, args.threads, args.reanalyse, model_box)
+    if reused:
+        print(f"  {root.name}: {reused:,} images unchanged since the last run, taken from the cache")
+    assign(items, bands, args.max_pixels)
+    out.mkdir(parents=True, exist_ok=True)
+    finish_moves(out)
+    removed = clear_previous(out)
+    if removed:
+        print(f"  {removed:,} files of the previous extract removed from {out}")
+    plan = plan_copies(out, items)
+    # The manifest lists the planned copies before the first one is made, so a
+    # stopped run leaves nothing the next run cannot clear.
+    write_manifest(out, {"root": str(root), "bands": bands, "files": [rel for _, fs in plan for _, rel in fs]})
+    copy_items(out, plan)
+    write_manifest(out, {"root": str(root), "bands": bands,
+                         "files": [rel for it, fs in plan if it.copy for _, rel in fs]})
+    write_csv(out, items)
+    write_summary(out, summary(root, out, items, bands, args.max_pixels, time.perf_counter() - t0))
+
+
+def extract(args) -> int:
+    folders = check_roots(args.folders)
+    resorts = [f for f in folders if is_extract_folder(f)]
+    roots = [f for f in folders if f not in resorts]
+    if resorts and args.out:
+        raise SystemExit("--out does not go with an extract folder, which is sorted in place")
+    if resorts and args.reanalyse:
+        raise SystemExit("--reanalyse needs the dataset folder; an extract folder has only the copies")
+    outs = output_dirs(roots, args.out) if roots else []
     model_box: list = []
-    for root, out in zip(roots, outs):
-        t0 = time.perf_counter()
-        items = scan(root, excludes, sidecar_exts)
-        print(f"{root}: {len(items):,} images found", flush=True)
-        reused = measure_items(root, items, args.max_pixels, args.threads, args.reanalyse, model_box)
-        if reused:
-            print(f"  {root.name}: {reused:,} images unchanged since the last run, taken from the cache")
-        assign(items, args.bands, args.max_pixels)
-        out.mkdir(parents=True, exist_ok=True)
-        removed = clear_previous(out)
-        if removed:
-            print(f"  {removed:,} files of the previous extract removed from {out}")
-        written = copy_items(out, items)
-        tmp = out / (MANIFEST_NAME + ".part")
-        tmp.write_text(json.dumps({"root": str(root), "bands": args.bands, "files": written},
-                                  ensure_ascii=False, indent=1), encoding="utf-8")
-        os.replace(tmp, out / MANIFEST_NAME)
-        write_csv(out, items)
-        lines = summary(root, out, items, args.bands, args.max_pixels, time.perf_counter() - t0)
-        (out / SUMMARY_NAME).write_text("\n".join(lines) + "\n", encoding="utf-8")
-        for line in lines:
-            print(line)
+    for folder in folders:
+        if folder in resorts:
+            t0 = time.perf_counter()
+            print(f"{folder}: an extract folder, sorted again from its extract.csv", flush=True)
+            items, bands, root = resort(folder, args)
+            write_summary(folder, summary(root, folder, items, bands, args.max_pixels, time.perf_counter() - t0))
+        else:
+            extract_dataset(folder, outs[roots.index(folder)], args, model_box)
     return 0
 
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Find heavily compressed images in a dataset with FBCNN.")
-    ap.add_argument("folders", nargs="*", help="dataset folders, scanned at any depth")
+    ap.add_argument("folders", nargs="*",
+                    help="dataset folders, scanned at any depth; or extract folders, sorted again in place")
     ap.add_argument("--extract", action="store_true",
                     help="copy the images under each band limit into one folder per band, outside the dataset")
     ap.add_argument("--fetch-models", action="store_true", help="download the FBCNN models into models/ and check them")
     ap.add_argument("--out", metavar="DIR",
                     help=f"output folder (default <folder>{EXTRACT_SUFFIX} next to each dataset folder)")
-    ap.add_argument("--bands", type=parse_bands, default=parse_bands(DEFAULT_BANDS), metavar="LIST",
-                    help=f"band limits, comma-separated (default {DEFAULT_BANDS})")
+    ap.add_argument("--bands", type=parse_bands, default=None, metavar="LIST",
+                    help=f"band limits, comma-separated (default {DEFAULT_BANDS}; for an extract folder, its own)")
     ap.add_argument("--max-pixels", type=int, default=DEFAULT_MAX_PIXELS, metavar="N",
                     help=f"skip images larger than N pixels (default {DEFAULT_MAX_PIXELS}, which is 2048 x 2048)")
     ap.add_argument("--exclude", action="append", default=[], metavar="NAME",

@@ -29,13 +29,14 @@ Examples:
 extract.bat D:\photos
 extract.bat D:\photos --bands 50,60,70,75,80,85,90
 extract.bat D:\photos --out E:\check\photos
+extract.bat D:\photos_jpeg_extract --bands 60,70,75,80,85
 ```
 
-The first command measures every image of `D:\photos` and its subfolders and copies the images with a QF under 85 into `D:\photos_jpeg_extract\60`, `70`, `80` and `85`. The second splits the same images into other bands; the measurements are taken from the cache, so it takes seconds. The third writes the copies to another folder.
+The first command measures every image of `D:\photos` and its subfolders and copies the images with a QF under 85 into `D:\photos_jpeg_extract\60`, `70`, `80` and `85`. The second splits the same images into other bands; the measurements are taken from the cache, so it takes seconds. The third writes the copies to another folder. The fourth sorts an existing extract folder again, in place and without the dataset: band `80` is split into `75` and `80` by moving its copies (section [Sorting an extract folder again](#sorting-an-extract-folder-again)).
 
 | option | what it does |
 |---|---|
-| `--bands LIST` | the band limits, comma-separated (default `60,70,80,85`) |
+| `--bands LIST` | the band limits, comma-separated (default `60,70,80,85`; for an extract folder, the limits of its last run) |
 | `--out DIR` | the output folder (default `<folder>_jpeg_extract` next to the dataset folder); with several folders, one subfolder per folder name |
 | `--max-pixels N` | skip images larger than N pixels (default 4194304, which is 2048 x 2048) |
 | `--exclude NAME` | another folder name to skip, at any depth; may repeat |
@@ -67,6 +68,12 @@ Not measured, and counted as skipped in the summary:
 JPEG, MPO, PNG, BMP, TIFF and lossless WebP are measured.
 
 The run prints a progress line every 500 images with the time left. Ctrl+C stops it; the measurements made so far stay in the cache, and the next run continues from there.
+
+## Sorting an extract folder again
+
+An extract folder given instead of a dataset folder is sorted in place from its `extract.csv` and its `manifest.json`; the dataset is not read and the model is not loaded. New `--bands` move copies with their captions between the band folders. Copies above a lower new top limit are deleted with their captions. Images above the old top limit were never copied, so a higher new top limit cannot add them; the run says how many there are, and a run on the dataset folder adds them.
+
+`extract.csv` and `manifest.json` are written first, then the moves are made. When a run is stopped, the next run finishes its moves from `moves.json` before anything else.
 
 ## Output
 
