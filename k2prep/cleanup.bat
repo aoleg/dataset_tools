@@ -6,17 +6,18 @@ rem
 rem      cleanup.bat <folder> <size> [--dim] [--dry-run]
 rem
 rem  Moves every image below <size>, and its .txt sidecar, out of <folder> and
-rem  its first-level subfolders into _foldername next to it, keeping the folder
-rem  structure. <size> is N (meaning NxN) or WxH, and the default test is area:
-rem  1024 moves anything with fewer than 1048576 pixels.
+rem  all its subfolders, at any depth, into _foldername next to it, keeping the
+rem  folder structure. <size> is N (meaning NxN) or WxH, and the default test
+rem  is area: 1024 moves anything with fewer than 1048576 pixels.
 rem
 rem      cleanup.bat T:\somefolder 1024
 rem
 rem  moves T:\somefolder\small.jpg to T:\_somefolder\small.jpg and
-rem  T:\somefolder\1\small.jpg to T:\_somefolder\1\small.jpg.
+rem  T:\somefolder\1\a\small.jpg to T:\_somefolder\1\a\small.jpg.
 rem
-rem  Subfolders whose name starts with an underscore are skipped, so _prep and
-rem  the sidecar folder itself are never touched.
+rem  Subfolders whose name starts with an underscore or a dot are skipped at
+rem  every depth, so _prep and the sidecar folder itself are never touched.
+rem  Links and junctions are not followed.
 rem
 rem  Every argument goes to cleanup.py exactly as typed, for the reason given
 rem  in run.bat: parsing it here deleted every "!" in a path.

@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """cleanup.py - move undersized images out of a training folder.
 
-Walks a folder and its first-level subfolders and moves every image smaller
-than a given size, together with its .txt caption sidecar, into a sidecar
-folder named after the source with a leading underscore. The original folder
-structure is preserved inside it:
+Walks a folder and all its subfolders, at any depth, and moves every image
+smaller than a given size, together with its .txt caption sidecar, into a
+sidecar folder named after the source with a leading underscore. The original
+folder structure is preserved inside it:
 
     cleanup.py T:\\somefolder 1024
 
     T:\\somefolder\\small.jpg     ->  T:\\_somefolder\\small.jpg
     T:\\somefolder\\1\\small.jpg   ->  T:\\_somefolder\\1\\small.jpg
+    T:\\somefolder\\1\\a\\small.jpg ->  T:\\_somefolder\\1\\a\\small.jpg
 
 Nothing is deleted and nothing is overwritten. The images stay on disk, one
 folder over, so a threshold chosen too aggressively is undone by moving them
@@ -28,7 +29,7 @@ from pathlib import Path
 
 from PIL import Image
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 # Mirrors k2prep's IMAGE_EXTENSIONS, for the same reason: these are the
 # extensions musubi-tuner recognises. Mixed-case variants such as .Jpg are not
@@ -70,12 +71,12 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(
         prog="cleanup",
         description="Move images below a size threshold, and their .txt "
-                    "sidecars, out of a folder and its first-level subfolders "
+                    "sidecars, out of a folder and all its subfolders "
                     "into a _foldername sidecar folder next to it.",
     )
-    p.add_argument("folder", help="Folder to clean. First-level subfolders are "
-                                  "cleaned too, except those starting with an "
-                                  "underscore.")
+    p.add_argument("folder", help="Folder to clean. Subfolders at any depth "
+                                  "are cleaned too, except those starting with "
+                                  "an underscore or a dot, and links.")
     p.add_argument("size", type=_size_arg, metavar="SIZE",
                    help="Threshold, N (meaning NxN) or WxH. By default an "
                         "image is moved when it has fewer pixels than this, "
@@ -96,14 +97,61 @@ def parse_args(argv=None):
 # Scanning
 # ---------------------------------------------------------------------------
 
-def folders_to_clean(root: Path) -> list[Path]:
-    """The root itself, then its first-level subfolders in name order."""
-    subs = []
-    for entry in os.scandir(root):
-        if entry.is_dir() and not entry.name.startswith(SIDECAR_PREFIX):
+def _is_link(entry: os.DirEntry) -> bool:
+    """A symlink or a Windows junction: anything that points elsewhere.
+
+    is_dir(follow_symlinks=False) is not enough - Windows reports a junction as
+    a real directory there - so ask for the reparse tag, which is non-zero for
+    every kind of reparse point. Anything that cannot be classified is treated
+    as a link, since the safe direction is not following it. Copied from
+    k2prep.py.
+    """
+    try:
+        if entry.is_symlink():
+            return True
+        st = entry.stat(follow_symlinks=False)
+    except OSError:
+        return True
+    return getattr(st, "st_reparse_tag", 0) != 0
+
+
+def folders_to_clean(root: Path) -> tuple[list[Path], list[str], list[str]]:
+    """The root and every folder below it, at any depth, each parent before
+    its subfolders and siblings in name order. Returns (folders, links not
+    followed, folders that could not be read).
+
+    Skipped at every depth, as k2prep's scan skips them: folders starting with
+    an underscore (sidecars, _prep) or a dot, and links and junctions, which
+    are not followed. An unreadable folder is listed and the walk goes on.
+    """
+    folders: list[Path] = []
+    links: list[str] = []
+    unreadable: list[str] = []
+    stack = [root]
+    while stack:
+        folder = stack.pop()
+        folders.append(folder)
+        subs = []
+        try:
+            entries = list(os.scandir(folder))
+        except OSError as exc:
+            unreadable.append(f"{folder}: {exc.strerror or exc}")
+            continue
+        for entry in entries:
+            try:
+                if not entry.is_dir():
+                    continue
+            except OSError:
+                continue
+            if entry.name.startswith((SIDECAR_PREFIX, ".")):
+                continue
+            if _is_link(entry):
+                links.append(entry.path)
+                continue
             subs.append(Path(entry.path))
-    subs.sort(key=lambda p: p.name.lower())
-    return [root] + subs
+        subs.sort(key=lambda p: p.name.lower(), reverse=True)
+        stack.extend(subs)
+    return folders, links, unreadable
 
 
 def images_in(folder: Path) -> tuple[list[Path], list[str]]:
@@ -255,12 +303,20 @@ def main(argv=None) -> int:
     print()
 
     counts = Counts()
-    for folder in folders_to_clean(root):
-        dest = dest_root if folder == root else dest_root / folder.name
+    folders, links, unreadable = folders_to_clean(root)
+    for folder in folders:
+        dest = dest_root / folder.relative_to(root)
         print(f"{folder}")
-        clean_folder(folder, dest, args.size, args.dim, args.dry_run, counts)
+        try:
+            clean_folder(folder, dest, args.size, args.dim, args.dry_run, counts)
+        except OSError as exc:
+            unreadable.append(f"{folder}: {exc.strerror or exc}")
 
     print()
+    for link in links:
+        print(f"not followed: {link} is a link or junction")
+    for line in unreadable:
+        print(f"cannot read: {line}")
     verb = "would move" if args.dry_run else "moved"
     print(f"{plural(counts.scanned, 'image')} scanned, {counts.moved} {verb}, "
           f"{counts.kept} kept.")
@@ -272,8 +328,11 @@ def main(argv=None) -> int:
         print(f"{plural(counts.unknown, 'file')} {was} an extension this script "
               f"does not recognise and {'was' if counts.unknown == 1 else 'were'} "
               f"not looked at.")
+    if unreadable:
+        print(f"{plural(len(unreadable), 'folder')} could not be read.")
     if counts.errors:
         print(f"{plural(counts.errors, 'image')} could not be read or moved.")
+    if counts.errors or unreadable:
         return 1
     return 0
 

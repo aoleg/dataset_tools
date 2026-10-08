@@ -137,16 +137,19 @@ k2prep skips images too small for the 512 tier and names them in the report, but
 cleanup.bat "L:\train\alice" 1024
 ```
 
-That moves every image with fewer than 1024×1024 pixels, along with its `.txt` caption sidecar, out of the folder and its first-level subfolders into a sidecar folder named after the source with a leading underscore, keeping the structure:
+That moves every image with fewer than 1024×1024 pixels, along with its `.txt` caption sidecar, out of the folder and all its subfolders, at any depth, into a sidecar folder named after the source with a leading underscore, keeping the structure:
 
 ```
 L:\train\alice\small.jpg      ->  L:\train\_alice\small.jpg
 L:\train\alice\1\small.jpg    ->  L:\train\_alice\1\small.jpg
+L:\train\alice\1\a\small.jpg  ->  L:\train\_alice\1\a\small.jpg
 ```
+
+What the walk skips, at every depth, is what k2prep's scan skips: folders starting with `_` (`_prep` and earlier sidecars) or `.`, and links and junctions, which are not followed and are listed at the end. A folder that cannot be read is listed too, and the run ends with an error code.
 
 | Option | Default | Meaning |
 |---|---|---|
-| `<folder>` | required | Folder to clean, positional. Its first-level subfolders are cleaned too, except those starting with an underscore. |
+| `<folder>` | required | Folder to clean, positional. Its subfolders at any depth are cleaned too, except those starting with an underscore or a dot. |
 | `<size>` | required | Threshold, positional. `N` means `N`×`N`; `WxH` is also accepted, e.g. `1600x900`. |
 | `--dim` | off | Compare dimensions instead of area: move an image if either side is shorter than the threshold's. |
 | `--dry-run` | off | List what would move and touch nothing. |
