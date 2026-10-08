@@ -1,4 +1,4 @@
-# k2prep — dataset preprocessor for musubi-tuner / Krea 2 LoRA training
+# k2prep — dataset preprocessor for musubi-tuner and Ostris AI Toolkit LoRA training
 
 Build specification, Phase 1.
 
@@ -105,7 +105,7 @@ UPSCALE_TOLERANCE = 1.15          # max permitted linear upscale into a tier
 
 `TIERS` must be a single module-level constant. Krea 2's technical report states that pretraining progressively scaled through 256px, 512px and 1024px stages, and there is secondhand advice circulating that 768 should therefore be avoided for training. That advice is anecdotal rather than measured, and 768 is included here for demotion granularity: without it the gap between tiers is 4× in area and near-boundary images lose most of their pixels. Editing one line reverts that decision.
 
-256 is deliberately **not** a tier. Anything that does not reach the 512 tier is skipped.
+256 is deliberately **not** a tier of the usual layouts. Anything that does not reach the 512 tier is skipped. The exception is `--by-tier` (section 7.6), which adds 256 for completeness: `BY_TIER_TIERS = [1024, 768, 512, 256]`. A run selects its tier list once, before any work, and nothing changes it while worker threads read it.
 
 `UPSCALE_TOLERANCE` prevents cliff-edge demotion. Lanczos upscaling softens slightly but fabricates nothing, so a 15% upscale is a far better trade than dropping a tier and discarding 44% of the pixels.
 
@@ -172,6 +172,19 @@ The nominal values are the *actual 1024-tier bucket ratios*, not the idealised o
 Latent token counts are near-constant within a tier: ~4,050–4,096 at 1024, ~2,280–2,304 at 768, ~1,008–1,024 at 512. This matters for the emitted TOML (section 10).
 
 Because the ratios differ between tiers, **the crop box cannot be computed until the tier is known**. See section 5.
+
+### 4.4 Bucket sets: `--musubi` and `--ostris`
+
+The buckets above are musubi-tuner's. Ostris AI Toolkit has other ones, so the trainer is named on the command line, and a `BucketSet` (key, label, `bucket_for(tier, family)`, `family_of_bucket`) holds each trainer's sizes. The run selects one with `use_buckets()` before any work; the module-level `bucket_for` and `family_of_bucket` delegate to it.
+
+- `musubi`: section 4.2, unchanged. Its 256 tier comes from the same port.
+- `ostris`: for each family, the size in steps of `OSTRIS_STEP = 64` closest to the family's nominal ratio in log-ratio distance, among those with at least `OSTRIS_MIN_AREA = 0.80` of the tier's area and at most all of it; the larger area wins a tie.
+
+AI Toolkit's `setup_buckets` calls `get_bucket_for_image_size(w, h, resolution, divisibility=bucket_tolerance)` (default 64), scales the image to cover that bucket and centre-crops it. The function caps the area at the image's own, so an image is never upscaled into a larger bucket. k2prep holds a verbatim port, `aitk_bucket_for_image_size` (ostris/ai-toolkit `toolkit/buckets.py` at a949f21), and asserts for every Ostris bucket that the port returns it unchanged for divisibility 64, 32, 16 and 8: AI Toolkit then trains the render as it is, scale 1.0, no crop. musubi's sizes, multiples of 16, are not fixed points: AI Toolkit at its default crops them again by 1 to 3 percent at 1024 and up to 14.3 percent at 512.
+
+The ratio-first rule was chosen over AI Toolkit's own area-first choice, which keeps more pixels but drifts the ratios: it would crop a 4:5 photo by 9 percent at 1024 and by 20 percent at 512, where 4:5, 1:1 and 5:4 all become 512×512. At 256 the 64-pixel grid is too coarse even for ratio first: 9:16 and 2:3 share 192×320, 3:2 and 16:9 share 320×192, and 4:5, 1:1 and 5:4 share 256×256. `family_of_bucket` names shared buckets together, "4:5/1:1/5:4".
+
+One of `--ostris` and `--musubi` is required whenever k2prep resizes (the build, its `--report` dry run, and `-R`). With neither, `main` prints the two options and the user's command with each one added, every argument that is not a plain word quoted, and exits 2 before any work. `--sort`, `--copy-to` and `--move-to` keep the originals as they are; they score with musubi buckets unless `--ostris` is given. Every run prints `Using <label> buckets` first, and every report has a `buckets` line.
 
 ---
 
@@ -476,6 +489,27 @@ One report per run, in `_prep/reports/`: `copy-scan-YYYYMMDD-HHMMSS.txt` under `
 
 `--move` with `--copy-to`, or `--move-to TARGET` for short, moves the selected originals and their captions instead of copying them, so the source keeps only what was not selected, for human review. It is the second mode, after `--sort --move`, that removes files from the source, and it adds these guards to the copy's: `shutil.move` (a rename within a volume, copy then unlink across volumes) so a file reaches the target before it leaves the source; an image and its caption move together, and if the second move fails the first is moved back and any duplicate a failed copy-then-unlink left in the target is removed when it is byte-identical; a caption shared with an image that stays in the source, or with a selected image still to come, is copied rather than moved; and a target file that matches by size and mtime removes its source only after a byte comparison agrees, otherwise it is a conflict. `--report` moves nothing. Reports are named `move-scan-*.txt` and `move-*.txt`. Empty source folders are left in place. `--png`, `--single-pass` and `--no-merge` are ignored with a note. `-R` is refused with `--copy-to`, because each per-folder run would copy into the root of the same target and flatten the tree.
 
+### 7.6 `--by-tier`: one folder per tier
+
+AI Toolkit has its settings per dataset folder and reads a dataset folder with `os.walk`, subfolders included (only `.` folders are pruned). A tree of datasets therefore trains best as one folder per tier holding the whole tree. `--by-tier` puts the tier first, and adds the 256 tier (section 4.1):
+
+| mode | default | with `--by-tier` |
+|---|---|---|
+| build | `_prep/<relpath>/<tier>/` | `_prep/_<tier>/<relpath>/` |
+| `--copy-to`, `--move-to` | `TARGET/<relpath>/` | `TARGET/_<tier>/<relpath>/` |
+
+`tier_dir()` and `copy_dest_dir()` are the only places that know a layout. The underscore keeps the tier folders out of k2prep's, cleanup's and deduplicate's scans.
+
+- **Tier.** The tier an image is rendered at, by the run's bucket set (section 4.4). In the copy modes the tier is a header-only geometry test kept in `Result.dest_tier`, apart from the 1024 tier the score is taken at. An image that fills no tier, 256 included, is skipped; under `--move-to` it stays in the source.
+- **Merge pool.** What one training folder batches together (`merge_pooled()`): under `--ostris --by-tier` all images of a tier across the tree, because AI Toolkit trains a tier folder as one dataset; otherwise one folder, because musubi's `glob_images` reads no subfolders and each folder is its own `[[datasets]]` block.
+- **TOML.** `--musubi` only: one block per populated `_<tier>/<relpath>`, `batch_size = 16` at 256.
+- **Reserved names.** Neither of section 7.4's collides tier first. A first-level source folder named `cache` does: `_prep/_1024/cache` is musubi's cache folder of the root dataset's 1024 block. `ScanError`.
+- **Sweep.** `sweep_superseded` clears the run's own layout as before and every file in the other layout's tier folders of the same datasets, so switching `--by-tier` on or off rebuilds `_prep`. Only files are removed, never folders, so musubi's cache folders stay.
+- **Stale.** `find_stale_datasets` walks both layouts and reports, never deletes.
+- **Reports.** A `layout` line, the merge pool in the `merging` lines, one bucket distribution for the whole tree when pooled, and a note when the 256 tier is populated: its scores are less reliable, because the bands were fitted on larger renders. The copy report gets the tier folder of each selected image and a BY TIER grid, tier against `--threshold`.
+
+`--by-tier` is refused with `--sort`.
+
 ---
 
 ## 8. Command-line interface
@@ -487,6 +521,8 @@ k2prep.py <folder> [options]
 | Option | Default | Meaning |
 |---|---|---|
 | `<folder>` | required | Input folder, positional. One dataset, unless `--recursive`. |
+| `--ostris`, `--musubi` | one required to resize | The trainer whose bucket sizes k2prep renders to. Section 4.4. |
+| `--by-tier` | off | Tier-first layout and the 256 tier. Section 7.6. |
 | `--report` | off | Dry run. Analyse and write a report; write no images. |
 | `--recursive` | off | Every subfolder that directly contains images is its own dataset, sharing one `_prep` and one TOML. Section 7.4. |
 | `--threshold N` | 0 | Process only images whose composite score ≥ N. 0 processes everything that fits a tier. Range 0–10. |
@@ -640,6 +676,8 @@ Report file size: for 8,000 images the per-image table is roughly 1 MB of text. 
 ---
 
 ## 10. `--emit-toml`
+
+Written by `--musubi` runs only. An `--ostris` run writes none and removes the TOML files k2prep wrote into `_prep` (they start with its marker), so musubi is never pointed at renders sized for another trainer; a dry run only reports them.
 
 Writes `_prep/dataset.toml`, one `[[datasets]]` block per populated tier:
 

@@ -42,7 +42,7 @@ import numpy as np
 from PIL import Image, ImageOps
 from tqdm import tqdm
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 EPS = 1e-6
 

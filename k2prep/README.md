@@ -1,10 +1,10 @@
 # k2prep
 
-k2prep takes a messy folder of mixed photographs and produces a small, clean, bucket-tight training set for musubi-tuner's Krea 2 trainer: every accepted image is cropped and resized onto one of 7 aspect ratios across 3 resolution tiers, and buckets too small to form a real batch are then consolidated into their nearest healthy neighbour — so instead of the 15+ buckets an ordinary photo folder scatters across, the trainer typically sees two or three per tier.
+k2prep takes a messy folder of mixed photographs and produces a small, clean, bucket-tight training set for Ostris AI Toolkit or musubi-tuner's Krea 2 trainer: every accepted image is cropped and resized onto the exact bucket sizes of the trainer you name (`--ostris` or `--musubi`), on one of 7 aspect ratios across 3 resolution tiers, and buckets too small to form a real batch are then consolidated into their nearest healthy neighbour — so instead of the 15+ buckets an ordinary photo folder scatters across, the trainer typically sees two or three per tier.
 
 The output is a **filtered subset**, not a transformation of the whole folder. Images that fail the quality threshold or are too small are skipped entirely, and the source folder is never written to, moved within, or deleted from — the report is the only record of a rejection. (The exceptions are `--sort --move` and `--move-to`, which exist to move originals and say so.)
 
-It can also just [sort a folder by quality](#sorting-a-folder-by-quality) and build nothing, or [copy the best originals of a whole tree](#copying-the-best-originals-to-another-folder) into another folder.
+It can also just [sort a folder by quality](#sorting-a-folder-by-quality) and build nothing, or [copy the best originals of a whole tree](#copying-the-best-originals-to-another-folder) into another folder. With [`--by-tier`](#one-folder-per-tier-for-ai-toolkit---by-tier) both the dataset and the copies get one folder per resolution tier, each holding the whole source tree, which is how AI Toolkit wants a tree of datasets.
 
 [`cleanup.bat`](#cleanupbat-moving-undersized-images-out) ships alongside it and does the one thing k2prep will not: move undersized images out of the source folder.
 
@@ -19,16 +19,18 @@ install.bat
 Then look before you leap:
 
 ```bash
-run.bat "L:\train\photos" --report
+run.bat "L:\train\photos" --ostris --report
 ```
 
 and when the report looks right:
 
 ```bash
-run.bat "L:\train\photos" --threshold 6
+run.bat "L:\train\photos" --ostris --threshold 6
 ```
 
-That is the whole workflow. One run scans, assigns buckets, consolidates the undersized ones, renders and scores every image, writes the ones that pass along with their captions, and emits `_prep/dataset.toml` ready to hand to musubi-tuner.
+Name the trainer on every run that resizes: `--ostris` for Ostris AI Toolkit, `--musubi` for musubi-tuner. See [The trainer](#the-trainer---ostris-or---musubi).
+
+That is the whole workflow. One run scans, assigns buckets, consolidates the undersized ones, renders and scores every image, writes the ones that pass along with their captions, and, with `--musubi`, emits `_prep/dataset.toml` ready to hand to musubi-tuner.
 
 **Run `--report` first.** It is a dry run: it analyses everything and writes a report but no images. Because rejections leave no artifact on disk — nothing is copied, moved or marked — the report is the only place a rejected file is ever named. Recovering from too high a threshold means lowering it and re-running, which is cheap (already-written images are skipped), but you cannot recover the list of what was dropped after the fact if you never generated it.
 
@@ -43,6 +45,9 @@ k2prep.py <folder> [options]
 | Option | Default | Meaning |
 |---|---|---|
 | `<folder>` | required | Input folder, positional. One dataset, unless `--recursive`. |
+| `--ostris` | one of the two | Resize onto Ostris AI Toolkit buckets. One of `--ostris` and `--musubi` is required whenever k2prep resizes. See [below](#the-trainer---ostris-or---musubi). |
+| `--musubi` | one of the two | Resize onto musubi-tuner buckets and write `_prep/dataset.toml`. |
+| `--by-tier` | off | One folder per tier (`_1024`, `_768`, `_512`, `_256`), each holding the whole source tree, for the dataset and for `--copy-to` and `--move-to`. Adds the 256 tier. See [below](#one-folder-per-tier-for-ai-toolkit---by-tier). |
 | `--report` | off | Dry run. Analyse and write a report; write no images. |
 | `--recursive` | off | Every subfolder that directly contains images is its own dataset, sharing one `_prep` and one `dataset.toml`. See [below](#--recursive-several-datasets-one-_prep). |
 | `-R` | off | One independent run for the folder and one for each first-level subfolder, each with its own `_prep`. See [below](#-r-independent-runs-per-subfolder). |
@@ -64,7 +69,7 @@ k2prep.py <folder> [options]
 
 Use `--filter box` for heavily compressed sources. Box averaging suppresses 8×8 block artifacts more cleanly than Lanczos, which can ring on them.
 
-Output goes to `<folder>/_prep/{1024,768,512}/`, flat, with `.txt` caption sidecars copied alongside, plus `_prep/dataset.toml` (under `--recursive`, each dataset gets its tier folders at `_prep/<subfolder>/<tier>/` instead). Every run writes two timestamped reports to `<folder>/_prep/reports/`:
+Output goes to `<folder>/_prep/{1024,768,512}/`, flat, with `.txt` caption sidecars copied alongside, plus `_prep/dataset.toml` with `--musubi` (under `--recursive`, each dataset gets its tier folders at `_prep/<subfolder>/<tier>/` instead, and under `--by-tier` the tier comes first: `_prep/_<tier>/<subfolder>/`). Every run writes two timestamped reports to `<folder>/_prep/reports/`:
 
 - `*-preliminary.txt` — the natural, per-family bucket assignment, before any consolidation and before anything is scored. This is the bucket explosion in its raw form.
 - `*-final.txt` — what was actually written, with the rendered scores, what the merge pass moved, and what it could not.
@@ -73,12 +78,34 @@ Reports are never overwritten, so two threshold settings are diffable — and so
 
 `_prep/` belongs to k2prep. Each run makes the tier folders match its own plan exactly: outputs left by an earlier run that the current one does not place (because the threshold changed, or merging moved an image elsewhere) are removed and listed under `SUPERSEDED OUTPUTS` in the final report. The source folder is never touched, so anything removed is one re-run away from coming back.
 
+## The trainer: `--ostris` or `--musubi`
+
+A trainer resizes and crops every image onto one of its own bucket sizes. An image that arrives at exactly one of them is used as it is; any other image is resized and cropped a second time, blind to where the subject is. So k2prep renders onto the exact bucket sizes of the trainer you name:
+
+- `--ostris`: Ostris AI Toolkit. Sides in steps of 64, within the tier's area. AI Toolkit's own bucket function (`get_bucket_for_image_size`, ported into k2prep and checked whenever a bucket is used) returns each of these sizes unchanged, so AI Toolkit trains the render with no second resize or crop. That holds for `bucket_tolerance` 64, AI Toolkit's default, and for 32, 16 and 8. No `dataset.toml` is written, and one that an earlier `--musubi` run wrote into `_prep` is removed; a TOML that k2prep did not write is never touched.
+- `--musubi`: musubi-tuner. The sizes of musubi's own bucket list (see [below](#why-the-output-dimensions-look-arbitrary)), and a `_prep/dataset.toml` for it.
+
+The two are not interchangeable. musubi sizes are multiples of 16, which AI Toolkit at its default settings crops again by 1 to 3 percent at 1024 and by up to 14 percent at 512.
+
+One of the two is required whenever k2prep resizes: building the dataset, its `--report` dry run, and `-R`. Without either, k2prep stops before it reads a single image, lists both options, and prints your command with each one added, ready to copy. `--sort`, `--copy-to` and `--move-to` keep the originals as they are and do not need it; they score with musubi buckets unless you give `--ostris`. Every run starts with a line that names the buckets it uses, `Using Ostris AI Toolkit buckets` or `Using Musubi Tuner buckets`, and every report repeats it.
+
+The Ostris bucket of an aspect ratio is the size in steps of 64 that is closest to the ratio with at least 80 percent of the tier's area. Keeping the ratio costs some pixels (2:3 at 1024 is 768×1152, 84 percent of the area) but cuts almost nothing off the photograph: at most 1.2 percent of a photo at its own ratio at 1024, and 3.1 percent at 512 (6 percent for 9:16 and 16:9).
+
+| tier | 9:16 | 2:3 | 4:5 | 1:1 | 5:4 | 3:2 | 16:9 |
+|---|---|---|---|---|---|---|---|
+| 1024 | 768×1344 | 768×1152 | 832×1024 | 1024×1024 | 1024×832 | 1152×768 | 1344×768 |
+| 768 | 576×1024 | 576×896 | 640×768 | 768×768 | 768×640 | 896×576 | 1024×576 |
+| 512 | 384×640 | 384×576 | 448×576 | 512×512 | 576×448 | 576×384 | 640×384 |
+| 256 | 192×320 | 192×320 | 256×256 | 256×256 | 256×256 | 320×192 | 320×192 |
+
+At 256 (only with `--by-tier`) the 64-pixel grid is too coarse for seven ratios, so some share a bucket, and the reports name them together, for example `4:5/1:1/5:4`.
+
 ## `--recursive`: several datasets, one `_prep`
 
 If your photos are split into subfolders — one per subject, per shoot, per concept — and you want to train them **together** in one run, pass `--recursive`. Every directory that directly contains at least one image becomes its own dataset, and the whole tree shares one `_prep`, one set of reports and one `dataset.toml`:
 
 ```bash
-run.bat "L:\train" --recursive --report
+run.bat "L:\train" --recursive --musubi --report
 ```
 
 ```
@@ -91,13 +118,13 @@ The output mirrors the source tree, so a tree with no subfolders produces exactl
 
 Everything that is per-dataset stays per-dataset:
 
-- **Bucket merging** never moves an image between datasets. musubi forms batches within a `[[datasets]]` block only, so a bucket that looks healthy summed across datasets can still be undersized in every one of them — the report's bucket distribution and its warnings are therefore printed per dataset.
+- **Bucket merging** never moves an image between datasets. musubi forms batches within a `[[datasets]]` block only, so a bucket that looks healthy summed across datasets can still be undersized in every one of them — the report's bucket distribution and its warnings are therefore printed per dataset. The one exception is `--ostris --by-tier`, where AI Toolkit trains a whole tier folder as one dataset; see [`--by-tier`](#one-folder-per-tier-for-ai-toolkit---by-tier).
 - **Filename collisions** are resolved per dataset per tier; `alice\photo.jpg` and `bob\photo.jpg` keep their names.
 - **Idempotency and superseded-output sweeping** work per dataset, so a re-run after a threshold change behaves exactly as in the flat layout, in every dataset at once.
 
 What the scan skips, at every depth: folders starting with `_` (which covers `_prep` — including one left inside a subfolder by an earlier `-R` run — and `cleanup.bat`'s `_foldername` sidecars) and folders starting with `.`. Directory symlinks and junctions are never followed: a junction cycle would loop forever, and one pointing outside the tree would drag foreign folders in. An unreadable folder is reported and the scan continues.
 
-Two names are refused with a clear error rather than mirrored: a source folder named like a tier (`1024`, `768`, `512`) anywhere in the tree — it would make `_prep\x\1024` ambiguous — and a first-level folder named `reports`, which would collide with `_prep\reports`. Rename them.
+Two names are refused with a clear error rather than mirrored: a source folder named like a tier (`1024`, `768`, `512`) anywhere in the tree — it would make `_prep\x\1024` ambiguous — and a first-level folder named `reports`, which would collide with `_prep\reports`. Rename them. Under `--by-tier` neither name collides, and the one refused name is a first-level folder named `cache`.
 
 If a source subfolder is renamed or deleted, its old outputs under `_prep` are reported as stale and **left alone** — the regenerated TOML simply no longer references them, so they cannot leak into training. Note that `dataset.toml` always describes the *last* run: a later non-recursive run on the same root rewrites it for the root dataset only (the subfolder outputs themselves are untouched, and one `--recursive` re-run restores the full TOML).
 
@@ -108,7 +135,7 @@ If a source subfolder is renamed or deleted, its old outputs under `_prep` are r
 `-R` is the other tool for a folder of subfolders, and the opposite trade: it runs k2prep once for the folder, then once for each first-level subfolder, so every folder keeps its **own** `_prep`, its own reports and its own `dataset.toml` — independent datasets, trained separately:
 
 ```bash
-run.bat "L:\train" -R --report --threshold 6
+run.bat "L:\train" -R --ostris --report --threshold 6
 ```
 
 ```
@@ -129,9 +156,46 @@ Combining `-R` with `--recursive` runs the tree mode once per subfolder, which i
 
 `-R` used to be implemented in `run.bat`, which deleted every `!` in a path: `"K:\!!!!_data\!!!_ok"` arrived as `K:\_ok`. Since 1.2.0 it is a k2prep option, and `run.bat` and `cleanup.bat` pass every argument through untouched, so `!`, `&`, `%`, `^` and non-Latin letters in folder names all work. Put the folder first on the line, or anywhere except straight after `--sort`, which takes an optional number and would read the folder as that number.
 
+## One folder per tier for AI Toolkit: `--by-tier`
+
+AI Toolkit has its settings (resolution, repeats, caption dropout, loss weight) per dataset folder, and it reads a dataset folder with all its subfolders. A tree of datasets therefore trains best as one folder per resolution tier, each holding the whole tree. `--by-tier` puts the tier first:
+
+```bash
+run.bat "L:\train" --recursive --by-tier --ostris --report
+run.bat "L:\train" --recursive --by-tier --ostris --threshold 6
+```
+
+```
+L:\train\photo.jpg            ->  L:\train\_prep\_1024\photo.jpg
+L:\train\alice\a.jpg          ->  L:\train\_prep\_1024\alice\a.jpg
+L:\train\bob\indoor\b.jpg     ->  L:\train\_prep\_512\bob\indoor\b.jpg
+```
+
+Each image is rendered at the largest tier it fills, as always, and goes to that tier's folder under its own subfolder path. In AI Toolkit, add each `_<tier>` folder as one dataset, with its resolution set to its tier and `bucket_tolerance` left at 64 (32, 16 and 8 work too).
+
+What changes with `--by-tier`:
+
+- **A 256 tier.** It is there for completeness: an image too small for 512 goes to `_256` instead of being skipped. Scores at 256 are less reliable, because the quality bands were fitted on larger renders, and the report says so. Keep or delete `_256` by hand.
+- **Merging is pooled per tier under `--ostris`.** AI Toolkit trains a whole tier folder as one dataset, so small buckets are merged across all folders of the tier. Under `--musubi` each folder stays its own pool and its own `[[datasets]]` block, because musubi reads no subfolders; the TOML then points at `_prep\_<tier>\<subfolder>`, with `batch_size = 16` at 256.
+- **Folder names.** Source folders named `1024` or `reports` are fine. A first-level source folder named `cache` is refused, because `_prep\_1024\cache` is where musubi keeps the cache of the root folder's 1024 renders.
+- **Switching.** Turning `--by-tier` on or off rebuilds `_prep` in the new layout: the renders of the other layout are removed and listed under `SUPERSEDED OUTPUTS`. Only files are removed, never folders, so musubi's cache folders stay. The source is never touched.
+
+`--by-tier` works with `-R` too, where each folder gets its own `_prep\_<tier>\` folders, and with [`--copy-to` and `--move-to`](#copying-the-best-originals-to-another-folder), which put each original, unchanged, into the tier folder it would be rendered into:
+
+```bash
+run.bat "L:\photos" --recursive --by-tier --move-to "L:\aitk" --threshold 6
+```
+
+```
+L:\photos\a.jpg               ->  L:\aitk\_1024\a.jpg
+L:\photos\trip\b.jpg (+ .txt) ->  L:\aitk\_768\trip\b.jpg (+ .txt)
+```
+
+The tier is decided by musubi buckets there, or by Ostris buckets with `--ostris`. An original too small for 256 is not copied, and under `--move-to` it stays in the source for review. The copy report adds a BY TIER grid: how many images each tier folder would get at each `--threshold`. `--by-tier` cannot be combined with `--sort`.
+
 ## `cleanup.bat`: moving undersized images out
 
-k2prep skips images too small for the 512 tier and names them in the report, but it never removes anything, so a folder full of thumbnails stays a folder full of thumbnails. `cleanup.bat` is the separate, deliberate step that takes them out of the way:
+k2prep skips images too small for the 512 tier (256 with `--by-tier`) and names them in the report, but it never removes anything, so a folder full of thumbnails stays a folder full of thumbnails. `cleanup.bat` is the separate, deliberate step that takes them out of the way:
 
 ```bash
 cleanup.bat "L:\train\alice" 1024
@@ -163,7 +227,7 @@ Nothing is deleted and nothing is overwritten. The images are still on disk, one
 ```bash
 cleanup.bat "L:\train" 1024 --dry-run
 cleanup.bat "L:\train" 1024
-run.bat "L:\train" -R --report
+run.bat "L:\train" -R --ostris --report
 ```
 
 ## Sorting a folder by quality
@@ -312,7 +376,7 @@ The target is your folder, not k2prep's, so k2prep never deletes anything in it:
 - A file that is already there and different is a **conflict**. The image and its caption are not copied, the report lists them under `CONFLICTS`, and the exit code is 1. `--force` overwrites.
 - A copy made by an earlier run that this run does not select, for example after you raise `--threshold`, stays where it is. The report lists it under `IN THE TARGET BUT NOT SELECTED`. Delete it yourself if you do not want it.
 
-`--copy-to` cannot be combined with `--sort`. `--png`, `--single-pass` and `--no-merge` have no effect on it, and the report says so if you give them.
+`--copy-to` cannot be combined with `--sort`. `--png`, `--single-pass` and `--no-merge` have no effect on it, and the report says so if you give them. With `--by-tier` the target gets one folder per tier; see [`--by-tier`](#one-folder-per-tier-for-ai-toolkit---by-tier).
 
 ### Moving instead of copying
 
@@ -343,6 +407,8 @@ k2prep therefore generates its targets with musubi's own algorithm, ported verba
 
 The per-tier tables differ, because the 16px grid is coarser relative to a smaller image — 9:16 is 768×1360 at the 1024 tier but 576×1024 at 768. `--report` prints the full table it used.
 
+All of this is `--musubi`. With `--ostris` the sizes follow AI Toolkit's rule instead; see [The trainer](#the-trainer---ostris-or---musubi).
+
 ## Bucket merging
 
 Assigning every image to its nearest aspect-ratio family is the right first answer, but on a real folder it leaves a long tail. A tier that looks like this trains in batches of three no matter what `batch_size` says:
@@ -356,7 +422,7 @@ Assigning every image to its nearest aspect-ratio family is the right first answ
         448x576 4:5           1   *** WARNING: fewer than 8 images
 ```
 
-So after the preliminary report and before anything is written, k2prep consolidates buckets holding fewer than 8 images. Moved images are re-rendered **from the original source**, never rescaled from an already-downsized output, and go through the same crop-box code as everything else. The rules, in order:
+So after the preliminary report and before anything is written, k2prep consolidates buckets holding fewer than 8 images, within each folder, or within each tier across all folders under `--ostris --by-tier`. Moved images are re-rendered **from the original source**, never rescaled from an already-downsized output, and go through the same crop-box code as everything else. The rules, in order:
 
 1. **Same tier.** Move to the nearest healthy bucket (8+ images) by aspect ratio.
 2. **One tier below.** Same test. Demotion costs 44% of the pixels, so it is only reached when no same-tier bucket will take the image.
@@ -372,7 +438,7 @@ Everything the pass did is in the final report: a `MERGED` table with each move 
 
 ## Do not set `bucket_no_upscale = true`
 
-The emitted TOML sets it to `false` and says so in a comment. Setting it `true` bypasses the bucket list and gives each image its own dimensions floored to 16 — which is exactly the bucket explosion this tool exists to prevent.
+The TOML that `--musubi` emits sets it to `false` and says so in a comment. Setting it `true` bypasses the bucket list and gives each image its own dimensions floored to 16 — which is exactly the bucket explosion this tool exists to prevent.
 
 ## Reading the bucket distribution
 
