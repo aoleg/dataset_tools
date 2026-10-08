@@ -54,9 +54,31 @@ EPS = 1e-6
 TIERS = [1024, 768, 512]          # nominal resolution, descending
 UPSCALE_TOLERANCE = 1.15          # max permitted linear upscale into a tier
 
-# 256 is deliberately not a tier. Anything that does not reach 512 is skipped.
-# 768 exists for demotion granularity: without it the gap between tiers is 4x
-# in area and near-boundary images lose most of their pixels.
+# 256 is not a tier of the usual layouts. Anything that does not reach 512 is
+# skipped. 768 exists for demotion granularity: without it the gap between
+# tiers is 4x in area and near-boundary images lose most of their pixels.
+#
+# --by-tier adds 256, for completeness: one folder per tier, and the smallest
+# can be kept or deleted by hand. A run selects its tier list with use_tiers()
+# before any work, as it selects its bucket set.
+BY_TIER_TIERS = [1024, 768, 512, 256]
+
+_active_tiers = TIERS
+
+
+def use_tiers(tiers: list[int]) -> None:
+    global _active_tiers
+    _active_tiers = tiers
+
+
+def active_tiers() -> list[int]:
+    return _active_tiers
+
+
+def by_tier_dirname(tier: int) -> str:
+    """The tier folder of the --by-tier layouts. The underscore keeps it out of
+    the scans of k2prep, cleanup and deduplicate when it sits in a source tree."""
+    return f"_{tier}"
 
 BATCH_SIZE_BY_TIER = {1024: 2, 768: 3, 512: 8}
 
@@ -417,7 +439,7 @@ def assign_tier(src_w: int, src_h: int, family: str):
     belongs in 768. Testing raw source area would place it in 1024 and force an
     upscale.
     """
-    for tier in TIERS:
+    for tier in active_tiers():
         bw, bh = bucket_for(tier, family)
         cw, ch = crop_dims(src_w, src_h, bw / bh)
         if cw * ch >= (bw * bh) / (UPSCALE_TOLERANCE ** 2):
@@ -762,6 +784,9 @@ class Result:
     reject_reason: str = ""
     copy_dest: Path | None = None
     copy_action: str = ""
+    # --copy-to --by-tier: the tier folder the original goes to. Kept apart
+    # from `tier`, which stays the 1024 tier the score is taken at.
+    dest_tier: int | None = None
 
     # --vl
     vl_scores: dict[str, int] | None = None
@@ -825,9 +850,10 @@ def _assign(res: Result) -> bool:
     res.family = assign_family(res.src_ar)              # 5.2
     fit = assign_tier(res.src_w, res.src_h, res.family)  # 5.3
     if fit is None:
-        bw, bh = bucket_for(TIERS[-1], res.family)
+        smallest = active_tiers()[-1]
+        bw, bh = bucket_for(smallest, res.family)
         res.crop = crop_dims(res.src_w, res.src_h, bw / bh)
-        res.need = needed_area(TIERS[-1], res.family)
+        res.need = needed_area(smallest, res.family)
         res.status = ST_SMALL
         return False
     place(res, fit[0], fit[1])
@@ -2097,8 +2123,12 @@ def check_copy_target(source: Path, target: Path) -> str | None:
     return None
 
 
-def copy_dest_dir(target: Path, dataset: str) -> Path:
-    """target/<relpath>, mirroring the source tree; the root maps to target."""
+def copy_dest_dir(target: Path, dataset: str, tier: int | None = None) -> Path:
+    """target/<relpath>, mirroring the source tree; the root maps to target.
+    With a tier (--by-tier), target/_<tier>/<relpath>: one folder per tier,
+    each holding the whole source tree."""
+    if tier is not None:
+        target = target / by_tier_dirname(tier)
     return target / dataset if dataset else target
 
 
@@ -2117,7 +2147,7 @@ def _target_state(src: Path, dst: Path) -> str:
 
 def place_copy(res: Result, target: Path, force: bool, dry_run: bool) -> None:
     """Copy one source image, and its caption, to its mirrored place."""
-    dest_dir = copy_dest_dir(target, res.dataset)
+    dest_dir = copy_dest_dir(target, res.dataset, res.dest_tier)
     pairs = [(res.path, dest_dir / res.path.name)]
     if res.caption_src is not None:
         pairs.append((res.caption_src, dest_dir / res.caption_src.name))
@@ -2172,7 +2202,7 @@ def place_move(res: Result, target: Path, force: bool, dry_run: bool,
     - keep_caption: another image still in the source uses this caption (x.jpg
       and x.png share x.txt), so it is copied, not moved.
     """
-    dest_dir = copy_dest_dir(target, res.dataset)
+    dest_dir = copy_dest_dir(target, res.dataset, res.dest_tier)
     pairs = [(res.path, dest_dir / res.path.name, True)]
     if res.caption_src is not None:
         pairs.append((res.caption_src, dest_dir / res.caption_src.name,
@@ -3060,6 +3090,13 @@ def build_copy_report(args, folder: Path, target: Path, results: list[Result],
     w(f"scoring     : every image is judged at the {SORT_TIER} tier, as in --sort,")
     w("              so scores compare across folders. An image already at or")
     w(f"              below the {SORT_TIER} tier is scored as it is, never upscaled.")
+    if args.by_tier:
+        tiers = ", ".join(str(t) for t in active_tiers())
+        w(f"layout      : tier first, {target / '_<tier>' / '<subfolder>'}")
+        w(f"              tiers {tiers}, by {active_buckets().label} buckets.")
+        w(f"              An image goes to the largest tier its crop fills with at")
+        w(f"              most {UPSCALE_TOLERANCE}x upscale: the tier it would be rendered at.")
+        w(f"              One that fills no tier is not {done_action}.")
     if args.move:
         w("policy      : --move REMOVES each selected original and its .txt")
         w("              caption from the source, into the target, mirroring the")
@@ -3095,7 +3132,9 @@ def build_copy_report(args, folder: Path, target: Path, results: list[Result],
     for r in sorted(selected, key=lambda r: r.name):
         action = done_word if r.copy_action == done_action else r.copy_action
         cap = "" if r.caption_src is not None else "  (no caption)"
-        w(row(r, action + cap))
+        where = (f"{by_tier_dirname(r.dest_tier):<6} "
+                 if args.by_tier and r.dest_tier else "")
+        w(row(r, where + action + cap))
     if selected:
         w("")
         w("Q~ is informational; the score is min(B, D), 'fine' the score plus its")
@@ -3194,6 +3233,26 @@ def build_copy_report(args, folder: Path, target: Path, results: list[Result],
     w("'*' marks this run's settings. --threshold 0 selects the same as 1: no")
     w("image scores below 1. --min-res N counts images with at least N x N pixels.")
     w("")
+
+    if args.by_tier:
+        # The selection grid split by tier folder, at this run's --min-res.
+        w("BY TIER  (images a run would put in each tier folder: rows tier, "
+          "columns --threshold)")
+        w(f"  {'folder':<11}" + "".join(f"{t:>8}" for t in range(1, 11)))
+        for tier in [*active_tiers(), None]:
+            fits = [r.composite for r in scored
+                    if r.dest_tier == tier and meets_min_res(r, min_res)]
+            cells = ""
+            for t in range(1, 11):
+                n = sum(1 for c in fits if c >= t)
+                here = t == max(args.threshold, 1)
+                cells += f"{_fmt_int(n) + ('*' if here else ''):>8}"
+            label = by_tier_dirname(tier) if tier else "no tier"
+            w(f"  {label:<11}{cells}")
+        w("")
+        w(f"'no tier': too small for the {active_tiers()[-1]} bucket; never "
+          f"{done_action}.")
+        w("")
 
     if args.recursive:
         w("BY FOLDER")
@@ -3470,6 +3529,15 @@ def parse_args(argv=None):
                    help="--copy-to TARGET --move: move the selected originals "
                         "and their captions out of the source, leaving only "
                         "what was not selected, for review.")
+    p.add_argument("--by-tier", action="store_true", dest="by_tier",
+                   help="Put the tier first: with --copy-to or --move-to each "
+                        "original goes to TARGET/_<tier>/<subfolder>/, one "
+                        "folder per tier (_1024, _768, _512, _256), each "
+                        "holding the whole source tree, for trainers such as "
+                        "Ostris AI Toolkit that have their settings per "
+                        "top-level folder. An image goes to the tier it would "
+                        "be rendered at; one too small for 256 is not copied. "
+                        "Adds the 256 tier.")
     p.add_argument("--move", action="store_true",
                    help="With --sort or --copy-to, move the originals and "
                         "their captions instead of copying them. This is the "
@@ -3523,6 +3591,13 @@ def parse_args(argv=None):
     if args.move and args.sort is None and args.copy_to is None:
         p.error("--move is only available with --sort or --copy-to; on its "
                 "own it would have nowhere to move to")
+    if args.by_tier and args.sort is not None:
+        p.error("--by-tier cannot be combined with --sort: sorting files every "
+                "image by its quality, --by-tier by its resolution tier; run "
+                "them separately")
+    if args.by_tier and args.copy_to is None:
+        p.error("--by-tier is only available with --copy-to and --move-to for "
+                "now; building the dataset tier first comes in a later version")
     if args.vl is not None and args.sort is None:
         p.error("--vl is only available with --sort. A model's opinion is not "
                 "reproducible, and --threshold has to mean the same thing on "
@@ -3835,10 +3910,21 @@ def run_copy(args, folder: Path, target: Path, prep_dir: Path,
                            f"{args.min_res}x{args.min_res}")
         if r.composite < args.threshold:
             reasons.append(f"score {r.composite} < {args.threshold}")
+        # --by-tier: the tier the image would be rendered at, by the run's
+        # bucket set. One that fills no tier, 256 included, has no folder.
+        fits_tier = True
+        if args.by_tier:
+            fit = assign_tier(r.src_w, r.src_h, r.family)
+            if fit is None:
+                fits_tier = False
+                reasons.insert(0, f"fits no tier (smaller than the "
+                                  f"{active_tiers()[-1]} bucket)")
+            else:
+                r.dest_tier = fit[0]
         r.reject_reason = ", ".join(reasons)
         if not reasons:
             r.status = ST_ACCEPTED
-        elif not meets_min_res(r, args.min_res):
+        elif not fits_tier or not meets_min_res(r, args.min_res):
             r.status = ST_SMALL
         else:
             r.status = ST_BELOW
@@ -3872,7 +3958,8 @@ def run_copy(args, folder: Path, target: Path, prep_dir: Path,
             keep = cap in stays or cap_users[cap] > 0
         place_move(r, target, args.force, args.report, keep)
     left_over = [r for r in results if r.status in (ST_BELOW, ST_SMALL)
-                 and (copy_dest_dir(target, r.dataset) / r.path.name).exists()]
+                 and (copy_dest_dir(target, r.dataset, r.dest_tier)
+                      / r.path.name).exists()]
 
     elapsed = time.perf_counter() - t0
     finished = datetime.now()
@@ -3904,6 +3991,10 @@ def run_copy(args, folder: Path, target: Path, prep_dir: Path,
                 else "any resolution")
     print(f"  selected    {len(selected):>7}   "
           f"(score >= {args.threshold}, {res_rule})")
+    if args.by_tier:
+        for tier in active_tiers():
+            n = sum(1 for r in selected if r.dest_tier == tier)
+            print(f"  {by_tier_dirname(tier):<12}{n:>7}")
     done = counts[COPY_MOVED] if args.move else counts[COPY_COPIED]
     verb = f"would {mode}" if args.report else ("moved" if args.move else "copied")
     print(f"  {verb:<12}{done:>7}")
@@ -3986,6 +4077,7 @@ def main(argv=None) -> int:
         return 2
     # Selected once, before any work: worker threads read it, nothing writes it.
     use_buckets(BUCKET_SETS[args.buckets or MUSUBI.key])
+    use_tiers(BY_TIER_TIERS if args.by_tier else TIERS)
     print(buckets_notice(args))
     if args.each:
         return run_each(args)
