@@ -75,12 +75,27 @@ def active_tiers() -> list[int]:
     return _active_tiers
 
 
+_tier_first = False
+
+
+def use_by_tier(on: bool) -> None:
+    """--by-tier for the run: the tier list with 256, and the tier-first
+    layout, _prep/_<tier>/<subfolder>/ instead of _prep/<subfolder>/<tier>/."""
+    global _tier_first
+    _tier_first = on
+    use_tiers(BY_TIER_TIERS if on else TIERS)
+
+
+def tier_first() -> bool:
+    return _tier_first
+
+
 def by_tier_dirname(tier: int) -> str:
     """The tier folder of the --by-tier layouts. The underscore keeps it out of
     the scans of k2prep, cleanup and deduplicate when it sits in a source tree."""
     return f"_{tier}"
 
-BATCH_SIZE_BY_TIER = {1024: 2, 768: 3, 512: 8}
+BATCH_SIZE_BY_TIER = {1024: 2, 768: 3, 512: 8, 256: 16}
 
 
 # ---------------------------------------------------------------------------
@@ -1203,11 +1218,12 @@ def can_accept(res: "Result", bucket: tuple[int, int]) -> tuple[bool, str]:
 
 def merge_candidates(res: "Result", counts: dict, min_size: int):
     """Ranked destinations for one image, plus the reason there are none."""
-    start = TIERS.index(res.tier)
+    tiers = active_tiers()
+    start = tiers.index(res.tier)
     ranked = []
     blocked: set[str] = set()
     saw_destination = False
-    for penalty, tier in enumerate(TIERS[start:start + 2]):
+    for penalty, tier in enumerate(tiers[start:start + 2]):
         for family in AR_FAMILIES:
             bucket = bucket_for(tier, family)
             if (tier, bucket) == (res.tier, res.bucket):
@@ -1271,7 +1287,7 @@ def _rescue_stranded(accepted, counts, moves, moved) -> bool:
     the most of the others wins, ties going to the smallest total crop.
     """
     changed = False
-    for tier in TIERS:
+    for tier in active_tiers():
         stranded = [r for r in accepted
                     if r.tier == tier and id(r) not in moved
                     and counts[(r.tier, r.bucket)] < MIN_BUCKET_SIZE
@@ -1302,6 +1318,18 @@ def _rescue_stranded(accepted, counts, moves, moved) -> bool:
             moved.add(id(res))
             changed = True
     return changed
+
+
+def merge_pooled() -> bool:
+    """Whether small buckets are merged across the whole tree, per tier.
+
+    The pool is what one training folder batches together. AI Toolkit trains a
+    _<tier> folder of the --by-tier layout, subfolders and all, as one dataset.
+    Musubi reads no subfolders: each folder is its own [[datasets]] block and
+    batches never cross blocks, so there the pool stays one folder, whatever
+    the layout.
+    """
+    return _tier_first and _active_buckets is OSTRIS
 
 
 def plan_merge(accepted: list["Result"]):
@@ -1368,7 +1396,19 @@ def dataset_dir(prep_dir: Path, dataset: str) -> Path:
     return prep_dir / dataset if dataset else prep_dir
 
 
-def tier_dir(prep_dir: Path, dataset: str, tier: int) -> Path:
+def tier_dir(prep_dir: Path, dataset: str, tier: int,
+             tier_first_layout: bool | None = None) -> Path:
+    """Where a dataset's renders for one tier go.
+
+    _prep/<relpath>/<tier>/ normally; under --by-tier _prep/_<tier>/<relpath>/,
+    one folder per tier holding the whole tree. The run's layout unless one is
+    named, which the sweep does to clear the other layout's outputs.
+    """
+    if tier_first_layout is None:
+        tier_first_layout = _tier_first
+    if tier_first_layout:
+        base = prep_dir / by_tier_dirname(tier)
+        return base / dataset if dataset else base
     return dataset_dir(prep_dir, dataset) / str(tier)
 
 
@@ -1393,7 +1433,8 @@ class ScanError(RuntimeError):
     """The source tree cannot be mirrored into _prep. Raised before any work."""
 
 
-def scan_tree(root: Path, recursive: bool, reserved: bool = True):
+def scan_tree(root: Path, recursive: bool, reserved: bool = True,
+              tier_first_layout: bool = False):
     """The scanner. A dataset is any directory that directly contains at least
     one image; its images are only the files directly in it, so each source
     directory maps 1:1 to _prep/<relpath>/<tier>/ and pooling a subtree is the
@@ -1419,6 +1460,11 @@ def scan_tree(root: Path, recursive: bool, reserved: bool = True):
     collide with _prep/reports. Both raise ScanError; rename the folder.
     reserved=False drops both checks, for --copy-to, which mirrors the tree
     into its own target rather than into _prep.
+
+    The tier-first layout of --by-tier (_prep/_<tier>/<relpath>/) has neither
+    collision. Its one is "cache" at the first level: the root's tier folder
+    _prep/_1024 holds musubi's cache folder of that name, and a dataset there
+    would mix its renders with the root's cache files.
     """
     if not recursive:
         images, unknown = scan_folder(root)
@@ -1465,12 +1511,20 @@ def scan_tree(root: Path, recursive: bool, reserved: bool = True):
                                  f"junctions are not followed")
                     continue
                 low = name.lower()
-                if reserved and low in tier_names:
+                if reserved and tier_first_layout:
+                    if rel == "" and low == CACHE_DIRNAME:
+                        raise ScanError(
+                            f"source folder {relname!r} would collide with "
+                            f"musubi's cache folder in "
+                            f"{PREP_DIRNAME}/{by_tier_dirname(TIERS[0])}. "
+                            f"Rename it, or run without --by-tier.")
+                elif reserved and low in tier_names:
                     raise ScanError(
                         f"source folder {relname!r} is named like a k2prep tier "
                         f"folder, which makes _prep/{relname} ambiguous. Rename "
                         f"it, or run without --recursive.")
-                if reserved and rel == "" and low == REPORTS_DIRNAME:
+                if (reserved and not tier_first_layout and rel == ""
+                        and low == REPORTS_DIRNAME):
                     raise ScanError(
                         f"source folder {relname!r} would collide with "
                         f"_prep/{REPORTS_DIRNAME}. Rename it, or run without "
@@ -2317,20 +2371,31 @@ def sweep_superseded(prep_dir: Path, datasets: list[str],
     accepted images: a dataset whose images all vanished or all fell below the
     threshold still gets its stale outputs cleared, exactly as an emptied
     folder always has in the flat layout.
+
+    The other layout's tier folders of the same datasets are cleared too:
+    switching --by-tier on or off rebuilds _prep in the new layout, and the
+    old renders would otherwise sit beside the new ones. Only files are
+    removed, never folders, so musubi's cache folders are left alone.
     """
     removed: list[str] = []
-    for ds in datasets:
-        for tier in TIERS:
-            d = tier_dir(prep_dir, ds, tier)
-            if not d.is_dir():
-                continue
-            keep = planned.get((ds, tier), set())
-            for path in sorted(d.iterdir(), key=lambda p: p.name):
-                if not path.is_file() or path.name in keep:
+    seen: set[Path] = set()
+    for layout in (_tier_first, not _tier_first):
+        current = layout == _tier_first
+        tiers = active_tiers() if current else (BY_TIER_TIERS if layout else TIERS)
+        for ds in datasets:
+            for tier in tiers:
+                d = tier_dir(prep_dir, ds, tier, layout)
+                if d in seen or not d.is_dir():
                     continue
-                removed.append(f"{qualified_name(ds, str(tier))}/{path.name}")
-                if not dry_run:
-                    path.unlink()
+                seen.add(d)
+                keep = planned.get((ds, tier), set()) if current else set()
+                for path in sorted(d.iterdir(), key=lambda p: p.name):
+                    if not path.is_file() or path.name in keep:
+                        continue
+                    rel = d.relative_to(prep_dir).as_posix()
+                    removed.append(f"{rel}/{path.name}")
+                    if not dry_run:
+                        path.unlink()
     return removed
 
 
@@ -2344,6 +2409,7 @@ def find_stale_datasets(prep_dir: Path, datasets: list[str]) -> list[str]:
     """
     known = set(datasets)
     tier_names = {str(t) for t in TIERS}
+    tier_first_names = {by_tier_dirname(t) for t in BY_TIER_TIERS}
     stale: set[str] = set()
 
     def walk(d: Path, rel: str) -> None:
@@ -2356,6 +2422,7 @@ def find_stale_datasets(prep_dir: Path, datasets: list[str]) -> list[str]:
                 continue
             name = entry.name
             if rel == "" and (name == REPORTS_DIRNAME
+                              or name in tier_first_names
                               or name.startswith((SORT_DIR_PREFIX,
                                                   QUALITY_DIR_PREFIX))):
                 continue
@@ -2365,7 +2432,23 @@ def find_stale_datasets(prep_dir: Path, datasets: list[str]) -> list[str]:
                 continue
             walk(Path(entry.path), qualified_name(rel, name))
 
+    def walk_tier_first(d: Path, rel: str, tier_root: str) -> None:
+        """_prep/_<tier>/<relpath>/: every folder holding files is a dataset."""
+        try:
+            entries = sorted(os.scandir(d), key=lambda e: e.name)
+        except OSError:
+            return
+        if rel and rel not in known and any(e.is_file() for e in entries):
+            stale.add(f"{tier_root}/{rel}")
+        for entry in entries:
+            if entry.is_dir(follow_symlinks=False) and entry.name != CACHE_DIRNAME:
+                walk_tier_first(Path(entry.path), qualified_name(rel, entry.name),
+                                tier_root)
+
     walk(prep_dir, "")
+    for name in sorted(tier_first_names):
+        if (prep_dir / name).is_dir():
+            walk_tier_first(prep_dir / name, "", name)
     return sorted(stale)
 
 
@@ -2504,14 +2587,20 @@ def build_report(args, folder: Path, results: list[Result], unknown: list[str],
       f"{' recursive=on' if getattr(args, 'recursive', False) else ''}"
       f"{' force=on' if args.force else ''}"
       f"{' no-merge=on' if args.no_merge else ''}")
-    w(f"tiers       : {', '.join(str(t) for t in TIERS)}   "
+    w(f"tiers       : {', '.join(str(t) for t in active_tiers())}   "
       f"(upscale tolerance {UPSCALE_TOLERANCE})")
+    if tier_first():
+        w(f"layout      : tier first, {PREP_DIRNAME}/_<tier>/<subfolder>/ "
+          f"(--by-tier)")
     if not args.no_merge:
         w(f"merging     : buckets under {MIN_BUCKET_SIZE} images are consolidated "
           f"into the nearest")
         w(f"              healthy bucket in the same tier or the one below, so long")
         w(f"              as the move crops no more than {MERGE_MAX_CROP:.0f}% "
           f"of the source.")
+        if merge_pooled():
+            w("              Pooled per tier across all folders: AI Toolkit trains a")
+            w("              tier folder, subfolders and all, as one dataset.")
     w("policy      : rejected images are skipped, not copied. Source folder unmodified.")
     if args.single_pass:
         w("scoring     : --single-pass, on the SOURCE image, before rendering.")
@@ -2542,13 +2631,13 @@ def build_report(args, folder: Path, results: list[Result], unknown: list[str],
     # -- target buckets ------------------------------------------------------
     w("TARGET BUCKETS")
     w("-" * 66)
-    w(f"{'family':<9} {'1024 tier':<16} {'768 tier':<16} {'512 tier':<16}")
+    w(f"{'family':<9} " + " ".join(f"{f'{t} tier':<16}" for t in active_tiers()))
     for fam in AR_FAMILIES:
         cells = []
-        for tier in TIERS:
+        for tier in active_tiers():
             bw, bh = bucket_for(tier, fam)
             cells.append(f"{bw}x{bh}")
-        w(f"{fam:<9} {cells[0]:<16} {cells[1]:<16} {cells[2]:<16}")
+        w(f"{fam:<9} " + " ".join(f"{c:<16}" for c in cells))
     w("")
 
     # -- processed -----------------------------------------------------------
@@ -2704,7 +2793,7 @@ def build_report(args, folder: Path, results: list[Result], unknown: list[str],
             line += f"   {note}"
         w(line)
 
-    for tier in TIERS:
+    for tier in active_tiers():
         dist_row(f"{tier:>4}", by_tier[tier])
     dist_row("skipped", len(below) + len(small),
              f"({len(below)} below threshold, {len(small)} too small)")
@@ -2719,23 +2808,32 @@ def build_report(args, folder: Path, results: list[Result], unknown: list[str],
     # Per dataset: each _prep/<dataset>/<tier> is its own [[datasets]] block,
     # and musubi forms batches within a dataset only - a bucket that is healthy
     # summed across datasets can still be undersized in every one of them.
-    label_datasets = getattr(args, "recursive", False)
+    # Under --ostris --by-tier the pool is the whole tier folder instead
+    # (merge_pooled), and the distribution is shown that way: one pool.
+    pooled = merge_pooled()
+    label_datasets = getattr(args, "recursive", False) and not pooled
     ds_list = sorted({r.dataset for r in processed}
                      | {m.res.dataset for m in (moves or [])})
+    if pooled:
+        ds_list = [None]
+    fam_w = max(6, *(len(active_buckets().family_of_bucket(t, bucket_for(t, f)))
+                     for t in active_tiers() for f in AR_FAMILIES))
 
     w("BUCKET DISTRIBUTION" + ("   (was -> now, across the merge)" if show_before else ""))
+    if pooled and getattr(args, "recursive", False):
+        w("  all folders: AI Toolkit trains each tier folder as one dataset")
     for ds in ds_list:
         if label_datasets:
             w(f"  dataset {ds or '(root)'}")
-        ds_processed = [r for r in processed if r.dataset == ds]
+        ds_processed = [r for r in processed if ds is None or r.dataset == ds]
         before_counts: dict[tuple[int, tuple[int, int]], int] = defaultdict(int)
         for m in (moves or []):
-            if m.res.dataset == ds:
+            if ds is None or m.res.dataset == ds:
                 before_counts[(m.from_tier, m.from_bucket)] += 1
         for r in ds_processed:
             if not r.merged:
                 before_counts[(r.tier, r.bucket)] += 1
-        for tier in TIERS:
+        for tier in active_tiers():
             rows = [r for r in ds_processed if r.tier == tier]
             pre = {b: n for (t, b), n in before_counts.items() if t == tier and n > 0}
             if not rows and not pre:
@@ -2761,7 +2859,7 @@ def build_report(args, folder: Path, results: list[Result], unknown: list[str],
                         note = "   (dissolved)"
                 else:
                     cell = f"{_fmt_int(n):>8}"
-                w(f"    {label:>11} {family_of_bucket(tier, bucket):<6} {cell}{note}")
+                w(f"    {label:>11} {family_of_bucket(tier, bucket):<{fam_w}} {cell}{note}")
     if not processed:
         w("  (none)")
     w("")
@@ -3094,7 +3192,7 @@ def build_copy_report(args, folder: Path, target: Path, results: list[Result],
         tiers = ", ".join(str(t) for t in active_tiers())
         w(f"layout      : tier first, {target / '_<tier>' / '<subfolder>'}")
         w(f"              tiers {tiers}, by {active_buckets().label} buckets.")
-        w(f"              An image goes to the largest tier its crop fills with at")
+        w("              An image goes to the largest tier its crop fills with at")
         w(f"              most {UPSCALE_TOLERANCE}x upscale: the tier it would be rendered at.")
         w(f"              One that fills no tier is not {done_action}.")
     if args.move:
@@ -3308,7 +3406,7 @@ def emit_toml(prep_dir: Path, stamp: datetime,
     blocks = []
     for ds in datasets:
         ds_blocks = []
-        for tier in TIERS:
+        for tier in active_tiers():
             d = tier_dir(prep_dir, ds, tier)
             if not d.is_dir():
                 continue
@@ -3530,14 +3628,15 @@ def parse_args(argv=None):
                         "and their captions out of the source, leaving only "
                         "what was not selected, for review.")
     p.add_argument("--by-tier", action="store_true", dest="by_tier",
-                   help="Put the tier first: with --copy-to or --move-to each "
-                        "original goes to TARGET/_<tier>/<subfolder>/, one "
-                        "folder per tier (_1024, _768, _512, _256), each "
-                        "holding the whole source tree, for trainers such as "
-                        "Ostris AI Toolkit that have their settings per "
-                        "top-level folder. An image goes to the tier it would "
-                        "be rendered at; one too small for 256 is not copied. "
-                        "Adds the 256 tier.")
+                   help="Put the tier first, one folder per tier (_1024, "
+                        "_768, _512, _256), each holding the whole source "
+                        "tree, for trainers such as Ostris AI Toolkit that "
+                        "have their settings per top-level folder. The dataset "
+                        "is rendered into _prep/_<tier>/<subfolder>/; with "
+                        "--copy-to or --move-to each original goes to "
+                        "TARGET/_<tier>/<subfolder>/, by the tier it would be "
+                        "rendered at. Adds the 256 tier; an image too small "
+                        "for it is skipped.")
     p.add_argument("--move", action="store_true",
                    help="With --sort or --copy-to, move the originals and "
                         "their captions instead of copying them. This is the "
@@ -3595,9 +3694,6 @@ def parse_args(argv=None):
         p.error("--by-tier cannot be combined with --sort: sorting files every "
                 "image by its quality, --by-tier by its resolution tier; run "
                 "them separately")
-    if args.by_tier and args.copy_to is None:
-        p.error("--by-tier is only available with --copy-to and --move-to for "
-                "now; building the dataset tier first comes in a later version")
     if args.vl is not None and args.sort is None:
         p.error("--vl is only available with --sort. A model's opinion is not "
                 "reproducible, and --threshold has to mean the same thing on "
@@ -4077,7 +4173,7 @@ def main(argv=None) -> int:
         return 2
     # Selected once, before any work: worker threads read it, nothing writes it.
     use_buckets(BUCKET_SETS[args.buckets or MUSUBI.key])
-    use_tiers(BY_TIER_TIERS if args.by_tier else TIERS)
+    use_by_tier(args.by_tier)
     print(buckets_notice(args))
     if args.each:
         return run_each(args)
@@ -4166,7 +4262,8 @@ def run_one(args) -> int:
 
     try:
         pairs, unknown, seen_dirs, scan_notes = scan_tree(
-            folder, args.recursive, reserved=target is None)
+            folder, args.recursive, reserved=target is None,
+            tier_first_layout=args.by_tier)
     except ScanError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -4263,12 +4360,16 @@ def run_one(args) -> int:
     # Per dataset, never across: each _prep/<dataset>/<tier> is its own
     # [[datasets]] block and musubi forms batches within a dataset only, so a
     # bucket in one dataset can never pad out an undersized one in another.
+    # The exception is --ostris --by-tier, where AI Toolkit trains a whole
+    # _<tier> folder as one dataset: there the pool is the tier (merge_pooled).
     moves: list[Move] = []
     unmerged: list[tuple[Result, str]] = []
     if not args.no_merge and accepted:
-        for ds in sorted({r.dataset for r in accepted}):
-            m, u, _before, _after = plan_merge(
-                [r for r in accepted if r.dataset == ds])
+        pools = ([accepted] if merge_pooled() else
+                 [[r for r in accepted if r.dataset == ds]
+                  for ds in sorted({r.dataset for r in accepted})])
+        for pool in pools:
+            m, u, _before, _after = plan_merge(pool)
             moves.extend(m)
             unmerged.extend(u)
 
@@ -4325,6 +4426,13 @@ def run_one(args) -> int:
                          f"matching source folder this run; left alone, and "
                          f"not referenced by the TOML. Delete it by hand if "
                          f"it is unwanted.")
+    smallest = active_tiers()[-1]
+    if tier_first() and any(r.tier == smallest for r in results
+                            if r.status in (ST_ACCEPTED, ST_ALREADY)):
+        notes.append(f"the {smallest} tier is for completeness: its scores are "
+                     f"less reliable, because the quality bands were fitted on "
+                     f"larger renders. Keep or delete "
+                     f"{PREP_DIRNAME}/{by_tier_dirname(smallest)} by hand.")
     if not args.single_pass and candidates:
         # Written in dry runs too: it costs nothing and makes the recommended
         # "--report first, then run for real" workflow skip a second rendering
@@ -4375,11 +4483,13 @@ def run_one(args) -> int:
     for r in results:
         if r.status in (ST_ACCEPTED, ST_ALREADY):
             by_tier[r.tier] += 1
-    # Undersized is judged per dataset: buckets never pool across datasets.
+    # Undersized is judged per merge pool: per dataset, or per tier when the
+    # whole tier folder is one pool (merge_pooled).
     per_ds_bucket: dict[tuple[str, int, tuple[int, int]], int] = defaultdict(int)
     for r in results:
         if r.status in (ST_ACCEPTED, ST_ALREADY):
-            per_ds_bucket[(r.dataset, r.tier, r.bucket)] += 1
+            pool = "" if merge_pooled() else r.dataset
+            per_ds_bucket[(pool, r.tier, r.bucket)] += 1
     undersized = sum(1 for n in per_ds_bucket.values()
                      if 0 < n < MIN_BUCKET_SIZE)
 
@@ -4388,9 +4498,10 @@ def run_one(args) -> int:
           f"in {_hms(elapsed)}")
     if args.recursive:
         print(f"  datasets    {len({r.dataset for r in results}):>7}")
-    for tier in TIERS:
+    for tier in active_tiers():
         if by_tier[tier]:
-            print(f"  tier {tier:<5} {by_tier[tier]:>7}")
+            label = by_tier_dirname(tier) if tier_first() else f"tier {tier}"
+            print(f"  {label:<11} {by_tier[tier]:>7}")
     print(f"  written     {counts[ST_ACCEPTED]:>7}"
           f"{'  (dry run: nothing written)' if args.report else ''}")
     print(f"  already     {counts[ST_ALREADY]:>7}")
