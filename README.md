@@ -15,6 +15,7 @@ Tools that prepare image datasets for LoRA and fine-tune training, mainly with [
 | [flatten_dataset](flatten_dataset/README.md) | Moves the images and captions of all subfolders into the dataset folder under normalised names (`<folder>__<subfolder>-datasetNNNNNN.ext`: transliterated, no spaces, at most 80 characters), always an image and its caption together. `--undo` puts every file back from the manifest in `_flatten_dataset`. |
 | [jpeg_cleanup](jpeg_cleanup/README.md) | Finds heavily compressed images with the FBCNN quality predictor, which also sees through re-saves. `extract.bat` copies the poor images with their captions into one folder per quality band (`60`, `70`, `80`, `85`), outside the dataset, so the threshold for the cleanup can be chosen by eye. `run.bat` restores the images under the threshold with FBCNN and replaces only those whose restoration removes enough of the artifacts, with the originals and captions in a `_backup` folder; `--dry-run` writes a report and before/after contact sheets instead, and `--undo` puts everything back. |
 | [extract_keywords](extract_keywords/README.md) | Moves the images whose captions contain any of the keywords (or all of them, joined by `AND`) with their captions out of a dataset into `<dataset>_<first keyword>` next to it, in the same subfolders: one concept for its own training, or every image whose caption mentions a watermark. `--undo` moves them back. |
+| [move_alone](move_alone/move_alone.bat) | Moves the images that have no caption (no `.txt` file with the same name) into a `single_files` subfolder, to caption them or leave them out. Copy `move_alone.bat` into the dataset folder and run it there; it handles that folder only, not its subfolders. |
 | [k2prep](k2prep/README.md) | Builds a training set for the musubi-tuner Krea 2 trainer from a folder of mixed photos: each image that passes a quality score is cropped and resized onto one of 7 aspect ratios in 3 resolution tiers (1024, 768, 512), buckets too small for a batch are merged into their nearest neighbour, and the result goes to `_prep` with its captions and a `dataset.toml`. The source folder is not changed. `--report` is a dry run; `--sort` files the originals into quality folders instead, and `--copy-to` copies the best originals of a tree into another folder. `cleanup.bat` moves undersized images out of a folder. |
 
 ## Install
@@ -24,6 +25,7 @@ All tools share one virtual environment: the `venv` folder in the repository roo
 | tool | needs |
 |---|---|
 | `telegram_dataset`, `taggui_captioning`, `flatten_dataset`, `extract_keywords` | Python only, nothing to install |
+| `move_alone` | nothing, it is a batch file |
 | `ddg_images` | the `ddgs` package for the Bing and DuckDuckGo backends; the SearXNG backend needs nothing |
 | `deduplicate` | Pillow, numpy, imagehash, OpenCV; runs on the CPU. With `--gpu` it uses the torch of the GPU tools when one of them is installed, and falls back to the CPU otherwise. |
 | `remove_borders` | Pillow, numpy, jpeglib, OpenCV; runs on the CPU |
