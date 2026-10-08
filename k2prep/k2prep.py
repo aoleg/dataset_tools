@@ -24,6 +24,7 @@ import io
 import json
 import math
 import os
+import re
 import shutil
 import statistics
 import sys
@@ -2464,6 +2465,7 @@ def build_report(args, folder: Path, results: list[Result], unknown: list[str],
     w("=" * 66)
     w(f"folder      : {folder}")
     w(f"run         : {run_desc}")
+    w(f"buckets     : {buckets_desc(args)}")
     w(f"stage       : {stage_desc}")
     w(f"started     : {started:%Y-%m-%d %H:%M:%S}")
     w(f"finished    : {finished:%Y-%m-%d %H:%M:%S}")
@@ -2796,6 +2798,7 @@ def build_sort_report(args, folder: Path, results: list[Result],
     w("=" * 66)
     w(f"folder      : {folder}")
     w(f"run         : {'sort / dry run, nothing placed' if args.report else 'sort'}")
+    w(f"buckets     : {buckets_desc(args)}")
     w(f"stage       : {'preliminary - scores only, before tiers are decided'
                        if stage == STAGE_PRELIMINARY else 'final - as placed'}")
     w(f"started     : {started:%Y-%m-%d %H:%M:%S}")
@@ -3038,6 +3041,7 @@ def build_copy_report(args, folder: Path, target: Path, results: list[Result],
     w(f"folder      : {folder}")
     w(f"target      : {target}")
     w(f"run         : {f'{mode} / dry run, nothing {done_action}' if args.report else mode}")
+    w(f"buckets     : {buckets_desc(args)}")
     w(f"started     : {started:%Y-%m-%d %H:%M:%S}")
     w(f"finished    : {finished:%Y-%m-%d %H:%M:%S}")
     w(f"options     : threshold={args.threshold} min-res={min_res} "
@@ -3293,6 +3297,28 @@ def emit_toml(prep_dir: Path, stamp: datetime,
     return dest
 
 
+def remove_own_toml(prep_dir: Path, dry_run: bool) -> list[str]:
+    """Remove the TOML files k2prep wrote into prep_dir, and name them.
+
+    Only files that start with k2prep's marker: a TOML somebody else put there
+    is never touched, as emit_toml never overwrites one.
+    """
+    removed = []
+    if not prep_dir.is_dir():
+        return removed
+    for path in sorted(prep_dir.glob("*.toml")):
+        try:
+            ours = path.read_text(encoding="utf-8").startswith(TOML_MARKER)
+        except (OSError, UnicodeDecodeError):
+            ours = False
+        if not ours:
+            continue
+        removed.append(path.name)
+        if not dry_run:
+            path.unlink()
+    return removed
+
+
 # ---------------------------------------------------------------------------
 # 8  CLI
 # ---------------------------------------------------------------------------
@@ -3356,9 +3382,26 @@ def _threads_arg(value: str) -> int:
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
         prog="k2prep",
-        description="Crop and resize a folder of photographs onto musubi-tuner's "
-                    "exact bucket dimensions for Krea 2 LoRA training.",
+        description="Crop and resize a folder of photographs onto the exact "
+                    "bucket dimensions of Ostris AI Toolkit (--ostris) or "
+                    "musubi-tuner (--musubi) for LoRA training.",
     )
+    trainer = p.add_mutually_exclusive_group()
+    trainer.add_argument("--ostris", action="store_const", const="ostris",
+                         dest="buckets",
+                         help="Resize onto Ostris AI Toolkit buckets: sides in "
+                              f"steps of {OSTRIS_STEP}, which AI Toolkit trains "
+                              "as they are, with no second resize or crop. "
+                              "Writes no dataset.toml.")
+    trainer.add_argument("--musubi", action="store_const", const="musubi",
+                         dest="buckets",
+                         help="Resize onto musubi-tuner buckets, the sizes of "
+                              "its own bucket list, and write a dataset.toml "
+                              "for it. One of --ostris and --musubi is required "
+                              "whenever k2prep resizes; --sort, --copy-to and "
+                              "--move-to keep the originals as they are and "
+                              "use musubi buckets for scoring unless told "
+                              "otherwise.")
     p.add_argument("folder", help="Input folder. Never modified, except by --move. One dataset, "
                                   "unless --recursive.")
     p.add_argument("--report", action="store_true",
@@ -3503,6 +3546,9 @@ def parse_args(argv=None):
     # and likes 4, a local inference server is usually single-slot and likes 1.
     args.local_threads = args.threads if args.threads is not None else 4
     args.vl_threads = args.threads if args.threads is not None else 1
+    # Building the dataset (and its --report dry run, and -R) resizes; --sort
+    # and --copy-to/--move-to keep the originals as they are.
+    args.resizes = args.sort is None and args.copy_to is None
     return args
 
 
@@ -3885,8 +3931,62 @@ def run_copy(args, folder: Path, target: Path, prep_dir: Path,
 # main
 # ---------------------------------------------------------------------------
 
+def missing_trainer_message(argv: list[str]) -> str:
+    """Why the run stopped, the two options, and the command to copy."""
+    def quote(arg: str) -> str:
+        # Quoted unless plainly safe, so a path with spaces, "&" or "!" can be
+        # pasted back into cmd as it is. Windows paths cannot hold a '"'.
+        return arg if re.fullmatch(r"[A-Za-z0-9_.=:+-]+", arg) else f'"{arg}"'
+
+    def example(flag: str) -> str:
+        return " ".join(["run.bat"] + [quote(a) for a in list(argv) + [flag]])
+    return "\n".join([
+        "k2prep resizes the images onto a trainer's bucket sizes, so it needs",
+        "to know the trainer. Add one of these options:",
+        "",
+        f"  --ostris   Ostris AI Toolkit: sides in steps of {OSTRIS_STEP}, which AI Toolkit",
+        "             trains as they are, with no second resize or crop.",
+        "  --musubi   Musubi Tuner: the sizes of musubi-tuner's bucket list, and a",
+        "             dataset.toml for it.",
+        "",
+        "For example:",
+        f"  {example('--ostris')}",
+        f"  {example('--musubi')}",
+        "",
+        "--sort, --copy-to and --move-to keep the originals as they are and do",
+        "not need it.",
+    ])
+
+
+BUCKETS_DEFAULT_NOTE = ("the default when the originals are kept as they are; "
+                        "--ostris changes it")
+
+
+def buckets_desc(args) -> str:
+    """The bucket set of the run, for the reports."""
+    label = active_buckets().label
+    if getattr(args, "buckets", None) is None:
+        return f"{label} ({BUCKETS_DEFAULT_NOTE})"
+    return label
+
+
+def buckets_notice(args) -> str:
+    """The line every run prints before any work."""
+    line = f"Using {active_buckets().label} buckets"
+    if args.buckets is None:
+        line += f" ({BUCKETS_DEFAULT_NOTE})"
+    return line
+
+
 def main(argv=None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
     args = parse_args(argv)
+    if args.resizes and args.buckets is None:
+        print(missing_trainer_message(argv), file=sys.stderr)
+        return 2
+    # Selected once, before any work: worker threads read it, nothing writes it.
+    use_buckets(BUCKET_SETS[args.buckets or MUSUBI.key])
+    print(buckets_notice(args))
     if args.each:
         return run_each(args)
     return run_one(args)
@@ -4144,7 +4244,16 @@ def run_one(args) -> int:
 
     # -- toml, written every run ---------------------------------------------
     toml_path = None
-    if args.report:
+    if active_buckets() is not MUSUBI:
+        # The TOML is musubi-tuner's. One left by an earlier --musubi run would
+        # point musubi at renders sized for another trainer, so it goes.
+        notes.append(f"{TOML_FILENAME} not written: it is for musubi-tuner, and "
+                     f"this run uses {active_buckets().label} buckets.")
+        for name in remove_own_toml(prep_dir, dry_run=args.report):
+            notes.append(f"{name} from an earlier --musubi run "
+                         f"{'would be' if args.report else 'was'} removed: it "
+                         f"pointed musubi-tuner at these folders.")
+    elif args.report:
         notes.append(f"{TOML_FILENAME} not written: a dry run creates no tier "
                      "folders for it to point at.")
     else:
