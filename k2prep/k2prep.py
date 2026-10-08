@@ -3631,7 +3631,9 @@ def parse_args(argv=None):
                    help="Put the tier first, one folder per tier (_1024, "
                         "_768, _512, _256), each holding the whole source "
                         "tree, for trainers such as Ostris AI Toolkit that "
-                        "have their settings per top-level folder. The dataset "
+                        "have their settings per top-level folder. Scans the "
+                        "whole tree at every depth (implies --recursive) and "
+                        "keeps its folder structure. The dataset "
                         "is rendered into _prep/_<tier>/<subfolder>/; with "
                         "--copy-to or --move-to each original goes to "
                         "TARGET/_<tier>/<subfolder>/, by the tier it would be "
@@ -3694,6 +3696,11 @@ def parse_args(argv=None):
         p.error("--by-tier cannot be combined with --sort: sorting files every "
                 "image by its quality, --by-tier by its resolution tier; run "
                 "them separately")
+    # --by-tier exists to hold a whole tree in each tier folder, so it always
+    # scans the whole tree, at every depth. On a flat folder that changes
+    # nothing: the recursive scan of a folder without subfolders is the flat one.
+    if args.by_tier:
+        args.recursive = True
     if args.vl is not None and args.sort is None:
         p.error("--vl is only available with --sort. A model's opinion is not "
                 "reproducible, and --threshold has to mean the same thing on "
@@ -4270,6 +4277,16 @@ def run_one(args) -> int:
     if not pairs:
         print(f"No images found in {folder} "
               f"({len(unknown)} files with unknown extensions).")
+        if not args.recursive:
+            try:
+                subs = [e for e in os.scandir(folder) if e.is_dir()
+                        and not e.name.startswith(("_", "."))]
+            except OSError:
+                subs = []
+            if subs:
+                print(f"It has {len(subs)} subfolder(s), and only the files "
+                      f"directly in it were scanned. Add --recursive (or "
+                      f"--by-tier) to scan the whole tree.")
     if args.recursive:
         n_datasets = len({ds for ds, _p in pairs})
         what = "folder(s)" if target is not None else "dataset(s)"

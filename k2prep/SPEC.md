@@ -498,7 +498,7 @@ AI Toolkit has its settings per dataset folder and reads a dataset folder with `
 | build | `_prep/<relpath>/<tier>/` | `_prep/_<tier>/<relpath>/` |
 | `--copy-to`, `--move-to` | `TARGET/<relpath>/` | `TARGET/_<tier>/<relpath>/` |
 
-`tier_dir()` and `copy_dest_dir()` are the only places that know a layout. The underscore keeps the tier folders out of k2prep's, cleanup's and deduplicate's scans.
+`--by-tier` sets `--recursive`: its purpose is a tree in every tier folder, and a root that holds only folders would otherwise scan as empty. On a flat folder the recursive scan is the flat one, so nothing is lost. `tier_dir()` and `copy_dest_dir()` are the only places that know a layout. The underscore keeps the tier folders out of k2prep's, cleanup's and deduplicate's scans.
 
 - **Tier.** The tier an image is rendered at, by the run's bucket set (section 4.4). In the copy modes the tier is a header-only geometry test kept in `Result.dest_tier`, apart from the 1024 tier the score is taken at. An image that fills no tier, 256 included, is skipped; under `--move-to` it stays in the source.
 - **Merge pool.** What one training folder batches together (`merge_pooled()`): under `--ostris --by-tier` all images of a tier across the tree, because AI Toolkit trains a tier folder as one dataset; otherwise one folder, because musubi's `glob_images` reads no subfolders and each folder is its own `[[datasets]]` block.

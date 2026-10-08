@@ -47,7 +47,7 @@ k2prep.py <folder> [options]
 | `<folder>` | required | Input folder, positional. One dataset, unless `--recursive`. |
 | `--ostris` | one of the two | Resize onto Ostris AI Toolkit buckets. One of `--ostris` and `--musubi` is required whenever k2prep resizes. See [below](#the-trainer---ostris-or---musubi). |
 | `--musubi` | one of the two | Resize onto musubi-tuner buckets and write `_prep/dataset.toml`. |
-| `--by-tier` | off | One folder per tier (`_1024`, `_768`, `_512`, `_256`), each holding the whole source tree, for the dataset and for `--copy-to` and `--move-to`. Adds the 256 tier. See [below](#one-folder-per-tier-for-ai-toolkit---by-tier). |
+| `--by-tier` | off | One folder per tier (`_1024`, `_768`, `_512`, `_256`), each holding the whole source tree, for the dataset and for `--copy-to` and `--move-to`. Scans the whole tree at every depth (implies `--recursive`). Adds the 256 tier. See [below](#one-folder-per-tier-for-ai-toolkit---by-tier). |
 | `--report` | off | Dry run. Analyse and write a report; write no images. |
 | `--recursive` | off | Every subfolder that directly contains images is its own dataset, sharing one `_prep` and one `dataset.toml`. See [below](#--recursive-several-datasets-one-_prep). |
 | `-R` | off | One independent run for the folder and one for each first-level subfolder, each with its own `_prep`. See [below](#-r-independent-runs-per-subfolder). |
@@ -161,8 +161,8 @@ Combining `-R` with `--recursive` runs the tree mode once per subfolder, which i
 AI Toolkit has its settings (resolution, repeats, caption dropout, loss weight) per dataset folder, and it reads a dataset folder with all its subfolders. A tree of datasets therefore trains best as one folder per resolution tier, each holding the whole tree. `--by-tier` puts the tier first:
 
 ```bash
-run.bat "L:\train" --recursive --by-tier --ostris --report
-run.bat "L:\train" --recursive --by-tier --ostris --threshold 6
+run.bat "L:\train" --by-tier --ostris --report
+run.bat "L:\train" --by-tier --ostris --threshold 6
 ```
 
 ```
@@ -171,7 +171,7 @@ L:\train\alice\a.jpg          ->  L:\train\_prep\_1024\alice\a.jpg
 L:\train\bob\indoor\b.jpg     ->  L:\train\_prep\_512\bob\indoor\b.jpg
 ```
 
-Each image is rendered at the largest tier it fills, as always, and goes to that tier's folder under its own subfolder path. In AI Toolkit, add each `_<tier>` folder as one dataset, with its resolution set to its tier and `bucket_tolerance` left at 64 (32, 16 and 8 work too).
+`--by-tier` always scans the whole tree, at every depth, so it needs no `--recursive`: a folder that holds nothing but other folders, with the images two or three levels down, works as it is. Folders starting with `_` or `.` are skipped, and links and junctions are not followed, as in [`--recursive`](#--recursive-several-datasets-one-_prep). Each image is rendered at the largest tier it fills, as always, and goes to that tier's folder under its own subfolder path. A folder appears in a tier folder only if at least one of its images goes to that tier. In AI Toolkit, add each `_<tier>` folder as one dataset, with its resolution set to its tier and `bucket_tolerance` left at 64 (32, 16 and 8 work too).
 
 What changes with `--by-tier`:
 
@@ -183,7 +183,7 @@ What changes with `--by-tier`:
 `--by-tier` works with `-R` too, where each folder gets its own `_prep\_<tier>\` folders, and with [`--copy-to` and `--move-to`](#copying-the-best-originals-to-another-folder), which put each original, unchanged, into the tier folder it would be rendered into:
 
 ```bash
-run.bat "L:\photos" --recursive --by-tier --move-to "L:\aitk" --threshold 6
+run.bat "L:\photos" --by-tier --move-to "L:\aitk" --threshold 6
 ```
 
 ```
