@@ -423,14 +423,6 @@ The default mode renders each image twice on a first run — once to score, once
 
 Run `--report` on your actual folder and read the QUALITY DISTRIBUTION histogram in the final report — it covers every image that reached a tier, including those below the threshold, so you can see what a different threshold would recover. Then adjust `D_RENDERED_BANDS` and `B_RENDERED_BANDS` at the top of `k2prep.py` before trusting `--threshold` to act on them.
 
-## Tests
-
-```bash
-..\venv\Scripts\python.exe tests\test_k2prep.py
-```
-
-Covers the bucket generation port, the per-tier family table, the geometry half of the acceptance criteria, the merge rules, the rendered-image metrics, and `--copy-to` end to end. Like the test suites of the other tools, `tests/` stays local and is not in the repository.
-
 ## License
 
 MIT, see the [LICENSE](../LICENSE) of the repository.
