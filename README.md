@@ -18,6 +18,93 @@ Tools that prepare image datasets for LoRA and fine-tune training, mainly with [
 | [move_alone](move_alone/move_alone.bat) | Moves the images that have no caption (no `.txt` file with the same name) into a `single_files` subfolder, to caption them or leave them out. Copy `move_alone.bat` into the dataset folder and run it there; it handles that folder only, not its subfolders. |
 | [k2prep](k2prep/README.md) | Builds a training set for the musubi-tuner Krea 2 trainer from a folder of mixed photos: each image that passes a quality score is cropped and resized onto one of 7 aspect ratios in 3 resolution tiers (1024, 768, 512), buckets too small for a batch are merged into their nearest neighbour, and the result goes to `_prep` with its captions and a `dataset.toml`. The source folder is not changed. `--report` is a dry run; `--sort` files the originals into quality folders instead, and `--copy-to` copies the best originals of a tree into another folder. `cleanup.bat` moves undersized images out of a folder. |
 
+## Workflow
+
+The stages of a dataset and the tools that come in at each of them. Tools marked (*) are in separate repositories: [taggui](https://github.com/aoleg/taggui), [watermark_remover](https://github.com/aoleg/watermark_remover) and [krea-2-merge-tool](https://github.com/aoleg/krea-2-merge-tool).
+
+```
+ 1. COLLECT  (side by side)
+  ________________________________    ________________________________
+ | telegram_dataset               |  | ddg_images                     |
+ |   Telegram channel export ->   |  |   Bing / DDG / SearXNG image   |
+ |   photos, one-line captions    |  |   search results, CSV log      |
+ |________________________________|  |________________________________|
+                  |                                   |
+                  +-----------------+-----------------+
+                                    v
+ 2. GATHER  (in this order)
+  __________________________________________________________________
+ | deduplicate               moves worse copies of a picture aside, |
+ |                           across folders, into a curated set     |
+ | flatten_dataset           all subfolders -> one folder           |
+ |__________________________________________________________________|
+                                    |
+                                    v
+ 3. SORT AND SELECT  (cleanup.bat first; the rest only copy, so
+                      they can run side by side)
+  __________________________________________________________________
+ | k2prep cleanup.bat        moves images too small to train on out |
+ | classify                  sorts into category folders, learned   |
+ |                           from a few hand-sorted examples        |
+ | k2prep --sort             files the originals by quality tier    |
+ | jpeg_cleanup extract.bat  copies badly compressed JPEGs by       |
+ |                           quality band, to pick a threshold      |
+ |__________________________________________________________________|
+                                    |
+                                    v
+ 4. REPAIR  (one at a time, in this order)                           <-+
+  __________________________________________________________________   |
+ | remove_borders            cuts off frames, lines, text banners   |  |
+ | jpeg_cleanup run.bat      fixes compression artefacts in         |  |
+ |                           severely damaged JPEGs                 |  |
+ | watermark_remover (*)     finds watermarks, paints them out      |  |
+ | reframe                   crops photos of people to the subject; |  |
+ |                           with --resize it also does the k2prep  |  |
+ |                           step of stage 6, so skip k2prep then   |  |
+ |__________________________________________________________________|  |
+                                    |                                  |
+                                    v                                  |
+ 5. CAPTION  (in this order)                                           |
+  __________________________________________________________________   |
+ | taggui (*)                writes the captions with a vision      |  |
+ |   + taggui_captioning     model; the prompt turns a photo and    |  |
+ |                           its editor's caption into a prompt     |  |
+ | move_alone                parks images still without a caption   |  |
+ | extract_keywords          moves images out by caption keyword:   |  |
+ |                           a concept to train apart, or           |  |
+ |                           "watermark" back to watermark_remover  |--+
+ | strip_watermark_sentence  cuts the watermark sentence out of     |
+ |                           the captions                           |
+ |__________________________________________________________________|
+                                    |
+                                    v
+ 6. BUILD  (in this order)
+  __________________________________________________________________
+ | k2prep                    crops and resizes onto 7 ratios in 3   |
+ |                           resolution tiers, drops images under   |
+ |                           a quality threshold, merges small      |
+ |                           buckets; for AI Toolkit and musubi,    |
+ |                           with a dataset.toml for musubi         |
+ | face_masks                loss masks that hide faces, made on    |
+ |                           the final images (AI Toolkit)          |
+ |   + extract.bat           face crops in 512/768/1024 buckets,    |
+ |                           for a separate face dataset            |
+ |__________________________________________________________________|
+                                    |
+                                    v
+ 7. TRAIN  (AI Toolkit, musubi-tuner)
+                                    |
+                                    v
+ 8. MERGE
+  __________________________________________________________________
+ | krea-2-merge-tool (*)     merges the trained Krea 2 LoRAs and    |
+ |                           checkpoints into one model             |
+ |__________________________________________________________________|
+
+ (*) separate repository: aoleg/taggui, aoleg/watermark_remover,
+     aoleg/krea-2-merge-tool
+```
+
 ## Install
 
 All tools share one virtual environment: the `venv` folder in the repository root, next to the tool folders. It needs Python 3.10 or newer on Windows. To install a tool, run the `install.bat` in its folder. It creates the shared `venv` when it is missing and installs only that tool's dependencies into it, so a tool that needs no GPU never pulls torch in. Install the tools you need, in any order; running an `install.bat` again installs what is missing. Every `run.bat` uses the shared `venv`.
