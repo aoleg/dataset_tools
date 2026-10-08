@@ -30,20 +30,29 @@ The target dimensions are therefore **generated with musubi's own algorithm** (s
 
 ## 2. Repository layout
 
+k2prep is one tool folder of the `dataset_tools` repository. The venv and the MIT `LICENSE` are in the repository root and shared by all tools.
+
 ```
-k2prep/
-├── k2prep.py            single-file script, all logic
-├── requirements.txt
-├── install.bat          Windows: create venv, install deps
-├── run.bat              Windows: activate venv, run k2prep.py with passthrough args
-├── README.md            usage, examples, the "why exact bucket dims" explanation
-├── .gitignore
-└── LICENSE              MIT
+dataset_tools/
+├── venv/                shared by all tools, not in git
+├── LICENSE              MIT
+└── k2prep/
+    ├── k2prep.py        single-file script, all logic
+    ├── cleanup.py       moves undersized images out of a folder
+    ├── requirements.txt
+    ├── install.bat      Windows: create the shared venv when missing, install deps into it
+    ├── run.bat          Windows: run k2prep.py in the shared venv with passthrough args
+    ├── cleanup.bat      Windows: run cleanup.py in the shared venv with passthrough args
+    ├── sample.env       --vl settings, copied to .env
+    ├── README.md        usage, examples, the "why exact bucket dims" explanation
+    ├── SPEC.md
+    ├── .gitignore
+    └── tests/           test_k2prep.py, local, not in git
 ```
 
 Single file is deliberate. The script is roughly 900 lines and splitting it adds import ceremony for no benefit. If it grows past ~1500 lines, split out `metrics.py` and `buckets.py` only.
 
-`.gitignore` must include `venv/`, `__pycache__/`, `*.pyc`, `_prep/`.
+`.gitignore` must include `__pycache__/`, `*.pyc`, `_prep/`, `.env`. The repository root ignores `venv/` and every `tests/` folder.
 
 ---
 
@@ -63,32 +72,19 @@ Python 3.10 or newer.
 
 ### install.bat
 
-```
-@echo off
-setlocal
-cd /d "%~dp0"
-if not exist venv (
-    python -m venv venv
-)
-call venv\Scripts\activate.bat
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-echo.
-echo Install complete. Use run.bat to run k2prep.
-pause
-```
+`install.bat` follows the pattern of every tool in the repository: it checks for Python 3.10 or newer, creates the shared venv in `..\venv` when it is missing, installs `requirements.txt` into it, and runs a self check (imports, then `k2prep.py --help` and `cleanup.py --help`). It installs only k2prep's own dependencies, so it never pulls torch in.
 
 ### run.bat
 
 ```
 @echo off
 setlocal disabledelayedexpansion
-if not exist "%~dp0venv\Scripts\python.exe" (
+if not exist "%~dp0..\venv\Scripts\python.exe" (
     echo Virtual environment not found. Run install.bat first.
     pause
     exit /b 1
 )
-"%~dp0venv\Scripts\python.exe" "%~dp0k2prep.py" %*
+"%~dp0..\venv\Scripts\python.exe" "%~dp0k2prep.py" %*
 exit /b %errorlevel%
 ```
 

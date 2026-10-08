@@ -121,7 +121,7 @@ PROMOTE_MARGIN = 1.0
 
 
 # ---------------------------------------------------------------------------
-# k2prep scoring. Copied from k2prep.py (T:/claude/github2/k2prep), two-pass
+# k2prep scoring. Copied from k2prep.py (../k2prep), two-pass
 # rendered scoring; keep the two in step. Q (JPEG quality) is not used: k2prep
 # reports it but keeps it out of the composite.
 # ---------------------------------------------------------------------------

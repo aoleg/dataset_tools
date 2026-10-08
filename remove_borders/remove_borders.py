@@ -616,7 +616,7 @@ def describe_cuts(cuts) -> str:
 # the image, and a crop below --min-area is not made (the image moves out).
 
 # Aspect-ratio families, tiers and buckets, copied from k2prep.py
-# (T:/claude/github2/k2prep), which ports musubi-tuner's BucketSelector.
+# (../k2prep), which ports musubi-tuner's BucketSelector.
 AR_FAMILIES = ["9:16", "2:3", "4:5", "1:1", "5:4", "3:2", "16:9"]
 AR_NOMINAL = [0.5647, 0.6667, 0.8028, 1.0000, 1.2456, 1.5000, 1.7708]
 TIERS = [1024, 768, 512]

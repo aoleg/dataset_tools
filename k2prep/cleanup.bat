@@ -1,7 +1,7 @@
 @echo off
 setlocal disabledelayedexpansion
 rem ---------------------------------------------------------------------------
-rem  cleanup.bat - run cleanup.py inside the local venv.
+rem  cleanup.bat - run cleanup.py inside the shared venv.
 rem
 rem      cleanup.bat <folder> <size> [--dim] [--dry-run]
 rem
@@ -22,10 +22,10 @@ rem  Every argument goes to cleanup.py exactly as typed, for the reason given
 rem  in run.bat: parsing it here deleted every "!" in a path.
 rem ---------------------------------------------------------------------------
 
-if not exist "%~dp0venv\Scripts\python.exe" (
+if not exist "%~dp0..\venv\Scripts\python.exe" (
     echo Virtual environment not found. Run install.bat first.
     pause
     exit /b 1
 )
-"%~dp0venv\Scripts\python.exe" "%~dp0cleanup.py" %*
+"%~dp0..\venv\Scripts\python.exe" "%~dp0cleanup.py" %*
 exit /b %errorlevel%

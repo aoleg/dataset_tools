@@ -14,6 +14,8 @@ It can also just [sort a folder by quality](#sorting-a-folder-by-quality) and bu
 install.bat
 ```
 
+`install.bat` installs into the `venv` that all tools of this repository share, in the repository root next to the tool folders, and creates it when it is missing. `run.bat` and `cleanup.bat` use that `venv`.
+
 Then look before you leap:
 
 ```bash
@@ -424,11 +426,11 @@ Run `--report` on your actual folder and read the QUALITY DISTRIBUTION histogram
 ## Tests
 
 ```bash
-python test_k2prep.py
+..\venv\Scripts\python.exe tests\test_k2prep.py
 ```
 
-Covers the bucket generation port, the per-tier family table, the geometry half of the acceptance criteria, the merge rules, the rendered-image metrics, and `--copy-to` end to end.
+Covers the bucket generation port, the per-tier family table, the geometry half of the acceptance criteria, the merge rules, the rendered-image metrics, and `--copy-to` end to end. Like the test suites of the other tools, `tests/` stays local and is not in the repository.
 
 ## License
 
-MIT.
+MIT, see the [LICENSE](../LICENSE) of the repository.

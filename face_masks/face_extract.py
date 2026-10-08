@@ -30,7 +30,7 @@ from PIL import Image, ImageOps
 from make_face_masks import DEFAULT_MODEL, IMG_EXTS, face_boxes, face_region, load_model
 
 # ---------------------------------------------------------------------------
-# Buckets. Copied from k2prep.py (T:/claude/github2/k2prep), which ports
+# Buckets. Copied from k2prep.py (../k2prep), which ports
 # musubi-tuner's BucketSelector. Keep the two in step.
 # ---------------------------------------------------------------------------
 
