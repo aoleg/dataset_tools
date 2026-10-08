@@ -100,18 +100,6 @@ AR_FAMILIES = ["9:16", "2:3", "4:5", "1:1", "5:4", "3:2", "16:9"]
 AR_NOMINAL = [0.5647, 0.6667, 0.8028, 1.0000, 1.2456, 1.5000, 1.7708]
 
 
-@lru_cache(maxsize=None)
-def bucket_for(tier: int, family: str) -> tuple[int, int]:
-    """Resolve a family to its bucket at ``tier``.
-
-    The per-tier dimensions differ, because the 16px grid is coarser relative to
-    a smaller image. This is why the crop box cannot be computed until the tier
-    is known.
-    """
-    nominal = AR_NOMINAL[AR_FAMILIES.index(family)]
-    return min(generate_buckets(tier), key=lambda b: abs(b[0] / b[1] - nominal))
-
-
 def assign_family(src_ar: float) -> str:
     """Nearest family by ratio. No guard, no exclusion - a 21:9 panorama is
     assigned to 16:9 and cropped hard, on purpose."""
@@ -119,15 +107,134 @@ def assign_family(src_ar: float) -> str:
     return AR_FAMILIES[idx]
 
 
+# ---------------------------------------------------------------------------
+# 4.4  Bucket sets - one per trainer
+# ---------------------------------------------------------------------------
+#
+# The trainer decides the bucket sizes an image must land on exactly, or it
+# resizes and crops a second time on its own. A run uses one set, chosen before
+# any work and never changed while worker threads read it (use_buckets).
+
+# Ostris AI Toolkit at its default bucket_tolerance. A side that is a multiple
+# of 64 is also a multiple of 32, 16 and 8, so the buckets hold for those too.
+OSTRIS_STEP = 64
+# Ratio first: a family's bucket is the step-aligned size closest to the
+# family's ratio among those with at least this share of the tier's area.
+OSTRIS_MIN_AREA = 0.80
+
+
+def aitk_bucket_for_image_size(width: int, height: int, resolution: int = 512,
+                               divisibility: int = 8) -> tuple[int, int]:
+    """Ostris AI Toolkit's bucket for an image, as (width, height).
+
+    Port of ``get_bucket_for_image_size`` from ``toolkit/buckets.py`` in
+    ostris/ai-toolkit at a949f21 (2026-10-08). AI Toolkit's ``setup_buckets``
+    calls it with divisibility=bucket_tolerance, then scales the image to cover
+    the bucket and centre-crops it. The area is capped at the image's own, so
+    an image is never upscaled into a bigger bucket.
+    """
+    total_pixels = width * height
+    max_pixels = resolution * resolution
+    target_pixels = min(total_pixels, max_pixels)
+    scaler = (target_pixels / total_pixels) ** 0.5
+    w_raw = (width * scaler) / divisibility
+    h_raw = (height * scaler) / divisibility
+    candidates = [
+        (math.floor(w_raw) * divisibility, math.floor(h_raw) * divisibility),
+        (math.floor(w_raw) * divisibility, math.ceil(h_raw) * divisibility),
+        (math.ceil(w_raw) * divisibility, math.floor(h_raw) * divisibility),
+        (math.ceil(w_raw) * divisibility, math.ceil(h_raw) * divisibility),
+    ]
+    capped = [(w, h) for w, h in candidates
+              if w > 0 and h > 0 and w * h <= max_pixels]
+    if not capped:
+        capped = [(max(divisibility, math.floor(w_raw) * divisibility),
+                   max(divisibility, math.floor(h_raw) * divisibility))]
+    return min(capped, key=lambda wh: abs(wh[0] * wh[1] - target_pixels))
+
+
 @lru_cache(maxsize=None)
+def _musubi_bucket(tier: int, family: str) -> tuple[int, int]:
+    nominal = AR_NOMINAL[AR_FAMILIES.index(family)]
+    return min(generate_buckets(tier), key=lambda b: abs(b[0] / b[1] - nominal))
+
+
+@lru_cache(maxsize=None)
+def _ostris_bucket(tier: int, family: str) -> tuple[int, int]:
+    nominal = AR_NOMINAL[AR_FAMILIES.index(family)]
+    area = tier * tier
+    best = None
+    for w in range(OSTRIS_STEP, 4 * tier + 1, OSTRIS_STEP):
+        for h in range(OSTRIS_STEP, 4 * tier + 1, OSTRIS_STEP):
+            if not OSTRIS_MIN_AREA * area <= w * h <= area:
+                continue
+            # Log-ratio distance, rounded so that float noise cannot beat a
+            # real tie; on a tie the larger bucket keeps more pixels.
+            key = (round(abs(math.log(w / h) - math.log(nominal)), 6), -w * h, w)
+            if best is None or key < best[0]:
+                best = (key, (w, h))
+    bucket = best[1]
+    # The point of this set: AI Toolkit must take the render as it is, with no
+    # second resize or crop. Any step-aligned size within the tier's area is
+    # its own bucket in AI Toolkit; assert it, so a change here cannot break it.
+    for div in (64, 32, 16, 8):
+        assert aitk_bucket_for_image_size(*bucket, tier, div) == bucket, \
+            (tier, family, bucket, div)
+    return bucket
+
+
+class BucketSet:
+    """The bucket sizes of one trainer.
+
+    bucket_for resolves a family to its bucket at a tier. The per-tier
+    dimensions differ, because the size grid is coarser relative to a smaller
+    image. This is why the crop box cannot be computed until the tier is known.
+    """
+
+    def __init__(self, key: str, label: str, resolve):
+        self.key = key            # command-line name: --musubi, --ostris
+        self.label = label        # for the notice line and the reports
+        self._resolve = resolve
+
+    def bucket_for(self, tier: int, family: str) -> tuple[int, int]:
+        return self._resolve(tier, family)
+
+    def family_of_bucket(self, tier: int, bucket: tuple[int, int]) -> str:
+        """Inverse of bucket_for. The merge pass moves images between
+        families, so the reported family is the one the bucket belongs to, not
+        the one the source aspect ratio was originally classified as. Families
+        that share a bucket on a coarse grid are named together, "4:5/1:1"."""
+        names = [f for f in AR_FAMILIES if self.bucket_for(tier, f) == bucket]
+        return "/".join(names) if names else "?"
+
+    def __repr__(self) -> str:
+        return f"BucketSet({self.key!r})"
+
+
+MUSUBI = BucketSet("musubi", "Musubi Tuner", _musubi_bucket)
+OSTRIS = BucketSet("ostris", "Ostris AI Toolkit", _ostris_bucket)
+BUCKET_SETS = {b.key: b for b in (MUSUBI, OSTRIS)}
+
+_active_buckets = MUSUBI
+
+
+def use_buckets(bucket_set: BucketSet) -> None:
+    """Select the bucket set for the run. Call before any work starts."""
+    global _active_buckets
+    _active_buckets = bucket_set
+
+
+def active_buckets() -> BucketSet:
+    return _active_buckets
+
+
+def bucket_for(tier: int, family: str) -> tuple[int, int]:
+    """Resolve a family to its bucket at ``tier``, in the run's bucket set."""
+    return _active_buckets.bucket_for(tier, family)
+
+
 def family_of_bucket(tier: int, bucket: tuple[int, int]) -> str:
-    """Inverse of bucket_for. --optimize moves images between families, so the
-    reported family is the one the bucket belongs to, not the one the source
-    aspect ratio was originally classified as."""
-    for family in AR_FAMILIES:
-        if bucket_for(tier, family) == bucket:
-            return family
-    return "?"
+    return _active_buckets.family_of_bucket(tier, bucket)
 
 
 # ---------------------------------------------------------------------------
