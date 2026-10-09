@@ -16,6 +16,7 @@ Tools that prepare image datasets for LoRA and fine-tune training, mainly with [
 | [jpeg_cleanup](jpeg_cleanup/README.md) | Finds heavily compressed images with the FBCNN quality predictor, which also sees through re-saves. `extract.bat` copies the poor images with their captions into one folder per quality band (`60`, `70`, `80`, `85`), outside the dataset, so the threshold for the cleanup can be chosen by eye. `run.bat` restores the images under the threshold with FBCNN and replaces only those whose restoration removes enough of the artifacts, with the originals and captions in a `_backup` folder; `--dry-run` writes a report and before/after contact sheets instead, and `--undo` puts everything back. |
 | [extract_keywords](extract_keywords/README.md) | Moves the images whose captions contain any of the keywords (or all of them, joined by `AND`) with their captions out of a dataset into `<dataset>_<first keyword>` next to it, in the same subfolders: one concept for its own training, or every image whose caption mentions a watermark. `--undo` moves them back. |
 | [move_alone](move_alone/move_alone.bat) | Moves the images that have no caption (no `.txt` file with the same name) into a `single_files` subfolder, to caption them or leave them out. Copy `move_alone.bat` into the dataset folder and run it there; it handles that folder only, not its subfolders. |
+| [scripts](scripts) | Small single-file scripts, run from the dataset folder or given it as an argument. `extract_uncaptioned_images.py` moves the images without a caption from all subfolders into `_uncaptioned`, in the same subfolders, so only those need captioning; `--restore` moves them back with their new captions. `clean_orphaned_txt.py` deletes the `.txt` captions that have no image. Both take `--dry-run`. |
 | [k2prep](k2prep/README.md) | Builds a training set for Ostris AI Toolkit (`--ostris`) or the musubi-tuner Krea 2 trainer (`--musubi`) from a folder of mixed photos: each image that passes a quality score is cropped and resized onto that trainer's exact bucket sizes, on one of 7 aspect ratios in 3 resolution tiers (1024, 768, 512), so the trainer uses it with no second resize or crop. Buckets too small for a batch are merged into their nearest neighbour, and the result goes to `_prep` with its captions, plus a `dataset.toml` for musubi. `--by-tier` gives one folder per tier (`_1024` to `_256`), each holding the whole source tree, as AI Toolkit wants a tree of datasets. The source folder is not changed. `--report` is a dry run; `--sort` files the originals into quality folders instead, and `--copy-to` copies the best originals of a tree into another folder, tier first with `--by-tier`. `cleanup.bat` moves undersized images out of a folder. |
 
 ## Workflow
@@ -70,6 +71,9 @@ The stages of a dataset and the tools that come in at each of them. Tools marked
  |   + taggui_captioning     model; the prompt turns a photo and    |  |
  |                           its editor's caption into a prompt     |  |
  | move_alone                parks images still without a caption   |  |
+ | extract_uncaptioned_images (scripts)                             |  |
+ |                           the same for a whole tree, into        |  |
+ |                           _uncaptioned; --restore puts back      |  |
  | extract_keywords          moves images out by caption keyword:   |  |
  |                           a concept to train apart, or           |  |
  |                           "watermark" back to watermark_remover  |--+
@@ -113,6 +117,7 @@ All tools share one virtual environment: the `venv` folder in the repository roo
 |---|---|
 | `telegram_dataset`, `taggui_captioning`, `flatten_dataset`, `extract_keywords` | Python only, nothing to install |
 | `move_alone` | nothing, it is a batch file |
+| `scripts` | Python only, nothing to install |
 | `ddg_images` | the `ddgs` package for the Bing and DuckDuckGo backends; the SearXNG backend needs nothing |
 | `deduplicate` | Pillow, numpy, imagehash, OpenCV; runs on the CPU. With `--gpu` it uses the torch of the GPU tools when one of them is installed, and falls back to the CPU otherwise. |
 | `remove_borders` | Pillow, numpy, jpeglib, OpenCV; runs on the CPU |
