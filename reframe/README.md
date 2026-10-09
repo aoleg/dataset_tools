@@ -29,10 +29,10 @@ Examples:
 ```
 run.bat D:\photos\2016 --dry-run --verdicts
 run.bat D:\photos\2016
-run.bat D:\photos\2016 --resize
+run.bat D:\photos\2016 --resize --ostris
 ```
 
-The first command plans the crops and draws a preview of each photo, without writing any photos. The second writes the crops. The third crops and resizes every photo into its k2prep bucket.
+The first command plans the crops and draws a preview of each photo, without writing any photos. The second writes the crops. The third crops and resizes every photo into its k2prep bucket, at the bucket sizes of Ostris AI Toolkit.
 
 Each folder is processed with all its subfolders. Folders whose names start with `_` are skipped. The output goes to `<folder>\_reframed\` with the same relative paths. The photos in the folder itself are never changed.
 
@@ -40,7 +40,9 @@ Each folder is processed with all its subfolders. Folders whose names start with
 |---|---|---|
 | `--dry-run` | off | write only `plan.json` and the previews |
 | `--verdicts` | off | draw the decision for each photo into `_reframed\_verdicts\` |
-| `--resize` | off | crop and resize every photo into its k2prep bucket, sorted into tier folders |
+| `--resize` | off | crop and resize every photo into its k2prep bucket, sorted into tier folders; needs `--ostris` or `--musubi` |
+| `--ostris` | | with `--resize`: Ostris AI Toolkit buckets, which AI Toolkit trains with no second resize or crop |
+| `--musubi` | | with `--resize`: musubi-tuner buckets |
 | `--png` | off | with `--resize`: write PNG instead of JPEG |
 | `--reencode` | off | crop JPEG photos by decoding and saving them again, not losslessly |
 | `--ratios` | all seven | the aspect ratios to choose from, for example `--ratios 2:3,4:5,1:1,5:4,3:2` |
@@ -75,12 +77,14 @@ The lossless crop keeps the EXIF data, including the orientation. The EXIF thumb
 **With `--resize`**, each crop, or each unchanged photo as a whole, is processed as k2prep processes a photo:
 
 1. The nearest k2prep aspect ratio.
-2. The largest of the tiers 1024, 768 and 512 whose bucket the crop fills, with an upscale of at most 1.15.
+2. The largest of the tiers 1024, 768 and 512 whose bucket the crop fills, with an upscale of at most 1.15. The buckets are those of the trainer you name: `--ostris` or `--musubi`.
 3. k2prep's crop to the exact bucket size: centred, with a third of the spare height above for portrait buckets.
 4. One Lanczos resize from the original photo.
 5. JPEG at quality 97 without chroma subsampling, or PNG with `--png`, without EXIF and ICC.
 
-The output goes to `<tier>\<name>`, or `<subfolder>\<tier>\<name>` for photos in subfolders, as k2prep does. A name that is taken gets `-2`, `-3` and so on. A photo that is too small for the 512 tier is skipped. On photos that are not cropped, the output is pixel-identical to the output of k2prep itself.
+The output goes to `<tier>\<name>`, or `<subfolder>\<tier>\<name>` for photos in subfolders, as k2prep does. A name that is taken gets `-2`, `-3` and so on. A photo that is too small for the 512 tier is skipped. On photos that are not cropped, the output is pixel-identical to the output of k2prep itself with the same trainer option.
+
+**The trainer.** `--resize` needs one of two options, the same as in [k2prep](../k2prep/README.md#the-trainer---ostris-or---musubi). `--ostris` gives Ostris AI Toolkit buckets: sides in steps of 64, the size closest to the aspect ratio with at least 80 percent of the tier's area, which AI Toolkit trains as they are, with no second resize or crop. `--musubi` gives the sizes of musubi-tuner's bucket list. Without either, the run stops before it reads a photo and prints the command with each option added, ready to copy. The first line of a `--resize` run names the buckets it uses. The crop around the subject is planned the same way for both; only the final bucket differs. A second run with the other option writes a resized photo again when its bucket differs; some buckets, such as 1024×1024, are the same in both. Without `--resize` the two options are refused: the crops keep their own size.
 
 **Next runs.** `_reframed\written.json` records what was written for each photo. A second run skips the photos that are done. It writes a photo again when the photo, its caption, the plan or the options changed. It removes outputs that are no longer wanted, for example the old copy of a photo that is now cropped. Each file is written under a temporary name and renamed when it is complete.
 

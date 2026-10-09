@@ -11,7 +11,8 @@ Output goes to <folder>/_reframed/<same relative path>: JPEG crops are lossless
 (whole DCT blocks, no re-encoding) unless --reencode is given, other formats are
 re-encoded in their own format, unchanged photos are copied, and .txt captions
 are copied along. With --resize every photo is instead cropped and resized into
-its k2prep bucket and filed under <tier>/ the way k2prep does it.
+its k2prep bucket and filed under <tier>/ the way k2prep does it; --resize needs
+--ostris (Ostris AI Toolkit buckets) or --musubi (musubi-tuner buckets).
 --dry-run writes only plan.json and the previews: --previews draws the
 detections, --people the measurements, --verdicts the subject choice and the
 planned crop.
@@ -20,13 +21,14 @@ Per-photo corrections: <folder>/overrides.txt, see OVERRIDES_NAME.
   faces           : face_yolov8m.pt  (Bingsu/adetailer, Hugging Face)
   pose keypoints  : yolo26x-pose.pt  (ultralytics assets)
 
-Usage:    python reframe.py <folder> [<folder> ...] [--dry-run] [--verdicts] [--resize [--png]]
+Usage:    python reframe.py <folder> [<folder> ...] [--dry-run] [--verdicts] [--resize --ostris|--musubi [--png]]
           [--reencode] [--ratios 2:3,4:5,...] [--skip-unchanged] [--overwrite] [--threads N] [--out DIR]
           python reframe.py --fetch-models
 """
 import argparse
 import json
 import math
+import re
 import shutil
 import threading
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
@@ -722,6 +724,71 @@ def bucket_for(tier: int, family: str):
     return min(generate_buckets(tier), key=lambda b: abs(b[0] / b[1] - nominal))
 
 
+# Ostris AI Toolkit buckets for --resize --ostris, copied from k2prep.py
+# (../k2prep, section 4.4 of its SPEC): for each family the size in steps of 64
+# closest to the family's ratio with at least 80% of the tier's area. AI Toolkit
+# takes any such size as its own bucket, so it trains the render with no second
+# resize or crop, at bucket_tolerance 64 and at 32, 16 and 8.
+OSTRIS_STEP = 64
+OSTRIS_MIN_AREA = 0.80
+
+
+def aitk_bucket_for_image_size(width: int, height: int, resolution: int = 512, divisibility: int = 8):
+    """Port of get_bucket_for_image_size from ostris/ai-toolkit toolkit/buckets.py at a949f21."""
+    total_pixels = width * height
+    max_pixels = resolution * resolution
+    target_pixels = min(total_pixels, max_pixels)
+    scaler = (target_pixels / total_pixels) ** 0.5
+    w_raw = (width * scaler) / divisibility
+    h_raw = (height * scaler) / divisibility
+    candidates = [
+        (math.floor(w_raw) * divisibility, math.floor(h_raw) * divisibility),
+        (math.floor(w_raw) * divisibility, math.ceil(h_raw) * divisibility),
+        (math.ceil(w_raw) * divisibility, math.floor(h_raw) * divisibility),
+        (math.ceil(w_raw) * divisibility, math.ceil(h_raw) * divisibility),
+    ]
+    capped = [(w, h) for w, h in candidates if w > 0 and h > 0 and w * h <= max_pixels]
+    if not capped:
+        capped = [(max(divisibility, math.floor(w_raw) * divisibility),
+                   max(divisibility, math.floor(h_raw) * divisibility))]
+    return min(capped, key=lambda wh: abs(wh[0] * wh[1] - target_pixels))
+
+
+@lru_cache(maxsize=None)
+def ostris_bucket_for(tier: int, family: str):
+    nominal = AR_NOMINAL[AR_FAMILIES.index(family)]
+    area = tier * tier
+    best = None
+    for w in range(OSTRIS_STEP, 4 * tier + 1, OSTRIS_STEP):
+        for h in range(OSTRIS_STEP, 4 * tier + 1, OSTRIS_STEP):
+            if not OSTRIS_MIN_AREA * area <= w * h <= area:
+                continue
+            key = (round(abs(math.log(w / h) - math.log(nominal)), 6), -w * h, w)
+            if best is None or key < best[0]:
+                best = (key, (w, h))
+    bucket = best[1]
+    for div in (64, 32, 16, 8):           # AI Toolkit must take the render as it is
+        assert aitk_bucket_for_image_size(*bucket, tier, div) == bucket, (tier, family, bucket, div)
+    return bucket
+
+
+# The trainer --resize renders for: --musubi or --ostris, chosen once in main
+# before any work. The crop planning above always uses the musubi buckets: its
+# 512 size floor is at least as large as the ostris one for every family, so a
+# planned crop fits either trainer.
+TRAINERS = {"musubi": ("Musubi Tuner", bucket_for), "ostris": ("Ostris AI Toolkit", ostris_bucket_for)}
+_trainer = "musubi"
+
+
+def use_trainer(key: str) -> None:
+    global _trainer
+    _trainer = key
+
+
+def resize_bucket_for(tier: int, family: str):
+    return TRAINERS[_trainer][1](tier, family)
+
+
 def image_header(path: Path) -> dict:
     """Format, EXIF orientation, stored size and JPEG MCU size, from the header only."""
     with Image.open(path) as im:
@@ -996,9 +1063,10 @@ def assign_family(src_ar: float) -> str:
 
 
 def assign_tier(src_w: int, src_h: int, family: str):
-    """k2prep: the largest tier whose bucket the crop fills within UPSCALE_TOLERANCE."""
+    """k2prep: the largest tier whose bucket, in the trainer's set, the crop fills
+    within UPSCALE_TOLERANCE."""
     for tier in (1024, 768, 512):
-        bw, bh = bucket_for(tier, family)
+        bw, bh = resize_bucket_for(tier, family)
         cw, ch = crop_dims(src_w, src_h, bw / bh)
         if cw * ch >= (bw * bh) / (UPSCALE_TOLERANCE ** 2):
             return tier, (bw, bh)
@@ -1006,8 +1074,8 @@ def assign_tier(src_w: int, src_h: int, family: str):
 
 
 def bucket_plan(box) -> dict | None:
-    """k2prep's bucket for the region box (display pixels): tier, bucket and the
-    exact box to resize from, or None if it is too small for 512."""
+    """k2prep's bucket for the region box (display pixels), in the trainer's set:
+    tier, bucket and the exact box to resize from, or None if it is too small for 512."""
     x0, y0, x1, y1 = box
     w, h = x1 - x0, y1 - y0
     family = assign_family(w / h)
@@ -1498,6 +1566,29 @@ def threads_arg(value: str) -> int:
     return n
 
 
+def missing_trainer_message(argv) -> str:
+    """Why --resize stopped, the two options, and the command to copy."""
+    def quote(arg: str) -> str:
+        # Quoted unless plainly safe, so a path with spaces, "&" or "!" can be
+        # pasted back into cmd as it is. Windows paths cannot hold a '"'.
+        return arg if re.fullmatch(r"[A-Za-z0-9_.=:+,-]+", arg) else f'"{arg}"'
+
+    def example(flag: str) -> str:
+        return " ".join(["run.bat"] + [quote(a) for a in list(argv) + [flag]])
+    return "\n".join([
+        "--resize resizes the crops onto a trainer's bucket sizes, so it needs",
+        "to know the trainer. Add one of these options:",
+        "",
+        f"  --ostris   Ostris AI Toolkit: sides in steps of {OSTRIS_STEP}, which AI Toolkit",
+        "             trains as they are, with no second resize or crop.",
+        "  --musubi   Musubi Tuner: the sizes of musubi-tuner's bucket list.",
+        "",
+        "For example:",
+        f"  {example('--ostris')}",
+        f"  {example('--musubi')}",
+    ])
+
+
 def main(argv=None) -> int:
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -1518,7 +1609,15 @@ def main(argv=None) -> int:
                     help="plan JPEG crops for re-encoding instead of a lossless DCT crop")
     ap.add_argument("--dry-run", action="store_true", help="write plan.json and the previews only")
     ap.add_argument("--resize", action="store_true",
-                    help="resize every photo into its k2prep bucket and sort it into <tier>/ folders")
+                    help="resize every photo into its k2prep bucket and sort it into <tier>/ folders; "
+                         "needs --ostris or --musubi")
+    trainer = ap.add_mutually_exclusive_group()
+    trainer.add_argument("--ostris", action="store_const", const="ostris", dest="trainer",
+                         help="with --resize: Ostris AI Toolkit buckets, sides in steps of 64, which "
+                              "AI Toolkit trains as they are, with no second resize or crop")
+    trainer.add_argument("--musubi", action="store_const", const="musubi", dest="trainer",
+                         help="with --resize: musubi-tuner buckets, the sizes of its own bucket list. "
+                              "--resize needs one of --ostris and --musubi")
     ap.add_argument("--png", action="store_true", help="with --resize: write PNG instead of JPEG")
     ap.add_argument("--skip-unchanged", action="store_true",
                     help="do not copy (or, with --resize, resize) the photos that are not cropped")
@@ -1546,6 +1645,14 @@ def main(argv=None) -> int:
         ap.error("--out works with one folder only")
     if args.png and not args.resize:
         ap.error("--png works with --resize only")
+    if args.trainer and not args.resize:
+        ap.error(f"--{args.trainer} works with --resize only: without it the crops keep their own size")
+    if args.resize and args.trainer is None:
+        print(missing_trainer_message(sys.argv[1:] if argv is None else argv), file=sys.stderr)
+        return 2
+    if args.resize:
+        use_trainer(args.trainer)
+        print(f"Using {TRAINERS[args.trainer][0]} buckets")
     families = [r.strip() for r in args.ratios.split(",") if r.strip()]
     bad = [r for r in families if r not in AR_FAMILIES]
     if bad or not families:
