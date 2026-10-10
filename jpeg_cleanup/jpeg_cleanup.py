@@ -189,6 +189,47 @@ def header_quality(im: Image.Image) -> int | None:
     return int(min(100, max(1, round(q))))
 
 
+def facts_of(im: Image.Image, path: Path | None = None) -> dict:
+    """The facts of an open image that decide and describe its measurement:
+    format, mode, stored size, EXIF orientation, EXIF and ICC blocks, the
+    header quality of a JPEG, the frame count and whether a WebP is lossless
+    (path needed for that; without it a WebP counts as lossy)."""
+    fmt = im.format or ""
+    d = {"format": fmt, "mode": im.mode, "width": im.size[0], "height": im.size[1], "gray": None,
+         "header_q": None, "skip": "", "orientation": 1, "frames": 1, "lossless_webp": False}
+    try:
+        o = im.getexif().get(274, 1) or 1
+        d["orientation"] = o if o in range(1, 9) else 1
+    except Exception:  # noqa: BLE001 - a damaged EXIF block is not fatal
+        pass
+    d["exif"], d["icc"] = im.info.get("exif"), im.info.get("icc_profile")
+    if fmt in ("JPEG", "MPO"):
+        d["header_q"] = header_quality(im)
+    if fmt != "MPO":
+        d["frames"] = getattr(im, "n_frames", 1) or 1
+    if fmt == "WEBP" and path is not None:
+        d["lossless_webp"] = webp_is_lossless(path)
+    return d
+
+
+def skip_of(d: dict, max_pixels: int) -> str:
+    """Why an image with these facts is not measured, or ""."""
+    fmt = d["format"]
+    if fmt not in MEASURED_FORMATS:
+        return f"format {fmt or '?'}"
+    if fmt == "WEBP" and not d.get("lossless_webp"):
+        return "format lossy WEBP"
+    if d.get("frames", 1) > 1:
+        return "animated"
+    if d["mode"] in ("1", "CMYK", "I", "F") or d["mode"].startswith("I;16"):
+        return f"mode {d['mode']}"
+    if d["width"] * d["height"] > max_pixels:
+        return "large"
+    if d.get("transparent"):
+        return "transparent"
+    return ""
+
+
 def decode(path: Path, max_pixels: int) -> dict:
     """Open one image and return its facts and, when it is to be measured, its
     stored pixels (no EXIF rotation, so the JPEG block grid stays aligned):
@@ -198,26 +239,8 @@ def decode(path: Path, max_pixels: int) -> dict:
          "orientation": 1}
     try:
         with Image.open(path) as im:
-            fmt = im.format or ""
-            d.update(format=fmt, mode=im.mode, width=im.size[0], height=im.size[1])
-            try:
-                o = im.getexif().get(274, 1) or 1
-                d["orientation"] = o if o in range(1, 9) else 1
-            except Exception:  # noqa: BLE001 - a damaged EXIF block is not fatal
-                pass
-            d["exif"], d["icc"] = im.info.get("exif"), im.info.get("icc_profile")
-            if fmt in ("JPEG", "MPO"):
-                d["header_q"] = header_quality(im)
-            if fmt not in MEASURED_FORMATS:
-                d["skip"] = f"format {fmt or '?'}"
-            elif fmt == "WEBP" and not webp_is_lossless(path):
-                d["skip"] = "format lossy WEBP"
-            elif fmt != "MPO" and (getattr(im, "n_frames", 1) or 1) > 1:
-                d["skip"] = "animated"
-            elif im.mode in ("1", "CMYK", "I", "F") or im.mode.startswith("I;16"):
-                d["skip"] = f"mode {im.mode}"
-            elif im.size[0] * im.size[1] > max_pixels:
-                d["skip"] = "large"
+            d = facts_of(im, path)
+            d["skip"] = skip_of(d, max_pixels)
             if d["skip"]:
                 return d
             im.load()
@@ -236,11 +259,60 @@ def decode(path: Path, max_pixels: int) -> dict:
     except Exception as e:  # noqa: BLE001 - any unreadable file is reported, not fatal
         d["skip"] = f"unreadable: {type(e).__name__}: {e}".strip()
         return d
+    return with_pixels(d, rgb)
+
+
+def with_pixels(d: dict, rgb: np.ndarray) -> dict:
+    """Add the stored RGB pixels to the facts, with the gray test and the luma."""
     d["rgb"] = rgb
     d["gray"] = is_gray(rgb)
     if d["gray"]:
         d["luma"] = np.array(Image.fromarray(rgb).convert("L"))
     return d
+
+
+def decode_array(array: np.ndarray, head: dict, max_pixels: int) -> dict:
+    """decode() for pixels decoded elsewhere: array holds the upright RGB uint8
+    pixels, head the facts (facts_of, or a dict with the same keys; an alpha
+    channel that was composited away is reported as "transparent": True). The
+    pixels are turned back to the stored orientation, where the JPEG grid is."""
+    d = {k: head.get(k) for k in ("format", "mode", "width", "height", "header_q", "orientation", "exif", "icc",
+                                   "frames", "lossless_webp", "transparent")}
+    d.update(format=d["format"] or "", mode=d["mode"] or "", orientation=d["orientation"] or 1,
+             frames=d["frames"] or 1, gray=None, skip="")
+    d["skip"] = skip_of(d, max_pixels)
+    if d["skip"]:
+        return d
+    return with_pixels(d, np.ascontiguousarray(to_stored(array, d["orientation"])))
+
+
+def to_stored(a: np.ndarray, orientation: int) -> np.ndarray:
+    """The upright pixels as the file stores them: the inverse of the EXIF
+    transpose (ImageOps.exif_transpose)."""
+    if orientation == 2:
+        return a[:, ::-1]
+    if orientation == 3:
+        return a[::-1, ::-1]
+    if orientation == 4:
+        return a[::-1]
+    if orientation == 5:
+        return a.transpose(1, 0, 2) if a.ndim == 3 else a.T
+    if orientation == 6:
+        return np.rot90(a, 1)
+    if orientation == 7:
+        return (a.transpose(1, 0, 2) if a.ndim == 3 else a.T)[::-1, ::-1]
+    if orientation == 8:
+        return np.rot90(a, -1)
+    return a
+
+
+def to_upright(a: np.ndarray, orientation: int) -> np.ndarray:
+    """The stored pixels turned the way the EXIF orientation shows them."""
+    if orientation == 6:
+        return np.rot90(a, -1)
+    if orientation == 8:
+        return np.rot90(a, 1)
+    return to_stored(a, orientation)                 # the flips and transposes are their own inverse
 
 
 def is_gray(rgb: np.ndarray) -> bool:
@@ -789,12 +861,7 @@ def write_summary(out: Path, lines) -> None:
 
 def fix_action(it, threshold: int, max_pixels: int) -> str:
     """fix, keep, or the skip reason."""
-    m = it.m
-    if m.get("skip"):
-        return m["skip"]
-    if m["width"] * m["height"] > max_pixels:
-        return "large"
-    return "fix" if m["qf"] < threshold else "keep"
+    return fix_action_of(it.m, threshold, max_pixels)
 
 
 def encode_jpeg(a: np.ndarray, quality: int) -> bytes:
@@ -1002,18 +1069,20 @@ def fix_one(model: QualityModel, d: dict, m: dict, offsets: list[int], quality: 
     orig = d["luma"] if d["gray"] else d["rgb"]
     qf = m.get("qf_color", m["qf"])
     jpeg = d["format"] in ("JPEG", "MPO")
-    outs, data = [], b""
+    outs, data, restored = [], b"", None
     for i, o in enumerate(offsets if sheet else offsets[:1]):
         y = model.restore("color", d["rgb"], min(100.0, qf + o))
         if d["gray"]:
             y = np.asarray(Image.fromarray(y).convert("L"))
+        if i == 0:
+            restored = y                                                   # the restoration itself
         if i == 0 or jpeg:
             enc = encode_output(y, d, quality)
             data = data or enc
             if jpeg:
                 y = np.array(Image.open(io.BytesIO(enc)))                  # what the file will hold
         outs.append(y)
-    r = {"data": data, "qf_used": round(min(100.0, qf + offsets[0]), 1),
+    r = {"data": data, "restored": restored, "qf_used": round(min(100.0, qf + offsets[0]), 1),
          "write": "jpeg" if d["format"] in ("JPEG", "MPO") else d["format"].lower(),
          "qf_after": round(model.qf("color", as_rgb(outs[0])), 1),
          "change": round(float(np.abs(orig.astype(np.int16) - outs[0]).mean()), 2),
@@ -1021,6 +1090,95 @@ def fix_one(model: QualityModel, d: dict, m: dict, offsets: list[int], quality: 
     if sheet:
         r["outs"] = outs
     return r
+
+
+def fix_action_of(m: dict, threshold: int, max_pixels: int) -> str:
+    """fix, keep, or the skip reason, from a measurement."""
+    if m.get("skip"):
+        return m["skip"]
+    if m["width"] * m["height"] > max_pixels:
+        return "large"
+    return "fix" if m["qf"] < threshold else "keep"
+
+
+# --- per-image API ---------------------------------------------------------------
+# What the pipeline tool calls, one image at a time, on pixels it decoded
+# itself: plan() measures and restores, apply() gives the restored pixels. The
+# command line goes through the same plan_decoded(), on files it decodes.
+
+_model: QualityModel | None = None
+
+
+def model_lazy() -> QualityModel:
+    """The FBCNN model, loaded on first use and kept."""
+    global _model
+    if _model is None:
+        _model = QualityModel()
+    return _model
+
+
+def plan_options(options: dict | None) -> dict:
+    return {"threshold": DEFAULT_THRESHOLD, "qf_offset": DEFAULT_QF_OFFSET, "max_pixels": DEFAULT_MAX_PIXELS,
+            "quality": DEFAULT_QUALITY, "min_block_drop": DEFAULT_MIN_BLOCK_DROP, "min_qf_gain": DEFAULT_MIN_QF_GAIN,
+            "sheet_offsets": [], "sheet": False, "model": None, "m": None, **(options or {})}
+
+
+def plan_decoded(d: dict, opts: dict) -> dict:
+    """The fix of one decoded image (decode or decode_array's dict), with the
+    options of plan(): measure it (or take opts["m"], the cached measurement),
+    decide, and restore it when its QF is under the threshold.
+    -> {"action": fix (worth saving), little benefit, keep or the skip reason,
+        "m": the measurement, "fix": fix_one's numbers with "benefit" and the
+        "data" to write, "restored": the restoration as stored pixels (None
+        unless worth saving), "outs" and "orig": for a contact-sheet tile when
+        opts["sheet"] is set}"""
+    if d["skip"]:
+        return {"action": d["skip"], "m": {k: d[k] for k in ("format", "mode", "width", "height", "gray",
+                                                             "header_q", "skip")}, "fix": {}, "restored": None}
+    model = opts["model"] or model_lazy()
+    m = opts["m"] or measure_one(model, d)
+    action = fix_action_of(m, opts["threshold"], opts["max_pixels"])
+    out = {"action": action, "m": m, "fix": {}, "restored": None}
+    if action != "fix":
+        return out
+    offsets = [opts["qf_offset"]] + [o for o in opts["sheet_offsets"] if o != opts["qf_offset"]]
+    r = fix_one(model, d, m, offsets, opts["quality"], opts["sheet"])
+    r["benefit"] = benefit(m, r, opts["min_block_drop"], opts["min_qf_gain"])
+    restored, outs = r.pop("restored"), r.pop("outs", None)
+    out["fix"] = r
+    if r["benefit"]:
+        out["restored"] = restored
+    else:
+        out["action"] = "little benefit"
+    if opts["sheet"]:
+        out["outs"], out["orig"] = outs, d["luma"] if d["gray"] else d["rgb"]
+    return out
+
+
+def plan(array: np.ndarray, head: dict, options: dict | None = None) -> dict:
+    """The fix of one image. array: the upright RGB uint8 pixels; head: the
+    facts of the file (facts_of, or a dict with its keys); options: threshold,
+    qf_offset, max_pixels, quality, min_block_drop, min_qf_gain (the command
+    line's defaults), model (a QualityModel, default model_lazy()), m (a cached
+    measurement of this file, else it is measured), sheet and sheet_offsets
+    (keep the restorations for a contact-sheet tile).
+    -> plan_decoded's dict, with "restored" turned upright and in RGB, so that
+    apply() can hand it back in place of array; the "data" bytes are left out."""
+    opts = plan_options(options)
+    d = decode_array(array, head, opts["max_pixels"])
+    out = plan_decoded(d, opts)
+    out["fix"].pop("data", None)
+    if out["restored"] is not None:
+        out["restored"] = np.ascontiguousarray(to_upright(as_rgb(out["restored"]), d["orientation"]))
+    return out
+
+
+def apply(array: np.ndarray, plan: dict) -> np.ndarray:
+    """The restored pixels when the plan found the restoration worth saving,
+    else array itself."""
+    if plan.get("action") == "fix" and plan.get("restored") is not None:
+        return plan["restored"]
+    return array
 
 
 FIX_FIELDS = ["path", "format", "mode", "width", "height", "gray", "header_q", "qf", "action", "benefit",
@@ -1270,6 +1428,10 @@ def fix_folder(root: Path, args, model_box: list) -> int:
             if not model_box:
                 model_box.append(QualityModel())
             model = model_box[0]
+            opts = plan_options({"threshold": args.threshold, "qf_offset": args.qf_offset, "max_pixels": args.max_pixels,
+                                 "quality": args.quality, "min_block_drop": args.min_block_drop,
+                                 "min_qf_gain": args.min_qf_gain, "sheet_offsets": args.sheet_offsets,
+                                 "sheet": sheets is not None, "model": model})
             progress = Progress(root.name, "restored", len(todo))
             with ThreadPoolExecutor(max_workers=args.threads) as pool, ThreadPoolExecutor(max_workers=2) as tiler:
                 decoded = bounded_map(pool, lambda it: decode(it.path, args.max_pixels), todo, args.threads * 2)
@@ -1278,9 +1440,9 @@ def fix_folder(root: Path, args, model_box: list) -> int:
                     if d["skip"]:                     # changed since it was measured
                         it.status = d["skip"]
                         continue
-                    r = fix_one(model, d, it.m, offsets, args.quality, sheets is not None)
-                    outs, data = r.pop("outs", None), r.pop("data")
-                    r["benefit"] = benefit(it.m, r, args.min_block_drop, args.min_qf_gain)
+                    p = plan_decoded(d, dict(opts, m=it.m))
+                    r, outs = p["fix"], p.get("outs")
+                    data = r.pop("data")
                     it.fix = r
                     if not r["benefit"]:
                         it.status = "little benefit"
