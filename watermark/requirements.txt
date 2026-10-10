@@ -1,0 +1,11 @@
+# torch and torchvision are installed by install.bat from the PyTorch CUDA index,
+# not from PyPI. Everything else comes from PyPI.
+ultralytics>=8.3
+huggingface_hub>=0.23
+# the DINOv3 backbone inside the yolov12x-dino3 checkpoint
+transformers>=4.56
+pillow>=10.0
+numpy>=2.0
+opencv-python>=4.8
+# lossless JPEG trim on the DCT coefficients
+jpeglib>=1.0
