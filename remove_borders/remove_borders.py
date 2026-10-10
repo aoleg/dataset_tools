@@ -88,14 +88,20 @@ class Item:
     @property
     def action(self) -> str:
         """skip, review, crop, too small or "" (nothing to do)."""
-        if skip_reason(self.head) or self.result.get("error"):
-            return "skip"
-        if self.result.get("review"):
-            return "review"
-        if not self.result.get("cuts"):
-            return ""
-        write = self.result.get("plan", {}).get("write", "")
-        return "too small" if write == "too small" else "crop" if write else ""
+        return action_of(self.head, self.result)
+
+
+def action_of(head: dict, result: dict) -> str:
+    """What the analysis of one image leads to: skip, review, crop, too small
+    or "" (nothing to do). result is analyse_array's dict with its "plan"."""
+    if skip_reason(head) or result.get("error"):
+        return "skip"
+    if result.get("review"):
+        return "review"
+    if not result.get("cuts"):
+        return ""
+    write = result.get("plan", {}).get("write", "")
+    return "too small" if write == "too small" else "crop" if write else ""
 
 
 # --- scan ---------------------------------------------------------------------
@@ -724,6 +730,73 @@ def crop_plan(head: dict, result: dict, min_area: int) -> dict:
     return plan
 
 
+# --- per-image API --------------------------------------------------------------
+# What the pipeline tool calls, one image at a time, on an image it decoded
+# itself: plan() on the upright (EXIF-transposed) pixels and the header, then
+# apply() for the box in the coordinates of that array. The analysis runs on
+# the stored pixels, as the command line does, so both give the same box.
+
+def to_stored(a: np.ndarray, orientation: int) -> np.ndarray:
+    """The upright pixels as the file stores them: the inverse of the EXIF
+    transpose (ImageOps.exif_transpose). A view where numpy allows one."""
+    if orientation == 2:
+        return a[:, ::-1]
+    if orientation == 3:
+        return a[::-1, ::-1]
+    if orientation == 4:
+        return a[::-1]
+    if orientation == 5:
+        return a.transpose(1, 0, 2)
+    if orientation == 6:
+        return np.rot90(a, 1)
+    if orientation == 7:
+        return a.transpose(1, 0, 2)[::-1, ::-1]
+    if orientation == 8:
+        return np.rot90(a, -1)
+    return a
+
+
+def to_upright(a: np.ndarray, orientation: int) -> np.ndarray:
+    """The stored pixels turned the way the EXIF orientation shows them,
+    exactly as ImageOps.exif_transpose turns the image."""
+    if orientation == 6:
+        return np.rot90(a, -1)
+    if orientation == 8:
+        return np.rot90(a, 1)
+    return to_stored(a, orientation)                 # the flips and transposes are their own inverse
+
+
+def plan(array: np.ndarray, head: dict, options: dict | None = None) -> dict:
+    """The border crop of one image. array: the upright RGB uint8 pixels
+    (transparency composited over white, as load_pixels gives them); head: the
+    file's read_header dict; options: "dark" (cut dark borders too, default
+    True) and "min_area" (default DEFAULT_MIN_AREA).
+    -> {"action": action_of, "result": the analysis with its crop plan,
+        "box": the crop in stored pixels or None, "display_box": the same in
+        upright pixels, "write": jpeg, exact, png, too small or ""}"""
+    opts = {"dark": True, "min_area": DEFAULT_MIN_AREA, **(options or {})}
+    o = head.get("orientation", 1)
+    result = analyse_array(to_stored(array, o), opts["dark"])
+    if result.get("cuts"):
+        result["plan"] = crop_plan(head, result, opts["min_area"])
+    out = {"action": action_of(head, result), "result": result, "box": None, "display_box": None, "write": ""}
+    if out["action"] in ("crop", "too small"):
+        box = result["plan"]["box"]
+        W, H = result["size"]
+        out.update(box=list(box), display_box=stored_to_display(box, o, W, H), write=result["plan"]["write"])
+    return out
+
+
+def apply(array: np.ndarray, plan: dict) -> list[int]:
+    """The box to keep, in the coordinates of the upright array: plan's
+    display box when it crops, else the whole array."""
+    h, w = array.shape[:2]
+    if plan.get("action") != "crop" or not plan.get("display_box"):
+        return [0, 0, w, h]
+    x0, y0, x1, y1 = plan["display_box"]
+    return [max(0, x0), max(0, y0), min(w, x1), min(h, y1)]
+
+
 # --- writing ------------------------------------------------------------------
 # Every write goes to <name>.part and replaces the target in one step. The
 # target keeps the modification time and the read-only flag of the source.
@@ -1106,13 +1179,21 @@ def tile_font(size: int):
 
 def make_tile(path: str, result: dict, label: str) -> tuple:
     """One sheet tile as (width, height, RGB bytes); runs in a worker process."""
-    tile = Image.new("RGB", (TILE_W, TILE_H), (40, 40, 48))
-    d = ImageDraw.Draw(tile)
     try:
         im = Image.fromarray(load_pixels(path))
     except Exception as e:  # noqa: BLE001 - a tile that cannot be drawn says why
-        d.text((6, 6), f"{label}: {type(e).__name__}: {e}", fill=(255, 120, 120), font=tile_font(13))
+        tile = Image.new("RGB", (TILE_W, TILE_H), (40, 40, 48))
+        ImageDraw.Draw(tile).text((6, 6), f"{label}: {type(e).__name__}: {e}", fill=(255, 120, 120),
+                                  font=tile_font(13))
         return tile.size[0], tile.size[1], tile.tobytes()
+    return tile_of(im, result, label)
+
+
+def tile_of(im: Image.Image, result: dict, label: str) -> tuple:
+    """The sheet tile of an image already decoded (stored pixels, RGB) and its
+    analysis: the thumbnail with the box, the four corners magnified, the label."""
+    tile = Image.new("RGB", (TILE_W, TILE_H), (40, 40, 48))
+    d = ImageDraw.Draw(tile)
     W, H = im.size
     x0, y0, x1, y1 = final_box(result)
     sc = min(THUMB / W, THUMB / H)
