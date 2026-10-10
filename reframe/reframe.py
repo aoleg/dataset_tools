@@ -1033,6 +1033,76 @@ def plan_crop(det: dict, sel: dict, head: dict, families, lossless: bool) -> dic
 
 
 # ---------------------------------------------------------------------------
+# Per-image API
+# ---------------------------------------------------------------------------
+# What the pipeline tool calls, one photo at a time: plan() on the upright RGB
+# pixels and the file header (image_header, or any dict with "orientation",
+# "stored" and, for a lossless crop, "mcu"), then apply() for the box in the
+# coordinates of that array. The command line goes through the same plan().
+
+_models: dict | None = None
+
+
+def models_lazy() -> dict:
+    """The three detectors, loaded on first use and kept."""
+    global _models
+    if _models is None:
+        _models = load_models()
+    return _models
+
+
+def plan(array: np.ndarray | None, head: dict, options: dict | None = None) -> dict:
+    """The subject crop of one photo. array: the upright RGB uint8 pixels (None
+    is allowed only with cached detections whose people are current, as the
+    command line reuses them); options:
+      models    the detectors (default: models_lazy())
+      det       cached detections of this photo (detect's dict); else detect runs
+      families  aspect ratios to choose from (default: all of AR_FAMILIES)
+      lossless  plan a lossless JPEG crop on the MCU grid (default True)
+      override  (action, [people]) from overrides.txt, or None
+    -> {"det": the detections with their people, "sel": select_subject's
+        choice, "crop": plan_crop's result or None, "verdict": crop or keep,
+        "reason", "flags", "box": the crop in upright pixels or None,
+        "stored_box": the same in stored pixels for a lossless crop, "fresh":
+        whether detect ran}"""
+    opts = options or {}
+    det = opts.get("det")
+    img = None if array is None else Image.fromarray(np.ascontiguousarray(array))
+    fresh = det is None
+    if fresh:
+        if img is None:
+            raise ValueError("plan() needs the pixels when there are no cached detections")
+        with GPU_LOCK:
+            det = detect(opts.get("models") or models_lazy(), img)
+    if det.get("people_version") != PEOPLE_VERSION:
+        if img is None:
+            raise ValueError("plan() needs the pixels to measure the people of cached detections")
+        det["people"] = people_for(det, img)
+        det["people_version"] = PEOPLE_VERSION
+    sel = select_subject(det, opts.get("override"))
+    crop = None
+    if sel["verdict"] == "crop":
+        crop = plan_crop(det, sel, head, opts.get("families") or list(AR_FAMILIES), opts.get("lossless", True))
+    cropping = bool(crop) and crop["verdict"] == "crop"
+    return {"det": det, "sel": sel, "crop": crop, "fresh": fresh,
+            "verdict": "crop" if cropping else "keep",
+            "reason": sel["reason"] if cropping or not crop else crop["reason"],
+            "flags": sel["flags"] + ((crop or {}).get("flags") or []),
+            "box": list(crop["box"]) if cropping else None,
+            "stored_box": list(crop["stored_box"]) if cropping and crop.get("stored_box") else None}
+
+
+def apply(array: np.ndarray, plan: dict) -> list[int]:
+    """The box to keep, in the coordinates of the upright array: the planned
+    crop, else the whole array."""
+    h, w = array.shape[:2]
+    if plan.get("verdict") != "crop" or not plan.get("box"):
+        return [0, 0, w, h]
+    x0, y0, x1, y1 = plan["box"]
+    return [max(0, x0), max(0, y0), min(w, x1), min(h, y1)]
+
+
+# ---------------------------------------------------------------------------
 # Writing
 # ---------------------------------------------------------------------------
 
@@ -1684,31 +1754,23 @@ def main(argv=None) -> int:
             previews for one photo -> (rel, detections, plan entry, log line)."""
             rel = path.relative_to(root).as_posix()
             st, fresh = stats[path]
-            img = None
+            det = None if fresh else cache[rel]
+            # the pixels are needed for detection, for the focus measure of
+            # people not measured yet, and for the previews; not otherwise
+            need_img = fresh or det.get("people_version") != PEOPLE_VERSION or args.previews or args.people \
+                or args.verdicts
+            img = load_image(path) if need_img else None
+            p = plan(None if img is None else np.asarray(img), image_header(path),
+                     {"models": models, "det": det, "families": families,
+                      "lossless": not (args.reencode or args.resize), "override": overrides.get(rel.lower())})
+            det, sel, crop = p["det"], p["sel"], p["crop"]
             if fresh:
-                img = load_image(path)
-                with GPU_LOCK:
-                    det = detect(models, img)
                 det.update(size=st.st_size, mtime_ns=st.st_mtime_ns)
-            else:
-                det = cache[rel]
-            if det.get("people_version") != PEOPLE_VERSION:
-                img = img or load_image(path)                # focus needs the pixels
-                det["people"] = people_for(det, img)
-                det["people_version"] = PEOPLE_VERSION
             if args.previews:
-                img = img or load_image(path)
                 draw_preview(img, det, out_dir / PREVIEW_DIRNAME / (rel + ".jpg"))
             if args.people:
-                img = img or load_image(path)
                 draw_people(img, det["people"], out_dir / PEOPLE_PREVIEW_DIRNAME / (rel + ".jpg"))
-            sel = select_subject(det, overrides.get(rel.lower()))
-            crop = None
-            if sel["verdict"] == "crop":
-                crop = plan_crop(det, sel, image_header(path), families,
-                                 lossless=not (args.reencode or args.resize))
             if args.verdicts:
-                img = img or load_image(path)
                 draw_verdict(img, det, sel, out_dir / VERDICT_PREVIEW_DIRNAME / (rel + ".jpg"), crop)
             if crop and crop["verdict"] == "crop":
                 what = (f"CROP {crop['family']} {crop['size'][0]}x{crop['size'][1]} "
@@ -1722,7 +1784,7 @@ def main(argv=None) -> int:
                     + ("" if fresh else " (cached)"))
             return rel, det, dict(sel, crop=crop), line
 
-        results, plan, failed = {}, {}, []
+        results, photos, failed = {}, {}, []
         with ThreadPoolExecutor(max_workers=args.threads) as pool:
             futures = {pool.submit(analyse, path): path for path in files}
             for k, fut in enumerate(as_completed(futures), 1):
@@ -1735,24 +1797,24 @@ def main(argv=None) -> int:
                     print(f"[{k}/{len(files)}] {rel}: could not be analysed: {type(ex).__name__}: {ex}",
                           flush=True)
                     continue
-                results[rel], plan[rel] = det, entry
+                results[rel], photos[rel] = det, entry
                 print(f"[{k}/{len(files)}] {line}", flush=True)
         order = [p.relative_to(root).as_posix() for p in files]
         results = {r: results[r] for r in order if r in results}
-        plan = {r: plan[r] for r in order if r in plan}
-        files = [p for p in files if p.relative_to(root).as_posix() in plan]
+        photos = {r: photos[r] for r in order if r in photos}
+        files = [p for p in files if p.relative_to(root).as_posix() in photos]
         write_json(cache_path, {"version": CACHE_VERSION, "models": models_signature(),
                                 "written": datetime.now().isoformat(timespec="seconds"), "files": results})
         write_json(out_dir / PLAN_NAME, {"written": datetime.now().isoformat(timespec="seconds"),
-                                         "people_version": PEOPLE_VERSION, "photos": plan})
-        n_crop = sum(1 for v in plan.values() if v["crop"] and v["crop"]["verdict"] == "crop")
-        n_flag = sum(1 for v in plan.values() if v["flags"] or (v["crop"] or {}).get("flags"))
+                                         "people_version": PEOPLE_VERSION, "photos": photos})
+        n_crop = sum(1 for v in photos.values() if v["crop"] and v["crop"]["verdict"] == "crop")
+        n_flag = sum(1 for v in photos.values() if v["flags"] or (v["crop"] or {}).get("flags"))
         print(f"{n_new} detected, {len(stats) - n_new} from cache, {time.time() - t0:.0f}s, "
               f"{args.threads} thread(s); " + (f"{len(failed)} failed; " if failed else "") +
-              f"{n_crop} to crop, {len(plan) - n_crop} unchanged" + (f", {n_flag} flagged" if n_flag else "")
+              f"{n_crop} to crop, {len(photos) - n_crop} unchanged" + (f", {n_flag} flagged" if n_flag else "")
               + f" -> {out_dir / PLAN_NAME}")
         if not args.dry_run:
-            write_outputs(root, out_dir, files, plan, args)
+            write_outputs(root, out_dir, files, photos, args)
     return 0
 
 
