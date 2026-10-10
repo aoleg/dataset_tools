@@ -89,6 +89,51 @@ def make_mask(size, boxes, grow: float, feather: int, include_hair: bool,
     return mask
 
 
+# --- per-image API ---------------------------------------------------------------
+# What the pipeline tool calls, one image at a time: plan() detects the faces
+# of the upright RGB pixels and keeps the mask options, apply() draws the mask.
+# The command line goes through the same two functions.
+
+_model = None
+
+
+def model_lazy(name: str = DEFAULT_MODEL):
+    """The face detector, loaded on first use and kept."""
+    global _model
+    if _model is None:
+        _model = load_model(name)
+    return _model
+
+
+def plan(array: np.ndarray, head: dict | None = None, options: dict | None = None) -> dict:
+    """The faces of one image. array: the upright RGB uint8 pixels (head is
+    not needed; it is accepted for the uniform call); options: conf (detector
+    threshold, default 0.3), grow (default 1.35), feather (default 12),
+    include_hair and invert (default False), model (default model_lazy()).
+    -> {"boxes": [[x0, y0, x1, y1], ...], "size": [w, h], and the mask options}"""
+    opts = {"conf": 0.3, "grow": 1.35, "feather": 12, "include_hair": False, "invert": False, **(options or {})}
+    model = opts.pop("model", None) or model_lazy()
+    img = Image.fromarray(np.ascontiguousarray(array))
+    boxes = [list(b) for b in face_boxes(model, img, opts["conf"])]
+    return {"boxes": boxes, "size": [img.width, img.height], **opts}
+
+
+def apply(array: np.ndarray, plan: dict) -> np.ndarray:
+    """The mask of array as a uint8 HxW array: 255 where the training loss
+    counts, 0 over the faces (the other way round with invert). The mask is
+    drawn at the size of array: when the faces were found on a larger image
+    they are scaled to it."""
+    h, w = array.shape[:2]
+    pw, ph = plan.get("size") or [w, h]
+    boxes = plan["boxes"]
+    if (pw, ph) != (w, h) and boxes:
+        sx, sy = w / pw, h / ph
+        boxes = [[b[0] * sx, b[1] * sy, b[2] * sx, b[3] * sy] for b in boxes]
+    mask = make_mask((w, h), boxes, plan.get("grow", 1.35), plan.get("feather", 12),
+                     plan.get("include_hair", False), plan.get("invert", False))
+    return np.asarray(mask)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("img_dir")
@@ -121,6 +166,8 @@ def main():
         sys.exit(f"no images in {args.img_dir}")
 
     model = load_model(args.model)
+    options = {"conf": args.conf, "grow": args.grow, "feather": args.feather, "include_hair": args.include_hair,
+               "invert": args.invert, "model": model}
     no_face = []
     for i, f in enumerate(files, 1):
         stem = os.path.splitext(f)[0]
@@ -128,10 +175,12 @@ def main():
         if os.path.exists(out) and not args.overwrite:
             continue
         img = ImageOps.exif_transpose(Image.open(os.path.join(args.img_dir, f))).convert("RGB")
-        boxes = face_boxes(model, img, args.conf)
+        array = np.asarray(img)
+        p = plan(array, None, options)
+        boxes = p["boxes"]
         if not boxes:
             no_face.append(f)
-        mask = make_mask(img.size, boxes, args.grow, args.feather, args.include_hair, args.invert)
+        mask = Image.fromarray(apply(array, p))
         mask.save(out)
         if args.preview:
             red = Image.new("RGB", img.size, (255, 0, 0))
