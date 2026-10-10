@@ -179,9 +179,9 @@ On the 3,258 images under QF 80 of the dataset above, the rule saved 68 of 75 un
 
 ### Backup and undo
 
-The original of a restored image goes to `_backup\<relative path>`, with copies of its captions. When `_backup` already holds a different original of that path (from `remove_borders`, for example), that one stays, and this run's original goes to `_backup\_jpeg_cleanup\originals\<run>\<relative path>`. A backup is never overwritten.
+The original of a restored image goes to `_backup\<relative path>`, with copies of its captions. When `_backup` already holds an original of that path (from `remove_borders`, the pipeline, or an earlier run), that one stays: a backup is the one untouched original of an image, shared by every tool, and it is never overwritten.
 
-`--undo` takes the last run that is not undone yet and puts back every image it restored, newest first, from where the run kept its original. A backup the run made is removed; one that was there before stays. Caption copies the run made are removed while the caption in place is unchanged, and a missing caption comes back. Each `--undo` goes one run further back. A run that wrote nothing logs no run.
+`--undo` takes the last run that is not undone yet and returns every image it restored to its original in `_backup`, newest first; an earlier run's change to the same image goes with it, since the only backup is the original. A backup the run made is removed; one that was there before stays. Caption copies the run made are removed while the caption in place is unchanged, and a missing caption comes back. Each `--undo` goes one run further back. A run that wrote nothing logs no run.
 
 ### Contact sheets
 
@@ -204,7 +204,6 @@ The original of a restored image goes to `_backup\<relative path>`, with copies 
     report.csv               the last fix, dry or real, one row per image
     sheets\                  its contact sheets
     log.jsonl                every real run and undo, step by step
-    originals\<run>\         originals whose place in _backup was taken
 ```
 
 `extract.csv` columns: `path` (relative to the dataset folder), `format`, `mode`, `width`, `height`, `megapixels`, `gray` (1 for a black-and-white image), `header_q` (the quality of the last save, estimated from the JPEG luminance table), `qf_color` and `qf_gray` (the QF of each model), `qf` (the one that decides), `band`, `copy` (relative to the output folder), `status` (copied, above, or the skip reason). A `qf` well under `header_q` means the image was compressed harder before its last save.

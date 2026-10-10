@@ -78,7 +78,6 @@ SUMMARY_NAME = "summary.txt"
 REPORT_NAME = "report.csv"        # inside _backup/_jpeg_cleanup: the fix, one row per image
 SHEETS_DIRNAME = "sheets"         # inside _backup/_jpeg_cleanup: the contact sheets of the last fix run
 LOG_NAME = "log.jsonl"            # inside _backup/_jpeg_cleanup: every real run and undo; --undo reads it
-ORIGINALS_DIRNAME = "originals"   # inside _backup/_jpeg_cleanup: originals whose place in _backup was taken
 MANIFEST_NAME = "manifest.json"   # the files the last extract copied, removed by the next one
 MOVES_NAME = "moves.json"         # the moves of a re-sort in progress; the next run finishes them
 PROGRESS_EVERY = 500              # images between progress lines
@@ -1211,10 +1210,10 @@ def write_report(root: Path, items) -> Path:
 
 # --- writing, backup and undo ------------------------------------------------------
 # A real run logs every image before it touches it, so --undo can put back an
-# interrupted run too. The original goes to _backup/<relative path>, unless an
-# earlier original of that path is there already (from remove_borders, say);
-# then it goes to _backup/_jpeg_cleanup/originals/<run>/<relative path>, so the
-# undo returns exactly what this run started from and the earlier one stays.
+# interrupted run too. The original goes to _backup/<relative path>; when an
+# earlier original of that path is there already (from remove_borders, say, or
+# an earlier run), it stays: a backup is the one untouched original of an
+# image, shared by every tool, and the undo returns the image to it.
 
 class RunLog:
     """log.jsonl in the run folder: one JSON object per line, flushed as written."""
@@ -1265,10 +1264,8 @@ def finish_write(tmp: Path, dst: Path, src_stat: os.stat_result) -> None:
 
 
 def backup_place(root: Path, it, run_id: str) -> Path:
-    bk = root / BACKUP_DIRNAME / it.rel
-    if bk.exists() and not same_bytes(it.path, bk):
-        bk = root / BACKUP_DIRNAME / RUN_DIRNAME / ORIGINALS_DIRNAME / run_id / it.rel
-    return bk
+    """_backup/<relative path>, whether or not an original is there already."""
+    return root / BACKUP_DIRNAME / it.rel
 
 
 def write_fix(root: Path, it, data: bytes, bk: Path) -> dict:
@@ -1317,9 +1314,10 @@ def last_run(entries: list[dict]) -> tuple[str | None, list[dict]]:
 
 def undo_root(root: Path) -> dict:
     """Put back what the last run of root changed, newest first. An image gets
-    its original back from where the run kept it; a backup this run made is
-    removed, one that was there before stays. A caption backup this run made
-    is removed when the caption in place has the same bytes. -> counts."""
+    its original back from _backup (the one untouched original, so an earlier
+    run's change to the image goes too); a backup this run made is removed,
+    one that was there before stays. A caption backup this run made is
+    removed when the caption in place has the same bytes. -> counts."""
     run_id, recs = last_run(read_log(root))
     counts = {"restored": 0, "no backup": 0}
     if run_id is None:
