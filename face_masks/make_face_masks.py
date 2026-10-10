@@ -105,6 +105,12 @@ def model_lazy(name: str = DEFAULT_MODEL):
     return _model
 
 
+def unload() -> None:
+    """Drop the detector loaded by model_lazy(), so its memory can go."""
+    global _model
+    _model = None
+
+
 def plan(array: np.ndarray, head: dict | None = None, options: dict | None = None) -> dict:
     """The faces of one image. array: the upright RGB uint8 pixels (head is
     not needed; it is accepted for the uniform call); options: conf (detector

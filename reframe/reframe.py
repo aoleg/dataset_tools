@@ -1051,6 +1051,12 @@ def models_lazy() -> dict:
     return _models
 
 
+def unload() -> None:
+    """Drop the detectors loaded by models_lazy(), so their memory can go."""
+    global _models
+    _models = None
+
+
 def plan(array: np.ndarray | None, head: dict, options: dict | None = None) -> dict:
     """The subject crop of one photo. array: the upright RGB uint8 pixels (None
     is allowed only with cached detections whose people are current, as the

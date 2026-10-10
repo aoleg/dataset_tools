@@ -1117,6 +1117,12 @@ def model_lazy() -> QualityModel:
     return _model
 
 
+def unload() -> None:
+    """Drop the model loaded by model_lazy(), so its memory can go."""
+    global _model
+    _model = None
+
+
 def plan_options(options: dict | None) -> dict:
     return {"threshold": DEFAULT_THRESHOLD, "qf_offset": DEFAULT_QF_OFFSET, "max_pixels": DEFAULT_MAX_PIXELS,
             "quality": DEFAULT_QUALITY, "min_block_drop": DEFAULT_MIN_BLOCK_DROP, "min_qf_gain": DEFAULT_MIN_QF_GAIN,

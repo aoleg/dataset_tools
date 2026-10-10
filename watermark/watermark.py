@@ -189,6 +189,15 @@ def lama_lazy() -> Lama:
     return _lama
 
 
+def unload(detector: bool = True, lama: bool = True) -> None:
+    """Drop the models loaded by detector_lazy() and lama_lazy(), so their memory can go."""
+    global _detector, _lama
+    if detector:
+        _detector = None
+    if lama:
+        _lama = None
+
+
 # --- detection and painting ---------------------------------------------------------
 
 def detect(model, array: np.ndarray, conf: float) -> list:
