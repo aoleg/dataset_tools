@@ -1,43 +1,55 @@
 #!/usr/bin/env python3
 """
-Run the repair tools of this repository over a dataset image by image: each
-image is decoded once, passes through the chosen stages in memory, and is
-written once. No temporary files.
+Run the repair tools of this repository over a dataset from a job file, one
+model at a time: detection passes over all images first, each loading one
+model and caching what it finds, then the plan, then one apply pass that
+decodes each image once, runs the in-memory chain, and writes it once.
 
-Stages, in this order, each taken from its own tool folder (../remove_borders,
-../watermark, ../reframe, ../jpeg_cleanup, ../face_masks):
-  borders        frames, lines and text banners -> a crop box
-  watermark      watermark boxes -> painted out, or a trim box
-  reframe        the subject of a photo of people -> a crop box
-  (compose)      one crop box from the boxes above, on the JPEG block grid
-  (inpaint)      the watermark boxes still inside the crop are painted out
-  jpeg_cleanup   heavily compressed JPEGs restored with FBCNN
-  (write)        no pixel stage touched the image: one lossless crop of the
-                 file (whole DCT blocks for JPEG, exact for lossless formats,
-                 a lossy format into PNG); otherwise the pixels, once, as
-                 JPEG quality 97 without chroma subsampling, or PNG
-  face_masks     a loss mask of the final image into <folder>/masks/<stem>.png
+Passes, in this order, each over all the images of the job (or its file list):
+  borders    remove_borders analysis (CPU)                  -> border cuts
+  watermark  the watermark detector, on the full original   -> boxes
+  reframe    the three reframe detectors, on the original   -> people
+  faces      the face detector, on the full original        -> face boxes
+  quality    the FBCNN quality predictor, on the original   -> quality factor
+  compose    no model: one crop box from the border cuts, the watermark trim
+             and the subject crop, on the JPEG block grid; the watermark boxes
+             left inside it; the face boxes moved into it; whether the image
+             is eligible for the cleanup (QF under the threshold, crop within
+             the size limit)
+  benefit    FBCNN restores the composed crop of each eligible image in
+             memory and judges, as jpeg_cleanup does, whether the restoration
+             is worth saving (the apply pass restores again: FBCNN runs twice)
+  apply      decode once upright, crop, paint the watermark boxes left inside
+             the crop (LaMa), restore (FBCNN) when the verdict says so, write
+             once (a lossless crop of the file when no pixel stage touched the
+             image), then the face mask of the final image into masks/
+Every detection is cached per image in <folder>/_backup/_pipeline/cache.json,
+keyed by the file's size and time and the model's signature, so a pass whose
+results are cached loads no model, and a real run after a dry run detects
+nothing again. A dry run is every pass but the last; it writes plan.json and
+the previews (reframe verdicts, border and cleanup contact sheets, watermark
+masks). The detection passes only read the images; the apply pass changes
+files and must run alone.
 
-The job comes from a JSON file (--job), see JOB_EXAMPLE and the README. Two
-output modes: "in_place" changes the dataset folder, with every original and
-its captions copied to <folder>/_backup/<same relative path> first (never
-over an earlier backup) and the run logged in _backup/_pipeline/log.jsonl, so
-that --undo puts the last run back; "parallel" writes the whole tree into a
-new folder and copies the unchanged images and the captions along. A dry run
-changes nothing: it writes the report, the previews (reframe verdicts, border
-and cleanup contact sheets, watermark masks) and the detection caches in
-_backup/_pipeline, so the real run that follows does no new GPU work for the
-detections. Captions are never deleted or changed; the log says which images
+Two output modes: "in_place" changes the dataset folder, with the original of
+every changed image and its caption copied to <folder>/_backup/<same
+relative path> before the write, never over an original that is there
+already (one backup per image, the untouched original, shared with the other
+tools), and the run logged in _backup/_pipeline/log.jsonl, so that --undo
+returns the images of the last run to their originals; "parallel" writes the
+whole tree into a new folder with the unchanged images and the captions
+copied along. Captions are never deleted or changed; the log says which images
 changed, so they can be captioned again.
 
-Progress goes to stdout as one JSON line per image (index, total, path, what
-changed, what was written) and a final summary line.
+Progress goes to stdout as JSON lines: one per image per pass (pass, index,
+total, path), a summary per pass, and a final summary.
 
 Usage:    python pipeline.py --job job.json [--dry-run] [--undo] [--threads N]
 Install:  ..\\install.bat (the install.bat of every tool above, in sequence)
 """
 import argparse
 import filecmp
+import gc
 import json
 import os
 import shutil
@@ -67,14 +79,14 @@ import jpeg_cleanup as jc  # noqa: E402
 import make_face_masks as fm  # noqa: E402
 
 BACKUP_DIRNAME = "_backup"
-RUN_DIRNAME = "_pipeline"                         # inside _backup: log, cache, report, previews, originals
+RUN_DIRNAME = "_pipeline"                         # inside _backup: log, cache, plan, report, previews
 LOG_NAME = "log.jsonl"
 CACHE_NAME = "cache.json"
+PLAN_NAME = "plan.json"
 REPORT_NAME = "report.jsonl"
 PREVIEWS_DIRNAME = "previews"
-ORIGINALS_DIRNAME = "originals"                   # originals whose place in _backup was taken by an earlier tool's
 MASKS_DIRNAME = "masks"
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 STAGES = ["borders", "watermark", "reframe", "jpeg_cleanup", "face_masks"]
 IMAGE_EXTS = rb.IMAGE_EXTS
 DEFAULT_EXCLUDES = rb.DEFAULT_EXCLUDES
@@ -82,6 +94,8 @@ DEFAULT_THREADS = 4
 JPEG_QUALITY = 97
 PNG_LEVEL = 6
 TRIM_MIN_OF_REFRAME = 0.5         # a trim that keeps less of the reframe crop is dropped for painting
+HEAD_KEYS = ("format", "kind", "mode", "bits", "width", "height", "mcu", "orientation", "frames", "error",
+             "header_q", "lossless_webp", "transparent", "stored")
 
 JOB_EXAMPLE = {
     "folder": "D:/datasets/set",
@@ -153,7 +167,13 @@ def read_job(path: Path, args) -> Job:
                excludes=DEFAULT_EXCLUDES + list(data.get("exclude") or []))
 
 
-# --- scan ---------------------------------------------------------------------------
+# --- scan and decode ----------------------------------------------------------------
+
+def file_key(path: Path) -> list[int]:
+    """A file counts as the same while its size and modification time stay."""
+    st = os.stat(path)
+    return [st.st_size, st.st_mtime_ns]
+
 
 def scan(job: Job) -> list[Item]:
     """The images to process, with their .txt captions: the job's file list,
@@ -164,7 +184,7 @@ def scan(job: Job) -> list[Item]:
         for rel in job.files:
             p = root / rel
             if not p.is_file():
-                print(json.dumps({"warning": f"not a file: {rel}"}), flush=True)
+                emit({"warning": f"not a file: {rel}"})
                 continue
             items.append(Item(path=p, rel=p.relative_to(root).as_posix()))
     else:
@@ -179,33 +199,51 @@ def scan(job: Job) -> list[Item]:
         cap = it.path.with_suffix(".txt")
         it.sidecars = [cap] if cap.is_file() else []
         try:
-            it.key = rb.file_key(it.path)
+            it.key = file_key(it.path)
         except OSError:
             it.key = None
     return items
 
 
-# --- decoding -------------------------------------------------------------------------
-
-def decode_image(path: Path) -> tuple[dict, np.ndarray | None]:
+def read_head(path: Path) -> dict:
     """The header of one image (remove_borders' read_header plus jpeg_cleanup's
-    facts: exif, icc, header_q, frames, transparency) and its upright RGB uint8
-    pixels, transparency composited over white. Pixels None when skipped."""
+    facts), without the EXIF and ICC bytes, so it can be cached as JSON."""
     head = rb.read_header(path)
+    head["stored"] = [head["width"], head["height"]]
+    head.setdefault("header_q", None)
+    head.setdefault("lossless_webp", False)
+    head.setdefault("transparent", False)
     if head["error"] or head["frames"] > 1:
-        return head, None
+        return head
     with Image.open(path) as im:
-        head.update({k: v for k, v in jc.facts_of(im, path).items()
-                     if k in ("exif", "icc", "header_q", "lossless_webp")})
-        head["transparent"] = False
+        facts = jc.facts_of(im, path)
+        head["header_q"], head["lossless_webp"] = facts["header_q"], facts["lossless_webp"]
         if "A" in im.mode or (im.mode == "P" and "transparency" in im.info) or "transparency" in im.info:
             try:
                 head["transparent"] = im.convert("RGBA").getchannel("A").getextrema()[0] < 255
             except Exception:  # noqa: BLE001
                 head["transparent"] = True
-    head["stored"] = [head["width"], head["height"]]
+    return head
+
+
+def decode_image(path: Path, head: dict | None = None) -> tuple[dict, np.ndarray | None]:
+    """The header and the upright RGB uint8 pixels of one image, transparency
+    composited over white. Pixels None when the image is skipped."""
+    head = head or read_head(path)
+    if head["error"] or head["frames"] > 1:
+        return head, None
     stored = rb.load_pixels(path)
     return head, np.ascontiguousarray(rb.to_upright(stored, head["orientation"]))
+
+
+def upright_size(head: dict) -> tuple[int, int]:
+    w, h = head["stored"]
+    return (h, w) if head["orientation"] in (5, 6, 7, 8) else (w, h)
+
+
+def exif_and_icc(path: Path) -> tuple:
+    with Image.open(path) as im:
+        return im.info.get("exif"), im.info.get("icc_profile")
 
 
 # --- boxes ----------------------------------------------------------------------------
@@ -223,20 +261,18 @@ def area(box) -> int:
     return max(0, box[2] - box[0]) * max(0, box[3] - box[1])
 
 
-def align_box(display_box, head: dict, inward_display_sides: set) -> tuple[list, list | None]:
+def align_box(display_box, head: dict, inward_display_sides: set) -> tuple[list, list]:
     """The composed crop on the JPEG block grid, in stored pixels: the stored
     origin moves to the MCU grid, inward (so that a border or a watermark goes
     completely) on a side that a border cut or a trim set, outward on the
     others, as remove_borders and reframe do on their own; the far edges stay.
-    inward_display_sides holds "L" and "T" (and "R", "B", which only matter
-    for an image stored rotated) in upright terms.
+    inward_display_sides holds "L", "T", "R", "B" in upright terms.
     -> (display box, stored box); a non-JPEG gets its exact box in stored pixels."""
     o, (sw, sh) = head["orientation"], head["stored"]
     stored = rf.display_to_stored([int(v) for v in display_box], o, sw, sh)
     if not head.get("mcu"):
         return [int(v) for v in display_box], [int(v) for v in stored]
     mw, mh = head["mcu"]
-    # which upright side became the stored left and top
     left_src = {1: "L", 2: "R", 3: "R", 4: "L", 5: "T", 6: "T", 7: "B", 8: "B"}[o]
     top_src = {1: "T", 2: "T", 3: "B", 4: "B", 5: "L", 6: "R", 7: "R", 8: "L"}[o]
     x0, y0, x1, y1 = stored
@@ -250,11 +286,12 @@ def align_box(display_box, head: dict, inward_display_sides: set) -> tuple[list,
     return [int(v) for v in rb.stored_to_display(stored, o, sw, sh)], stored
 
 
-# --- the stages of one image ------------------------------------------------------------
+# --- caches -----------------------------------------------------------------------------
 
 class Caches:
-    """Per-file detection caches in _backup/_pipeline/cache.json, keyed by
-    the file (size, time, ID) and a signature of the stage's inputs."""
+    """Per-file caches in _backup/_pipeline/cache.json: the header and, per
+    pass, the result under a signature of the pass's inputs. An entry holds
+    while the file's size and time stay."""
 
     def __init__(self, root: Path):
         self.path = root / BACKUP_DIRNAME / RUN_DIRNAME / CACHE_NAME
@@ -265,20 +302,34 @@ class Caches:
             self.files = {}
         self.dirty = False
 
-    def get(self, it: Item, stage: str, sig: str):
+    def entry(self, it: Item) -> dict | None:
         e = self.files.get(it.rel)
-        if not e or not it.key or e.get("key") != it.key:
-            return None
-        return e.get(stage, {}).get(sig)
+        return e if e and it.key and e.get("key") == it.key else None
 
-    def put(self, it: Item, stage: str, sig: str, value) -> None:
+    def get(self, it: Item, pass_name: str, sig: str):
+        e = self.entry(it)
+        return None if e is None else e.get(pass_name, {}).get(sig)
+
+    def put(self, it: Item, pass_name: str, sig: str, value) -> None:
         if not it.key:
             return
-        e = self.files.get(it.rel)
-        if not e or e.get("key") != it.key:
+        e = self.entry(it)
+        if e is None:
             e = self.files[it.rel] = {"key": it.key}
-        e.setdefault(stage, {})[sig] = value
+        e.setdefault(pass_name, {})[sig] = value
         self.dirty = True
+
+    def head(self, it: Item) -> dict:
+        e = self.entry(it)
+        if e is not None and e.get("head"):
+            return dict(e["head"])
+        head = {k: v for k, v in read_head(it.path).items() if k in HEAD_KEYS}
+        if it.key:
+            if e is None:
+                e = self.files[it.rel] = {"key": it.key}
+            e["head"] = head
+            self.dirty = True
+        return dict(head)
 
     def save(self) -> None:
         if not self.dirty:
@@ -295,11 +346,40 @@ def sig(*parts) -> str:
     return json.dumps(parts, sort_keys=True, separators=(",", ":"))
 
 
-class Stages:
-    """The stage functions with their options, models loaded on first use."""
+def emit(obj: dict) -> None:
+    print(json.dumps(obj, ensure_ascii=False), flush=True)
 
-    def __init__(self, job: Job, caches: Caches):
-        self.job, self.caches = job, caches
+
+def bounded_map(pool, fn, args, window: int):
+    pending = deque()
+    it = iter(args)
+    for a in it:
+        pending.append(pool.submit(fn, a))
+        if len(pending) >= window:
+            break
+    while pending:
+        yield pending.popleft().result()
+        nxt = next(it, None)
+        if nxt is not None:
+            pending.append(pool.submit(fn, nxt))
+
+
+def free_gpu() -> None:
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+# --- the detection passes -------------------------------------------------------------
+
+class Stages:
+    """The options of the stages in the job, with their tools' defaults."""
+
+    def __init__(self, job: Job):
         s = job.stages
         self.borders = {"dark": True, "min_area": rb.DEFAULT_MIN_AREA, **(s.get("borders") or {})} if "borders" in s else None
         self.watermark = ({"conf": wm.DEFAULT_CONF, "dilate": wm.DEFAULT_DILATE, "mode": "inpaint",
@@ -318,178 +398,274 @@ class Stages:
             if bad:
                 raise SystemExit(f"reframe: unknown ratio(s) {', '.join(bad)}; choose from {', '.join(rf.AR_FAMILIES)}")
 
-    # borders runs on the CPU, in the decoder threads
-    def plan_borders(self, it: Item, head: dict, array: np.ndarray) -> dict | None:
-        if not self.borders:
-            return None
-        key = sig(rb.DETECTOR_VERSION, self.borders)
-        cached = self.caches.get(it, "borders", key)
-        if cached is not None:
-            result = dict(cached)
-            if result.get("cuts"):
-                result["plan"] = rb.crop_plan(head, result, self.borders["min_area"])
-            action = rb.action_of(head, result)
-            p = {"action": action, "result": result, "box": None, "display_box": None, "write": ""}
-            if action in ("crop", "too small"):
-                box = result["plan"]["box"]
-                W, H = result["size"]
-                p.update(box=list(box), display_box=rb.stored_to_display(box, head["orientation"], W, H),
-                         write=result["plan"]["write"])
-            return p
-        p = rb.plan(array, head, self.borders)
-        self.caches.put(it, "borders", key, {k: v for k, v in p["result"].items() if k != "plan"})
-        return p
 
-    def detect_watermark(self, it: Item, sub: np.ndarray, sub_box) -> list:
-        key = sig(wm.DETECTOR_VERSION, self.watermark["conf"], sub_box)
-        cached = self.caches.get(it, "watermark", key)
-        if cached is not None:
-            return [list(b) for b in cached]
-        boxes = wm.detect(wm.detector_lazy()[1], sub, self.watermark["conf"])
-        self.caches.put(it, "watermark", key, boxes)
-        return boxes
+def detection_pass(name: str, items: list, caches: Caches, signature, compute, threads: int,
+                   in_threads: bool = False, unload=None, only=None) -> dict:
+    """One pass over the images: the result of compute(it, head, array) cached
+    under the pass name and signature (a string, or a function of the item).
+    Images whose result is cached are not decoded; a pass with nothing to
+    compute loads no model. compute runs in the main thread (a GPU model), or
+    in the decoder threads with in_threads (CPU work). only: the items the
+    pass applies to (default all). unload() is called at the end to drop the
+    model. -> the pass summary."""
+    t0 = time.perf_counter()
+    chosen = items if only is None else only
+    total = len(chosen)
+    index = {it.rel: n for n, it in enumerate(chosen, 1)}
+    sig_of = signature if callable(signature) else (lambda it: signature)
+    todo, counts = [], {"computed": 0, "cached": 0, "skipped": 0, "failed": 0}
+    for it in chosen:
+        if it.key and caches.get(it, name, sig_of(it)) is not None:
+            counts["cached"] += 1
+            emit({"pass": name, "index": index[it.rel], "total": total, "path": it.rel, "cached": True})
+        else:
+            todo.append(it)
 
-    def plan_reframe(self, it: Item, sub: np.ndarray, sub_box, head: dict) -> dict:
-        key = sig(rf.CACHE_VERSION, rf.models_signature(), sub_box)
-        det = self.caches.get(it, "reframe", key)
-        fresh = det is None
-        p = rf.plan(sub, {"format": head["format"], "orientation": 1, "stored": [sub.shape[1], sub.shape[0]]},
-                    {"det": None if fresh else dict(det), "families": self.reframe["ratios"], "lossless": False,
-                     "override": self.overrides.get(it.rel.lower())})
-        if fresh or det.get("people_version") != rf.PEOPLE_VERSION:
-            self.caches.put(it, "reframe", key, p["det"])
-        return p
+    def work(it: Item):
+        try:
+            head, array = decode_image(it.path, caches.head(it))
+            if array is None:
+                return it, head, None, None, ""
+            value = compute(it, head, array) if in_threads else None
+            return it, head, array, value, ""
+        except Exception as e:  # noqa: BLE001
+            return it, None, None, None, f"{type(e).__name__}: {e}"
 
-    def plan_cleanup(self, it: Item, array: np.ndarray, head: dict, inputs, sheet: bool) -> dict:
-        """inputs: what made the array (the crop box and the painted boxes), so
-        a cached measurement belongs to these pixels."""
-        key = sig(jc.MEASURE_VERSION, inputs, self.cleanup["max_pixels"])
-        m = self.caches.get(it, "jpeg_cleanup", key)
-        opts = {k: v for k, v in self.cleanup.items()} | {"m": m, "sheet": sheet, "quality": JPEG_QUALITY}
-        p = jc.plan(array, head, opts)
-        if m is None and p["m"] and not p["m"].get("skip", "").startswith("unreadable"):
-            self.caches.put(it, "jpeg_cleanup", key, p["m"])
-        return p
+    try:
+        if todo:
+            with ThreadPoolExecutor(max_workers=threads) as tp:
+                for it, head, array, value, err in bounded_map(tp, work, todo, threads * 2):
+                    line = {"pass": name, "index": index[it.rel], "total": total, "path": it.rel}
+                    if err:
+                        line["error"] = err
+                        counts["failed"] += 1
+                    elif array is None:
+                        line["skipped"] = rb.skip_reason(head)
+                        counts["skipped"] += 1
+                    else:
+                        try:
+                            if not in_threads:
+                                value = compute(it, head, array)
+                            caches.put(it, name, sig_of(it), value)
+                            counts["computed"] += 1
+                        except Exception as e:  # noqa: BLE001 - one bad image is reported, not fatal
+                            line["error"] = f"{type(e).__name__}: {e}"
+                            counts["failed"] += 1
+                    emit(line)
+    finally:
+        caches.save()
+        if unload is not None:
+            unload()
+        free_gpu()
+    summary = {"pass": name, "summary": True, "images": total, **counts, "seconds": round(time.perf_counter() - t0, 1)}
+    emit(summary)
+    return summary
 
-    def plan_faces(self, it: Item, array: np.ndarray, inputs) -> dict:
-        key = sig(self.faces["conf"], inputs)
-        boxes = self.caches.get(it, "face_masks", key)
-        opts = dict(self.faces)
-        if boxes is None:
-            p = fm.plan(array, None, opts)
-            self.caches.put(it, "face_masks", key, p["boxes"])
-            return p
-        h, w = array.shape[:2]
-        return {"boxes": [list(b) for b in boxes], "size": [w, h], **{k: v for k, v in opts.items() if k != "model"}}
+
+def run_detection_passes(items: list, caches: Caches, stages: Stages, threads: int) -> list:
+    summaries = []
+    if stages.borders:
+        dark = stages.borders["dark"]
+        summaries.append(detection_pass(
+            "borders", items, caches, sig(rb.DETECTOR_VERSION, dark),
+            lambda it, head, array: {k: v for k, v in rb.plan(array, head, {"dark": dark})["result"].items() if k != "plan"},
+            threads, in_threads=True))
+    if stages.watermark:
+        conf = stages.watermark["conf"]
+        summaries.append(detection_pass(
+            "watermark", items, caches, sig(wm.DETECTOR_VERSION, conf),
+            lambda it, head, array: wm.detect(wm.detector_lazy()[1], array, conf),
+            threads, unload=lambda: wm.unload(detector=True, lama=False)))
+    if stages.reframe:
+        def reframe_compute(it, head, array):
+            p = rf.plan(array, {"format": head["format"], "orientation": 1, "stored": list(array.shape[1::-1])},
+                        {"lossless": False})
+            return p["det"]
+        summaries.append(detection_pass(
+            "reframe", items, caches, sig(rf.CACHE_VERSION, rf.models_signature(), rf.PEOPLE_VERSION),
+            reframe_compute, threads, unload=rf.unload))
+    if stages.faces:
+        conf = stages.faces["conf"]
+        summaries.append(detection_pass(
+            "faces", items, caches, sig(conf),
+            lambda it, head, array: fm.plan(array, None, {"conf": conf})["boxes"],
+            threads, unload=fm.unload))
+    if stages.cleanup:
+        max_pixels = stages.cleanup["max_pixels"]
+
+        def quality_compute(it, head, array):
+            d = jc.decode_array(array, head, max_pixels)
+            if d["skip"]:
+                return {k: d.get(k) for k in ("format", "mode", "width", "height", "gray", "header_q", "skip")}
+            return jc.measure_one(jc.model_lazy(), d)
+        summaries.append(detection_pass(
+            "quality", items, caches, sig(jc.MEASURE_VERSION, max_pixels), quality_compute, threads, unload=jc.unload))
+    return summaries
 
 
-def process(it: Item, head: dict, array: np.ndarray, bp: dict | None, stages: Stages, previews) -> dict:
-    """All stages of one decoded image, in order. -> what to write:
-    {"changed": [stage names], "box": the final crop in upright pixels or
-     None, "stored_box": the same in stored pixels for a lossless JPEG crop,
-     "touched": a pixel stage changed the pixels, "array": the final pixels
-     (None when untouched), "mask": the face mask array or None, "notes": {...}}"""
-    H, W = array.shape[:2]
+# --- compose -----------------------------------------------------------------------------
+
+def compose(it: Item, caches: Caches, stages: Stages) -> dict:
+    """The plan of one image from the cached detections, no model: the final
+    crop (upright and stored), the watermark boxes left inside it, the face
+    boxes moved into it, the cleanup eligibility, and notes per stage."""
+    head = caches.head(it)
+    entry = {"path": it.rel, "changed": [], "notes": {}, "box": None, "stored_box": None, "wm_inside": [],
+             "faces": None, "cleanup": None, "write": "none", "head": {k: head.get(k) for k in HEAD_KEYS}}
+    if head["error"] or head["frames"] > 1:
+        entry["skipped"] = rb.skip_reason(head)
+        return entry
+    W, H = upright_size(head)
     full = [0, 0, W, H]
-    changed, notes = [], {}
+    changed, notes = entry["changed"], entry["notes"]
     inward = set()
-    # 1. borders
+    # borders
     box = full
-    if bp is not None:
-        notes["borders"] = {"action": bp["action"], "cuts": rb.describe_cuts(bp["result"].get("cuts", [])),
-                            "note": bp["result"].get("review") or bp["result"].get("plan", {}).get("note") or ""}
-        if bp["action"] == "crop":
-            box = rb.apply(array, bp)
-            inward |= {s for s, cut in zip("LTRB", (box[0] > 0, box[1] > 0, box[2] < W, box[3] < H)) if cut}
-            changed.append("borders")
-        if previews is not None and bp["action"] in ("crop", "review", "too small"):
-            previews.border_tile(it, head, array, bp)
-    sub = array[box[1]:box[3], box[0]:box[2]]
-    sh, sw = sub.shape[:2]
-    # 2. watermark detection, on the picture inside the borders
+    if stages.borders:
+        result = caches.get(it, "borders", sig(rb.DETECTOR_VERSION, stages.borders["dark"]))
+        if result is None:
+            notes["borders"] = {"action": "skip", "note": "not analysed"}
+        else:
+            result = dict(result)
+            if result.get("cuts"):
+                result["plan"] = rb.crop_plan(head, result, stages.borders["min_area"])
+            action = rb.action_of(head, result)
+            notes["borders"] = {"action": action, "cuts": rb.describe_cuts(result.get("cuts", [])),
+                                "note": result.get("review") or result.get("plan", {}).get("note") or ""}
+            entry["borders_result"] = result
+            if action == "crop":
+                bx = rb.stored_to_display(result["plan"]["box"], head["orientation"], *head["stored"])
+                box = [max(0, bx[0]), max(0, bx[1]), min(W, bx[2]), min(H, bx[3])]
+                inward |= {s for s, cut in zip("LTRB", (box[0] > 0, box[1] > 0, box[2] < W, box[3] < H)) if cut}
+                changed.append("borders")
+    # watermark boxes, in original coordinates
     wm_boxes, trim_box = [], None
     if stages.watermark:
-        wm_boxes = stages.detect_watermark(it, sub, box)
+        wm_boxes = caches.get(it, "watermark", sig(wm.DETECTOR_VERSION, stages.watermark["conf"])) or []
+        wm_boxes = [list(b) for b in wm_boxes]
         if wm_boxes:
             notes["watermark"] = {"boxes": len(wm_boxes), "conf": max(b[4] for b in wm_boxes)}
             if stages.watermark["mode"] == "trim":
-                mask = wm.boxes_mask(sub.shape, wm_boxes, stages.watermark["dilate"])
-                rect = wm.largest_clear_rect(wm.mask_boxes(mask), sw, sh)
-                if rect and area(rect) >= stages.watermark["trim_min_keep"] * sw * sh:
+                mask = wm.boxes_mask((H, W), wm_boxes, stages.watermark["dilate"])
+                rect = wm.largest_clear_rect(wm.mask_boxes(mask), W, H)
+                rect = intersect(rect, box) if rect else None
+                if rect and area(rect) >= stages.watermark["trim_min_keep"] * area(box):
                     trim_box = rect
-        if previews is not None and wm_boxes:
-            previews.watermark(it, sub, wm_boxes, trim_box, stages.watermark)
-    # 3. reframe, on the same picture
+        entry["wm_boxes"] = wm_boxes
+    # the subject crop, planned on the original
     rf_box = None
     if stages.reframe:
-        p = stages.plan_reframe(it, sub, box, head)
-        notes["reframe"] = {"verdict": p["verdict"], "reason": p["reason"], "people": len(p["det"]["people"]),
-                            "flags": p["flags"]}
-        if p["verdict"] == "crop":
-            rf_box = rf.apply(sub, p)
-            notes["reframe"].update(family=p["crop"]["family"], size=p["crop"]["size"])
-        if previews is not None:
-            previews.verdict(it, sub, p)
-    # 4. compose: inside the borders, then the reframe crop, then the trim
-    crop = [0, 0, sw, sh]
+        det = caches.get(it, "reframe", sig(rf.CACHE_VERSION, rf.models_signature(), rf.PEOPLE_VERSION))
+        if det is not None and det.get("people_version") == rf.PEOPLE_VERSION:
+            sel = rf.select_subject(det, stages.overrides.get(it.rel.lower()))
+            crop = None
+            if sel["verdict"] == "crop":
+                crop = rf.plan_crop(det, sel, {"orientation": 1, "stored": [W, H]}, stages.reframe["ratios"], False)
+            cropping = bool(crop) and crop["verdict"] == "crop"
+            notes["reframe"] = {"verdict": "crop" if cropping else "keep",
+                                "reason": sel["reason"] if cropping or not crop else crop["reason"],
+                                "people": len(det["people"]), "flags": sel["flags"] + ((crop or {}).get("flags") or [])}
+            entry["reframe"] = {"sel": sel, "crop": crop}
+            if cropping:
+                rf_box = intersect(crop["box"], box) or box
+                notes["reframe"].update(family=crop["family"], size=crop["size"])
+        else:
+            notes["reframe"] = {"verdict": "keep", "reason": "not detected", "people": 0, "flags": []}
+    # compose: inside the borders, then the subject crop, then the trim
+    crop_box = box
     if rf_box:
-        crop = rf_box
+        crop_box = rf_box
         changed.append("reframe")
     if trim_box:
-        both = intersect(crop, trim_box)
-        if both and area(both) >= TRIM_MIN_OF_REFRAME * area(crop):
-            if both != crop:
-                inward |= {s for s, cut in zip("LTRB", (both[0] > crop[0], both[1] > crop[1],
-                                                        both[2] < crop[2], both[3] < crop[3])) if cut}
-                crop = both
+        both = intersect(crop_box, trim_box)
+        if both and area(both) >= TRIM_MIN_OF_REFRAME * area(crop_box):
+            if both != crop_box:
+                inward |= {s for s, cut in zip("LTRB", (both[0] > crop_box[0], both[1] > crop_box[1],
+                                                        both[2] < crop_box[2], both[3] < crop_box[3])) if cut}
+                crop_box = both
                 changed.append("watermark")
             notes["watermark"]["trim"] = True
         else:
             trim_box = None                               # the trim would cut the subject: paint instead
-    if rf_box and crop != full:
-        # a reframe origin lies inside the picture: it may move outward to the grid
-        pass
-    final = shift(crop, box[0], box[1])
-    final, stored_box = align_box(final, head, inward)
+    final, stored_box = align_box(crop_box, head, inward)
     final = intersect(final, full) or full
-    if final != full and "borders" not in changed and "reframe" not in changed and "watermark" not in changed:
-        changed.append("borders" if bp is not None else "crop")
+    if final == full:
+        entry["box"], entry["stored_box"] = None, None
+        for s_ in ("borders", "reframe"):
+            if s_ in changed:
+                changed.remove(s_)
+    else:
+        entry["box"], entry["stored_box"] = final, stored_box
     x0, y0, x1, y1 = final
-    out = np.ascontiguousarray(array[y0:y1, x0:x1])
-    touched = False
-    # 5. paint the watermarks still inside the crop
+    cw, ch = x1 - x0, y1 - y0
+    # the watermark boxes still inside the crop, in crop coordinates
     if wm_boxes and not trim_box:
         inside = []
         for b in wm_boxes:
-            fb = shift(b[:4], box[0], box[1])
-            cut = intersect(fb, final)
+            cut = intersect(b[:4], final)
             if cut:
                 inside.append(shift(cut, -x0, -y0) + [b[4]])
         if inside:
-            out = wm.inpaint(out, inside, stages.watermark["dilate"], stages.watermark["max_size"])
-            touched = True
+            entry["wm_inside"] = inside
             changed.append("watermark")
             notes.setdefault("watermark", {})["painted"] = len(inside)
-    # 6. jpeg_cleanup on the pixels as they are now
-    if stages.cleanup:
-        inputs = [final, [b[:4] for b in wm_boxes] if touched else []]
-        p = stages.plan_cleanup(it, out, head, inputs, sheet=previews is not None)
-        notes["jpeg_cleanup"] = {"action": p["action"], "qf": p["m"].get("qf"), **{k: v for k, v in p["fix"].items()
-                                                                                      if k in ("benefit", "qf_after", "block_before", "block_after")}}
-        if p["action"] == "fix":
-            out = jc.apply(out, p)
-            touched = True
-            changed.append("jpeg_cleanup")
-        if previews is not None and p.get("outs") is not None:
-            previews.cleanup_tile(it, head, p)
-    # 7. the face mask of the final image
-    mask = None
+    # the face boxes, moved into the crop
     if stages.faces:
-        p = stages.plan_faces(it, out, [final, touched])
-        mask = fm.apply(out, p)
-        notes["face_masks"] = {"faces": len(p["boxes"])}
-    return {"changed": changed, "box": None if final == full else final, "stored_box": stored_box,
-            "touched": touched, "array": out if touched else None, "mask": mask, "notes": notes}
+        boxes = caches.get(it, "faces", sig(stages.faces["conf"]))
+        moved = []
+        for b in boxes or []:
+            cut = intersect(b[:4], final)
+            if cut:
+                moved.append(shift(cut, -x0, -y0))
+        entry["faces"] = {"boxes": moved, "size": [cw, ch],
+                          **{k: v for k, v in stages.faces.items() if k != "conf"}}
+        notes["face_masks"] = {"faces": len(moved)}
+    # cleanup eligibility: the quality under the threshold, the crop within the limit
+    if stages.cleanup:
+        m = caches.get(it, "quality", sig(jc.MEASURE_VERSION, stages.cleanup["max_pixels"]))
+        fits = cw * ch <= stages.cleanup["max_pixels"]
+        if m is None:
+            notes["jpeg_cleanup"] = {"action": "not measured"}
+        elif m.get("skip") and not (m["skip"] == "large" and fits):
+            notes["jpeg_cleanup"] = {"action": m["skip"], "qf": None}
+        elif not fits:
+            notes["jpeg_cleanup"] = {"action": "large", "qf": m.get("qf")}
+        elif m.get("qf") is not None and m["qf"] >= stages.cleanup["threshold"]:
+            notes["jpeg_cleanup"] = {"action": "keep", "qf": m["qf"]}
+        else:
+            entry["cleanup"] = {"m": None if m.get("skip") else m, "verdict": None}
+            notes["jpeg_cleanup"] = {"action": "eligible", "qf": m.get("qf")}
+    return entry
+
+
+def cleanup_signature(entry: dict, stages: Stages) -> str:
+    opts = {k: stages.cleanup[k] for k in ("threshold", "qf_offset", "min_block_drop", "min_qf_gain", "max_pixels")}
+    return sig(jc.MEASURE_VERSION, entry["box"], opts, JPEG_QUALITY)
+
+
+def finish_plan(entry: dict) -> None:
+    """The write kind of an image once its cleanup verdict is known."""
+    if entry.get("skipped"):
+        return
+    fix = bool(entry.get("cleanup") and (entry["cleanup"].get("verdict") or {}).get("action") == "fix")
+    if fix and "jpeg_cleanup" not in entry["changed"]:
+        entry["changed"].append("jpeg_cleanup")
+    entry["write"] = "array" if entry["wm_inside"] or fix else "lossless" if entry["box"] else "none"
+
+
+def write_plan(root: Path, job: Job, entries: dict) -> Path:
+    path = root / BACKUP_DIRNAME / RUN_DIRNAME / PLAN_NAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    slim = {}
+    for rel, e in entries.items():
+        slim[rel] = {k: v for k, v in e.items() if k not in ("borders_result", "reframe", "wm_boxes", "head")}
+        if e.get("cleanup"):
+            slim[rel]["cleanup"] = {"qf": (e["cleanup"].get("m") or {}).get("qf"), "verdict": e["cleanup"].get("verdict")}
+    tmp = path.with_name(path.name + ".part")
+    tmp.write_text(json.dumps({"written": time.strftime("%Y-%m-%d %H:%M:%S"), "stages": job.stages, "mode": job.mode,
+                               "images": slim}, ensure_ascii=False, indent=1), encoding="utf-8")
+    os.replace(tmp, path)
+    return path
 
 
 # --- previews (dry run) ------------------------------------------------------------------
@@ -514,18 +690,21 @@ class Previews:
         while len(self.pending) > 8:
             self.pending.pop(0).result()
 
-    def verdict(self, it: Item, sub: np.ndarray, p: dict) -> None:
-        dest = self.dir / "reframe" / (it.rel + ".jpg")
-        self._submit(rf.draw_verdict, Image.fromarray(sub), p["det"], p["sel"], dest, p["crop"])
-
-    def watermark(self, it: Item, sub: np.ndarray, boxes, trim_box, opts) -> None:
-        plan_ = {"boxes": boxes, "dilate": opts["dilate"], "trim_box": trim_box}
-        self._submit(wm.draw_preview, sub, plan_, self.dir / "watermark" / (it.rel + ".jpg"))
-
-    def border_tile(self, it: Item, head: dict, array: np.ndarray, bp: dict) -> None:
-        stored = Image.fromarray(rb.to_stored(array, head["orientation"]))
-        label = f"{it.rel}  {head['width']}x{head['height']}"
-        self.border_tiles.append((rb.sheet_group(_ItemLike(bp)), self.pool.submit(rb.tile_of, stored, bp["result"], label)))
+    def draw(self, it: Item, head: dict, array: np.ndarray, entry: dict, caches: Caches, stages: Stages) -> None:
+        if entry.get("reframe"):
+            det = caches.get(it, "reframe", sig(rf.CACHE_VERSION, rf.models_signature(), rf.PEOPLE_VERSION))
+            if det is not None:
+                self._submit(rf.draw_verdict, Image.fromarray(array), det, entry["reframe"]["sel"],
+                             self.dir / "reframe" / (it.rel + ".jpg"), entry["reframe"]["crop"])
+        if entry.get("wm_boxes"):
+            trim = entry["box"] if entry["notes"].get("watermark", {}).get("trim") else None
+            plan_ = {"boxes": entry["wm_boxes"], "dilate": stages.watermark["dilate"], "trim_box": trim}
+            self._submit(wm.draw_preview, array, plan_, self.dir / "watermark" / (it.rel + ".jpg"))
+        if entry.get("borders_result") and entry["notes"]["borders"]["action"] in ("crop", "review", "too small"):
+            stored = Image.fromarray(rb.to_stored(array, head["orientation"]))
+            label = f"{it.rel}  {head['width']}x{head['height']}"
+            bp = _ItemLike(entry["notes"]["borders"]["action"], entry["borders_result"])
+            self.border_tiles.append((rb.sheet_group(bp), self.pool.submit(rb.tile_of, stored, entry["borders_result"], label)))
 
     def cleanup_tile(self, it: Item, head: dict, p: dict) -> None:
         if self.sheets is None:
@@ -570,11 +749,11 @@ class Previews:
 class _ItemLike:
     """What remove_borders.sheet_group reads of an Item: action and result."""
 
-    def __init__(self, bp: dict):
-        self.action, self.result = bp["action"], bp["result"]
+    def __init__(self, action: str, result: dict):
+        self.action, self.result = action, result
 
 
-# --- writing --------------------------------------------------------------------------------
+# --- writing ---------------------------------------------------------------------------------
 
 def same_bytes(a: Path, b: Path) -> bool:
     try:
@@ -589,7 +768,8 @@ def make_writable(path: Path) -> None:
 
 
 def copy_keep(src: Path, dst: Path) -> str:
-    """Copy src to dst unless dst exists. -> copied, same or kept."""
+    """Copy src to dst unless dst exists: a backup is the one untouched
+    original and is never overwritten. -> copied, same or kept."""
     if dst.exists():
         return "same" if same_bytes(src, dst) else "kept"
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -597,15 +777,6 @@ def copy_keep(src: Path, dst: Path) -> str:
     shutil.copy2(src, tmp)
     os.replace(tmp, dst)
     return "copied"
-
-
-def backup_place(root: Path, rel: str, src: Path, run_id: str) -> str:
-    """Where the original of rel goes: _backup/rel, unless an earlier original
-    of another run is there; then _backup/_pipeline/originals/<run>/rel."""
-    bk = root / BACKUP_DIRNAME / rel
-    if bk.exists() and not same_bytes(src, bk):
-        bk = root / BACKUP_DIRNAME / RUN_DIRNAME / ORIGINALS_DIRNAME / run_id / rel
-    return bk.relative_to(root).as_posix()
 
 
 def output_name(rel: str, head: dict, write: str, save_png: bool) -> str:
@@ -618,10 +789,10 @@ def output_name(rel: str, head: dict, write: str, save_png: bool) -> str:
     return rel
 
 
-def write_array(array: np.ndarray, dst: Path, fmt: str, head: dict, src_stat) -> None:
+def write_array(array: np.ndarray, dst: Path, fmt: str, exif: bytes | None, icc: bytes | None, src_stat) -> None:
     im = Image.fromarray(np.ascontiguousarray(array))
-    exif = rf.exif_for_output(head.get("exif"), im.width, im.height, keep_orientation=False)
-    kw = {k: v for k, v in (("exif", exif), ("icc_profile", head.get("icc"))) if v}
+    exif = rf.exif_for_output(exif, im.width, im.height, keep_orientation=False)
+    kw = {k: v for k, v in (("exif", exif), ("icc_profile", icc)) if v}
     tmp = rb.part_path(dst)
     if fmt == "JPEG":
         im.save(tmp, "JPEG", quality=JPEG_QUALITY, subsampling=0, optimize=True, **kw)
@@ -631,16 +802,16 @@ def write_array(array: np.ndarray, dst: Path, fmt: str, head: dict, src_stat) ->
 
 
 def write_job(job: dict) -> dict:
-    """One image's writes, in a worker process: the backups (in place), the
-    image, the mask. -> the log record."""
+    """One image's writes, in a worker process: the backup (in place, once,
+    before the first byte changes), the image, the mask. -> the log record."""
     rec = {"op": "done", "rel": job["rel"], "changed": job["changed"], "write": job["write"]}
+    root, src, dst = Path(job["root"]), Path(job["src"]), Path(job["dst"])
+    in_place = job["mode"] == "in_place"
     try:
-        root, src, dst = Path(job["root"]), Path(job["src"]), Path(job["dst"])
         head = job["head"]
-        in_place = job["mode"] == "in_place"
         st = os.stat(src)
         if in_place and job["write"] != "none":
-            rec["backup"] = copy_keep(src, root / job["backup"])
+            rec["backup"] = copy_keep(src, root / BACKUP_DIRNAME / job["rel"])
             rec["sidecars"] = {Path(sc).relative_to(root).as_posix(): copy_keep(Path(sc), root / BACKUP_DIRNAME / Path(sc).relative_to(root))
                                for sc in job["sidecars"]}
         if job["write"] == "none":
@@ -657,7 +828,8 @@ def write_job(job: dict) -> dict:
             else:
                 rb.write_png(src, dst, job["stored_box"])
         else:
-            write_array(job["array"], dst, job["fmt"], head, st)
+            exif, icc = exif_and_icc(src)
+            write_array(job["array"], dst, job["fmt"], exif, icc, st)
         if job["write"] != "none":
             if not in_place:
                 for sc in job["sidecars"]:
@@ -681,12 +853,12 @@ def write_job(job: dict) -> dict:
             rec["mask"] = mpath.relative_to(root if in_place else Path(job["target"])).as_posix()
     except Exception as e:  # noqa: BLE001 - one bad file is reported, not fatal
         rec["error"] = f"{type(e).__name__}: {e}".strip()
-        # the writes are atomic, so the image in place is intact: the backups
-        # this job copied for it are not needed and go again
+        # the writes are atomic, so the image in place is intact: a backup this
+        # job copied for it is not needed and goes again
         try:
-            root, src = Path(job["root"]), Path(job["src"])
-            if rec.get("backup") == "copied" and src.is_file() and same_bytes(src, root / job["backup"]):
-                (root / job["backup"]).unlink()
+            bk = root / BACKUP_DIRNAME / job["rel"]
+            if rec.get("backup") == "copied" and src.is_file() and same_bytes(src, bk):
+                bk.unlink()
                 rec["backup"] = "removed"
             for sc, status in list((rec.get("sidecars") or {}).items()):
                 b = root / BACKUP_DIRNAME / sc
@@ -742,9 +914,11 @@ def last_run(entries: list[dict]) -> tuple[dict | None, list[dict]]:
 # --- undo ------------------------------------------------------------------------------------
 
 def undo(root: Path) -> dict:
-    """Put back what the last run changed: in place, every image from its
-    backup, a renamed output removed, the masks restored or removed; in
-    parallel mode, the files written into the target removed. -> counts."""
+    """Return the images of the last run to their originals: in place, every
+    image written from _backup (the one untouched original, so an earlier
+    run's change goes too), a renamed output removed, the masks restored or
+    removed; in parallel mode, the files written into the target removed.
+    A backup this run made is removed; one that was there before stays. -> counts."""
     head, recs = last_run(read_log(root))
     counts = {"restored": 0, "removed": 0, "no backup": 0}
     if head is None:
@@ -773,10 +947,10 @@ def undo(root: Path) -> dict:
                     cap.unlink()
             continue
         if intent["write"] != "none":
-            bk = root / intent["backup"]
+            bk = root / BACKUP_DIRNAME / intent["rel"]
             if not bk.exists():
                 counts["no backup"] += 1
-                print(json.dumps({"warning": f"no backup for {intent['rel']}"}), flush=True)
+                emit({"warning": f"no backup for {intent['rel']}"})
             else:
                 out = root / rec["out"]
                 if rec["out"] != intent["rel"] and out.is_file():
@@ -802,12 +976,14 @@ def undo(root: Path) -> dict:
         if rec.get("mask"):
             m = root / rec["mask"]
             mb = root / BACKUP_DIRNAME / rec["mask"]
-            if rec.get("mask_backup") in ("copied", "same") and mb.exists():
+            if rec.get("mask_backup") in ("copied", "same", "kept") and mb.exists():
                 make_writable(m)
-                os.replace(mb, m)
+                tmp = rb.part_path(m)
+                shutil.copy2(mb, tmp)
+                os.replace(tmp, m)
+                if rec["mask_backup"] == "copied":
+                    mb.unlink()
                 counts["restored"] += 1
-            elif rec.get("mask_backup") == "kept":
-                pass                                       # an earlier tool's backup stays; the mask stays too
             elif m.is_file():
                 make_writable(m)
                 m.unlink()
@@ -823,61 +999,41 @@ def undo(root: Path) -> dict:
     return counts
 
 
-# --- the run ---------------------------------------------------------------------------------
+# --- the apply pass ---------------------------------------------------------------------------
 
-def bounded_map(pool, fn, args, window: int):
-    pending = deque()
-    it = iter(args)
-    for a in it:
-        pending.append(pool.submit(fn, a))
-        if len(pending) >= window:
-            break
-    while pending:
-        yield pending.popleft().result()
-        nxt = next(it, None)
-        if nxt is not None:
-            pending.append(pool.submit(fn, nxt))
-
-
-def emit(obj: dict) -> None:
-    print(json.dumps(obj, ensure_ascii=False), flush=True)
+def restore_array(array: np.ndarray, head: dict, m: dict, opts: dict) -> np.ndarray:
+    """The FBCNN restoration of upright pixels, as jpeg_cleanup's fix_one
+    makes it: the colour model told the image's own QF plus the offset, on
+    the stored pixels; a gray image keeps the luma only."""
+    d = jc.decode_array(array, head, 1 << 62)
+    model = jc.model_lazy()
+    qf = m.get("qf_color", m["qf"])
+    y = model.restore("color", d["rgb"], min(100.0, qf + opts["qf_offset"]))
+    if d["gray"]:
+        y = np.asarray(Image.fromarray(y).convert("L"))
+    return np.ascontiguousarray(rb.to_upright(jc.as_rgb(y), d["orientation"]))
 
 
-def run(job: Job) -> int:
-    root = job.root
+def apply_pass(job: Job, items: list, entries: dict, caches: Caches, stages: Stages, run_id: str, log: RunLog,
+               report) -> dict:
+    """Decode once, crop, paint, restore, write once, mask: the images whose
+    plan changes them, and in parallel mode every image. -> counts"""
     t0 = time.perf_counter()
-    items = scan(job)
-    total = len(items)
-    caches = Caches(root)
-    stages = Stages(job, caches)
-    previews = Previews(root, job.threads) if job.dry_run else None
-    run_id = time.strftime("%Y%m%d-%H%M%S")
-    taken = {e["run"] for e in read_log(root) if "run" in e}
-    while run_id in taken:                        # two runs within one second
-        run_id += "x"
-    log = None
-    if not job.dry_run:
-        log = RunLog(root)
-        log.write({"run": run_id, "time": time.strftime("%Y-%m-%d %H:%M:%S"), "mode": job.mode,
-                   "target": str(job.target) if job.target else "", "stages": job.stages, "save_png": job.save_png,
-                   "images": total})
-    report_path = root / BACKUP_DIRNAME / RUN_DIRNAME / REPORT_NAME
-    report_path.parent.mkdir(parents=True, exist_ok=True)
-    report = open(report_path, "w", encoding="utf-8")
+    root = job.root
+    base = root if job.mode == "in_place" else job.target
+    chosen = []
+    for it in items:
+        e = entries[it.rel]
+        if e.get("skipped"):
+            continue
+        if job.mode == "parallel" or e["write"] != "none" or e["faces"] is not None:
+            chosen.append(it)
+    total = len(chosen)
+    index = {it.rel: n for n, it in enumerate(chosen, 1)}
     counts = {"changed": 0, "unchanged": 0, "skipped": 0, "failed": 0, "masks": 0}
-    index = {it.rel: n for n, it in enumerate(items, 1)}
-
-    def decoded(it: Item):
-        try:
-            head, array = decode_image(it.path)
-            bp = stages.plan_borders(it, head, array) if array is not None else None
-            return it, head, array, bp, ""
-        except Exception as e:  # noqa: BLE001
-            return it, {}, None, None, f"{type(e).__name__}: {e}"
 
     def finish(rec: dict, line: dict) -> None:
-        if log is not None:
-            log.write(rec)
+        log.write(rec)
         if "error" in rec:
             line["error"] = rec["error"]
             counts["failed"] += 1
@@ -892,40 +1048,46 @@ def run(job: Job) -> int:
         report.write(json.dumps(line, ensure_ascii=False) + "\n")
         emit(line)
 
-    pool = None if job.dry_run else ProcessPoolExecutor(max_workers=job.threads, initializer=ignore_ctrl_c)
+    def decoded(it: Item):
+        try:
+            head, array = decode_image(it.path, caches.head(it))
+            return it, head, array, ""
+        except Exception as e:  # noqa: BLE001
+            return it, None, None, f"{type(e).__name__}: {e}"
+
+    pool = ProcessPoolExecutor(max_workers=job.threads, initializer=ignore_ctrl_c)
     pending = []
     try:
         with ThreadPoolExecutor(max_workers=job.threads) as tp:
-            for it, head, array, bp, err in bounded_map(tp, decoded, items, job.threads * 2):
-                line = {"index": index[it.rel], "total": total, "path": it.rel, "changed": []}
+            for it, head, array, err in bounded_map(tp, decoded, chosen, job.threads * 2):
+                e = entries[it.rel]
+                line = {"pass": "apply", "index": index[it.rel], "total": total, "path": it.rel,
+                        "changed": list(e["changed"]), "notes": e["notes"], "write": e["write"]}
+                if e["box"]:
+                    line["box"] = e["box"]
                 if err or array is None:
-                    line["skipped"] = err or rb.skip_reason(head)
-                    counts["skipped"] += 1
-                    report.write(json.dumps(line, ensure_ascii=False) + "\n")
-                    emit(line)
-                    continue
-                try:
-                    r = process(it, head, array, bp, stages, previews)
-                except Exception as e:  # noqa: BLE001 - one bad image is reported, not fatal
-                    line["error"] = f"{type(e).__name__}: {e}"
+                    line["error"] = err or "could not be decoded"
                     counts["failed"] += 1
                     report.write(json.dumps(line, ensure_ascii=False) + "\n")
                     emit(line)
                     continue
-                line["changed"] = r["changed"]
-                line["notes"] = r["notes"]
-                write = "array" if r["touched"] else "lossless" if r["box"] else "none"
-                if r["box"]:
-                    line["box"] = r["box"]
-                line["write"] = write
-                if job.dry_run:
-                    line["mask"] = bool(r["mask"] is not None)
-                    counts["changed" if r["changed"] else "unchanged"] += 1
+                try:
+                    x0, y0, x1, y1 = e["box"] or [0, 0, array.shape[1], array.shape[0]]
+                    out = np.ascontiguousarray(array[y0:y1, x0:x1])
+                    if e["wm_inside"]:
+                        out = wm.inpaint(out, e["wm_inside"], stages.watermark["dilate"], stages.watermark["max_size"])
+                    verdict = (e.get("cleanup") or {}).get("verdict") or {}
+                    if verdict.get("action") == "fix":
+                        out = restore_array(out, head, e["cleanup"]["m"], stages.cleanup)
+                    mask = fm.apply(out, e["faces"]) if e["faces"] is not None else None
+                except Exception as ex:  # noqa: BLE001 - one bad image is reported, not fatal
+                    line["error"] = f"{type(ex).__name__}: {ex}"
+                    counts["failed"] += 1
                     report.write(json.dumps(line, ensure_ascii=False) + "\n")
                     emit(line)
                     continue
+                write = e["write"]
                 out_rel = output_name(it.rel, head, write, job.save_png)
-                base = root if job.mode == "in_place" else job.target
                 dst = base / out_rel
                 if write != "none" and job.mode == "in_place" and dst != it.path and dst.exists():
                     line["skipped"] = f"{out_rel} exists already; the image is left as it is"
@@ -935,22 +1097,20 @@ def run(job: Job) -> int:
                     emit(line)
                     continue
                 mask_path = None
-                if r["mask"] is not None:
+                if mask is not None:
                     mask_path = base / Path(out_rel).parent / MASKS_DIRNAME / (Path(out_rel).stem + ".png")
-                intent = {"op": "intent", "rel": it.rel, "write": write, "out": out_rel,
-                          "sidecars": [sc.relative_to(root).as_posix() for sc in it.sidecars],
-                          "mask": mask_path.relative_to(base).as_posix() if mask_path else "",
-                          "backup": backup_place(root, it.rel, it.path, run_id) if job.mode == "in_place" and write != "none" else ""}
-                log.write(intent)
+                log.write({"op": "intent", "rel": it.rel, "write": write, "out": out_rel,
+                           "sidecars": [sc.relative_to(root).as_posix() for sc in it.sidecars],
+                           "mask": mask_path.relative_to(base).as_posix() if mask_path else ""})
                 wjob = {"root": str(root), "target": str(job.target) if job.target else "", "rel": it.rel,
-                        "src": str(it.path), "dst": str(dst), "head": {k: v for k, v in head.items()},
-                        "mode": job.mode, "write": write, "changed": r["changed"], "stored_box": r["stored_box"],
-                        "sidecars": [str(sc) for sc in it.sidecars], "backup": intent["backup"],
+                        "src": str(it.path), "dst": str(dst), "head": {k: v for k, v in head.items() if k in HEAD_KEYS},
+                        "mode": job.mode, "write": write, "changed": list(e["changed"]), "stored_box": e["stored_box"],
+                        "sidecars": [str(sc) for sc in it.sidecars],
                         "fmt": "JPEG" if out_rel.lower().endswith((".jpg", ".jpeg", ".jpe", ".jfif")) else "PNG",
-                        "array": r["array"], "mask": r["mask"], "mask_path": str(mask_path) if mask_path else ""}
-                if write == "lossless" and head["kind"] == rb.KIND_JPEG and not r["stored_box"]:
-                    # a JPEG without a known MCU size: crop the pixels instead
-                    wjob.update(write="array", array=np.ascontiguousarray(array[r["box"][1]:r["box"][3], r["box"][0]:r["box"][2]]))
+                        "array": out if write == "array" else None, "mask": mask,
+                        "mask_path": str(mask_path) if mask_path else ""}
+                if write == "lossless" and head["kind"] == rb.KIND_JPEG and not head.get("mcu"):
+                    wjob.update(write="array", array=out)        # a JPEG without a known block size
                     line["write"] = "array"
                 pending.append((line, pool.submit(write_job, wjob)))
                 while len(pending) > job.threads * 2:
@@ -959,26 +1119,148 @@ def run(job: Job) -> int:
         for line0, fut in pending:
             finish(fut.result(), line0)
     finally:
-        if pool is not None:
-            pool.shutdown(wait=True, cancel_futures=True)
-        caches.save()
-        if log is not None:
-            log.write({"end": run_id, **counts})
-            log.close()
+        pool.shutdown(wait=True, cancel_futures=True)
+        wm.unload()
+        jc.unload()
+        free_gpu()
+    summary = {"pass": "apply", "summary": True, "images": total, **counts, "seconds": round(time.perf_counter() - t0, 1)}
+    emit(summary)
+    return counts
+
+
+# --- the run ---------------------------------------------------------------------------------
+
+def run(job: Job) -> int:
+    root = job.root
+    t0 = time.perf_counter()
+    items = scan(job)
+    caches = Caches(root)
+    stages = Stages(job)
+    passes = run_detection_passes(items, caches, stages, job.threads)
+
+    # compose, no model
+    t1 = time.perf_counter()
+    entries, counts = {}, {"planned": 0, "unchanged": 0, "skipped": 0}
+    for n, it in enumerate(items, 1):
+        e = compose(it, caches, stages)
+        entries[it.rel] = e
+        line = {"pass": "compose", "index": n, "total": len(items), "path": it.rel}
+        if e.get("skipped"):
+            line["skipped"] = e["skipped"]
+            counts["skipped"] += 1
+        else:
+            line.update(changed=e["changed"], notes=e["notes"])
+            if e["box"]:
+                line["box"] = e["box"]
+            counts["planned" if e["changed"] else "unchanged"] += 1
+        emit(line)
+    caches.save()
+    emit({"pass": "compose", "summary": True, "images": len(items), **counts, "seconds": round(time.perf_counter() - t1, 1)})
+
+    # the cleanup benefit, FBCNN on the composed crop of the eligible images
+    previews = Previews(root, job.threads) if job.dry_run else None
+    if stages.cleanup:
+        eligible = [it for it in items if entries[it.rel].get("cleanup")]
+        opts = {k: stages.cleanup[k] for k in ("threshold", "qf_offset", "min_block_drop", "min_qf_gain", "max_pixels")}
+
+        def benefit_compute(it, head, array):
+            e = entries[it.rel]
+            x0, y0, x1, y1 = e["box"] or [0, 0, array.shape[1], array.shape[0]]
+            crop = np.ascontiguousarray(array[y0:y1, x0:x1])
+            # the crop's own stored size decides the size limit, not the original's
+            cw, ch = x1 - x0, y1 - y0
+            head_crop = dict(head, width=ch if head["orientation"] in (5, 6, 7, 8) else cw,
+                             height=cw if head["orientation"] in (5, 6, 7, 8) else ch)
+            p = jc.plan(crop, head_crop, {**opts, "quality": JPEG_QUALITY, "m": e["cleanup"]["m"],
+                                          "sheet": previews is not None})
+            if previews is not None and p.get("outs") is not None:
+                previews.cleanup_tile(it, head, p)
+            numbers = {k: v for k, v in p["fix"].items() if k in ("benefit", "qf_used", "qf_after", "change",
+                                                                   "block_before", "block_after")}
+            return {"action": p["action"], "fix": numbers, "m": p["m"]}
+        for it in eligible:
+            s_ = cleanup_signature(entries[it.rel], stages)
+            # the benefit of a cached verdict is still drawn on the sheets of a dry run
+            if previews is not None and caches.get(it, "benefit", s_) is not None:
+                caches.files[it.rel]["benefit"].pop(s_, None)
+        passes.append(detection_pass(
+            "benefit", items, caches, lambda it: cleanup_signature(entries[it.rel], stages), benefit_compute,
+            job.threads, unload=jc.unload, only=eligible) if eligible else {"pass": "benefit", "summary": True, "images": 0})
+        for it in eligible:
+            e = entries[it.rel]
+            e["cleanup"]["verdict"] = caches.get(it, "benefit", cleanup_signature(e, stages))
+            if e["cleanup"]["verdict"]:
+                e["cleanup"]["m"] = e["cleanup"]["verdict"].get("m") or e["cleanup"]["m"]
+                e["notes"]["jpeg_cleanup"] = {"action": e["cleanup"]["verdict"]["action"], "qf": (e["cleanup"]["m"] or {}).get("qf"),
+                                              **{k: v for k, v in e["cleanup"]["verdict"]["fix"].items()
+                                                 if k in ("benefit", "qf_after", "block_before", "block_after")}}
+    for e in entries.values():
+        finish_plan(e)
+    plan_path = write_plan(root, job, entries)
+    planned = sum(1 for e in entries.values() if e.get("changed"))
+
+    if job.dry_run:
+        # the previews need the pixels once more
+        def draw(it: Item):
+            e = entries[it.rel]
+            if e.get("skipped") or not (e.get("reframe") or e.get("wm_boxes") or e.get("borders_result")):
+                return it, ""
+            try:
+                head, array = decode_image(it.path, caches.head(it))
+                if array is not None:
+                    previews.draw(it, head, array, e, caches, stages)
+                return it, ""
+            except Exception as ex:  # noqa: BLE001
+                return it, f"{type(ex).__name__}: {ex}"
+        with ThreadPoolExecutor(max_workers=job.threads) as tp:
+            for it, err in bounded_map(tp, draw, items, job.threads * 2):
+                if err:
+                    emit({"pass": "previews", "path": it.rel, "error": err})
+        drawn = previews.finish()
+        summary = {"summary": True, "dry_run": True, "images": len(items), "changed": planned,
+                   "unchanged": len(items) - planned - counts["skipped"], "skipped": counts["skipped"],
+                   "plan": str(plan_path), "previews": str(previews.dir), **drawn,
+                   "seconds": round(time.perf_counter() - t0, 1), "mode": job.mode}
+        summary.update(peak_vram())
+        emit(summary)
+        return 0
+
+    # the apply pass
+    run_id = time.strftime("%Y%m%d-%H%M%S")
+    taken = {e["run"] for e in read_log(root) if "run" in e}
+    while run_id in taken:                        # two runs within one second
+        run_id += "x"
+    log = RunLog(root)
+    log.write({"run": run_id, "time": time.strftime("%Y-%m-%d %H:%M:%S"), "mode": job.mode,
+               "target": str(job.target) if job.target else "", "stages": job.stages, "save_png": job.save_png,
+               "images": len(items)})
+    report_path = root / BACKUP_DIRNAME / RUN_DIRNAME / REPORT_NAME
+    report = open(report_path, "w", encoding="utf-8")
+    done = {"changed": 0, "unchanged": 0, "skipped": 0, "failed": 0, "masks": 0}
+    try:
+        done = apply_pass(job, items, entries, caches, stages, run_id, log, report)
+    finally:
+        log.write({"end": run_id, **done})
+        log.close()
         report.close()
-    summary = {"summary": True, "images": total, **counts, "seconds": round(time.perf_counter() - t0, 1),
-               "dry_run": job.dry_run, "mode": job.mode, "report": str(report_path)}
-    if previews is not None:
-        summary["previews"] = str(previews.dir)
-        summary.update(previews.finish())
+    skipped = done["skipped"] + counts["skipped"]
+    summary = {"summary": True, "dry_run": False, "images": len(items), **done, "skipped": skipped,
+               "unchanged": len(items) - done["changed"] - done["failed"] - skipped,
+               "seconds": round(time.perf_counter() - t0, 1), "mode": job.mode, "report": str(report_path),
+               "plan": str(plan_path)}
+    summary.update(peak_vram())
+    emit(summary)
+    return 1 if done["failed"] else 0
+
+
+def peak_vram() -> dict:
     try:
         import torch
         if torch.cuda.is_available():
-            summary["peak_vram_mb"] = round(torch.cuda.max_memory_allocated() / 2 ** 20)
+            return {"peak_vram_mb": round(torch.cuda.max_memory_allocated() / 2 ** 20)}
     except Exception:  # noqa: BLE001
         pass
-    emit(summary)
-    return 1 if counts["failed"] else 0
+    return {}
 
 
 def main(argv=None) -> int:
@@ -987,10 +1269,10 @@ def main(argv=None) -> int:
             stream.reconfigure(errors="replace", encoding="utf-8")
         except (AttributeError, ValueError):
             pass
-    ap = argparse.ArgumentParser(description="Run the repair tools over a dataset image by image, from a job file.")
+    ap = argparse.ArgumentParser(description="Run the repair tools over a dataset from a job file, one model at a time.")
     ap.add_argument("--job", required=False, metavar="FILE", help="the job as JSON (see --example)")
-    ap.add_argument("--dry-run", action="store_true", help="plan, report and preview; change nothing")
-    ap.add_argument("--undo", action="store_true", help="put back what the last run of the job's folder changed")
+    ap.add_argument("--dry-run", action="store_true", help="the detection passes, the plan and the previews; change nothing")
+    ap.add_argument("--undo", action="store_true", help="return the images of the last run of the job's folder to their originals")
     ap.add_argument("--threads", type=int, default=0, metavar="N", help="decoder threads and writer processes")
     ap.add_argument("--example", action="store_true", help="print an example job and exit")
     args = ap.parse_args(argv)
