@@ -3,7 +3,7 @@
 Generate ai-toolkit loss masks that suppress faces.
 
 For every image in IMG_DIR, writes MASK_DIR/<same basename>.png
-(MASK_DIR defaults to IMG_DIR/masks):
+(MASK_DIR defaults to IMG_DIR/_controls; set mask_path to that folder):
   white (255) everywhere  -> full loss
   black (0) over faces    -> loss scaled to dataset mask_min_value
 Faces are covered by a soft-edged ellipse grown by --grow around the detected box.
@@ -22,6 +22,18 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageOps
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
+# The default mask folder, inside the image folder. AI Toolkit trains every
+# image under a dataset folder, except the files in a folder named _controls
+# (where it keeps the control images it makes; skipped since its 96ba2fd,
+# 2025-04-09), so masks there are not trained as images. Until 2026-10-11 the
+# default was masks, which AI Toolkit trains; such a folder is renamed.
+MASKS_DIRNAME = "_controls"
+OLD_MASKS_DIRNAME = "masks"
+# A mask may be any of these. AI Toolkit's mask_path takes the first one that
+# exists for the image's name, in this order, so <name>.jpg shadows <name>.png:
+# a new mask goes over the one AI Toolkit reads, in that file's format.
+MASK_EXTS = (".jpg", ".jpeg", ".png", ".webp")
+MASK_JPEG_QUALITY = 95
 MODEL_REPO = "Bingsu/adetailer"
 DEFAULT_MODEL = "face_yolov8m.pt"
 
@@ -140,10 +152,61 @@ def apply(array: np.ndarray, plan: dict) -> np.ndarray:
     return np.asarray(mask)
 
 
+def move_old_masks(old: str, new: str) -> None:
+    """The masks of an earlier run without mask_dir, from masks into _controls:
+    one rename, or file by file when _controls exists (a file there is never
+    replaced; the old one stays)."""
+    if not os.path.isdir(old):
+        return
+    if any(os.path.splitext(f)[1].lower() not in MASK_EXTS or not os.path.isfile(os.path.join(old, f))
+           for f in os.listdir(old)):
+        print(f"{old} holds files other than masks; left as it is")
+        return
+    if not os.path.lexists(new):
+        os.rename(old, new)
+        print(f"renamed {old} to {new}")
+        return
+    left = 0
+    for f in os.listdir(old):
+        if os.path.lexists(os.path.join(new, f)):
+            left += 1
+        else:
+            os.replace(os.path.join(old, f), os.path.join(new, f))
+    if left:
+        print(f"{left} files of {old} stay there, {new} has files of the same names")
+    else:
+        os.rmdir(old)
+        print(f"moved the masks of {old} into {new}")
+
+
+def existing_masks(mask_dir: str) -> dict:
+    """stem (lower case) -> the mask files of that stem in mask_dir, the one
+    AI Toolkit reads first."""
+    out = {}
+    try:
+        names = [f for f in os.listdir(mask_dir) if os.path.splitext(f)[1].lower() in MASK_EXTS]
+    except OSError:
+        return out
+    for f in sorted(names, key=lambda f: (MASK_EXTS.index(os.path.splitext(f)[1].lower()), f.lower())):
+        out.setdefault(os.path.splitext(f)[0].lower(), []).append(f)
+    return out
+
+
+def save_mask(mask, path: str) -> None:
+    """In the format the extension names: JPEG without chroma subsampling, WebP lossless, else PNG."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".jpg", ".jpeg"):
+        mask.save(path, "JPEG", quality=MASK_JPEG_QUALITY, subsampling=0)
+    elif ext == ".webp":
+        mask.save(path, "WEBP", lossless=True)
+    else:
+        mask.save(path, "PNG")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("img_dir")
-    ap.add_argument("mask_dir", nargs="?", default=None, help="output dir for masks (default: <img_dir>/masks)")
+    ap.add_argument("mask_dir", nargs="?", default=None, help="output dir for masks (default: <img_dir>/_controls)")
     ap.add_argument("--grow", type=float, default=1.35, help="scale factor on the detected face box")
     ap.add_argument("--feather", type=int, default=12, help="Gaussian blur radius in px for the mask edge")
     ap.add_argument("--conf", type=float, default=0.3, help="detector confidence threshold")
@@ -158,7 +221,8 @@ def main():
     if not os.path.isdir(args.img_dir):
         sys.exit(f"not a directory: {args.img_dir}")
     if args.mask_dir is None:
-        args.mask_dir = os.path.join(args.img_dir, "masks")
+        args.mask_dir = os.path.join(args.img_dir, MASKS_DIRNAME)
+        move_old_masks(os.path.join(args.img_dir, OLD_MASKS_DIRNAME), args.mask_dir)
         print(f"mask_dir not given, writing masks to {args.mask_dir}")
 
     os.makedirs(args.mask_dir, exist_ok=True)
@@ -174,12 +238,15 @@ def main():
     model = load_model(args.model)
     options = {"conf": args.conf, "grow": args.grow, "feather": args.feather, "include_hair": args.include_hair,
                "invert": args.invert, "model": model}
-    no_face = []
+    no_face, shadowed = [], []
+    existing = existing_masks(args.mask_dir)
     for i, f in enumerate(files, 1):
         stem = os.path.splitext(f)[0]
-        out = os.path.join(args.mask_dir, stem + ".png")
-        if os.path.exists(out) and not args.overwrite:
+        found = existing.get(stem.lower(), [])
+        if found and not args.overwrite:
             continue
+        out = os.path.join(args.mask_dir, found[0] if found else stem + ".png")
+        shadowed += found[1:]
         img = ImageOps.exif_transpose(Image.open(os.path.join(args.img_dir, f))).convert("RGB")
         array = np.asarray(img)
         p = plan(array, None, options)
@@ -187,7 +254,7 @@ def main():
         if not boxes:
             no_face.append(f)
         mask = Image.fromarray(apply(array, p))
-        mask.save(out)
+        save_mask(mask, out)
         if args.preview:
             red = Image.new("RGB", img.size, (255, 0, 0))
             alpha = ImageOps.invert(mask).point(lambda v: int(v * 0.55))
@@ -195,6 +262,13 @@ def main():
             prev.paste(red, (0, 0), alpha)
             prev.save(os.path.join(args.preview, stem + ".jpg"), quality=85)
         print(f"[{i}/{len(files)}] {f}: {len(boxes)} face(s)", flush=True)
+
+    if shadowed:
+        print()
+        print(f"{len(shadowed)} older mask(s) with the name of a newer one and another extension; "
+              f"AI Toolkit never reads them (it takes {', '.join(MASK_EXTS)} in this order), delete them:")
+        for f in shadowed:
+            print("  ", os.path.join(args.mask_dir, f))
 
     if no_face:
         colour = "black: nothing in it is trained" if args.invert else "white"

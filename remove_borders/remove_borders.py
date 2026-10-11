@@ -45,7 +45,7 @@ Image.MAX_IMAGE_PIXELS = None     # large scans are normal input, not an attack
 
 BACKUP_SUFFIX = "_backup"         # <root>_backup next to the root: originals, sidecars, run folders
 OLD_BACKUP_DIRNAME = "_backup"    # the backup inside the root until 2026-10-11; moved out by claim_backup
-BACKUP_MARK = "_dataset_tools.json"  # marks a backup folder of the dataset tools; such a folder is never scanned
+BACKUP_MARK = "_dataset_tools.json"  # marks a folder the dataset tools made next to a dataset; never scanned
 RUN_DIRNAME = "_remove_borders"   # inside the backup folder: plan, log, report, cache, sheets
 REPORT_NAME = "report.csv"
 PLAN_NAME = "plan.json"
@@ -53,17 +53,25 @@ SHEETS_DIRNAME = "sheets"
 LOG_NAME = "log.jsonl"            # every real run and undo, appended; --undo reads it
 CACHE_NAME = "cache.json"         # analysis results by file, reused while a file is unchanged
 PROGRESS_EVERY = 500              # images between progress lines
-MASKS_DIRNAME = "masks"           # face_masks: <dir>/masks/<stem>.png, the size of its image
+MASKS_DIRNAME = "_controls"       # face_masks: <dir>/_controls/<stem>.png, the size of its image
+OLD_MASKS_DIRNAME = "masks"       # the same until 2026-10-11; moved by move_old_masks
+# A mask may be any of these, and AI Toolkit's mask_path takes the first one
+# that exists for the image's stem, in this order: <stem>.jpg shadows <stem>.png.
+MASK_EXTS = (".jpg", ".jpeg", ".png", ".webp")
+MASK_JPEG_QUALITY = 95            # a JPEG mask that a tool crops or writes again
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".jpe", ".jfif", ".png", ".webp", ".bmp", ".tif", ".tiff",
               ".gif", ".avif", ".heic", ".heif"}
 # Folders never scanned, at any depth: the output folders of the dataset tools.
-# _backup is the old backup folder of this tool and the others, _duplicates is
-# deduplicate's, _prep is k2prep's, _classify and _embeddings are classify's,
-# masks and faces are face_masks'. A folder holding BACKUP_MARK (the backup of
-# a subfolder, <subfolder>_backup) is skipped too. Any other folder is
-# scanned, whatever its name; --exclude adds names.
-DEFAULT_EXCLUDES = [OLD_BACKUP_DIRNAME, "_duplicates", "_prep", "_classify", "_embeddings", "masks", "faces"]
+# _backup, _duplicates and _prep are the old in-dataset folders of this tool
+# and the others, of deduplicate and of k2prep, from before they moved out next
+# to the dataset; _classify and _embeddings are classify's, _controls (masks
+# before 2026-10-11) and faces are face_masks'. A folder holding BACKUP_MARK (a
+# folder the tools made next to a dataset, such as <subfolder>_backup) is
+# skipped too. Any other folder is scanned, whatever its name; --exclude adds
+# names.
+DEFAULT_EXCLUDES = [OLD_BACKUP_DIRNAME, "_duplicates", "_prep", "_classify", "_embeddings",
+                    MASKS_DIRNAME, OLD_MASKS_DIRNAME, "faces"]
 DEFAULT_SIDECARS = ".txt"
 DEFAULT_MIN_AREA = 256 * 256      # smaller than this after a crop: moved to the backup, not cropped
 DEFAULT_THREADS = 8
@@ -86,7 +94,8 @@ class Item:
     rel: str                                  # relative to root, forward slashes
     sidecars: list[Path] = field(default_factory=list)
     shared_stem: bool = False                 # another image in the folder has the same stem
-    mask: Path | None = None
+    mask: Path | None = None                  # the mask AI Toolkit reads
+    mask_shadowed: list[Path] = field(default_factory=list)   # other masks of the stem, never read
     head: dict = field(default_factory=dict)
     result: dict = field(default_factory=dict)  # analyse_file
     key: list | None = None                       # file_key when analysed, for the cache
@@ -121,7 +130,7 @@ def scan(root: Path, excludes, sidecar_exts) -> list[Item]:
     items = []
     for dirpath, dirnames, filenames in os.walk(root):
         here = Path(dirpath)
-        masks_dir = next((d for d in dirnames if d.casefold() == MASKS_DIRNAME), None)
+        mask_dirs = [d for name in (OLD_MASKS_DIRNAME, MASKS_DIRNAME) for d in dirnames if d.casefold() == name]
         dirnames[:] = sorted(d for d in dirnames if d.casefold() not in excl and not is_backup_dir(here / d))
         side_by_stem: dict[str, list[str]] = {}
         images_by_stem: dict[str, int] = {}
@@ -131,13 +140,10 @@ def scan(root: Path, excludes, sidecar_exts) -> list[Item]:
                 side_by_stem.setdefault(stem.casefold(), []).append(fn)
             elif ext.casefold() in IMAGE_EXTS:
                 images_by_stem[stem.casefold()] = images_by_stem.get(stem.casefold(), 0) + 1
-        masks = {}
-        if masks_dir:
-            try:
-                masks = {os.path.splitext(f)[0].casefold(): f for f in os.listdir(here / masks_dir)
-                         if f.lower().endswith(".png")}
-            except OSError:
-                masks = {}
+        masks: dict[str, list[Path]] = {}
+        for masks_dir in reversed(mask_dirs):         # _controls first, so its masks win
+            for key, found in mask_files(here / masks_dir).items():
+                masks.setdefault(key, []).extend(found)
         for fn in sorted(filenames):
             stem, ext = os.path.splitext(fn)
             if ext.casefold() not in IMAGE_EXTS:
@@ -148,7 +154,8 @@ def scan(root: Path, excludes, sidecar_exts) -> list[Item]:
                 root=root, path=p, rel=p.relative_to(root).as_posix(),
                 sidecars=[here / s for s in sorted(side_by_stem.get(key, []))],
                 shared_stem=images_by_stem.get(key, 0) > 1,
-                mask=(here / masks_dir / masks[key]) if key in masks else None))
+                mask=masks[key][0] if key in masks else None,
+                mask_shadowed=masks.get(key, [])[1:]))
     return items
 
 
@@ -1024,12 +1031,18 @@ def png_target(src: Path) -> Path:
 
 def write_mask(mask: Path, dst: Path, display_box) -> str:
     """Crop a face_masks mask (made from the upright image) with the image's
-    box in upright pixels. "" when done, else why not."""
+    box in upright pixels, and save it in its own format (save_mask). ""
+    when done, else why not."""
+    st = os.stat(mask)
     with Image.open(mask) as m:
         x0, y0, x1, y1 = display_box
         if x1 > m.width or y1 > m.height:
             return f"mask is {m.width}x{m.height}, smaller than the crop box"
-    write_exact(mask, dst, display_box)
+        out = m.crop((x0, y0, x1, y1))
+        out.load()
+    tmp = part_path(dst)
+    save_mask(out, tmp, dst.name)
+    finish_write(tmp, dst, st)
     return ""
 
 
@@ -1304,6 +1317,13 @@ def claim_backup(root: Path, create: bool = True, say=print) -> Path:
         left = move_old_backup(old, bdir)
         say(f"{root.name}: the backup moved out of the dataset, from {old} to {bdir}"
             + (f"; {left} files that differ from the ones in {bdir.name} stay in {old}" if left else ""))
+    for top, check in ((root, True), (bdir, False)):
+        if top.is_dir():
+            moved, left = move_old_masks(top, check)
+            if moved:
+                say(f"{top.name}: {moved} {OLD_MASKS_DIRNAME} folder(s) of face masks renamed to {MASKS_DIRNAME}"
+                    + (f"; {left} files that differ from the ones in {MASKS_DIRNAME} stay in {OLD_MASKS_DIRNAME}"
+                       if left else ""))
     if create or bdir.is_dir():
         bdir.mkdir(exist_ok=True)
         if not is_backup_dir(bdir):
@@ -1341,6 +1361,125 @@ def move_old_backup(old: Path, bdir: Path) -> int:
         except OSError:
             pass
     return left
+
+
+# --- face masks ------------------------------------------------------------------
+# face_masks writes the mask of <dir>/<stem>.<ext> to <dir>/_controls/<stem>.png.
+# AI Toolkit never trains a file whose folder is named _controls (that is where
+# it keeps the control images it makes itself; skipped since its 96ba2fd,
+# 2025-04-09), and its mask_path finds a mask by the image's stem, so a dataset
+# entry takes mask_path: <dataset>/_controls. Until 2026-10-11 the folder was
+# named masks, and AI Toolkit trained every mask as an image. claim_backup
+# renames those folders, in the dataset and in its backup; mask_rel maps the
+# paths that older log records give.
+
+def mask_order(name: str) -> tuple:
+    """Sort key: the mask AI Toolkit reads first (MASK_EXTS order), then by name."""
+    return MASK_EXTS.index(os.path.splitext(name)[1].casefold()), name.casefold()
+
+
+def mask_files(d: Path) -> dict[str, list[Path]]:
+    """The masks in folder d by stem (casefolded), each list in MASK_EXTS order:
+    the first is the one AI Toolkit reads, the rest are shadowed by it."""
+    out: dict[str, list[Path]] = {}
+    try:
+        names = [f for f in os.listdir(d) if os.path.splitext(f)[1].casefold() in MASK_EXTS]
+    except OSError:
+        return out
+    for f in sorted(names, key=mask_order):
+        out.setdefault(os.path.splitext(f)[0].casefold(), []).append(d / f)
+    return out
+
+
+def mask_target(d: Path, stem: str) -> tuple[Path, list[Path]]:
+    """Where a tool writes a new mask of <d>/<stem>.*: over the mask in
+    <d>/_controls that AI Toolkit reads, in that file's format, else
+    <stem>.png. -> (that path, the other masks of the stem there)."""
+    found = mask_files(d / MASKS_DIRNAME).get(stem.casefold(), [])
+    if found:
+        return found[0], found[1:]
+    return d / MASKS_DIRNAME / (stem + ".png"), []
+
+
+def save_mask(img: Image.Image, fp, name: str) -> None:
+    """Save a mask to fp (a path or a file) in the format that name's
+    extension gives: JPEG at MASK_JPEG_QUALITY without chroma subsampling,
+    WebP lossless, else PNG."""
+    ext = os.path.splitext(name)[1].casefold()
+    if ext in (".jpg", ".jpeg"):
+        img.save(fp, "JPEG", quality=MASK_JPEG_QUALITY, subsampling=0)
+    elif ext == ".webp":
+        img.save(fp, "WEBP", lossless=True)
+    else:
+        img.save(fp, "PNG", compress_level=PNG_LEVEL)
+
+
+def is_old_masks_dir(d: Path) -> bool:
+    """A masks folder of face_masks: mask files only (MASK_EXTS), at least one
+    of them named like an image in the folder above. A folder of mask photos
+    with captions, or of anything else, is not one."""
+    try:
+        files = [f for f in os.listdir(d) if (d / f).is_file()]
+        if not files or any(os.path.splitext(f)[1].casefold() not in MASK_EXTS for f in files):
+            return False
+        stems = {os.path.splitext(f)[0].casefold() for f in os.listdir(d.parent)
+                 if os.path.splitext(f)[1].casefold() in IMAGE_EXTS and (d.parent / f).is_file()}
+    except OSError:
+        return False
+    return any(os.path.splitext(f)[0].casefold() in stems for f in files)
+
+
+def move_old_masks(top: Path, check: bool = True) -> tuple[int, int]:
+    """Rename every masks folder of face masks under top to _controls: one
+    rename when there is no _controls next to it, else file by file, never over
+    a file in _controls (one with the same bytes is dropped, one with other bytes
+    stays). check: only folders that is_old_masks_dir confirms (in a dataset;
+    in a backup folder every masks folder is one). Marked folders other than
+    top are not entered. -> (folders moved, files left behind)."""
+    moved = left = 0
+    for dirpath, dirnames, filenames in os.walk(top):
+        here = Path(dirpath)
+        olds = [d for d in dirnames if d.casefold() == OLD_MASKS_DIRNAME]
+        dirnames[:] = [d for d in dirnames if d.casefold() not in (OLD_MASKS_DIRNAME, MASKS_DIRNAME)
+                       and not is_backup_dir(here / d)]
+        for d in olds:
+            old = here / d
+            if check and not is_old_masks_dir(old):
+                continue
+            new = here / MASKS_DIRNAME
+            try:
+                if not new.exists():
+                    os.rename(old, new)
+                else:
+                    for f in os.listdir(old):
+                        src, dst = old / f, new / f
+                        if not dst.exists():
+                            os.replace(src, dst)
+                        elif same_bytes(src, dst):
+                            make_writable(src)
+                            src.unlink()
+                        else:
+                            left += 1
+                    try:
+                        old.rmdir()
+                    except OSError:
+                        pass
+            except OSError as e:
+                raise SystemExit(f"cannot rename {old} to {new}: {e}")
+            moved += 1
+    return moved, left
+
+
+def mask_rel(root: Path, where: str) -> str:
+    """A mask path from a log record, relative to root: <dir>/masks/<stem>.png
+    in a record from before the rename is <dir>/_controls/<stem>.png, unless the
+    old path is still there (a folder move_old_masks did not take)."""
+    p = Path(where)
+    if p.parent.name.casefold() != OLD_MASKS_DIRNAME:
+        return where
+    if (root / p).exists() or (backup_dir(root) / p).exists():
+        return where
+    return (p.parent.parent / MASKS_DIRNAME / p.name).as_posix()
 
 
 def from_log(bdir: Path, where: str) -> Path:
@@ -1425,6 +1564,11 @@ def crop_job(job: dict) -> dict:
         rec["sidecars"] = {Path(sc).name: copy_keep(Path(sc), backup_of(root, Path(sc))) for sc in job["sidecars"]}
         if job["mask"]:
             rec["mask"] = copy_keep(Path(job["mask"]), backup_of(root, Path(job["mask"])))
+        # The other masks of the stem would keep the old geometry; AI Toolkit
+        # never reads them, and nothing should: they go to the backup.
+        rec["mask_shadowed"] = {Path(m).relative_to(root).as_posix():
+                                move_keep(Path(m), backup_of(root, Path(m))).relative_to(backup_dir(root)).as_posix()
+                                for m in job.get("mask_shadowed", [])}
         out = write_crop(job["path"], job["plan"], job["head"], job["mask"])
         if "error" in out:
             rec["error"] = out["error"]
@@ -1448,6 +1592,7 @@ def move_out(root: Path, it) -> dict:
         files = [(it.path, False)] + [(sc, it.shared_stem) for sc in it.sidecars]
         if it.mask:
             files.append((it.mask, False))
+        files += [(m, False) for m in it.mask_shadowed]
         for f, shared in files:
             if shared:
                 rec["moved"][f.relative_to(root).as_posix()] = "copy:" + copy_keep(f, backup_of(root, f))
@@ -1500,9 +1645,11 @@ def real_run(root: Path, items, threads: int) -> dict:
         for it in crops:
             log.write({"op": "intent", "rel": it.rel, "action": "crop", "write": it.result["plan"]["write"],
                        "sidecars": [sc.relative_to(root).as_posix() for sc in it.sidecars],
-                       "mask": it.mask.relative_to(root).as_posix() if it.mask else ""})
+                       "mask": it.mask.relative_to(root).as_posix() if it.mask else "",
+                       "mask_shadowed": [m.relative_to(root).as_posix() for m in it.mask_shadowed]})
         jobs = [{"root": str(root), "path": str(it.path), "rel": it.rel, "plan": it.result["plan"], "head": it.head,
-                 "sidecars": [str(sc) for sc in it.sidecars], "mask": str(it.mask) if it.mask else None}
+                 "sidecars": [str(sc) for sc in it.sidecars], "mask": str(it.mask) if it.mask else None,
+                 "mask_shadowed": [str(m) for m in it.mask_shadowed]}
                 for it in crops]
         progress = Progress(root.name, "cropped", len(crops))
         for n, (it, rec) in enumerate(zip(crops, run_pool(crop_job, [jobs], threads)), 1):
@@ -1581,12 +1728,17 @@ def undo_root(root: Path) -> dict:
                     if where == "copy:copied":
                         (bdir / orig).unlink(missing_ok=True)
                     continue
+                src = from_log(bdir, where)
+                if not src.exists() and src.parent.name.casefold() == OLD_MASKS_DIRNAME:
+                    # a mask moved out before its masks folder was renamed to _controls
+                    src = src.parent.parent / MASKS_DIRNAME / src.name
+                    orig = (Path(orig).parent.parent / MASKS_DIRNAME / Path(orig).name).as_posix()
                 if (root / orig).exists():
                     counts["conflicts"] += 1
                     print(f"  not moved back, {orig} exists again")
                     continue
                 (root / orig).parent.mkdir(parents=True, exist_ok=True)
-                os.replace(from_log(bdir, where), root / orig)
+                os.replace(src, root / orig)
             counts["moved back"] += 1
             continue
         # a crop: the image (or, for a lossy format, the original moved out and the PNG written)
@@ -1606,7 +1758,11 @@ def undo_root(root: Path) -> dict:
             if restore_file(root, rel, keep_backup=keep) == "restored":
                 counts["restored"] += 1
         if intent.get("mask"):
-            restore_file(root, intent["mask"], keep_backup=rec.get("mask") == "kept")
+            restore_file(root, mask_rel(root, intent["mask"]), keep_backup=rec.get("mask") == "kept")
+        for m in intent.get("mask_shadowed", []):     # back from the backup, also after an interrupted run
+            b = bdir / (rec.get("mask_shadowed") or {}).get(m, m)
+            if b.is_file() and not (root / m).exists():
+                os.replace(b, root / m)
         for sc in intent.get("sidecars", []):
             status = (rec.get("sidecars") or {}).get(Path(sc).name)
             b = bdir / sc

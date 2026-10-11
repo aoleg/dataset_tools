@@ -34,12 +34,16 @@ run.bat D:\photos\2016 --resize --ostris
 
 The first command plans the crops and draws a preview of each photo, without writing any photos. The second writes the crops. The third crops and resizes every photo into its k2prep bucket, at the bucket sizes of Ostris AI Toolkit.
 
-Each folder is processed with all its subfolders. Folders whose names start with `_` are skipped. The output goes to `<folder>\_reframed\` with the same relative paths. The photos in the folder itself are never changed.
+Each folder is processed with all its subfolders. Folders whose names start with `_` are skipped. The output goes to `<folder>_reframed\` next to the folder, with the same relative paths. The photos in the folder itself are never changed.
+
+The output is next to the folder, not inside it, because a trainer that reads all subfolders (Ostris AI Toolkit trains every subfolder whose name does not start with a dot) would train every photo twice. Caption and train `<folder>_reframed` as a dataset of its own. Until 2026-10-11 the output was `<folder>\_reframed\`; the next run without `--out` moves it out. If a `<folder>_reframed` that reframe did not write is in the way, the run stops; rename it or give `--out`.
+
+The detection cache, the plan and the previews go to `<folder>_backup\_reframe\`, the run folder of reframe in the backup folder that the dataset tools share (see [The backup folder](../README.md#the-backup-folder)), so the output holds only photos, captions and `written.json`. A run moves these files there from an output folder of an earlier run.
 
 | option | default | meaning |
 |---|---|---|
 | `--dry-run` | off | write only `plan.json` and the previews |
-| `--verdicts` | off | draw the decision for each photo into `_reframed\_verdicts\` |
+| `--verdicts` | off | draw the decision for each photo into `<folder>_backup\_reframe\_verdicts\` |
 | `--resize` | off | crop and resize every photo into its k2prep bucket, sorted into tier folders; needs `--ostris` or `--musubi` |
 | `--ostris` | | with `--resize`: Ostris AI Toolkit buckets, which AI Toolkit trains with no second resize or crop |
 | `--musubi` | | with `--resize`: musubi-tuner buckets |
@@ -49,9 +53,9 @@ Each folder is processed with all its subfolders. Folders whose names start with
 | `--mode` | `best_fit` | how the ratio is chosen: `best_fit`, `square` or `closest`, see [Crop modes](#crop-modes) |
 | `--skip-unchanged` | off | do not copy the photos that are not cropped |
 | `--overwrite` | off | write all outputs again, also the ones that are up to date |
-| `--out DIR` | `<folder>\_reframed` | another output folder; with one input folder only |
-| `--previews` | off | draw the raw detections (outlines, faces, skeletons) into `_reframed\_preview\` |
-| `--people` | off | draw the people with their measurements into `_reframed\_people\` |
+| `--out DIR` | `<folder>_reframed` | another output folder; with one input folder only |
+| `--previews` | off | draw the raw detections (outlines, faces, skeletons) into `<folder>_backup\_reframe\_preview\` |
+| `--people` | off | draw the people with their measurements into `<folder>_backup\_reframe\_people\` |
 | `--redetect` | off | run the detection again, without the cache |
 | `--threads N` | 4 | number of parallel workers, 1 to 32 |
 
@@ -87,15 +91,15 @@ The output goes to `<tier>\<name>`, or `<subfolder>\<tier>\<name>` for photos in
 
 **The trainer.** `--resize` needs one of two options, the same as in [k2prep](../k2prep/README.md#the-trainer---ostris-or---musubi). `--ostris` gives Ostris AI Toolkit buckets: sides in steps of 64, the size closest to the aspect ratio with at least 80 percent of the tier's area, which AI Toolkit trains as they are, with no second resize or crop. `--musubi` gives the sizes of musubi-tuner's bucket list. Without either, the run stops before it reads a photo and prints the command with each option added, ready to copy. The first line of a `--resize` run names the buckets it uses. The crop around the subject is planned the same way for both; only the final bucket differs. A second run with the other option writes a resized photo again when its bucket differs; some buckets, such as 1024×1024, are the same in both. Without `--resize` the two options are refused: the crops keep their own size.
 
-**Next runs.** `_reframed\written.json` records what was written for each photo. A second run skips the photos that are done. It writes a photo again when the photo, its caption, the plan or the options changed. It removes outputs that are no longer wanted, for example the old copy of a photo that is now cropped. Each file is written under a temporary name and renamed when it is complete.
+**Next runs.** `written.json` in the output folder records what was written for each photo. A second run skips the photos that are done. It writes a photo again when the photo, its caption, the plan or the options changed. It removes outputs that are no longer wanted, for example the old copy of a photo that is now cropped. Each file is written under a temporary name and renamed when it is complete.
 
-Other files in `_reframed`:
+Other files:
 
 | file | content |
 |---|---|
-| `detections.json` | the detections and measurements of each photo; a second run reuses them |
-| `plan.json` | the decision for each photo: the subject people, the reason, the crop box and the flags |
-| `written.json` | the outputs of the last run |
+| `<folder>_backup\_reframe\detections.json` | the detections and measurements of each photo; a second run reuses them |
+| `<folder>_backup\_reframe\plan.json` | the decision for each photo: the subject people, the reason, the crop box and the flags |
+| `<folder>_reframed\written.json` | the outputs of the last run |
 
 ## How the subject is chosen
 

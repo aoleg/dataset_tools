@@ -22,7 +22,7 @@ Passes, in this order, each over all the images of the job (or its file list):
   apply      decode once upright, crop, paint the watermark boxes left inside
              the crop (LaMa), restore (FBCNN) when the verdict says so, write
              once (a lossless crop of the file when no pixel stage touched the
-             image), then the face mask of the final image into masks/
+             image), then the face mask of the final image into _controls/
 Every detection is cached per image in <folder>_backup/_pipeline/cache.json,
 keyed by the file's size and time and the model's signature, so a pass whose
 results are cached loads no model, and a real run after a dry run detects
@@ -74,7 +74,7 @@ import stat
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -101,7 +101,7 @@ CACHE_NAME = "cache.json"
 PLAN_NAME = "plan.json"
 REPORT_NAME = "report.jsonl"
 PREVIEWS_DIRNAME = "previews"
-MASKS_DIRNAME = "masks"
+MASKS_DIRNAME = rb.MASKS_DIRNAME                 # <dir>/_controls/<stem>.png; masks/ before 2026-10-11
 CACHE_VERSION = 2
 STAGES = ["borders", "watermark", "reframe", "jpeg_cleanup", "face_masks"]
 IMAGE_EXTS = rb.IMAGE_EXTS
@@ -862,18 +862,29 @@ def write_job(job: dict) -> dict:
                 src.unlink()
                 rec["removed"] = job["rel"]
         rec["out"] = dst.relative_to(root if in_place else Path(job["target"])).as_posix()
-        if job.get("mask") is not None:
+        if job.get("mask") is not None or job.get("crop_mask"):
             mpath = Path(job["mask_path"])
             if in_place and mpath.exists():
                 rec["mask_backup"] = copy_keep(mpath, rb.backup_dir(root) / mpath.relative_to(root))
-            mpath.parent.mkdir(parents=True, exist_ok=True)
-            # two images with one stem (a.jpg, a.png) share one mask: each
-            # worker writes its own part file, the last one to finish wins
-            tmp = mpath.with_name(f"{mpath.name}.part{os.getpid()}")
-            Image.fromarray(job["mask"]).save(tmp, "PNG", compress_level=PNG_LEVEL)
-            make_writable(mpath)
-            os.replace(tmp, mpath)
+            if job.get("mask") is not None:
+                mpath.parent.mkdir(parents=True, exist_ok=True)
+                # two images with one stem (a.jpg, a.png) share one mask: each
+                # worker writes its own part file, the last one to finish wins
+                tmp = mpath.with_name(f"{mpath.name}.part{os.getpid()}")
+                rb.save_mask(Image.fromarray(job["mask"]), tmp, mpath.name)
+                make_writable(mpath)
+                os.replace(tmp, mpath)
+            else:                                          # no face_masks stage: the mask follows the crop
+                note = rb.write_mask(mpath, mpath, job["crop_mask"])
+                if note:
+                    rec["mask_note"] = note
             rec["mask"] = mpath.relative_to(root if in_place else Path(job["target"])).as_posix()
+        if job.get("mask_shadowed"):                       # in place: the masks AI Toolkit would not read
+            rec["mask_shadowed"] = {
+                Path(m).relative_to(root).as_posix():
+                    rb.move_keep(Path(m), rb.backup_dir(root) / Path(m).relative_to(root))
+                      .relative_to(rb.backup_dir(root)).as_posix()
+                for m in job["mask_shadowed"] if Path(m).exists()}
     except Exception as e:  # noqa: BLE001 - one bad file is reported, not fatal
         rec["error"] = f"{type(e).__name__}: {e}".strip()
         # the writes are atomic, so the image in place is intact: a backup this
@@ -997,8 +1008,9 @@ def undo(root: Path) -> dict:
                     make_writable(b)
                     b.unlink()
         if rec.get("mask"):
-            m = root / rec["mask"]
-            mb = rb.backup_dir(root) / rec["mask"]
+            mrel = rb.mask_rel(root, rec["mask"])         # masks/ in a record from before 2026-10-11
+            m = root / mrel
+            mb = rb.backup_dir(root) / mrel
             if rec.get("mask_backup") in ("copied", "same", "kept") and mb.exists():
                 make_writable(m)
                 tmp = rb.part_path(m)
@@ -1012,9 +1024,13 @@ def undo(root: Path) -> dict:
                 m.unlink()
                 counts["removed"] += 1
             try:
-                m.parent.rmdir()                      # a masks folder this run made and emptied
+                m.parent.rmdir()                      # a _controls folder this run made and emptied
             except OSError:
                 pass
+        for mrel, where in (rec.get("mask_shadowed") or {}).items():
+            b = rb.backup_dir(root) / where
+            if b.is_file() and not (root / mrel).exists():
+                os.replace(b, root / mrel)
     log = RunLog(root)
     log.write({"undo": head["run"], "time": time.strftime("%Y-%m-%d %H:%M:%S"), **counts})
     log.close()
@@ -1058,9 +1074,15 @@ def rel_of(root: Path, raw) -> str | None:
     return p.as_posix()
 
 
-def mask_rel_of(rel: str) -> str:
-    """Where the tools keep the mask of an image: masks/<stem>.png next to it."""
+def mask_rel_of(root: Path, rel: str) -> str:
+    """The mask of an image, relative to root: the one AI Toolkit reads in
+    _controls next to it, from its backup (the original, when a tool changed
+    it) or in place; _controls/<stem>.png when there is none."""
     p = Path(rel)
+    for top in (rb.backup_dir(root), root):
+        found = rb.mask_files(top / p.parent / MASKS_DIRNAME).get(p.stem.casefold())
+        if found:
+            return found[0].relative_to(top).as_posix()
     return (p.parent / MASKS_DIRNAME / (p.stem + ".png")).as_posix()
 
 
@@ -1125,7 +1147,7 @@ def undo_files(root: Path, files: list, delete_captions: bool) -> dict:
             restore_from_backup(bk, dst)
             line["restored"] = rel
             # the mask: back from its backup, else gone when the pipeline made it
-            mask_rel = rec.get("mask") or mask_rel_of(out_rel or rel)
+            mask_rel = rb.mask_rel(root, rec["mask"]) if rec.get("mask") else mask_rel_of(root, out_rel or rel)
             m, mb = root / mask_rel, bdir / mask_rel
             if mb.is_file():
                 restore_from_backup(mb, m)
@@ -1140,6 +1162,9 @@ def undo_files(root: Path, files: list, delete_captions: bool) -> dict:
                     m.parent.rmdir()
                 except OSError:
                     pass
+            for mrel, where in (rec.get("mask_shadowed") or {}).items():
+                if (bdir / where).is_file() and not (root / mrel).exists():
+                    os.replace(bdir / where, root / mrel)
             # the caption
             cap_rel = Path(rel).with_suffix(".txt").as_posix()
             cap, cb = root / cap_rel, bdir / cap_rel
@@ -1202,6 +1227,8 @@ def apply_pass(job: Job, items: list, entries: dict, caches: Caches, stages: Sta
     total = len(chosen)
     index = {it.rel: n for n, it in enumerate(chosen, 1)}
     counts = {"changed": 0, "unchanged": 0, "skipped": 0, "failed": 0, "masks": 0}
+    stem_count = Counter((it.path.parent, it.path.stem.casefold()) for it in items)
+    shadow_done: set = set()
 
     def finish(rec: dict, line: dict) -> None:
         log.write(rec)
@@ -1267,19 +1294,35 @@ def apply_pass(job: Job, items: list, entries: dict, caches: Caches, stages: Sta
                     report.write(json.dumps(line, ensure_ascii=False) + "\n")
                     emit(line)
                     continue
-                mask_path = None
+                # The mask: a new one goes over the mask AI Toolkit reads (any
+                # extension, see rb.mask_target), else to <stem>.png; without
+                # the face_masks stage, an existing mask is cropped with the
+                # image in place. Two images of one stem share their mask, so
+                # it is cropped for neither, and the other masks of the stem
+                # (shadowed: AI Toolkit never reads them) go to the backup once.
+                mask_path, shadowed, crop_mask = None, [], None
+                mdir, mstem = base / Path(out_rel).parent, Path(out_rel).stem
                 if mask is not None:
-                    mask_path = base / Path(out_rel).parent / MASKS_DIRNAME / (Path(out_rel).stem + ".png")
+                    mask_path, shadowed = rb.mask_target(mdir, mstem)
+                elif job.mode == "in_place" and write != "none" and e["box"]:
+                    found = rb.mask_files(mdir / MASKS_DIRNAME).get(mstem.casefold(), [])
+                    if found and stem_count[(it.path.parent, it.path.stem.casefold())] == 1:
+                        mask_path, shadowed, crop_mask = found[0], found[1:], e["box"]
+                if job.mode != "in_place" or (mdir, mstem.casefold()) in shadow_done:
+                    shadowed = []
+                shadow_done.add((mdir, mstem.casefold()))
                 log.write({"op": "intent", "rel": it.rel, "write": write, "out": out_rel,
                            "sidecars": [sc.relative_to(root).as_posix() for sc in it.sidecars],
-                           "mask": mask_path.relative_to(base).as_posix() if mask_path else ""})
+                           "mask": mask_path.relative_to(base).as_posix() if mask_path else "",
+                           "mask_shadowed": [m.relative_to(root).as_posix() for m in shadowed]})
                 wjob = {"root": str(root), "target": str(job.target) if job.target else "", "rel": it.rel,
                         "src": str(it.path), "dst": str(dst), "head": {k: v for k, v in head.items() if k in HEAD_KEYS},
                         "mode": job.mode, "write": write, "changed": list(e["changed"]), "stored_box": e["stored_box"],
                         "sidecars": [str(sc) for sc in it.sidecars],
                         "fmt": "JPEG" if out_rel.lower().endswith((".jpg", ".jpeg", ".jpe", ".jfif")) else "PNG",
                         "array": out if write == "array" else None, "mask": mask,
-                        "mask_path": str(mask_path) if mask_path else ""}
+                        "mask_path": str(mask_path) if mask_path else "", "crop_mask": crop_mask,
+                        "mask_shadowed": [str(m) for m in shadowed]}
                 if write == "lossless" and head["kind"] == rb.KIND_JPEG and not head.get("mcu"):
                     wjob.update(write="array", array=out)        # a JPEG without a known block size
                     line["write"] = "array"

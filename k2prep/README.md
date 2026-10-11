@@ -30,7 +30,7 @@ run.bat "L:\train\photos" --ostris --threshold 6
 
 Name the trainer on every run that resizes: `--ostris` for Ostris AI Toolkit, `--musubi` for musubi-tuner. See [The trainer](#the-trainer---ostris-or---musubi).
 
-That is the whole workflow. One run scans, assigns buckets, consolidates the undersized ones, renders and scores every image, writes the ones that pass along with their captions, and, with `--musubi`, emits `_prep/dataset.toml` ready to hand to musubi-tuner.
+That is the whole workflow. One run scans, assigns buckets, consolidates the undersized ones, renders and scores every image, writes the ones that pass along with their captions, and, with `--musubi`, emits `_prep_<folder>/dataset.toml` ready to hand to musubi-tuner.
 
 **Run `--report` first.** It is a dry run: it analyses everything and writes a report but no images. Because rejections leave no artifact on disk — nothing is copied, moved or marked — the report is the only place a rejected file is ever named. Recovering from too high a threshold means lowering it and re-running, which is cheap (already-written images are skipped), but you cannot recover the list of what was dropped after the fact if you never generated it.
 
@@ -46,11 +46,12 @@ k2prep.py <folder> [options]
 |---|---|---|
 | `<folder>` | required | Input folder, positional. One dataset, unless `--recursive`. |
 | `--ostris` | one of the two | Resize onto Ostris AI Toolkit buckets. One of `--ostris` and `--musubi` is required whenever k2prep resizes. See [below](#the-trainer---ostris-or---musubi). |
-| `--musubi` | one of the two | Resize onto musubi-tuner buckets and write `_prep/dataset.toml`. |
+| `--musubi` | one of the two | Resize onto musubi-tuner buckets and write `dataset.toml` into the output folder. |
 | `--by-tier` | off | One folder per tier (`_1024`, `_768`, `_512`, `_256`), each holding the whole source tree, for the dataset and for `--copy-to` and `--move-to`. Scans the whole tree at every depth (implies `--recursive`). Adds the 256 tier. See [below](#one-folder-per-tier-for-ai-toolkit---by-tier). |
 | `--report` | off | Dry run. Analyse and write a report; write no images. |
-| `--recursive` | off | Every subfolder that directly contains images is its own dataset, sharing one `_prep` and one `dataset.toml`. See [below](#--recursive-several-datasets-one-_prep). |
-| `-R` | off | One independent run for the folder and one for each first-level subfolder, each with its own `_prep`. See [below](#-r-independent-runs-per-subfolder). |
+| `--recursive` | off | Every subfolder that directly contains images is its own dataset, sharing one output folder and one `dataset.toml`. See [below](#--recursive-several-datasets-one-output-folder). |
+| `--out DIR` | `_prep_<folder>` | The output folder, instead of `_prep_<folder>` next to the folder. Not with `-R`. |
+| `-R` | off | One independent run for the folder and one for each first-level subfolder, each with its own output folder. See [below](#-r-independent-runs-per-subfolder). |
 | `--threshold N` | 0 | Process only images whose composite score ≥ N. 0 processes everything that fits a tier. Range 0–10. |
 | `--png` | off | Write PNG instead of JPEG q97 4:4:4. |
 | `--filter NAME` | `lanczos` | `lanczos`, `box`, `bicubic`, `bilinear`. |
@@ -69,21 +70,25 @@ k2prep.py <folder> [options]
 
 Use `--filter box` for heavily compressed sources. Box averaging suppresses 8×8 block artifacts more cleanly than Lanczos, which can ring on them.
 
-Output goes to `<folder>/_prep/{1024,768,512}/`, flat, with `.txt` caption sidecars copied alongside, plus `_prep/dataset.toml` with `--musubi` (under `--recursive`, each dataset gets its tier folders at `_prep/<subfolder>/<tier>/` instead, and under `--by-tier` the tier comes first: `_prep/_<tier>/<subfolder>/`). Every run writes two timestamped reports to `<folder>/_prep/reports/`:
+Output goes to the output folder `_prep_<folder>`, next to the folder: `L:\photos` gets `L:\_prep_photos`, or the folder that `--out` names. In it: `{1024,768,512}/`, flat, with `.txt` caption sidecars copied alongside, plus `dataset.toml` with `--musubi` (under `--recursive`, each dataset gets its tier folders at `<subfolder>/<tier>/` instead, and under `--by-tier` the tier comes first: `_<tier>/<subfolder>/`). Every run writes two timestamped reports to `reports/` in it:
 
 - `*-preliminary.txt` — the natural, per-family bucket assignment, before any consolidation and before anything is scored. This is the bucket explosion in its raw form.
 - `*-final.txt` — what was actually written, with the rendered scores, what the merge pass moved, and what it could not.
 
 Reports are never overwritten, so two threshold settings are diffable — and so are the two stages of a single run.
 
-`_prep/` belongs to k2prep. Each run makes the tier folders match its own plan exactly: outputs left by an earlier run that the current one does not place (because the threshold changed, or merging moved an image elsewhere) are removed and listed under `SUPERSEDED OUTPUTS` in the final report. The source folder is never touched, so anything removed is one re-run away from coming back.
+The output folder is next to the source, not inside it, because Ostris AI Toolkit trains every subfolder whose name does not start with a dot: a training run on the source folder would train every render along with its original. The name starts with `_` so that a k2prep scan of the parent skips it. It holds a `_dataset_tools.json` file that marks it, so the other dataset tools skip it too; a `_prep_<folder>` that k2prep did not make stops the run. A drive root has no folder next to it: give a subfolder, or `--out`. `--out` must not be inside the source, except under a folder whose name starts with `_` or `.`.
+
+Until 2026-10-11 the output folder was `<folder>/_prep`, inside the source. The next run without `--out` moves it to `_prep_<folder>` in one rename, with its renders, reports, score caches and musubi's cache folders, and rewrites the paths in the `dataset.toml` that k2prep wrote, so nothing is rendered again. When `_prep_<folder>` exists already, or with `--out`, the old `_prep` stays and the run says so: delete it, because a trainer that reads subfolders trains it.
+
+The output folder belongs to k2prep. Each run makes the tier folders match its own plan exactly: outputs left by an earlier run that the current one does not place (because the threshold changed, or merging moved an image elsewhere) are removed and listed under `SUPERSEDED OUTPUTS` in the final report. The source folder is never touched, so anything removed is one re-run away from coming back.
 
 ## The trainer: `--ostris` or `--musubi`
 
 A trainer resizes and crops every image onto one of its own bucket sizes. An image that arrives at exactly one of them is used as it is; any other image is resized and cropped a second time, blind to where the subject is. So k2prep renders onto the exact bucket sizes of the trainer you name:
 
-- `--ostris`: Ostris AI Toolkit. Sides in steps of 64, within the tier's area. AI Toolkit's own bucket function (`get_bucket_for_image_size`, ported into k2prep and checked whenever a bucket is used) returns each of these sizes unchanged, so AI Toolkit trains the render with no second resize or crop. That holds for `bucket_tolerance` 64, AI Toolkit's default, and for 32, 16 and 8. No `dataset.toml` is written, and one that an earlier `--musubi` run wrote into `_prep` is removed; a TOML that k2prep did not write is never touched.
-- `--musubi`: musubi-tuner. The sizes of musubi's own bucket list (see [below](#why-the-output-dimensions-look-arbitrary)), and a `_prep/dataset.toml` for it.
+- `--ostris`: Ostris AI Toolkit. Sides in steps of 64, within the tier's area. AI Toolkit's own bucket function (`get_bucket_for_image_size`, ported into k2prep and checked whenever a bucket is used) returns each of these sizes unchanged, so AI Toolkit trains the render with no second resize or crop. That holds for `bucket_tolerance` 64, AI Toolkit's default, and for 32, 16 and 8. No `dataset.toml` is written, and one that an earlier `--musubi` run wrote into the output folder is removed; a TOML that k2prep did not write is never touched.
+- `--musubi`: musubi-tuner. The sizes of musubi's own bucket list (see [below](#why-the-output-dimensions-look-arbitrary)), and a `dataset.toml` for it.
 
 The two are not interchangeable. musubi sizes are multiples of 16, which AI Toolkit at its default settings crops again by 1 to 3 percent at 1024 and by up to 14 percent at 512.
 
@@ -100,18 +105,18 @@ The Ostris bucket of an aspect ratio is the size in steps of 64 that is closest 
 
 At 256 (only with `--by-tier`) the 64-pixel grid is too coarse for seven ratios, so some share a bucket, and the reports name them together, for example `4:5/1:1/5:4`.
 
-## `--recursive`: several datasets, one `_prep`
+## `--recursive`: several datasets, one output folder
 
-If your photos are split into subfolders — one per subject, per shoot, per concept — and you want to train them **together** in one run, pass `--recursive`. Every directory that directly contains at least one image becomes its own dataset, and the whole tree shares one `_prep`, one set of reports and one `dataset.toml`:
+If your photos are split into subfolders — one per subject, per shoot, per concept — and you want to train them **together** in one run, pass `--recursive`. Every directory that directly contains at least one image becomes its own dataset, and the whole tree shares one output folder, one set of reports and one `dataset.toml`:
 
 ```bash
 run.bat "L:\train" --recursive --musubi --report
 ```
 
 ```
-L:\train\photo.jpg          ->  L:\train\_prep\1024\
-L:\train\alice\...          ->  L:\train\_prep\alice\{1024,768,512}\
-L:\train\bob\indoor\...     ->  L:\train\_prep\bob\indoor\{1024,768,512}\
+L:\train\photo.jpg          ->  L:\_prep_train\1024\
+L:\train\alice\...          ->  L:\_prep_train\alice\{1024,768,512}\
+L:\train\bob\indoor\...     ->  L:\_prep_train\bob\indoor\{1024,768,512}\
 ```
 
 The output mirrors the source tree, so a tree with no subfolders produces exactly the flat layout — `--recursive` on a plain folder changes nothing. A dataset's images are only the files **directly** in it: `bob\` and `bob\indoor\` are separate datasets and separate `[[datasets]]` blocks, and whether they *should* be one dataset is a balancing decision k2prep will not guess. If you want a subtree pooled, flatten it in the source.
@@ -122,31 +127,31 @@ Everything that is per-dataset stays per-dataset:
 - **Filename collisions** are resolved per dataset per tier; `alice\photo.jpg` and `bob\photo.jpg` keep their names.
 - **Idempotency and superseded-output sweeping** work per dataset, so a re-run after a threshold change behaves exactly as in the flat layout, in every dataset at once.
 
-What the scan skips, at every depth: folders starting with `_` (which covers `_prep` — including one left inside a subfolder by an earlier `-R` run — and `cleanup.bat`'s `_foldername` sidecars) and folders starting with `.`. Directory symlinks and junctions are never followed: a junction cycle would loop forever, and one pointing outside the tree would drag foreign folders in. An unreadable folder is reported and the scan continues.
+What the scan skips, at every depth: folders starting with `_` (which covers the `_prep_<subfolder>` output folders of a `-R` run, an old `_prep` inside a folder, and `cleanup.bat`'s `_foldername` sidecars) and folders starting with `.`. Directory symlinks and junctions are never followed: a junction cycle would loop forever, and one pointing outside the tree would drag foreign folders in. An unreadable folder is reported and the scan continues.
 
-Two names are refused with a clear error rather than mirrored: a source folder named like a tier (`1024`, `768`, `512`) anywhere in the tree — it would make `_prep\x\1024` ambiguous — and a first-level folder named `reports`, which would collide with `_prep\reports`. Rename them. Under `--by-tier` neither name collides, and the one refused name is a first-level folder named `cache`.
+Two names are refused with a clear error rather than mirrored: a source folder named like a tier (`1024`, `768`, `512`) anywhere in the tree — it would make `x\1024` in the output folder ambiguous — and a first-level folder named `reports`, which would collide with `reports` in the output folder. Rename them. Under `--by-tier` neither name collides, and the one refused name is a first-level folder named `cache`.
 
-If a source subfolder is renamed or deleted, its old outputs under `_prep` are reported as stale and **left alone** — the regenerated TOML simply no longer references them, so they cannot leak into training. Note that `dataset.toml` always describes the *last* run: a later non-recursive run on the same root rewrites it for the root dataset only (the subfolder outputs themselves are untouched, and one `--recursive` re-run restores the full TOML).
+If a source subfolder is renamed or deleted, its old outputs in the output folder are reported as stale and **left alone** — the regenerated TOML simply no longer references them, so they cannot leak into training. Note that `dataset.toml` always describes the *last* run: a later non-recursive run on the same root rewrites it for the root dataset only (the subfolder outputs themselves are untouched, and one `--recursive` re-run restores the full TOML).
 
 `--sort` is refused together with `--recursive`; triage one folder at a time.
 
 ## `-R`: independent runs per subfolder
 
-`-R` is the other tool for a folder of subfolders, and the opposite trade: it runs k2prep once for the folder, then once for each first-level subfolder, so every folder keeps its **own** `_prep`, its own reports and its own `dataset.toml` — independent datasets, trained separately:
+`-R` is the other tool for a folder of subfolders, and the opposite trade: it runs k2prep once for the folder, then once for each first-level subfolder, so every folder keeps its **own** output folder, its own reports and its own `dataset.toml` — independent datasets, trained separately:
 
 ```bash
 run.bat "L:\train" -R --ostris --report --threshold 6
 ```
 
 ```
-L:\train\          ->  L:\train\_prep\
-L:\train\alice\    ->  L:\train\alice\_prep\
-L:\train\bob\      ->  L:\train\bob\_prep\
+L:\train\          ->  L:\_prep_train\
+L:\train\alice\    ->  L:\train\_prep_alice\
+L:\train\bob\      ->  L:\train\_prep_bob\
 ```
 
 Train them together: `--recursive`. Train them separately: `-R`. Nothing below the first level is visited by `-R`.
 
-Subfolders whose name starts with an underscore are skipped, which covers `_prep` and the `_foldername` sidecars that `cleanup.bat` makes. Subfolders starting with `.`, and links and junctions, are skipped too. The `score*` and `quality*` folders that `--sort` produces are **not** skipped — building a dataset out of one triaged tier is a real thing to want.
+Subfolders whose name starts with an underscore are skipped, which covers the `_prep_<subfolder>` output folders that the sweep puts next to each subfolder and the `_foldername` sidecars that `cleanup.bat` makes. Subfolders starting with `.`, and links and junctions, are skipped too. The `score*` and `quality*` folders that `--sort` produces are **not** skipped — building a dataset out of one triaged tier is a real thing to want.
 
 The other options apply to every folder. A folder that fails does not stop the sweep: the failures are listed at the end and the exit code is non-zero.
 
@@ -166,21 +171,21 @@ run.bat "L:\train" --by-tier --ostris --threshold 6
 ```
 
 ```
-L:\train\photo.jpg            ->  L:\train\_prep\_1024\photo.jpg
-L:\train\alice\a.jpg          ->  L:\train\_prep\_1024\alice\a.jpg
-L:\train\bob\indoor\b.jpg     ->  L:\train\_prep\_512\bob\indoor\b.jpg
+L:\train\photo.jpg            ->  L:\_prep_train\_1024\photo.jpg
+L:\train\alice\a.jpg          ->  L:\_prep_train\_1024\alice\a.jpg
+L:\train\bob\indoor\b.jpg     ->  L:\_prep_train\_512\bob\indoor\b.jpg
 ```
 
-`--by-tier` always scans the whole tree, at every depth, so it needs no `--recursive`: a folder that holds nothing but other folders, with the images two or three levels down, works as it is. Folders starting with `_` or `.` are skipped, and links and junctions are not followed, as in [`--recursive`](#--recursive-several-datasets-one-_prep). Each image is rendered at the largest tier it fills, as always, and goes to that tier's folder under its own subfolder path. A folder appears in a tier folder only if at least one of its images goes to that tier. In AI Toolkit, add each `_<tier>` folder as one dataset, with its resolution set to its tier and `bucket_tolerance` left at 64 (32, 16 and 8 work too).
+`--by-tier` always scans the whole tree, at every depth, so it needs no `--recursive`: a folder that holds nothing but other folders, with the images two or three levels down, works as it is. Folders starting with `_` or `.` are skipped, and links and junctions are not followed, as in [`--recursive`](#--recursive-several-datasets-one-output-folder). Each image is rendered at the largest tier it fills, as always, and goes to that tier's folder under its own subfolder path. A folder appears in a tier folder only if at least one of its images goes to that tier. In AI Toolkit, add each `_<tier>` folder as one dataset, with its resolution set to its tier and `bucket_tolerance` left at 64 (32, 16 and 8 work too).
 
 What changes with `--by-tier`:
 
 - **A 256 tier.** It is there for completeness: an image too small for 512 goes to `_256` instead of being skipped. Scores at 256 are less reliable, because the quality bands were fitted on larger renders, and the report says so. Keep or delete `_256` by hand.
-- **Merging is pooled per tier under `--ostris`.** AI Toolkit trains a whole tier folder as one dataset, so small buckets are merged across all folders of the tier. Under `--musubi` each folder stays its own pool and its own `[[datasets]]` block, because musubi reads no subfolders; the TOML then points at `_prep\_<tier>\<subfolder>`, with `batch_size = 16` at 256.
-- **Folder names.** Source folders named `1024` or `reports` are fine. A first-level source folder named `cache` is refused, because `_prep\_1024\cache` is where musubi keeps the cache of the root folder's 1024 renders.
-- **Switching.** Turning `--by-tier` on or off rebuilds `_prep` in the new layout: the renders of the other layout are removed and listed under `SUPERSEDED OUTPUTS`. Only files are removed, never folders, so musubi's cache folders stay. The source is never touched.
+- **Merging is pooled per tier under `--ostris`.** AI Toolkit trains a whole tier folder as one dataset, so small buckets are merged across all folders of the tier. Under `--musubi` each folder stays its own pool and its own `[[datasets]]` block, because musubi reads no subfolders; the TOML then points at `_prep_<folder>\_<tier>\<subfolder>`, with `batch_size = 16` at 256.
+- **Folder names.** Source folders named `1024` or `reports` are fine. A first-level source folder named `cache` is refused, because `_1024\cache` in the output folder is where musubi keeps the cache of the root folder's 1024 renders.
+- **Switching.** Turning `--by-tier` on or off rebuilds the output folder in the new layout: the renders of the other layout are removed and listed under `SUPERSEDED OUTPUTS`. Only files are removed, never folders, so musubi's cache folders stay. The source is never touched.
 
-`--by-tier` works with `-R` too, where each folder gets its own `_prep\_<tier>\` folders, and with [`--copy-to` and `--move-to`](#copying-the-best-originals-to-another-folder), which put each original, unchanged, into the tier folder it would be rendered into:
+`--by-tier` works with `-R` too, where each folder gets its own `_prep_<subfolder>\_<tier>\` folders, and with [`--copy-to` and `--move-to`](#copying-the-best-originals-to-another-folder), which put each original, unchanged, into the tier folder it would be rendered into:
 
 ```bash
 run.bat "L:\photos" --by-tier --move-to "L:\aitk" --threshold 6
@@ -209,7 +214,7 @@ L:\train\alice\1\small.jpg    ->  L:\train\_alice\1\small.jpg
 L:\train\alice\1\a\small.jpg  ->  L:\train\_alice\1\a\small.jpg
 ```
 
-What the walk skips, at every depth, is what k2prep's scan skips: folders starting with `_` (`_prep` and earlier sidecars) or `.`, and links and junctions, which are not followed and are listed at the end. A folder that cannot be read is listed too, and the run ends with an error code.
+What the walk skips, at every depth, is what k2prep's scan skips: folders starting with `_` (output folders and earlier sidecars) or `.`, and links and junctions, which are not followed and are listed at the end. A folder that cannot be read is listed too, and the run ends with an error code.
 
 | Option | Default | Meaning |
 |---|---|---|
@@ -239,9 +244,9 @@ run.bat "L:\train\photos" --sort
 ```
 
 ```
-_prep/score10/   IMG_0431.jpg  IMG_0431.txt  ...
-_prep/score9/    ...
-_prep/score2/    ...
+_prep_photos/score10/   IMG_0431.jpg  IMG_0431.txt  ...
+_prep_photos/score9/    ...
+_prep_photos/score2/    ...
 ```
 
 It writes no tier folders, no resized images and no TOML. The point is triage: see what you have, keep the good folders, then run k2prep normally on whichever of them you decide to train from.
@@ -314,7 +319,7 @@ Per-criterion scores are **averaged**, not minimised. The technical composite us
 
 **Local servers only, and no API key is ever sent.** There is no option to add one. That is deliberate: no key to leak, no bill to run up, and no folder of photographs leaving the machine because a URL was wrong. A hosted endpoint will reject the unauthenticated request, which is the intended outcome. Configure it in `.env` (copy `sample.env`) — llama.cpp, koboldcpp and LM Studio are what this was built against, and the server needs a **vision** model loaded (`--mmproj` for llama.cpp).
 
-**A `--vl` run is not reproducible.** A model can answer differently between runs, and a different model will disagree outright. The report says so in its header. The technical columns beside it are still exact, and the opinions are cached in `_prep/vl-cache.json` so re-running the same folder is stable — the cache is keyed to the model, the criteria and the prompt, so changing any of them correctly throws it away.
+**A `--vl` run is not reproducible.** A model can answer differently between runs, and a different model will disagree outright. The report says so in its header. The technical columns beside it are still exact, and the opinions are cached in `vl-cache.json` in the output folder so re-running the same folder is stable — the cache is keyed to the model, the criteria and the prompt, so changing any of them correctly throws it away.
 
 `--threads` controls how many requests are in flight, defaulting to **1** for the model because llama.cpp, koboldcpp and LM Studio all serve one request at a time unless started with parallel slots — and a queue of four in front of a slow model is how you turn a working setup into timeouts. Raising it is worth a little anyway: against koboldcpp with a 31B vision model, 29 images took 39s at `--threads 1` and 32s at `--threads 4`, so expect roughly 20%, not 4×. The same flag raises the local worker count to match.
 
@@ -364,11 +369,11 @@ An image is copied when both gates pass:
 - **Score.** The composite is at least `--threshold`, as everywhere else in k2prep. Every image is scored as `--sort` scores it: rendered at the 1024 tier, so a score means the same thing in every folder of the tree. An image already at or below the 1024 tier is scored at its own size, never upscaled.
 - **Resolution.** The image has at least `--min-res`×`--min-res` pixels, measured as **area**. `--min-res 1024` is the pixel budget of the 1024 bucket, 1,048,576 pixels, whatever the aspect ratio: 1536×768 passes and 1200×800 does not.
 
-Without `--recursive`, only the images directly in the folder are looked at, as in every other mode. With it, the whole tree is scanned with the same rules as a `--recursive` dataset run: folders starting with `_` or `.` are skipped, and links and junctions are not followed. Folders named `1024`, `768`, `512` or `reports` are allowed here, because nothing is mirrored into `_prep`.
+Without `--recursive`, only the images directly in the folder are looked at, as in every other mode. With it, the whole tree is scanned with the same rules as a `--recursive` dataset run: folders starting with `_` or `.` are skipped, and links and junctions are not followed. Folders named `1024`, `768`, `512` or `reports` are allowed here, because nothing is mirrored into the output folder.
 
-The report goes to `<folder>\_prep\reports\`, named `copy-scan-*.txt` for a `--report` run and `copy-*.txt` for a real one. It lists every image with its dimensions and scores: the selected ones with what happened to each, and the rest with the reason they were not selected. Its summary has a score histogram, a **selection grid**, and, under `--recursive`, a count per folder. The grid has one row per `--min-res` (any, 512, 768, 1024, 1280, 1536, 2048, and the run's own value) and one column per `--threshold` from 1 to 10, and each cell is the number of images that combination would copy. Read the grid after step 1 to choose both values for step 2. The scores are cached in `_prep\metrics-cache.json`, so step 2 does not render anything again.
+The report goes to `reports\` in the output folder (`_prep_<folder>\reports\`), named `copy-scan-*.txt` for a `--report` run and `copy-*.txt` for a real one. It lists every image with its dimensions and scores: the selected ones with what happened to each, and the rest with the reason they were not selected. Its summary has a score histogram, a **selection grid**, and, under `--recursive`, a count per folder. The grid has one row per `--min-res` (any, 512, 768, 1024, 1280, 1536, 2048, and the run's own value) and one column per `--threshold` from 1 to 10, and each cell is the number of images that combination would copy. Read the grid after step 1 to choose both values for step 2. The scores are cached in `metrics-cache.json` in the output folder, so step 2 does not render anything again.
 
-The target is created if it does not exist. It must not overlap the source: the target cannot be the source, contain it, or sit inside its `_prep`. A target inside the source is accepted only under a folder whose name starts with `_` or `.`, such as `L:\photos\_selected`, because the scan skips those folders. Any other folder in the source would be scanned as source by the next `--recursive` run.
+The target is created if it does not exist. It must not overlap the source: the target cannot be the source, contain it, or sit inside its output folder. A target inside the source is accepted only under a folder whose name starts with `_` or `.`, such as `L:\photos\_selected`, because the scan skips those folders. Any other folder in the source would be scanned as source by the next `--recursive` run.
 
 The target is your folder, not k2prep's, so k2prep never deletes anything in it:
 
@@ -484,7 +489,7 @@ The composite is the **minimum** of the metrics that apply, so `--threshold 6` m
 
 ### Cost, and the score cache
 
-The default mode renders each image twice on a first run — once to score, once to write. Scores do not depend on `--threshold`, so they are cached in `_prep/metrics-cache.json`, keyed on file size and mtime. Re-running at a different threshold reuses every score and rewrites only what changed, which makes the tune-and-re-run loop essentially free. Delete the file to force a rescore; `--force` ignores it.
+The default mode renders each image twice on a first run — once to score, once to write. Scores do not depend on `--threshold`, so they are cached in `metrics-cache.json` in the output folder, keyed on file size and mtime. Re-running at a different threshold reuses every score and rewrites only what changed, which makes the tune-and-re-run loop essentially free. Delete the file to force a rescore; `--force` ignores it.
 
 ### The bands are uncalibrated
 

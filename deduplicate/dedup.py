@@ -7,8 +7,8 @@ images are copies when their perceptual hashes are close, or when local image
 features (ORB) show the same picture under another crop, border, scale or a
 mock-up. Copies connected through such matches form one group. In each group the
 best copy stays; every other copy, and its .txt caption, moves to
-<root>/_duplicates/<same relative path>, where <root> is the folder given on the
-command line that contains it. If the kept copy has no caption and a moved copy
+<root>_duplicates/<same relative path>, next to <root>, where <root> is the
+folder given on the command line that contains it. If the kept copy has no caption and a moved copy
 has one, that caption is also copied next to the kept copy, under its name.
 No prompt.
 
@@ -48,7 +48,8 @@ from PIL import Image, ImageOps
 
 Image.MAX_IMAGE_PIXELS = None     # large scans are normal input, not an attack
 
-OUT_DIRNAME = "_duplicates"
+OUT_SUFFIX = "_duplicates"        # <root>_duplicates next to the root: moved copies, caches, plan, log
+OLD_OUT_DIRNAME = "_duplicates"   # the same folder inside the root until 2026-10-11; moved out by claim_out
 HASHES_NAME = "hashes.json"
 VERIFIED_NAME = "verified.json"
 PLAN_NAME = "plan.json"
@@ -57,15 +58,17 @@ CACHE_VERSION = 1
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".gif", ".avif"}
 # Folders never scanned, at any depth: the output folders of the dataset tools.
-# _duplicates is this tool's own, _prep is k2prep's, _classify and _embeddings
-# are classify's, masks and faces are face_masks' (near-identical images by
-# design), _backup is where the repair tools kept the originals of the images
-# they changed, before that backup moved out to <dataset>_backup. A folder
-# holding BACKUP_MARK (the backup of a subfolder, <subfolder>_backup) is
-# skipped too. Any other folder is scanned, whatever its name; --exclude adds
-# names.
-DEFAULT_EXCLUDES = ["_duplicates", "_prep", "_classify", "_embeddings", "masks", "faces", "_backup"]
-BACKUP_MARK = "_dataset_tools.json"  # marks <dataset>_backup, the backup folder of the other tools: never scanned
+# _duplicates was this tool's own and _prep k2prep's, before both moved out
+# next to the dataset; _classify and _embeddings are classify's, _controls
+# holds the face masks (masks before 2026-10-11) and faces the face crops of
+# face_masks (near-identical images by design), _backup is where the repair
+# tools kept the originals of the images they changed, before that backup
+# moved out to <dataset>_backup. A folder holding BACKUP_MARK (a folder the
+# tools made next to a dataset: <dataset>_backup, <dataset>_duplicates,
+# _prep_<dataset>) is skipped too. Any other folder is scanned, whatever its
+# name; --exclude adds names.
+DEFAULT_EXCLUDES = ["_duplicates", "_prep", "_classify", "_embeddings", "_controls", "masks", "faces", "_backup"]
+BACKUP_MARK = "_dataset_tools.json"  # marks a folder the dataset tools made next to a dataset: never scanned
 
 # --- matching, calibrated on 690 real poster and photo downloads -------------
 # pHash and dHash are 64-bit; distances are Hamming distances. pHash distances
@@ -426,7 +429,7 @@ def scan(roots, excludes, roles=None):
 
 
 def load_cache(root: Path) -> dict:
-    p = root / OUT_DIRNAME / HASHES_NAME
+    p = out_dir(root) / HASHES_NAME
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
         if data.get("version") == CACHE_VERSION:
@@ -443,12 +446,93 @@ def write_json(path: Path, obj) -> None:
     os.replace(tmp, path)
 
 
+# --- the output folder next to the root ------------------------------------------
+# <root>_duplicates holds BACKUP_MARK, so every dataset tool skips it; a folder
+# of that name without the mark is not this tool's and stops the run. Until
+# 2026-10-11 the folder was <root>/_duplicates, where AI Toolkit, which trains
+# every subfolder that does not start with a dot, trained the copies again.
+
+def out_dir(root: Path) -> Path:
+    return root.with_name(root.name + OUT_SUFFIX)
+
+
+def is_marked(path: Path) -> bool:
+    return (path / BACKUP_MARK).is_file()
+
+
+def claim_out(root: Path, create: bool = True, say=print) -> Path:
+    """The output folder of root, checked, with an old <root>/_duplicates moved
+    into it. create=False: the folder is not made when nothing moves into it."""
+    if root.parent == root:
+        raise SystemExit(f"{root}: a drive root has no folder next to it for {OUT_SUFFIX}; use a subfolder")
+    if is_marked(root):
+        raise SystemExit(f"{root} is a folder the dataset tools made next to a dataset, not a dataset")
+    out = out_dir(root)
+    if out.exists() and not is_marked(out) and (not out.is_dir() or any(out.iterdir())):
+        raise SystemExit(f"{out} exists and was not made by the dataset tools; rename it or move it away, "
+                         f"the duplicates of {root.name} go there")
+    old = root / OLD_OUT_DIRNAME
+    if old.is_dir():
+        left = move_old_out(old, out)
+        say(f"{root.name}: {OLD_OUT_DIRNAME} moved out of the folder, from {old} to {out}"
+            + (f"; {left} files that differ from the ones in {out.name} stay in {old}" if left else ""))
+    if create or out.is_dir():
+        out.mkdir(exist_ok=True)
+        if not is_marked(out):
+            (out / BACKUP_MARK).write_text(json.dumps({"made_by": "dataset_tools", "kind": "duplicates",
+                                                       "dataset": root.name}) + "\n", encoding="utf-8")
+    return out
+
+
+def move_old_out(old: Path, out: Path) -> int:
+    """One rename when out is not there yet, else file by file, never over a
+    file in out (one with the same bytes is dropped, one with other bytes stays
+    in old). -> the files left in old."""
+    left = 0
+    try:
+        if not out.exists():
+            os.rename(old, out)
+            return 0
+        for dirpath, dirnames, filenames in os.walk(old):
+            for fn in filenames:
+                src = Path(dirpath) / fn
+                dst = out / src.relative_to(old)
+                if not dst.exists():
+                    move_file(src, dst)
+                elif src.stat().st_size == dst.stat().st_size and file_sha256(src) == file_sha256(dst):
+                    os.chmod(src, 0o666)
+                    src.unlink()
+                else:
+                    left += 1
+    except OSError as e:
+        raise SystemExit(f"cannot move {old} to {out}: {e}")
+    for dirpath, dirnames, filenames in os.walk(old, topdown=False):
+        try:
+            Path(dirpath).rmdir()
+        except OSError:
+            pass
+    return left
+
+
+def logged_path(where: str, roots) -> Path:
+    """A path from a log or plan: one under <root>/_duplicates, written before
+    that folder moved out, is mapped to <root>_duplicates when it is not there."""
+    p = Path(where)
+    if p.exists():
+        return p
+    for root in roots:
+        old = root / OLD_OUT_DIRNAME
+        if p.is_relative_to(old):
+            return out_dir(root) / p.relative_to(old)
+    return p
+
+
 def load_verified(roots) -> dict:
     """Feature-check results, keyed by the content of both images."""
     out = {}
     for root in roots:
         try:
-            data = json.loads((root / OUT_DIRNAME / VERIFIED_NAME).read_text(encoding="utf-8"))
+            data = json.loads((out_dir(root) / VERIFIED_NAME).read_text(encoding="utf-8"))
             if data.get("version") == CACHE_VERSION:
                 out.update(data.get("pairs", {}))
         except (OSError, ValueError):
@@ -461,12 +545,12 @@ def save_verified(roots, items, cache) -> None:
     for ri, root in enumerate(roots):
         mine = {it.data["sha256"][:20] for it in items if it.root_idx == ri and "sha256" in it.data}
         pairs = {k: v for k, v in cache.items() if k.split("|")[0] in mine or k.split("|")[1] in mine}
-        write_json(root / OUT_DIRNAME / VERIFIED_NAME,
+        write_json(out_dir(root) / VERIFIED_NAME,
                    {"version": CACHE_VERSION, "tool": "dedup.py", "pairs": pairs})
 
 
 def write_cache(root: Path, files: dict) -> None:
-    write_json(root / OUT_DIRNAME / HASHES_NAME,
+    write_json(out_dir(root) / HASHES_NAME,
                {"version": CACHE_VERSION, "tool": "dedup.py",
                 "written": datetime.now().isoformat(timespec="seconds"), "files": files})
 
@@ -1274,7 +1358,7 @@ def plan_placement(best, slot, items, names, leaving, action, best_caption=None)
         own_shared = own_cap is not None and caption_shared(b, items, leaving)
         if slot_cap is not None:
             if own_cap is not None and not own_shared:
-                park = names.free_dest((b.root / OUT_DIRNAME / b.rel).with_suffix(".txt"))
+                park = names.free_dest((out_dir(b.root) / b.rel).with_suffix(".txt"))
                 captions.append({"action": "move", "from": str(own_cap), "to": str(park),
                                  "reason": "caption of a promoted copy; the caption of the slot wins"})
         elif own_cap is not None:
@@ -1300,13 +1384,13 @@ def undo(roots) -> int:
     failed = 0
     for root in roots:
         restored = skipped = 0
-        log = root / OUT_DIRNAME / MOVES_NAME
+        log = out_dir(root) / MOVES_NAME
         if not log.is_file():
             print(f"{root}: no {MOVES_NAME}, nothing to undo")
             continue
         entries = [json.loads(ln) for ln in log.read_text(encoding="utf-8").splitlines() if ln.strip()]
         for e in reversed(entries):
-            src, dst = Path(e["from"]), Path(e["to"])
+            src, dst = Path(e["from"]), logged_path(e["to"], roots)
             if e.get("action") == "copy":
                 # A caption the tool copied to a kept image: remove it, but only
                 # if nobody has edited it since.
@@ -1391,6 +1475,8 @@ def main(argv=None) -> int:
     if len(set(roots)) != len(roots):
         ap.error("the same folder is given twice")
 
+    for r in roots:
+        claim_out(r, create=not args.undo)
     if args.undo:
         return undo(roots)
 
@@ -1475,7 +1561,7 @@ def main(argv=None) -> int:
                 mode = None                         # stays with the image of the same stem
             else:
                 mode = "move"
-            out = it.root / OUT_DIRNAME / it.rel
+            out = out_dir(it.root) / it.rel
             # Two slot images that share one caption may share its copy too.
             peer = out.with_suffix(".txt") if mode and names.copies.get(out.with_suffix(".txt")) != cap else None
             dst = names.free_dest(out, peer)
@@ -1566,7 +1652,7 @@ def main(argv=None) -> int:
                            "promotions": len(promotions), "promotions_renamed": n_ren, "slots_synced": n_sync,
                            "slots_left_as_they_are": n_left, "sorted_copies_out": n_out} if with_roles else {})}
     for root in roots:
-        write_json(root / OUT_DIRNAME / PLAN_NAME, plan)
+        write_json(out_dir(root) / PLAN_NAME, plan)
     print(f"{len(groups)} group(s); {n_moves} worse cop{'y' if n_moves == 1 else 'ies'} to move, "
           f"{n_bytes / 1e6:.1f} MB"
           + (f"; {len(skipped)} group(s) left for review, nothing moves there" if skipped else ""))
@@ -1602,7 +1688,7 @@ def main(argv=None) -> int:
                   + (" (one slot per picture)" if args.sorted_copies == "one" else " (a better copy stays in the same folder)"))
 
     if args.dry_run:
-        print(f"Dry run: nothing moved. Plan: {roots[0] / OUT_DIRNAME / PLAN_NAME}")
+        print(f"Dry run: nothing moved. Plan: {out_dir(roots[0]) / PLAN_NAME}")
         if args.review:
             print("--review needs a real run; nothing has moved yet")
         return 0
@@ -1619,8 +1705,8 @@ def main(argv=None) -> int:
 
     def log_for(root):
         if root not in logs:
-            (root / OUT_DIRNAME).mkdir(parents=True, exist_ok=True)
-            logs[root] = open(root / OUT_DIRNAME / MOVES_NAME, "a", encoding="utf-8")
+            out_dir(root).mkdir(parents=True, exist_ok=True)
+            logs[root] = open(out_dir(root) / MOVES_NAME, "a", encoding="utf-8")
         return logs[root]
 
     def log(root, **entry):
@@ -1734,7 +1820,7 @@ def main(argv=None) -> int:
 
     for root, (n_img, n_cap, n_b, n_copied, n_in, n_sync) in moved.items():
         print(f"{root}: moved {n_img} image(s) and {n_cap} caption(s), {n_b / 1e6:.1f} MB "
-              f"-> {root / OUT_DIRNAME}" + (f"; copied {n_copied} caption(s) to kept images" if n_copied else "")
+              f"-> {out_dir(root)}" + (f"; copied {n_copied} caption(s) to kept images" if n_copied else "")
               + (f"; {n_in} image(s) promoted into it" if n_in else "")
               + (f"; {n_sync} slot(s) synced" if n_sync else ""))
     print(f"Done in {time.time() - t0:.0f}s. Undo with --undo.")

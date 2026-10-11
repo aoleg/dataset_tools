@@ -3,7 +3,11 @@
 Cut close-up face crops out of a folder of images, for character training.
 
 For every face detected in IMG_DIR, writes OUT_DIR/<tier>/<basename>_face<N>.png
-(OUT_DIR defaults to IMG_DIR/faces; <tier> is 512, 768 or 1024).
+(OUT_DIR defaults to IMG_DIR_faces next to IMG_DIR; <tier> is 512, 768 or 1024).
+The default is next to IMG_DIR, not inside it, because a trainer that reads all
+subfolders (Ostris AI Toolkit trains every subfolder whose name does not start
+with a dot) would train the crops along with IMG_DIR. An IMG_DIR/faces folder
+from before 2026-10-11 is moved there on the next run without OUT_DIR.
 
 Each crop is framed around the face and hair, cut at the aspect ratio of a
 standard musubi-tuner bucket and resized to that bucket. The tier is the largest
@@ -185,6 +189,8 @@ def plan_crop(face_box, region, img_w, img_h, ratio, fill, min_fill):
 # Output bookkeeping
 # ---------------------------------------------------------------------------
 
+OUT_SUFFIX = "_faces"          # default output: <img_dir>_faces next to <img_dir>
+OLD_OUT_DIRNAME = "faces"      # the default output inside <img_dir> until 2026-10-11
 OUT_NAME = re.compile(r"^(?P<stem>.+)_face\d+\.(png|jpg)$", re.IGNORECASE)
 
 
@@ -205,7 +211,7 @@ def existing_outputs(out_dir: str):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("img_dir")
-    ap.add_argument("out_dir", nargs="?", default=None, help="output dir (default: <img_dir>/faces)")
+    ap.add_argument("out_dir", nargs="?", default=None, help="output dir (default: <img_dir>_faces next to <img_dir>)")
     ap.add_argument("--fill", type=float, default=0.5,
                     help="preferred share of the crop covered by the face and hair area")
     ap.add_argument("--min-fill", type=float, default=0.25,
@@ -230,7 +236,16 @@ def main():
     if not 0 < args.min_fill <= args.fill <= 1:
         sys.exit("need 0 < --min-fill <= --fill <= 1")
     if args.out_dir is None:
-        args.out_dir = os.path.join(args.img_dir, "faces")
+        img_dir = os.path.abspath(args.img_dir)
+        if os.path.dirname(img_dir) == img_dir:
+            sys.exit(f"{img_dir}: a drive root has no folder next to it for {OUT_SUFFIX}; give out_dir")
+        args.out_dir = img_dir + OUT_SUFFIX
+        old = os.path.join(img_dir, OLD_OUT_DIRNAME)
+        if os.path.isdir(old):
+            if os.path.lexists(args.out_dir):
+                sys.exit(f"both {old} and {args.out_dir} exist; merge them by hand, or give out_dir")
+            os.rename(old, args.out_dir)
+            print(f"moved {old} out of the image folder, to {args.out_dir}")
         print(f"out_dir not given, writing faces to {args.out_dir}")
 
     files = sorted(

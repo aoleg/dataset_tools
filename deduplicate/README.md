@@ -2,7 +2,7 @@
 
 `dedup.py` finds copies of the same picture in one or more image folders and moves the worse copies out. It is for raw downloads, where the same picture often arrives several times: as other scans, at other sizes, with borders or watermarks, cropped, or as a shop mock-up on a wall or in a frame.
 
-All folders that you give, with all their subfolders, form one pool. In each group of copies the best copy stays. Every other copy, with its `.txt` caption, moves to a `_duplicates` folder. If the copy that stays has no caption and a moved copy has one, that caption is also copied next to the copy that stays. Nothing is deleted, and `--undo` puts the files back.
+All folders that you give, with all their subfolders, form one pool. In each group of copies the best copy stays. Every other copy, with its `.txt` caption, moves to a `<folder>_duplicates` folder next to the folder that you gave. If the copy that stays has no caption and a moved copy has one, that caption is also copied next to the copy that stays. Nothing is deleted, and `--undo` puts the files back.
 
 A folder can also be a curated collection, given with `--sorted`. Then a better copy from a raw folder moves into the collection, under the name of the copy it replaces, and the collection's captions stay as they are. See [Sorted folders](#sorted-folders).
 
@@ -52,7 +52,7 @@ Example of a run followed by the review:
 run.bat D:\data\downloads --sorted D:\data\collection --review
 ```
 
-The output folders of the dataset tools are never scanned, at any depth: `_duplicates` (this tool), `_prep` (k2prep), `_classify` and `_embeddings` (classify), `masks` and `faces` (face_masks, which writes near-identical images there), and `_backup` (where the repair tools kept the originals of the images they changed, until that backup moved out to `<dataset>_backup`). A backup folder of the dataset tools, marked by `_dataset_tools.json`, is skipped whatever its name. Every other folder is scanned whatever its name, so a collection folder called `_1_posters` is fine as a root or below one. `--exclude` adds names to the list.
+The output folders of the dataset tools are never scanned, at any depth: `_classify` and `_embeddings` (classify), `_controls` and `faces` (face_masks, which writes near-identical images there; `masks` before 2026-10-11), and the old in-folder names `_duplicates` (this tool), `_prep` (k2prep) and `_backup` (the repair tools), from before these folders moved out next to the dataset. A folder that the dataset tools made next to a dataset (`<dataset>_backup`, `<dataset>_duplicates`, `_prep_<dataset>`), marked by `_dataset_tools.json`, is skipped whatever its name. Every other folder is scanned whatever its name, so a collection folder called `_1_posters` is fine as a root or below one. `--exclude` adds names to the list.
 
 `run.bat` pauses at the end when it is started by double-click or drag-and-drop, or when the script fails. Set `NOPAUSE=1` to prevent this.
 
@@ -70,9 +70,9 @@ This is the workflow for a curated collection that receives new downloads. The r
 
    Nothing moves. The summary at the end tells you how many copies would move, how many raw copies would move into the collection, how many slots would be synced, and how many groups are left for review.
 
-3. **Read the plan.** `plan.json` in the first folder's `_duplicates` opens with a `summary` block. Below it, each group shows the kept copy, every destination, and for collections the `slots`, `promote` and `sync` entries. Groups with a `review` field are the ones the tool refuses to decide, usually because a border, a frame or a footer differs. Those files stay where they are for you to look at. Two things are worth a glance before a real run: the `promote` entries, because they replace files in your collection, and raw sources that carry printed catalogue footers, because a footer passes on a hash match.
+3. **Read the plan.** `plan.json` in the first folder's `_duplicates` folder opens with a `summary` block. Below it, each group shows the kept copy, every destination, and for collections the `slots`, `promote` and `sync` entries. Groups with a `review` field are the ones the tool refuses to decide, usually because a border, a frame or a footer differs. Those files stay where they are for you to look at. Two things are worth a glance before a real run: the `promote` entries, because they replace files in your collection, and raw sources that carry printed catalogue footers, because a footer passes on a hash match.
 
-4. **Run.** The same command without `--dry-run`. There is no prompt. Nothing is deleted. Every moved file goes to the `_duplicates` folder of its own root, under its original relative path, and every action is logged in `moves.jsonl`. Add `--review` to open the groups full screen right after the run and correct the tool's choices by eye, or run `compare.bat` later for sheets and a text list; see [Check the result by eye](#check-the-result-by-eye).
+4. **Run.** The same command without `--dry-run`. There is no prompt. Nothing is deleted. Every moved file goes to the `_duplicates` folder of its own root (`<root>_duplicates`, next to it), under its original relative path, and every action is logged in `moves.jsonl`. Add `--review` to open the groups full screen right after the run and correct the tool's choices by eye, or run `compare.bat` later for sheets and a text list; see [Check the result by eye](#check-the-result-by-eye).
 
 5. **Undo if needed.** The same folders, the same `--sorted` folders, plus `--undo`:
 
@@ -100,14 +100,14 @@ compare.bat D:\data\downloads --skip-exact
 
 You can also drop a folder onto `compare.bat` in Explorer.
 
-It reads `D:\data\downloads\_duplicates\plan.json` (any folder of the run will do, the plan is the same in each) and writes `_duplicates\compare\pairs.txt`, one block per group with the kept file, every moved copy, where that copy is now, the match kind and the sizes, and one JPG sheet per group with the kept copy and the moved copies side by side, labelled. Groups that matched by features come first, because a border, a crop, a frame or a footer differed there and they are the ones to look at. Nothing is moved or changed.
+It reads `D:\data\downloads_duplicates\plan.json` (any folder of the run will do, the plan is the same in each) and writes `D:\data\downloads_duplicates\compare\pairs.txt`, one block per group with the kept file, every moved copy, where that copy is now, the match kind and the sizes, and one JPG sheet per group with the kept copy and the moved copies side by side, labelled. Groups that matched by features come first, because a border, a crop, a frame or a footer differed there and they are the ones to look at. Nothing is moved or changed.
 
 | option | default | meaning |
 |---|---|---|
 | `--skip-exact` | off | leave out groups whose moved copies are byte-identical to the kept one; there is nothing to see there |
 | `--only hash` or `--only features` | all | only groups with at least one moved copy of this match kind; `features` is the kind to check first |
 | `--height N` | 360 | tile height of the sheets in pixels |
-| `--out DIR` | `_duplicates\compare` | write the list and the sheets somewhere else |
+| `--out DIR` | `<folder>_duplicates\compare` | write the list and the sheets somewhere else |
 | `--review` | off | then open the review tool on the same groups |
 
 The sheets are for a quick look in Explorer. To judge quality, and to correct a choice, use the review tool below.
@@ -138,11 +138,13 @@ Each screen shows the kept copy with a green frame and every moved copy, labelle
 | H | hide and show the help at the top |
 | Esc | exit; the choice on the current group is discarded |
 
-The help is shown at the top until you hide it. Your position and your decisions are saved in `_duplicates\compare\review.json` of the first folder of the run, and the next launch resumes at the group you left. A group with a promotion or a slot sync (sorted folders) is shown but locked: undo the run to change it. A file that is no longer where the plan says is shown as a grey tile and cannot be chosen.
+The help is shown at the top until you hide it. Your position and your decisions are saved in `compare\review.json` in the `_duplicates` folder of the first folder of the run, and the next launch resumes at the group you left. A group with a promotion or a slot sync (sorted folders) is shown but locked: undo the run to change it. A file that is no longer where the plan says is shown as a grey tile and cannot be chosen.
 
 ## Where the files go
 
-Each copy that moves keeps its path relative to the folder that you gave. For example, with `run.bat D:\data`, the file `D:\data\set2\a.jpg` moves to `D:\data\_duplicates\set2\a.jpg`, and `D:\data\set2\a.txt` moves with it. If you give several folders, each one gets its own `_duplicates` folder for its own files, but copies are found across all of them. The one exception is a copy that moves into a sorted folder, described in [Sorted folders](#sorted-folders).
+Each copy that moves keeps its path relative to the folder that you gave. For example, with `run.bat D:\data`, the file `D:\data\set2\a.jpg` moves to `D:\data_duplicates\set2\a.jpg`, and `D:\data\set2\a.txt` moves with it. If you give several folders, each one gets its own `_duplicates` folder next to it for its own files, but copies are found across all of them.
+
+The `_duplicates` folder is next to the folder, not inside it, because a trainer that reads all subfolders (Ostris AI Toolkit trains every subfolder whose name does not start with a dot) would train the moved copies again. It holds a `_dataset_tools.json` file that marks it as made by the dataset tools, so no tool of this repository scans it. If a folder of that name exists without the mark and is not empty, the tool stops and asks you to rename it. A drive root has no folder next to it, so give a subfolder. Until 2026-10-11 the folder was `_duplicates` inside the folder; the next run, `--undo`, `compare.bat` or `review.bat` moves it out, and the logs and plans of earlier runs still work. Move a folder and its `_duplicates` folder together, or `--undo` finds no log. The one exception is a copy that moves into a sorted folder, described in [Sorted folders](#sorted-folders).
 
 A name that is already taken in `_duplicates` gets ` (1)`, ` (2)` and so on. A caption stays in place if another image with the same name (for example `a.png` next to `a.jpg`) stays in the folder.
 

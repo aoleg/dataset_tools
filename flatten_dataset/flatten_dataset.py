@@ -45,7 +45,9 @@ MIN_DIGITS = 6
 SEPARATOR = "__"                   # between folder names; a name part never holds "__" itself
 MIN_PART = 8                       # a subfolder name is cut to this before a shallower one is cut
 FALLBACK_PART = "folder"           # a folder name with nothing left after cleaning
-MASKS_DIRNAME = "masks"            # face_masks: <dir>/masks/<stem>.png
+MASKS_DIRNAME = "_controls"        # face_masks: <dir>/_controls/<stem>.png, which AI Toolkit never trains
+OLD_MASKS_DIRNAME = "masks"        # the same until 2026-10-11, which AI Toolkit trains
+MASK_EXTS = (".jpg", ".jpeg", ".png", ".webp")  # a mask is any of these; every one moves with its image
 TMP_PREFIX = ".flatten-"
 PROGRESS_EVERY = 50000             # renames between progress lines
 LIST_LIMIT = 20                    # lines of any list printed
@@ -53,11 +55,12 @@ LIST_LIMIT = 20                    # lines of any list printed
 IMAGE_EXTS = {".jpg", ".jpeg", ".jpe", ".jfif", ".png", ".webp", ".bmp", ".tif", ".tiff",
               ".gif", ".avif", ".heic", ".heif"}
 # Folders never flattened, at any depth: this tool's own folder and the output
-# folders of the other dataset tools. A masks folder is not flattened as images;
-# the mask of an image moves with it to <root>/masks.
+# folders of the other dataset tools. A mask folder is not flattened as images;
+# the mask of an image moves with it to <root>/_controls, also from an old
+# masks folder.
 DEFAULT_EXCLUDES = [TOOL_DIRNAME, "_backup", "_duplicates", "_prep", "_classify", "_embeddings",
-                    MASKS_DIRNAME, "faces"]
-BACKUP_MARK = "_dataset_tools.json"  # marks <dataset>_backup, the backup folder of the other tools: never scanned
+                    MASKS_DIRNAME, OLD_MASKS_DIRNAME, "faces"]
+BACKUP_MARK = "_dataset_tools.json"  # marks a folder the dataset tools made next to a dataset: never scanned
 
 CYRILLIC = {
     "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "yo", "ж": "zh",
@@ -138,10 +141,10 @@ def natural_key(name: str):
 
 class Group:
     """An image (or several images with one stem) and its sidecars in one folder."""
-    def __init__(self, dir_parts: tuple, names: list[str], mask: str | None):
+    def __init__(self, dir_parts: tuple, names: list[str], masks: list[str]):
         self.dir_parts = dir_parts    # folder names from the root, as on disk
         self.names = names            # file names in that folder
-        self.mask = mask              # path of the mask relative to the root, or None
+        self.masks = masks            # paths of its masks relative to the root, one per extension
 
 
 def scan(root: Path, excludes, sidecar_exts):
@@ -159,24 +162,28 @@ def scan(root: Path, excludes, sidecar_exts):
             print(f"  cannot read {here}: {e}")
             return
         subdirs, files = [], []
-        masks_dir = None
+        mask_dirs = {}
         for e in entries:
             if e.is_symlink() or (e.is_dir() and os.path.isjunction(e.path)):
                 links.append("/".join(dir_parts + (e.name,)))
             elif e.is_dir():
-                if e.name.casefold() == MASKS_DIRNAME:
-                    masks_dir = e.name
+                if e.name.casefold() in (MASKS_DIRNAME, OLD_MASKS_DIRNAME):
+                    mask_dirs[e.name.casefold()] = e.name
                 if e.name.casefold() not in excl and not os.path.isfile(os.path.join(e.path, BACKUP_MARK)):
                     subdirs.append(e.name)
             elif e.is_file():
                 files.append(e.name)
-        masks = {}
-        if masks_dir:
-            try:
-                masks = {os.path.splitext(f)[0].casefold(): f for f in os.listdir(here / masks_dir)
-                         if f.casefold().endswith(".png")}
-            except OSError:
-                masks = {}
+        masks: dict[str, dict[str, str]] = {}            # stem -> extension -> mask path
+        for key in (OLD_MASKS_DIRNAME, MASKS_DIRNAME):     # _controls last, so its masks win
+            if key in mask_dirs:
+                try:
+                    for f in os.listdir(here / mask_dirs[key]):
+                        stem, ext = os.path.splitext(f)
+                        if ext.casefold() in MASK_EXTS:
+                            masks.setdefault(stem.casefold(), {})[ext.casefold()] = \
+                                "/".join(dir_parts + (mask_dirs[key], f))
+                except OSError:
+                    pass
         by_stem: dict[str, list[str]] = {}
         for fn in files:
             by_stem.setdefault(os.path.splitext(fn)[0].casefold(), []).append(fn)
@@ -187,8 +194,7 @@ def scan(root: Path, excludes, sidecar_exts):
             rest = [n for n in names if n not in images and n not in sides]
             others.extend("/".join(dir_parts + (n,)) for n in rest)
             if images:
-                mask = "/".join(dir_parts + (masks_dir, masks[key])) if key in masks else None
-                groups.append(Group(dir_parts, images + sides, mask))
+                groups.append(Group(dir_parts, images + sides, sorted(masks.get(key, {}).values())))
             else:
                 orphans.extend("/".join(dir_parts + (n,)) for n in sides)
         for d in sorted(subdirs, key=natural_key):
@@ -213,7 +219,7 @@ def plan_root(root: Path, args) -> dict:
     groups, orphans, others, links = scan(root, DEFAULT_EXCLUDES + args.exclude, args.sidecars)
     digits = max(MIN_DIGITS, len(str(len(groups))))
     ext_len = max([len(os.path.splitext(n)[1]) for g in groups for n in g.names]
-                  + [len(".png") if any(g.mask for g in groups) else 0], default=0)
+                  + [len(os.path.splitext(m)[1]) for g in groups for m in g.masks], default=0)
     budget = args.max_length - ext_len - len(NUMBER_PREFIX) - digits
     if groups and budget < 1:
         raise SystemExit(f"--max-length {args.max_length} leaves no room for the folder name "
@@ -238,8 +244,8 @@ def plan_root(root: Path, args) -> dict:
             conflicts.append(f"{staying[stem.casefold()]} stays and has the new name of an image")
         for n in g.names:
             files.append({"from": "/".join(g.dir_parts + (n,)), "to": stem + os.path.splitext(n)[1].lower()})
-        if g.mask:
-            files.append({"from": g.mask, "to": f"{MASKS_DIRNAME}/{stem}.png"})
+        for m in g.masks:
+            files.append({"from": m, "to": f"{MASKS_DIRNAME}/{stem}{os.path.splitext(m)[1].lower()}"})
 
     files = [f for f in files if f["from"] != f["to"]]   # already named right: nothing to do
     sources = {f["from"].casefold() for f in files}
@@ -286,6 +292,32 @@ def read_manifest(root: Path) -> dict | None:
         return None
     with open(path, encoding="utf-8") as fh:
         return json.load(fh)
+
+
+def renamed_masks(root: Path, m: dict) -> bool:
+    """A manifest from before 2026-10-11 moved the masks to <root>/masks. When
+    another tool has renamed that folder to _controls since, the mask entries
+    are read as _controls on both sides, so --undo finds them and puts them into
+    the _controls folder of their subfolder. -> True when it changed m."""
+    def renamed(rel: str) -> str:
+        p = rel.split("/")
+        if len(p) >= 2 and p[-2].casefold() == OLD_MASKS_DIRNAME:
+            p[-2] = MASKS_DIRNAME
+        return "/".join(p)
+
+    changed = False
+    for f in m["files"]:
+        to = f["to"]
+        if (to.split("/")[0].casefold() == OLD_MASKS_DIRNAME and not (root / to).exists()
+                and (root / renamed(to)).exists()):
+            f["from"], f["to"] = renamed(f["from"]), renamed(to)
+            if "tmp" in f:
+                f["tmp"] = renamed(f["tmp"])
+            changed = True
+    if changed:
+        for key in ("created_dirs", "removed_dirs"):
+            m[key] = [renamed(d + "/x")[:-2] for d in m.get(key, [])]
+    return changed
 
 
 # --- run ----------------------------------------------------------------------
@@ -391,6 +423,9 @@ def undo_root(root: Path) -> bool:
         print(f"{root}: nothing to undo (no {TOOL_DIRNAME}/{MANIFEST_NAME})")
         return True
     print(f"{root}: undoing the run of {m.get('time')}")
+    if renamed_masks(root, m):
+        print(f"  the masks moved from {OLD_MASKS_DIRNAME} to {MASKS_DIRNAME} since the run; they go back into "
+              f"the {MASKS_DIRNAME} folders")
     a, b = phases(m["files"])
     restored, errors = 0, []
 

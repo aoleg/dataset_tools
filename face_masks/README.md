@@ -2,7 +2,7 @@
 
 Two tools that use the same YOLOv8 face detector:
 
-- `make_face_masks.py` (`run.bat`) makes per-image loss masks that hide faces from LoRA/LoKr training in [Ostris AI Toolkit](https://github.com/ostris/ai-toolkit). Point it at a folder of images; it writes a matching folder of mask PNGs.
+- `make_face_masks.py` (`run.bat`) makes per-image loss masks that hide faces from LoRA/LoKr training in [Ostris AI Toolkit](https://github.com/ostris/ai-toolkit). Point it at a folder of images; it writes a matching folder of mask PNGs, `_controls` inside the image folder by default.
 - `face_extract.py` (`extract.bat`) cuts close-up face crops out of a folder of images and sorts them into 512, 768 and 1024 bucket folders, to make a face dataset for character training. See [face_extract.py: close-up face crops](#face_extractpy-close-up-face-crops).
 
 ## What the masks are for
@@ -17,7 +17,7 @@ The images themselves are untouched. The model still sees the face as input cont
 2. For each image in the input folder, runs the detector and gets one bounding box per face.
 3. Creates a white mask the size of the image and draws a black ellipse over each face box, enlarged by `--grow` (default 1.35, so a 35 % margin). With `--include-hair` the ellipse is also extended upward to cover hair.
 4. Blurs the mask edge by `--feather` pixels (default 12) so the transition from "ignored" to "trained" is gradual rather than a hard line across the collar.
-5. Saves `<mask_dir>/<image basename>.png` (`<mask_dir>` defaults to `<img_dir>\masks`). Images with no detected face get an all-white mask and are listed at the end so you can check them.
+5. Saves `<mask_dir>/<image basename>.png` (`<mask_dir>` defaults to `<img_dir>\_controls`). When the image has a mask there already (any of `.jpg`, `.jpeg`, `.png`, `.webp`), the image is skipped, and with `--overwrite` the new mask goes over the one AI Toolkit reads, in that file's format (JPEG at quality 95). Images with no detected face get an all-white mask and are listed at the end so you can check them.
 
 With `--preview <dir>` it also writes a copy of each image with the masked area tinted red, which is the quickest way to verify the detector did what you expect.
 
@@ -57,7 +57,9 @@ run.bat <img_dir> [<mask_dir>] [options]
 
 This is the same as `python make_face_masks.py ...` with the venv active.
 
-If you do not give `<mask_dir>`, the masks go into a `masks` subfolder of `<img_dir>`, which the script creates if it does not exist. You can also drop an image folder onto `run.bat` in Explorer to get this result.
+If you do not give `<mask_dir>`, the masks go into a `_controls` subfolder of `<img_dir>`, which the script creates if it does not exist. You can also drop an image folder onto `run.bat` in Explorer to get this result.
+
+The name `_controls` matters. AI Toolkit trains every image under a dataset folder, in every subfolder whose name does not start with a dot, so masks in any other subfolder are trained as images. The one subfolder it never trains is `_controls`, where it keeps the control images it makes itself (since its commit 96ba2fd of 2025-04-09); those are named `<image name>.<type>.<ext>` and do not clash with the masks. Until 2026-10-11 the default was `masks`. When `<img_dir>\masks` holds only PNG files and you do not give `<mask_dir>`, the script renames it to `_controls` (or moves its files there when `_controls` exists, never over a file), so the masks are not made again. remove_borders and the pipeline rename the old `masks` folders of a whole dataset the same way.
 
 Examples:
 
@@ -66,7 +68,7 @@ run.bat D:\data\studio
 run.bat D:\data\studio D:\data\studio_masks --preview D:\data\studio_preview --include-hair
 ```
 
-The first command writes the masks to `D:\data\studio\masks`.
+The first command writes the masks to `D:\data\studio\_controls`.
 
 Options:
 
@@ -92,9 +94,9 @@ datasets:
     mask_min_value: 0.2
 ```
 
-With the default mask location, set `mask_path: D:\data\studio\masks`.
+With the default mask location, set `mask_path: D:\data\studio\_controls`. A mask folder elsewhere, such as `D:\data\studio_masks`, works the same; do not put it into the dataset folder under another name, or AI Toolkit trains the masks as images. A dataset with subfolders has one `_controls` folder per subfolder, and `mask_path` names one folder, so give each subfolder its own dataset entry, or flatten the dataset first (flatten_dataset moves the masks into one `_controls` folder).
 
-AI Toolkit finds each mask by the image's basename inside `mask_path` (any image extension), converts it to grayscale, resizes it to the training bucket, and remaps it so that white = 1.0 and black = `mask_min_value`. A `mask_min_value` of 0 removes the face from the loss entirely; 0.1–0.2 leaves a little signal so the model keeps learning that a face belongs there without learning whose it is.
+AI Toolkit finds each mask by the image's basename inside `mask_path`, trying `.jpg`, `.jpeg`, `.png` and `.webp` in this order, so a `.jpg` mask shadows a `.png` mask of the same name (the script lists such shadowed masks at the end; delete them), converts it to grayscale, resizes it to the training bucket, and remaps it so that white = 1.0 and black = `mask_min_value`. A `mask_min_value` of 0 removes the face from the loss entirely; 0.1–0.2 leaves a little signal so the model keeps learning that a face belongs there without learning whose it is.
 
 With `--invert` the same setting applies to everything except the faces. This is for training a character's face while the model learns little of the clothes, background and body in the dataset. An image with no detected face gets an all-black mask, so with a `mask_min_value` of 0 nothing in it is trained. The tool lists these images at the end.
 
@@ -111,7 +113,7 @@ With `--invert` the same setting applies to everything except the faces. This is
 extract.bat <img_dir> [<out_dir>] [options]
 ```
 
-For every face found in `<img_dir>`, it writes one crop to `<out_dir>\<tier>\<image basename>_face<N>.png`. `<out_dir>` defaults to `<img_dir>\faces`, and `<tier>` is `512`, `768` or `1024`. `N` counts the faces of one image from the largest down. You can also drop an image folder onto `extract.bat` in Explorer.
+For every face found in `<img_dir>`, it writes one crop to `<out_dir>\<tier>\<image basename>_face<N>.png`. `<out_dir>` defaults to `<img_dir>_faces` next to `<img_dir>` (not inside it, where a trainer that reads subfolders would train the crops with the dataset; an `<img_dir>\faces` folder from before 2026-10-11 is moved there on the next run without `<out_dir>`), and `<tier>` is `512`, `768` or `1024`. `N` counts the faces of one image from the largest down. You can also drop an image folder onto `extract.bat` in Explorer.
 
 Example:
 
@@ -119,7 +121,7 @@ Example:
 extract.bat D:\data\alice --largest-only
 ```
 
-This writes to `D:\data\alice\faces\512`, `D:\data\alice\faces\768` and `D:\data\alice\faces\1024`.
+This writes to `D:\data\alice_faces\512`, `D:\data\alice_faces\768` and `D:\data\alice_faces\1024`.
 
 ### How a crop is made
 

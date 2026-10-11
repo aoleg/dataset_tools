@@ -7,7 +7,10 @@ Every image is analysed with three models; the detections are merged into one
 list of people, each person is measured, and the subject group is chosen, or
 the photo is marked to stay unchanged (crowd, no clear subject).
 The crop holds the subject with margins, in one of the k2prep aspect ratios.
-Output goes to <folder>/_reframed/<same relative path>: JPEG crops are lossless
+Output goes to <folder>_reframed/<same relative path>, next to the folder (not
+inside it, where a trainer that reads all subfolders would train every photo
+twice; until 2026-10-11 it was <folder>/_reframed, which the next run moves
+out): JPEG crops are lossless
 (whole DCT blocks, no re-encoding) unless --reencode is given, other formats are
 re-encoded in their own format, unchanged photos are copied, and .txt captions
 are copied along. With --resize every photo is instead cropped and resized into
@@ -15,7 +18,10 @@ its k2prep bucket and filed under <tier>/ the way k2prep does it; --resize needs
 --ostris (Ostris AI Toolkit buckets) or --musubi (musubi-tuner buckets).
 --dry-run writes only plan.json and the previews: --previews draws the
 detections, --people the measurements, --verdicts the subject choice and the
-planned crop.
+planned crop. The detection cache, the plan and the previews go to
+<folder>_backup/_reframe, the run folder of this tool in the backup folder that
+the dataset tools share, so the output folder holds only photos, captions and
+written.json.
 Per-photo corrections: <folder>/overrides.txt, see OVERRIDES_NAME.
   person outlines : yolo26x-seg.pt   (ultralytics assets, COCO class "person")
   faces           : face_yolov8m.pt  (Bingsu/adetailer, Hugging Face)
@@ -43,11 +49,17 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageDraw, ImageOps
 
+HERE = Path(__file__).resolve().parent
+if str(HERE.parent / "remove_borders") not in sys.path:
+    sys.path.insert(0, str(HERE.parent / "remove_borders"))
+import remove_borders as rb  # noqa: E402  the backup folder the dataset tools share
+
 Image.MAX_IMAGE_PIXELS = None
 
-HERE = Path(__file__).resolve().parent
 MODELS_DIR = HERE / "models"
-OUT_DIRNAME = "_reframed"
+OUT_SUFFIX = "_reframed"          # default output: <folder>_reframed next to the folder
+OLD_OUT_DIRNAME = "_reframed"     # the default output inside the folder until 2026-10-11
+RUN_DIRNAME = "_reframe"          # inside <folder>_backup: detections, plan, previews
 DETECTIONS_NAME = "detections.json"
 PREVIEW_DIRNAME = "_preview"
 CACHE_VERSION = 1
@@ -66,7 +78,7 @@ OUTPUT_VERSION = 1                # bump when the files written for a plan chang
 OVERRIDES_NAME = "overrides.txt"
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
-BACKUP_MARK = "_dataset_tools.json"  # marks <dataset>_backup, the backup folder of the other tools: never scanned
+BACKUP_MARK = rb.BACKUP_MARK  # marks a folder the dataset tools made next to a dataset: never scanned
 
 # name -> (source, file). "hf" files come from Bingsu/adetailer on Hugging Face,
 # "ultralytics" files from the ultralytics GitHub assets.
@@ -1702,6 +1714,37 @@ def draw_verdict(img: Image.Image, det: dict, sel: dict, dest: Path, plan: dict 
 # Scanning and cache
 # ---------------------------------------------------------------------------
 
+def default_out(root: Path) -> Path:
+    """<root>_reframed next to root; an old <root>/_reframed is moved there."""
+    if root.parent == root:
+        raise SystemExit(f"{root}: a drive root has no folder next to it for {OUT_SUFFIX}; use a subfolder")
+    out = root.with_name(root.name + OUT_SUFFIX)
+    old = root / OLD_OUT_DIRNAME
+    if old.is_dir():
+        if out.exists():
+            raise SystemExit(f"both {old} and {out} exist; merge them by hand, or give --out")
+        os.rename(old, out)
+        print(f"{root.name}: the output moved out of the folder, from {old} to {out}")
+    if out.is_dir() and any(out.iterdir()) and not (out / WRITTEN_NAME).is_file():
+        raise SystemExit(f"{out} exists and was not written by reframe; rename it or give --out")
+    return out
+
+
+def claim_run_dir(root: Path, out_dir: Path) -> Path:
+    """<root>_backup/_reframe, with the run files that earlier runs kept in the
+    output folder (the cache, the plan, the previews) moved into it."""
+    run_dir = rb.claim_backup(root) / RUN_DIRNAME
+    run_dir.mkdir(exist_ok=True)
+    for name in (DETECTIONS_NAME, PLAN_NAME, PREVIEW_DIRNAME, PEOPLE_PREVIEW_DIRNAME, VERDICT_PREVIEW_DIRNAME):
+        old = out_dir / name
+        if old.exists():
+            if (run_dir / name).exists():
+                print(f"  {old} stays: {run_dir / name} exists")
+            else:
+                os.replace(old, run_dir / name)
+    return run_dir
+
+
 def scan(root: Path, out_dir: Path | None = None):
     """Images under root; folders whose names start with "_", the output
     folder, and the backup folder of a subfolder (<subfolder>_backup, marked
@@ -1784,12 +1827,13 @@ def main(argv=None) -> int:
             pass
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("folders", nargs="*", help="folders to process recursively")
-    ap.add_argument("--out", help="output folder instead of <folder>/_reframed (one folder only)")
-    ap.add_argument("--previews", action="store_true", help="draw the detections into <out>/_preview")
+    ap.add_argument("--out", help="output folder instead of <folder>_reframed (one folder only)")
+    ap.add_argument("--previews", action="store_true",
+                    help="draw the detections into <folder>_backup/_reframe/_preview")
     ap.add_argument("--people", action="store_true",
-                    help="draw the merged people and their measurements into <out>/_people")
+                    help="draw the merged people and their measurements into <folder>_backup/_reframe/_people")
     ap.add_argument("--verdicts", action="store_true",
-                    help="draw the subject choice, with numbered people, into <out>/_verdicts")
+                    help="draw the subject choice, with numbered people, into <folder>_backup/_reframe/_verdicts")
     ap.add_argument("--ratios", default=",".join(AR_FAMILIES),
                     help="aspect ratios to choose from, comma-separated (default: all seven k2prep ratios)")
     ap.add_argument("--mode", choices=MODES, default=DEFAULT_MODE,
@@ -1851,8 +1895,9 @@ def main(argv=None) -> int:
 
     models = None
     for root in roots:
-        out_dir = Path(args.out).resolve() if args.out else root / OUT_DIRNAME
-        cache_path = out_dir / DETECTIONS_NAME
+        out_dir = Path(args.out).resolve() if args.out else default_out(root)
+        run_dir = claim_run_dir(root, out_dir)
+        cache_path = run_dir / DETECTIONS_NAME
         cache = {} if args.redetect else load_cache(cache_path)
         files = scan(root, out_dir)
         overrides = read_overrides(root)
@@ -1888,11 +1933,11 @@ def main(argv=None) -> int:
             if fresh:
                 det.update(size=st.st_size, mtime_ns=st.st_mtime_ns)
             if args.previews:
-                draw_preview(img, det, out_dir / PREVIEW_DIRNAME / (rel + ".jpg"))
+                draw_preview(img, det, run_dir / PREVIEW_DIRNAME / (rel + ".jpg"))
             if args.people:
-                draw_people(img, det["people"], out_dir / PEOPLE_PREVIEW_DIRNAME / (rel + ".jpg"))
+                draw_people(img, det["people"], run_dir / PEOPLE_PREVIEW_DIRNAME / (rel + ".jpg"))
             if args.verdicts:
-                draw_verdict(img, det, sel, out_dir / VERDICT_PREVIEW_DIRNAME / (rel + ".jpg"), crop)
+                draw_verdict(img, det, sel, run_dir / VERDICT_PREVIEW_DIRNAME / (rel + ".jpg"), crop)
             if crop and crop["verdict"] == "crop":
                 what = (f"CROP {crop['family']} {crop['size'][0]}x{crop['size'][1]} "
                         f"(keeps {crop['keeps']:.0%}{', lossless' if crop['lossless'] else ''})")
@@ -1926,14 +1971,14 @@ def main(argv=None) -> int:
         files = [p for p in files if p.relative_to(root).as_posix() in photos]
         write_json(cache_path, {"version": CACHE_VERSION, "models": models_signature(),
                                 "written": datetime.now().isoformat(timespec="seconds"), "files": results})
-        write_json(out_dir / PLAN_NAME, {"written": datetime.now().isoformat(timespec="seconds"),
+        write_json(run_dir / PLAN_NAME, {"written": datetime.now().isoformat(timespec="seconds"),
                                          "people_version": PEOPLE_VERSION, "photos": photos})
         n_crop = sum(1 for v in photos.values() if v["crop"] and v["crop"]["verdict"] == "crop")
         n_flag = sum(1 for v in photos.values() if v["flags"] or (v["crop"] or {}).get("flags"))
         print(f"{n_new} detected, {len(stats) - n_new} from cache, {time.time() - t0:.0f}s, "
               f"{args.threads} thread(s); " + (f"{len(failed)} failed; " if failed else "") +
               f"{n_crop} to crop, {len(photos) - n_crop} unchanged" + (f", {n_flag} flagged" if n_flag else "")
-              + f" -> {out_dir / PLAN_NAME}")
+              + f" -> {run_dir / PLAN_NAME}")
         if not args.dry_run:
             write_outputs(root, out_dir, files, photos, args)
     return 0

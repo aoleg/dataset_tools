@@ -56,9 +56,10 @@ RUN_DIRNAME = "_classify"
 UNSURE_DIRNAME = "_unsure"
 DEDUP_DIRNAME = "_duplicates"
 BACKUP_DIRNAME = "_backup"     # the repair tools' originals, before they moved out to <dataset>_backup
-BACKUP_MARK = "_dataset_tools.json"  # marks <dataset>_backup, the backup folder of the other tools: never scanned
+MASKS_DIRNAMES = ("_controls", "masks")  # face_masks' masks: <dir>/_controls/<stem>.png, masks/ before 2026-10-11
+BACKUP_MARK = "_dataset_tools.json"  # marks a folder the dataset tools made next to a dataset: never scanned
 # Skipped by exact name only. Dataset subfolders may start with "_" too.
-SKIP_DIRNAMES = {EMBED_DIRNAME, RUN_DIRNAME, UNSURE_DIRNAME, DEDUP_DIRNAME, BACKUP_DIRNAME}
+SKIP_DIRNAMES = {EMBED_DIRNAME, RUN_DIRNAME, UNSURE_DIRNAME, DEDUP_DIRNAME, BACKUP_DIRNAME, *MASKS_DIRNAMES}
 
 CACHE_FLUSH_EVERY = 2000
 WINDOW = 1024  # images handed to the decode pool at a time

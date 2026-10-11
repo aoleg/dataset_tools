@@ -44,7 +44,7 @@ Each folder on the command line is scanned with all its subfolders and has its o
 
 ## What a run does
 
-1. Scans the folder with all its subfolders. Images are `.jpg`, `.jpeg`, `.jpe`, `.jfif`, `.png`, `.webp`, `.bmp`, `.tif`, `.tiff`, `.gif`, `.avif`, `.heic` and `.heif`. A `.txt` file with the same name as an image is its caption. Folders named `_backup`, `_duplicates`, `_prep`, `_classify`, `_embeddings`, `masks` and `faces` are skipped, at any depth, and so is a backup folder of the dataset tools (marked by `_dataset_tools.json`); every other folder is scanned, also one whose name starts with `_`. Animated images and files that cannot be read are skipped and listed.
+1. Scans the folder with all its subfolders. Images are `.jpg`, `.jpeg`, `.jpe`, `.jfif`, `.png`, `.webp`, `.bmp`, `.tif`, `.tiff`, `.gif`, `.avif`, `.heic` and `.heif`. A `.txt` file with the same name as an image is its caption. Folders named `_backup`, `_duplicates`, `_prep`, `_classify`, `_embeddings`, `_controls`, `masks` and `faces` are skipped, at any depth, and so is a folder the dataset tools made next to a dataset (marked by `_dataset_tools.json`); every other folder is scanned, also one whose name starts with `_`. Animated images and files that cannot be read are skipped and listed.
 2. Analyses every image (section [What counts as a border](#what-counts-as-a-border)) and plans the crop (section [How an image is cropped](#how-an-image-is-cropped)).
 3. Writes `plan.json`, `report.csv` and `cache.json` into `<folder>_backup\_remove_borders\`, and the contact sheets into its `sheets\` folder. With `--dry-run` the run stops here.
 4. For every image to crop: copies the image, its captions and its face mask to `<folder>_backup` under the same relative path, then writes the crop in place. An image too small after its crop moves to the backup folder with its captions instead.
@@ -74,7 +74,9 @@ Mid tones are never borders. The colour of a border is matched within 24 levels 
 
 A thin line on a JPEG is cut only when the crop keeps the image in the same k2prep bucket (aspect-ratio family and resolution tier of 1024, 768 or 512). The block alignment at the left or top can take more than the line, and that must not cost an image its tier. When the bucket would change, the line stays and the report says so. An image too small for the 512 tier anyway is cut.
 
-A face mask made by `face_masks` (`<folder>\masks\<name>.png`) is cropped with the same box, turned with the EXIF orientation of its image.
+A face mask made by `face_masks` (`<folder>\_controls\<name>.png`) is cropped with the same box, turned with the EXIF orientation of its image, and saved in its own format. A mask may be a `.jpg`, `.jpeg`, `.png` or `.webp` file. AI Toolkit reads the first of these that exists for the image's name, in this order, so `<name>.jpg` shadows `<name>.png`, and the tools use the same mask. The other masks of the image's name would keep the old size; nothing reads them, so they move to the backup, and undo puts them back.
+
+Until 2026-10-11 the face masks were in `<folder>\masks\`, which AI Toolkit trains as images. Every run, dry run and undo first renames such a folder to `_controls`, in the dataset and in the backup folder, when it holds only PNG files and at least one of them has the name of an image next to it; a `masks` folder of anything else stays as it is. The logs of earlier runs name `masks\`; undo reads them as `_controls\`.
 
 Every write goes to a `.part` file first and replaces the image in one step. The image keeps its modification time and its read-only flag.
 
@@ -85,7 +87,7 @@ Every write goes to a `.part` file first and replaces the image in one step. The
   _dataset_tools.json                 marks the folder as the backup folder of the dataset tools
   <relative path>\<image>             the original of a cropped image, or a too-small image
   <relative path>\<name>.txt          its captions
-  <relative path>\masks\<name>.png    its face mask
+  <relative path>\_controls\<name>.* its face mask, and its shadowed masks
   _remove_borders\
     report.csv                        one row per image: what was found, what was done
     plan.json                         the analysis and the crop plan of every image

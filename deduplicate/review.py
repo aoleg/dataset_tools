@@ -2,14 +2,14 @@
 """
 Review the groups of the last dedup.py run full screen, and change the kept copy.
 
-Reads <folder>/_duplicates/plan.json and shows one group per screen: the kept
+Reads <folder>_duplicates/plan.json and shows one group per screen: the kept
 copy and every moved copy, drawn from the files themselves, scaled to fit.
 Click a copy to choose it as the kept one. When you move on to another group,
 the chosen copy returns to its place and the old kept copy moves to
 _duplicates. Press B after the click to keep both instead: the copy returns
 and the kept copy stays. Every move is appended to moves.jsonl, so --undo of
 the run still puts everything back. Your position and decisions are saved in
-<first folder>/_duplicates/compare/review.json, and the next launch resumes.
+<first folder>_duplicates/compare/review.json, and the next launch resumes.
 
 Keys: Right or Space next group, Left previous, Home and End first and last,
 click chooses a copy, B keeps both, U clears the choice, 1-9 show one copy
@@ -68,12 +68,12 @@ def group_id(entry) -> str:
 
 
 class Group:
-    def __init__(self, entry: dict):
+    def __init__(self, entry: dict, roots=()):
         self.entry, self.id = entry, group_id(entry)
         k = entry["keep"]
         self.members = [Member(Path(k["path"]), Path(k["path"]), k)]
         for m in entry.get("move", []):
-            self.members.append(Member(Path(m["path"]), Path(m.get("to") or m["path"]), m))
+            self.members.append(Member(Path(m["path"]), dedup.logged_path(m.get("to") or m["path"], roots), m))
         for m in entry.get("members", []):
             self.members.append(Member(Path(m["path"]), Path(m["path"]), m))
         self.keeper = self.members[0].orig
@@ -103,14 +103,18 @@ class Group:
 class Review:
     def __init__(self, folder: Path):
         folder = folder.resolve()
-        self.plan_path = folder / dedup.OUT_DIRNAME / dedup.PLAN_NAME
+        dedup.claim_out(folder, create=False)
+        self.plan_path = dedup.out_dir(folder) / dedup.PLAN_NAME
         if not self.plan_path.is_file():
             raise SystemExit(f"no plan: {self.plan_path}\nRun the tool first; the review reads the plan of the last run.")
         self.plan = json.loads(self.plan_path.read_text(encoding="utf-8"))
         self.roots = [Path(p) for p in self.plan.get("folders", []) + self.plan.get("sorted_folders", [])]
+        for r in self.roots:
+            if r != folder and r.is_dir():
+                dedup.claim_out(r, create=False)
         first = self.roots[0] if self.roots else folder
-        self.state_path = first / dedup.OUT_DIRNAME / "compare" / STATE_NAME
-        self.groups = [Group(e) for e in self.plan["groups"] if e.get("move") or e.get("members")]
+        self.state_path = dedup.out_dir(first) / "compare" / STATE_NAME
+        self.groups = [Group(e, self.roots) for e in self.plan["groups"] if e.get("move") or e.get("members")]
         self.groups.sort(key=lambda g: (g.kind, str(g.members[0].orig).casefold()))
         self.position = 0
         self.load_state()
@@ -144,8 +148,8 @@ class Review:
         return p.parent
 
     def log(self, root: Path, **entry) -> None:
-        (root / dedup.OUT_DIRNAME).mkdir(parents=True, exist_ok=True)
-        with open(root / dedup.OUT_DIRNAME / dedup.MOVES_NAME, "a", encoding="utf-8") as f:
+        dedup.claim_out(root).mkdir(parents=True, exist_ok=True)
+        with open(dedup.out_dir(root) / dedup.MOVES_NAME, "a", encoding="utf-8") as f:
             f.write(json.dumps({"time": datetime.now().isoformat(timespec="seconds"), **entry}, ensure_ascii=False) + "\n")
 
     def move(self, m: Member, target: Path, keeper: Path, reason: str) -> bool:
@@ -177,7 +181,7 @@ class Review:
     def dup_target(self, m: Member) -> Path:
         root = self.root_of(m.orig)
         rel = m.orig.relative_to(root) if m.orig.is_relative_to(root) else Path(m.orig.name)
-        out = root / dedup.OUT_DIRNAME / rel
+        out = dedup.out_dir(root) / rel
         return dedup.free_dest(out, out.with_suffix(".txt"))
 
     def apply(self, g: Group, keeper: Path, kept_add=()) -> int:
@@ -451,7 +455,7 @@ def run_ui(rv: Review, snapshot: str | None = None) -> int:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("folder", help="a folder of the run; its _duplicates/plan.json is read")
+    ap.add_argument("folder", help="a folder of the run; the plan.json in <folder>_duplicates next to it is read")
     ap.add_argument("--snapshot", metavar="FILE", help="save a screenshot of the first screen to FILE and exit")
     args = ap.parse_args(argv)
     for stream in (sys.stdout, sys.stderr):

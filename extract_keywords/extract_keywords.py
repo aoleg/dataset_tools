@@ -39,7 +39,9 @@ TOOL_DIRNAME = "_extract_keywords"  # in the new folder: manifest.json
 MANIFEST_NAME = "manifest.json"
 MANIFEST_VERSION = 1
 CAPTION_EXT = ".txt"
-MASKS_DIRNAME = "masks"             # face_masks: <dir>/masks/<stem>.png moves with its image
+MASKS_DIRNAME = "_controls"         # face_masks: <dir>/_controls/<stem>.png moves with its image
+OLD_MASKS_DIRNAME = "masks"         # the same until 2026-10-11; such a mask moves into _controls
+MASK_EXTS = (".jpg", ".jpeg", ".png", ".webp")  # a mask is any of these; every one moves with its image
 LIST_LIMIT = 20                     # lines of any list printed
 PROGRESS_EVERY = 10000              # moves between progress lines
 
@@ -48,8 +50,8 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".jpe", ".jfif", ".png", ".webp", ".bmp", ".tif",
 # Folders never searched, at any depth: this tool's own folder and the output
 # folders of the other dataset tools.
 EXCLUDES = {TOOL_DIRNAME, "_flatten_dataset", "_backup", "_duplicates", "_prep", "_classify",
-            "_embeddings", MASKS_DIRNAME, "faces"}
-BACKUP_MARK = "_dataset_tools.json"  # marks <dataset>_backup, the backup folder of the other tools: never scanned
+            "_embeddings", MASKS_DIRNAME, OLD_MASKS_DIRNAME, "faces"}
+BACKUP_MARK = "_dataset_tools.json"  # marks a folder the dataset tools made next to a dataset: never scanned
 AND, OR = "AND", "OR"
 BAD_NAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f\s]+')
 
@@ -114,7 +116,7 @@ def read_caption(path: Path) -> str | None:
 
 
 def scan(root: Path):
-    """Yield (folder parts, caption name, [files of the image], mask or None) for
+    """Yield (folder parts, caption name, [files of the image], [its masks]) for
     every caption that has an image, and collect the captions without one.
     The files of an image are every file with the stem of the caption in its
     folder: the images (a.jpg, a.png), the caption and any other sidecar."""
@@ -126,13 +128,13 @@ def scan(root: Path):
         except OSError as e:
             print(f"  cannot read {here}: {e}")
             return
-        subdirs, files, masks_dir = [], [], None
+        subdirs, files, mask_dirs = [], [], {}
         for e in entries:
             if e.is_symlink() or (e.is_dir() and os.path.isjunction(e.path)):
                 links.append("/".join(parts + (e.name,)))
             elif e.is_dir():
-                if e.name.casefold() == MASKS_DIRNAME:
-                    masks_dir = e.name
+                if e.name.casefold() in (MASKS_DIRNAME, OLD_MASKS_DIRNAME):
+                    mask_dirs[e.name.casefold()] = e.name
                 if (e.name.casefold() not in {x.casefold() for x in EXCLUDES}
                         and not os.path.isfile(os.path.join(e.path, BACKUP_MARK))):
                     subdirs.append(e.name)
@@ -141,13 +143,17 @@ def scan(root: Path):
         by_stem: dict[str, list[str]] = {}
         for fn in files:
             by_stem.setdefault(os.path.splitext(fn)[0].casefold(), []).append(fn)
-        masks = {}
-        if masks_dir:
-            try:
-                masks = {os.path.splitext(f)[0].casefold(): f for f in os.listdir(here / masks_dir)
-                         if f.casefold().endswith(".png")}
-            except OSError:
-                masks = {}
+        masks: dict[str, dict[str, str]] = {}            # stem -> extension -> mask path
+        for key in (OLD_MASKS_DIRNAME, MASKS_DIRNAME):     # _controls last, so its masks win
+            if key in mask_dirs:
+                try:
+                    for f in os.listdir(here / mask_dirs[key]):
+                        stem, ext = os.path.splitext(f)
+                        if ext.casefold() in MASK_EXTS:
+                            masks.setdefault(stem.casefold(), {})[ext.casefold()] = \
+                                "/".join(parts + (mask_dirs[key], f))
+                except OSError:
+                    pass
         for key in sorted(by_stem):
             names = sorted(by_stem[key])
             captions = [n for n in names if os.path.splitext(n)[1].casefold() == CAPTION_EXT]
@@ -156,8 +162,7 @@ def scan(root: Path):
             if not any(os.path.splitext(n)[1].casefold() in IMAGE_EXTS for n in names):
                 orphans.extend("/".join(parts + (c,)) for c in captions)
                 continue
-            mask = "/".join(parts + (masks_dir, masks[key])) if key in masks else None
-            yield parts, captions[0], names, mask
+            yield parts, captions[0], names, sorted(masks.get(key, {}).values())
         for d in sorted(subdirs):
             yield from walk(here / d, parts + (d,))
 
@@ -169,7 +174,7 @@ def find_matches(root: Path, groups, partial: bool, case_sensitive: bool):
     hits = {t: 0 for t in regexes}
     matches, captions = [], 0
     items, orphans, links = scan(root)
-    for parts, caption, names, mask in items:
+    for parts, caption, names, masks in items:
         captions += 1
         text = read_caption(root.joinpath(*parts, caption))
         if text is None:
@@ -179,8 +184,7 @@ def find_matches(root: Path, groups, partial: bool, case_sensitive: bool):
             hits[t] += 1
         if any(all(t in found for t in g) for g in groups):
             files = ["/".join(parts + (n,)) for n in names]
-            if mask:
-                files.append(mask)
+            files.extend(masks)
             matches.append(files)
     return matches, captions, hits, orphans, links
 
@@ -222,6 +226,14 @@ def move(src: Path, dst: Path):
         if getattr(e, "winerror", None) != 17 and e.errno != 18:   # not "another drive"
             raise
         shutil.move(src, dst)
+
+
+def new_mask_rel(rel: str) -> str:
+    """<dir>/masks/<stem>.<ext> -> <dir>/_controls/<stem>.<ext>; any other path as it is."""
+    p = rel.split("/")
+    if len(p) >= 2 and p[-2].casefold() == OLD_MASKS_DIRNAME:
+        p[-2] = MASKS_DIRNAME
+    return "/".join(p)
 
 
 def remove_emptied_dirs(root: Path, rel_files: list[str]) -> list[str]:
@@ -277,16 +289,21 @@ def run(dataset: Path, out: Path, groups, args) -> bool:
         print("  nothing to extract; no folder created")
         return True
 
-    files = [f for m in matches for f in m]
+    sources = [f for m in matches for f in m]
+    # A mask from an old masks folder moves into _controls: "files" names every
+    # file where it is in the new folder, and "moved_from" the old place of each
+    # mask whose path changed, where --undo puts it back.
+    files = [new_mask_rel(f) for f in sources]
     m = {"tool": "extract_keywords", "version": MANIFEST_VERSION, "time": time.strftime("%Y-%m-%d %H:%M:%S"),
          "dataset": str(dataset), "out": str(out), "keywords": groups, "partial": args.partial,
-         "case_sensitive": args.case_sensitive, "state": "planned", "files": files, "removed_dirs": []}
+         "case_sensitive": args.case_sensitive, "state": "planned", "files": files,
+         "moved_from": {f: src for f, src in zip(files, sources) if f != src}, "removed_dirs": []}
     out.mkdir(parents=True)
     write_manifest(out, m)
     done = 0
     try:
-        for f in files:
-            move(dataset / f, out / f)
+        for f, src in zip(files, sources):
+            move(dataset / src, out / f)
             done += 1
             if done % PROGRESS_EVERY == 0:
                 print(f"  {done}/{len(files)} moved")
@@ -297,7 +314,7 @@ def run(dataset: Path, out: Path, groups, args) -> bool:
         print(f"  move failed after {done} of {len(files)}: {e}")
         print("  --undo puts back what was moved")
         return False
-    m["removed_dirs"] = remove_emptied_dirs(dataset, files)
+    m["removed_dirs"] = remove_emptied_dirs(dataset, sources)
     m["state"] = "done"
     write_manifest(out, m)
     print(f"  files moved: {len(files)} into {out}")
@@ -322,7 +339,11 @@ def undo(out: Path) -> bool:
     for d in m.get("removed_dirs", []):
         (dataset / d).mkdir(parents=True, exist_ok=True)
     for f in m["files"]:
-        src, dst = out / f, dataset / f
+        src, dst = out / f, dataset / m.get("moved_from", {}).get(f, f)    # back to where it was
+        if not src.exists() and (out / new_mask_rel(f)).exists():
+            # a manifest from before 2026-10-11, and another tool has renamed the
+            # masks folder of the new folder to _controls since
+            src, dst = out / new_mask_rel(f), dataset / new_mask_rel(f)
         if not src.exists():
             if not dst.exists():
                 gone.append(f)          # deleted from the extraction
@@ -343,7 +364,7 @@ def undo(out: Path) -> bool:
         (out / TOOL_DIRNAME).rmdir()
     except OSError:
         pass
-    remove_emptied_dirs(out, m["files"])
+    remove_emptied_dirs(out, m["files"] + [new_mask_rel(f) for f in m["files"]])
     try:
         out.rmdir()
         print(f"  {out} is empty and deleted")

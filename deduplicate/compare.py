@@ -2,8 +2,9 @@
 """
 Show which files dedup.py judged copies of which, for a check by eye.
 
-Reads <folder>/_duplicates/plan.json (the same plan is in every folder of a
-run) and writes to <folder>/_duplicates/compare/:
+Reads <folder>_duplicates/plan.json, next to the folder (the same plan is in
+the output folder of every folder of a run), and writes to
+<folder>_duplicates/compare/:
 
   pairs.txt           one block per group: the kept file, then every moved
                       copy with where it is now, the match kind and its size
@@ -18,7 +19,7 @@ Usage:    python compare.py <folder> [--skip-exact] [--only hash|features]
                  "features" is the kind worth checking first (a border, crop,
                  frame or footer differed)
   --height N     tile height in pixels (default 360)
-  --out DIR      write somewhere else than <folder>/_duplicates/compare
+  --out DIR      write somewhere else than <folder>_duplicates/compare
 
 Nothing is moved or changed. Moved copies are read from where they are now.
 """
@@ -28,6 +29,8 @@ import sys
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageOps
+
+import dedup
 
 Image.MAX_IMAGE_PIXELS = None
 
@@ -53,7 +56,7 @@ def tile(path: Path, label: str, height: int) -> Image.Image:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("folder", help="a folder of the run; its _duplicates/plan.json is read")
+    ap.add_argument("folder", help="a folder of the run; the plan.json in <folder>_duplicates next to it is read")
     ap.add_argument("--skip-exact", action="store_true")
     ap.add_argument("--only", choices=["hash", "features"])
     ap.add_argument("--height", type=int, default=360)
@@ -67,12 +70,14 @@ def main(argv=None) -> int:
             pass
 
     folder = Path(args.folder).resolve()
-    plan_path = folder / "_duplicates" / "plan.json"
+    dedup.claim_out(folder, create=False)
+    plan_path = dedup.out_dir(folder) / dedup.PLAN_NAME
     if not plan_path.is_file():
         print(f"no plan: {plan_path}")
         return 1
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
-    out = Path(args.out).resolve() if args.out else folder / "_duplicates" / "compare"
+    roots = [Path(p) for p in plan.get("folders", []) + plan.get("sorted_folders", [])]
+    out = Path(args.out).resolve() if args.out else dedup.out_dir(folder) / "compare"
     out.mkdir(parents=True, exist_ok=True)
 
     groups = []
@@ -100,7 +105,7 @@ def main(argv=None) -> int:
                      + (f"  REVIEW: {g['review']}" if "review" in g else ""))
         tiles = [tile(Path(k["path"]), f"KEPT {Path(k['path']).name} {k.get('w')}x{k.get('h')} t{k.get('tier')} {k.get('score')}", args.height)]
         for m in moves:
-            now = Path(m.get("to") or m["path"])
+            now = dedup.logged_path(m.get("to") or m["path"], roots)
             src = now if now.exists() else Path(m["path"])
             kind = m.get("match", "?") + (" (identical)" if m.get("exact") else "")
             lines.append(f"       copy: {m['path']}")

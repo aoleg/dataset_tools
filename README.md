@@ -4,11 +4,11 @@ Tools that prepare image datasets for LoRA and fine-tune training, mainly with [
 
 | folder | what it does |
 |---|---|
-| [face_masks](face_masks/README.md) | Makes per-image loss masks that hide faces from training, and cuts close-up face crops sorted into 512, 768 and 1024 buckets. |
+| [face_masks](face_masks/README.md) | Makes per-image loss masks that hide faces from training, in a `_controls` folder next to the images (AI Toolkit's `mask_path`; AI Toolkit never trains that folder as images), and cuts close-up face crops sorted into 512, 768 and 1024 buckets into `<folder>_faces` next to the folder. |
 | [telegram_dataset](telegram_dataset/README.md) | Turns the photos of a Telegram channel export into images with clean one-line captions. |
 | [taggui_captioning](taggui_captioning/README.md) | A TagGUI prompt that turns a photo and its editor's caption into an English text-to-image prompt, with the TagGUI settings it needs. |
 | [ddg_images](ddg_images/README.md) | Downloads the image results of Bing, DuckDuckGo or SearXNG searches, page by page, removes duplicates and logs every image to a CSV file. |
-| [deduplicate](deduplicate/README.md) | Finds copies of the same picture across folders (hashes plus a feature check for crops, borders and mock-ups) and moves the worse copies, with their captions, to a `_duplicates` folder; a kept copy without a caption gets a copy of one. A curated collection given with `--sorted` receives the better copies from raw folders under its own names and keeps its captions. `compare.bat` shows which files were judged copies of which, side by side, for a check by eye; `review.bat` (or `--review` after a run) opens the groups full screen and lets you change the kept copy with a click. `--undo` puts everything back, including review changes. `--gpu` matches the image features on the GPU when torch is in the shared venv, which cuts the slow stage from minutes to seconds on large sets. |
+| [deduplicate](deduplicate/README.md) | Finds copies of the same picture across folders (hashes plus a feature check for crops, borders and mock-ups) and moves the worse copies, with their captions, to a `<folder>_duplicates` folder next to each folder; a kept copy without a caption gets a copy of one. A curated collection given with `--sorted` receives the better copies from raw folders under its own names and keeps its captions. `compare.bat` shows which files were judged copies of which, side by side, for a check by eye; `review.bat` (or `--review` after a run) opens the groups full screen and lets you change the kept copy with a click. `--undo` puts everything back, including review changes. `--gpu` matches the image features on the GPU when torch is in the shared venv, which cuts the slow stage from minutes to seconds on large sets. |
 | [reframe](reframe/README.md) | Crops photos of people to the subject (one person or a group, without passers-by) in a [k2prep](k2prep/README.md) aspect ratio; lossless for JPEG, and with `--resize` straight into k2prep buckets, for Ostris AI Toolkit (`--ostris`) or musubi-tuner (`--musubi`). |
 | [classify](classify/README.md) | Sorts a dataset into category folders from a folder of hand-sorted examples per category: every image is embedded once with SigLIP 2, a classifier is trained on the examples, and each image is copied with its caption into its category folder, or into `_unsure` when the classifier is not confident. A dry run writes a report with a confusion matrix, a confidence histogram and contact sheets; `--undo` puts everything back. |
 | [remove_borders](remove_borders/README.md) | Finds images with borders (light and dark frames, thin lines, slanted frames of rotated scans, banners with text at the bottom or top) and cuts the borders off in place; lossless for JPEG, exact for PNG and other lossless formats, lossy formats become PNG. Originals and captions go to the backup folder `<dataset>_backup` next to the dataset first, an image too small after its crop moves there instead, and `--undo` puts everything back. A dry run writes a report and contact sheets with the cut lines magnified. |
@@ -19,8 +19,8 @@ Tools that prepare image datasets for LoRA and fine-tune training, mainly with [
 | [extract_keywords](extract_keywords/README.md) | Moves the images whose captions contain any of the keywords (or all of them, joined by `AND`) with their captions out of a dataset into `<dataset>_<first keyword>` next to it, in the same subfolders: one concept for its own training, or every image whose caption mentions a watermark. `--undo` moves them back. |
 | [rebalance_medium](rebalance_medium/README.md) | For captions that all open with their medium (`A color photograph ...`, `A black-and-white photograph ...`): moves a random share of the colour and black-and-white images (by default 30 % of the captions, 60 % of them colour, at most half of either class) into `<dataset>_media-rebalanced` next to the dataset, with the medium word removed from their captions, so the model learns what a prompt without a medium means. Made for an AI Toolkit run in progress: the latent caches move with the images, the original captions and text-embedding caches are kept in `<dataset>_rebalance_backup`. A dry run by default, `--apply` moves, `--undo` puts everything back. |
 | [move_alone](move_alone/move_alone.bat) | Moves the images that have no caption (no `.txt` file with the same name) into a `single_files` subfolder, to caption them or leave them out. Copy `move_alone.bat` into the dataset folder and run it there; it handles that folder only, not its subfolders. |
-| [scripts](scripts) | Small single-file scripts, run from the dataset folder or given it as an argument. `extract_uncaptioned_images.py` moves the images without a caption from all subfolders into `_uncaptioned`, in the same subfolders, so only those need captioning; `--restore` moves them back with their new captions. `clean_orphaned_txt.py` deletes the `.txt` captions that have no image. Both take `--dry-run`. |
-| [k2prep](k2prep/README.md) | Builds a training set for Ostris AI Toolkit (`--ostris`) or the musubi-tuner Krea 2 trainer (`--musubi`) from a folder of mixed photos: each image that passes a quality score is cropped and resized onto that trainer's exact bucket sizes, on one of 7 aspect ratios in 3 resolution tiers (1024, 768, 512), so the trainer uses it with no second resize or crop. Buckets too small for a batch are merged into their nearest neighbour, and the result goes to `_prep` with its captions, plus a `dataset.toml` for musubi. `--by-tier` gives one folder per tier (`_1024` to `_256`), each holding the whole source tree, as AI Toolkit wants a tree of datasets. The source folder is not changed. `--report` is a dry run; `--sort` files the originals into quality folders instead, and `--copy-to` copies the best originals of a tree into another folder, tier first with `--by-tier`. `cleanup.bat` moves undersized images out of a folder. |
+| [scripts](scripts) | Small single-file scripts, run from the dataset folder or given it as an argument. `extract_uncaptioned_images.py` moves the images without a caption from all subfolders into `<folder>_uncaptioned` next to the folder, in the same subfolders, so only those need captioning; `--restore` moves them back with their new captions. `clean_orphaned_txt.py` deletes the `.txt` captions that have no image. Both take `--dry-run`. |
+| [k2prep](k2prep/README.md) | Builds a training set for Ostris AI Toolkit (`--ostris`) or the musubi-tuner Krea 2 trainer (`--musubi`) from a folder of mixed photos: each image that passes a quality score is cropped and resized onto that trainer's exact bucket sizes, on one of 7 aspect ratios in 3 resolution tiers (1024, 768, 512), so the trainer uses it with no second resize or crop. Buckets too small for a batch are merged into their nearest neighbour, and the result goes to `_prep_<folder>` next to the folder (or `--out`) with its captions, plus a `dataset.toml` for musubi. `--by-tier` gives one folder per tier (`_1024` to `_256`), each holding the whole source tree, as AI Toolkit wants a tree of datasets. The source folder is not changed. `--report` is a dry run; `--sort` files the originals into quality folders instead, and `--copy-to` copies the best originals of a tree into another folder, tier first with `--by-tier`. `cleanup.bat` moves undersized images out of a folder. |
 
 ## Workflow
 
@@ -82,7 +82,8 @@ The stages of a dataset and the tools that come in at each of them. Tools marked
  | move_alone                parks images still without a caption   |  |
  | extract_uncaptioned_images (scripts)                             |  |
  |                           the same for a whole tree, into        |  |
- |                           _uncaptioned; --restore puts back      |  |
+ |                           <folder>_uncaptioned; --restore puts   |  |
+ |                           them back                              |  |
  | extract_keywords          moves images out by caption keyword:   |  |
  |                           a concept to train apart, or           |  |
  |                           "watermark" back to watermark         |--+
@@ -125,7 +126,7 @@ The stages of a dataset and the tools that come in at each of them. Tools marked
 
 ## The backup folder
 
-remove_borders, jpeg_cleanup, watermark and the pipeline keep the untouched originals of the images they change, their captions, and their own logs, caches, reports and contact sheets in one folder next to the dataset: `<dataset>_backup`, with the same relative paths as in the dataset. The folder is shared: each image has one backup, the original from before the first tool changed it, and it is never overwritten. Each tool's `--undo` reads its own log in `<dataset>_backup\_<tool>\`.
+remove_borders, jpeg_cleanup, watermark and the pipeline keep the untouched originals of the images they change, their captions, and their own logs, caches, reports and contact sheets in one folder next to the dataset (reframe keeps its detection cache, plan and previews there too): `<dataset>_backup`, with the same relative paths as in the dataset. The folder is shared: each image has one backup, the original from before the first tool changed it, and it is never overwritten. Each tool's `--undo` reads its own log in `<dataset>_backup\_<tool>\`.
 
 The backup is outside the dataset because a trainer must not see it. Ostris AI Toolkit trains on every image under the dataset folder, in every subfolder whose name does not start with `.`, so originals, contact sheets and previews inside the dataset would be trained next to the edited images. musubi-tuner reads only the images directly in its `image_directory`.
 
@@ -137,6 +138,27 @@ Two things to know:
 
 - Run the tools on the folder that you train from, or on a folder that contains it. A run on a subfolder of a training folder puts `<subfolder>_backup` inside the training folder, where AI Toolkit trains on it.
 - Move or rename the dataset and its `<dataset>_backup` together. When the backup is not next to the dataset under that name, `--undo` finds no run.
+
+## Output folders
+
+No tool writes into the dataset folder anything that a trainer must not train, for the same reason as the backup. The output folders are next to the dataset:
+
+| folder | tool | holds |
+|---|---|---|
+| `<dataset>_backup` | remove_borders, jpeg_cleanup, watermark, pipeline, reframe | originals, logs, caches, previews; see [The backup folder](#the-backup-folder) |
+| `<dataset>_duplicates` | deduplicate | the worse copies with their captions, the plan, the caches and the undo log |
+| `_prep_<dataset>` | k2prep | the training set, its reports, its caches and `dataset.toml`; `--out` names another folder |
+| `<dataset>_reframed` | reframe | the reframed copy of the dataset, to caption and train as a dataset of its own |
+| `<dataset>_faces` | face_masks (`extract.bat`) | the face crops, a separate face dataset |
+| `<dataset>_uncaptioned` | scripts/extract_uncaptioned_images.py | the images that wait for a caption |
+| `<dataset>_classified` | classify | the category folders; train the category folders, not the whole folder |
+| `<dataset>_watermark_removed`, `<dataset>_jpeg_extract`, `<dataset>_media-rebalanced`, `_<dataset>` | watermark, jpeg_cleanup, rebalance_medium, k2prep's `cleanup.bat` | see their READMEs |
+
+`<dataset>_backup`, `<dataset>_duplicates` and `_prep_<dataset>` hold the `_dataset_tools.json` mark, so the tools never scan them; a folder of one of these names without the mark stops the tool. The other folders are datasets in their own right and have no mark.
+
+The face masks are the one exception, and they stay next to their images: the mask of `<dir>\<name>.<ext>` is `<dir>\_controls\<name>.png`, or a `.jpg`, `.jpeg` or `.webp` of that name; AI Toolkit reads the first of `.jpg`, `.jpeg`, `.png`, `.webp` that exists, and the tools write and crop that same file. AI Toolkit never trains a file whose folder is named `_controls`, because it keeps its own control images there (since its commit 96ba2fd of 2025-04-09), and its `mask_path` finds a mask by the image name, so `mask_path: <dataset>\_controls` reads them.
+
+Until 2026-10-11 these folders were inside the dataset: `_duplicates`, `_prep`, `_reframed`, `faces`, `_uncaptioned`, and `masks` for the face masks, which AI Toolkit trained as images. The next run of the tool that owns a folder moves it out (or renames `masks` to `_controls`), and the undo logs and manifests of earlier runs still work. Before that, the tools still skip these names when they scan.
 
 ## Install
 

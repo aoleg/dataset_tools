@@ -56,14 +56,14 @@ A file directly in the folder gets `<folder>-datasetNNNNNN.<ext>`.
 ## What a run does
 
 1. Scans the folder with all its subfolders. Images are `.jpg`, `.jpeg`, `.jpe`, `.jfif`, `.png`, `.webp`, `.bmp`, `.tif`, `.tiff`, `.gif`, `.avif`, `.heic` and `.heif`. A `.txt` file with the same name as an image is its caption. Two images with the same name and different extensions (`a.jpg` and `a.png`) share their caption, so they get the same new name with their own extensions.
-2. Skips the folders `_flatten_dataset`, `_backup`, `_duplicates`, `_prep`, `_classify`, `_embeddings`, `masks` and `faces`, at any depth. These are the output folders of the dataset tools. A backup folder of the dataset tools, marked by `_dataset_tools.json`, is skipped too. Every other folder is flattened, also one whose name starts with `_`. Links and junctions are not followed.
+2. Skips the folders `_flatten_dataset`, `_backup`, `_duplicates`, `_prep`, `_classify`, `_embeddings`, `_controls`, `masks` and `faces`, at any depth. These are the output folders of the dataset tools. A folder the dataset tools made next to a dataset (marked by `_dataset_tools.json`) is skipped too. Every other folder is flattened, also one whose name starts with `_`. Links and junctions are not followed.
 3. Plans every rename and checks the plan. When a file that stays in the folder already has a new name (for example a caption without an image), nothing is renamed.
 4. Writes the plan to `<folder>\_flatten_dataset\manifest.json`, then renames the files.
 5. Removes the subfolders that are empty after the run. A subfolder that was empty before the run stays.
 
 These files stay where they are: a caption without an image, and every file that is not an image or a caption. The run lists them. A subfolder that holds such a file is not removed.
 
-A face mask made by `face_masks` (`<subfolder>\masks\<name>.png`) moves with its image to `<folder>\masks\<new name>.png`.
+A face mask made by `face_masks` (`<subfolder>\_controls\<name>.<ext>`, or `<subfolder>\masks\<name>.<ext>` from before 2026-10-11, where `<ext>` is `.jpg`, `.jpeg`, `.png` or `.webp`) moves with its image to `<folder>\_controls\<new name>.<ext>`; every mask of the image moves, so AI Toolkit reads the same one as before. `--undo` puts it back where it was. When another tool has renamed `<folder>\masks` to `_controls` since an older run, `--undo` finds the masks there and puts them into the `_controls` folders of their subfolders.
 
 A file that already has a new name of another file (a folder flattened before, for example) is first renamed to a temporary name, so no file is ever overwritten.
 

@@ -353,7 +353,9 @@ METRIC_CROP = 1024
 # 7  Output layout
 # ---------------------------------------------------------------------------
 
-PREP_DIRNAME = "_prep"
+PREP_DIRNAME = "_prep"            # the output folder inside the source until 2026-10-11
+PREP_PREFIX = "_prep_"            # the output folder: _prep_<folder> next to the folder
+BACKUP_MARK = "_dataset_tools.json"  # marks a folder the dataset tools made next to a dataset: never scanned
 REPORTS_DIRNAME = "reports"
 TOML_FILENAME = "dataset.toml"
 # Latent/text-encoder caches live under each tier folder. k2prep never creates
@@ -1515,13 +1517,13 @@ def scan_tree(root: Path, recursive: bool, reserved: bool = True,
                     if rel == "" and low == CACHE_DIRNAME:
                         raise ScanError(
                             f"source folder {relname!r} would collide with "
-                            f"musubi's cache folder in "
-                            f"{PREP_DIRNAME}/{by_tier_dirname(TIERS[0])}. "
+                            f"musubi's cache folder in the output folder's "
+                            f"{by_tier_dirname(TIERS[0])}. "
                             f"Rename it, or run without --by-tier.")
                 elif reserved and low in tier_names:
                     raise ScanError(
                         f"source folder {relname!r} is named like a k2prep tier "
-                        f"folder, which makes _prep/{relname} ambiguous. Rename "
+                        f"folder, which makes {relname} in the output folder ambiguous. Rename "
                         f"it, or run without --recursive.")
                 if (reserved and not tier_first_layout and rel == ""
                         and low == REPORTS_DIRNAME):
@@ -2151,7 +2153,95 @@ def _path_inside(child: Path, parent: Path) -> bool:
         return False
 
 
-def check_copy_target(source: Path, target: Path) -> str | None:
+# ---------------------------------------------------------------------------
+# 7.0  The output folder
+# ---------------------------------------------------------------------------
+# The renders go to _prep_<folder> next to the folder, or to --out. Until
+# 2026-10-11 they went to <folder>/_prep, inside the source, where Ostris AI
+# Toolkit, which trains every subfolder whose name does not start with a dot,
+# trained them along with the originals whenever the source folder itself was
+# trained. The leading underscore keeps the folder out of a k2prep scan of the
+# parent (a -R sweep puts _prep_<subfolder> next to each subfolder), and
+# BACKUP_MARK keeps it out of the other dataset tools.
+
+class PrepDirError(Exception):
+    """The output folder cannot be used. Raised before any work."""
+
+
+def prep_path(folder: Path, out: str | None = None) -> Path:
+    """Where the output of folder goes: --out, else _prep_<folder> next to it."""
+    if out:
+        return Path(out).expanduser().resolve()
+    if folder.parent == folder:
+        raise PrepDirError(f"{folder}: a drive root has no folder next to it for "
+                           f"{PREP_PREFIX}<folder>; use a subfolder, or give --out")
+    return folder.parent / f"{PREP_PREFIX}{folder.name}"
+
+
+def made_by_k2prep(d: Path) -> bool:
+    """A marked folder, or one with k2prep's reports, caches or TOML in it."""
+    if (d / BACKUP_MARK).is_file() or (d / REPORTS_DIRNAME).is_dir() \
+            or (d / CACHE_FILENAME).is_file() or (d / VL_CACHE_FILENAME).is_file():
+        return True
+    try:
+        return any(t.read_text(encoding="utf-8").startswith(TOML_MARKER) for t in d.glob("*.toml"))
+    except OSError:
+        return False
+
+
+def mark_prep(prep_dir: Path, folder: Path) -> None:
+    if prep_dir.is_dir() and not (prep_dir / BACKUP_MARK).is_file():
+        (prep_dir / BACKUP_MARK).write_text(
+            json.dumps({"made_by": "dataset_tools", "kind": "k2prep", "dataset": folder.name}) + "\n",
+            encoding="utf-8")
+
+
+def claim_prep_dir(folder: Path, out: str | None = None) -> Path:
+    """The output folder of folder, checked, with an old <folder>/_prep moved
+    there (one rename; k2prep's TOML is rewritten for the new place).
+    Raises PrepDirError."""
+    prep_dir = prep_path(folder, out)
+    if _path_inside(folder, prep_dir):
+        raise PrepDirError(f"the output folder {prep_dir} holds the source folder; choose another")
+    if _path_inside(prep_dir, folder):
+        rel = prep_dir.relative_to(folder)
+        if not any(part.startswith(("_", ".")) for part in rel.parts):
+            raise PrepDirError(f"the output folder {prep_dir} is inside the source folder, where the "
+                               f"next scan would read it; choose a folder outside {folder}, or one "
+                               f"whose name starts with '_'")
+    old = folder / PREP_DIRNAME
+    if old.is_dir() and old != prep_dir:
+        if out:
+            print(f"note: an old output folder {old} is still inside the source; a trainer that reads "
+                  f"subfolders trains it. Delete it, or run without --out to move it out.")
+        elif prep_dir.exists():
+            print(f"note: {old} is an old output folder and {prep_dir} exists too; the run uses "
+                  f"{prep_dir.name}. Delete {old}: a trainer that reads subfolders trains it.")
+        else:
+            try:
+                os.rename(old, prep_dir)
+            except OSError as exc:
+                raise PrepDirError(f"cannot move {old} to {prep_dir}: {exc}")
+            print(f"note: the output moved out of the source folder, from {old} to {prep_dir}")
+            old_posix = str(old).replace("\\", "/")
+            new_posix = str(prep_dir).replace("\\", "/")
+            for toml in prep_dir.glob("*.toml"):
+                try:
+                    text = toml.read_text(encoding="utf-8")
+                    if text.startswith(TOML_MARKER):
+                        toml.write_text(text.replace(f'"{old_posix}/', f'"{new_posix}/'), encoding="utf-8")
+                except OSError:
+                    pass
+    if prep_dir.exists() and not prep_dir.is_dir():
+        raise PrepDirError(f"{prep_dir} exists and is not a folder")
+    if prep_dir.is_dir() and any(prep_dir.iterdir()) and not made_by_k2prep(prep_dir):
+        raise PrepDirError(f"{prep_dir} exists and was not made by k2prep; rename it or move it away, "
+                           f"or give another folder with --out")
+    mark_prep(prep_dir, folder)
+    return prep_dir
+
+
+def check_copy_target(source: Path, target: Path, prep_dir: Path | None = None) -> str | None:
     """Why target cannot receive copies of source, or None if it can.
 
     The two must not overlap. A target that holds the source could put copies
@@ -2164,9 +2254,15 @@ def check_copy_target(source: Path, target: Path) -> str | None:
         what = "is" if _path_inside(target, source) else "contains"
         return (f"the target folder {what} the source folder; copies could "
                 f"land among the originals. Choose a folder outside {source}.")
-    if _path_inside(target, source / PREP_DIRNAME):
-        return (f"the target folder is inside {PREP_DIRNAME}, which belongs to "
-                f"k2prep's own runs. Choose a folder outside it.")
+    if prep_dir is None:
+        try:
+            prep_dir = prep_path(source)
+        except PrepDirError:
+            prep_dir = source / PREP_DIRNAME
+    for own in (prep_dir, source / PREP_DIRNAME):
+        if _path_inside(target, own):
+            return (f"the target folder is inside {own.name}, which belongs to "
+                    f"k2prep's own runs. Choose a folder outside it.")
     if _path_inside(target, source):
         rel = target.relative_to(source)
         if not any(part.startswith(("_", ".")) for part in rel.parts):
@@ -2590,7 +2686,7 @@ def build_report(args, folder: Path, results: list[Result], unknown: list[str],
     w(f"tiers       : {', '.join(str(t) for t in active_tiers())}   "
       f"(upscale tolerance {UPSCALE_TOLERANCE})")
     if tier_first():
-        w(f"layout      : tier first, {PREP_DIRNAME}/_<tier>/<subfolder>/ "
+        w(f"layout      : tier first, {PREP_PREFIX}<folder>/_<tier>/<subfolder>/ "
           f"(--by-tier)")
     if not args.no_merge:
         w(f"merging     : buckets under {MIN_BUCKET_SIZE} images are consolidated "
@@ -3607,6 +3703,10 @@ def parse_args(argv=None):
                         f"divides this folder into N populated tiers, "
                         f"{QUALITY_DIR_PREFIX}1 best. Writes no tier folders "
                         f"and no TOML.")
+    p.add_argument("--out", metavar="DIR",
+                   help=f"Output folder for the renders, reports, caches and "
+                        f"TOML, instead of {PREP_PREFIX}<folder> next to the "
+                        f"folder. Not with -R, which gives every folder its own.")
     p.add_argument("--copy-to", metavar="TARGET", dest="copy_to",
                    help="Select instead of building a dataset: score every "
                         f"image at the {SORT_TIER} tier, as --sort does, and "
@@ -3677,6 +3777,9 @@ def parse_args(argv=None):
                 "that should mean across a tree of datasets is not decided. "
                 "Run --sort on one folder at a time, or -R to sweep "
                 "each subfolder separately.")
+    if args.each and args.out is not None:
+        p.error("-R cannot be combined with --out: every per-folder run has "
+                f"its own output folder, {PREP_PREFIX}<subfolder> next to it")
     if args.each and args.copy_to is not None:
         p.error("-R cannot be combined with --copy-to: every per-folder run "
                 "would copy into the root of the same target and flatten the "
@@ -4245,6 +4348,17 @@ def run_each(args) -> int:
 
 
 def run_one(args) -> int:
+    code = run_one_folder(args)
+    folder = Path(args.folder).expanduser()
+    try:
+        folder = folder.resolve()
+        mark_prep(prep_path(folder, args.out), folder)   # a folder the run created
+    except (OSError, PrepDirError):
+        pass
+    return code
+
+
+def run_one_folder(args) -> int:
     folder = Path(args.folder).expanduser()
     if not folder.exists():
         print(f"error: folder does not exist: {folder}", file=sys.stderr)
@@ -4253,11 +4367,16 @@ def run_one(args) -> int:
         print(f"error: not a directory: {folder}", file=sys.stderr)
         return 2
     folder = folder.resolve()
+    try:
+        prep_dir = claim_prep_dir(folder, args.out)
+    except PrepDirError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
     target = None
     if args.copy_to is not None:
         target = Path(args.copy_to).expanduser().resolve()
-        why = check_copy_target(folder, target)
+        why = check_copy_target(folder, target, prep_dir)
         if why is None and target.exists() and not target.is_dir():
             why = f"the target exists and is not a directory: {target}"
         if why is not None:
@@ -4295,7 +4414,6 @@ def run_one(args) -> int:
     for note in scan_notes:
         print(f"note: {note}")
 
-    prep_dir = folder / PREP_DIRNAME
     reports_dir = prep_dir / REPORTS_DIRNAME
     ext = ".png" if args.png else ".jpg"
     resample = RESAMPLE_FILTERS[args.filter]
@@ -4439,7 +4557,7 @@ def run_one(args) -> int:
     notes: list[str] = list(scan_notes)
     if args.recursive:
         for ds in find_stale_datasets(prep_dir, seen_dirs):
-            notes.append(f"stale output folder {PREP_DIRNAME}/{ds} has no "
+            notes.append(f"stale output folder {prep_dir.name}/{ds} has no "
                          f"matching source folder this run; left alone, and "
                          f"not referenced by the TOML. Delete it by hand if "
                          f"it is unwanted.")
@@ -4449,7 +4567,7 @@ def run_one(args) -> int:
         notes.append(f"the {smallest} tier is for completeness: its scores are "
                      f"less reliable, because the quality bands were fitted on "
                      f"larger renders. Keep or delete "
-                     f"{PREP_DIRNAME}/{by_tier_dirname(smallest)} by hand.")
+                     f"{prep_dir.name}/{by_tier_dirname(smallest)} by hand.")
     if not args.single_pass and candidates:
         # Written in dry runs too: it costs nothing and makes the recommended
         # "--report first, then run for real" workflow skip a second rendering

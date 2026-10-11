@@ -89,12 +89,14 @@ PROGRESS_EVERY = 500              # images between progress lines
 IMAGE_EXTS = {".jpg", ".jpeg", ".jpe", ".jfif", ".png", ".webp", ".bmp", ".tif", ".tiff",
               ".gif", ".avif", ".heic", ".heif"}
 # Folders never scanned, at any depth: the output folders of the dataset tools.
-# _backup is the old backup folder of this tool and the others, _duplicates is
-# deduplicate's, _prep is k2prep's, _classify and _embeddings are classify's,
-# masks and faces are face_masks'. A folder holding BACKUP_MARK (the backup of
-# a subfolder, <subfolder>_backup) is skipped too. Any other folder is
-# scanned; --exclude adds names.
-DEFAULT_EXCLUDES = [OLD_BACKUP_DIRNAME, "_duplicates", "_prep", "_classify", "_embeddings", "masks", "faces"]
+# _backup, _duplicates and _prep are the old in-dataset folders of this tool
+# and the others, of deduplicate and of k2prep, from before they moved out next
+# to the dataset; _classify and _embeddings are classify's, _controls (masks
+# before 2026-10-11) and faces are face_masks'. A folder holding BACKUP_MARK (a
+# folder the tools made next to a dataset, such as <subfolder>_backup) is
+# skipped too. Any other folder is scanned; --exclude adds names.
+DEFAULT_EXCLUDES = [OLD_BACKUP_DIRNAME, "_duplicates", "_prep", "_classify", "_embeddings",
+                    "_controls", "masks", "faces"]
 DEFAULT_SIDECARS = ".txt"
 DEFAULT_BANDS = "60,70,80,85"
 DEFAULT_MAX_PIXELS = 2048 * 2048  # larger images are skipped: the downscale to 1024^2 hides their artifacts

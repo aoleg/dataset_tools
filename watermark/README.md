@@ -6,7 +6,7 @@ This is the per-image core of [watermark_remover](https://github.com/aoleg/water
 
 ## What it does
 
-1. Scans every folder given at any depth. The output folders of the dataset tools (`_backup`, `_duplicates`, `_prep`, `_classify`, `_embeddings`, `masks`, `faces`) and a backup folder of the tools (marked by `_dataset_tools.json`) are never scanned; `--exclude` adds names.
+1. Scans every folder given at any depth. The output folders of the dataset tools (`_backup`, `_duplicates`, `_prep`, `_classify`, `_embeddings`, `_controls`, `masks`, `faces`) and a folder the dataset tools made next to a dataset (marked by `_dataset_tools.json`) are never scanned; `--exclude` adds names.
 2. Runs the detector on each image (upright, as EXIF shows it) and keeps the boxes above `--conf` (default 0.1, low on purpose: the detector is confident about real watermarks and a missed one costs more than a painted patch of background).
 3. Paints the boxes out: each box is grown by `--dilate` pixels (default 15), and LaMa fills the area from a window of context around it (at least 128 px, or half the watermark's size), so the rest of the image is not touched at all. A window with a side over `--max-size` (default 2048) is scaled down for LaMa and its fill scaled back; the image itself keeps its size.
 4. With `--trim`, the largest rectangle that holds no watermark is cut out instead, when it keeps at least `--trim-min-keep` of the image (default 0.5); otherwise the image is painted. A JPEG trim is lossless: whole DCT blocks, no re-encoding, the top and left edges moved inward to the block grid so that the watermark goes completely. A tiled watermark (more than 20 boxes) is never trimmed.

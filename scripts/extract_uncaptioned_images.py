@@ -1,12 +1,21 @@
-"""Move images that have no .txt caption sidecar into "_uncaptioned", recursively.
+"""Move images that have no .txt caption sidecar into "<root>_uncaptioned", recursively.
 
 An image "name.png" counts as captioned when the same folder holds
 "name.txt" (case-insensitive). Every uncaptioned png/jpg/jpeg/gif/webp is
-moved to "<root>/_uncaptioned/<same relative path>", so the original
-directory tree is kept. The "_uncaptioned" folder itself is never scanned.
+moved to "<root>_uncaptioned/<same relative path>", next to the root, so the
+original directory tree is kept. The folder is next to the root, not inside
+it, because a trainer that reads all subfolders (Ostris AI Toolkit trains
+every subfolder whose name does not start with a dot) would train the
+uncaptioned images. Until 2026-10-11 it was "<root>/_uncaptioned"; such a
+folder is moved out on the next run, or restored from where it is.
 
-After captioning, --restore moves every file in "_uncaptioned" (images and
-their new .txt files) back to the same place in the tree and removes the
+Not scanned: folders whose names start with a dot, the output folders of the
+dataset tools (EXCLUDES: face masks, face crops, duplicates and the others,
+which have no captions by design), and any folder the dataset tools marked
+with MARK.
+
+After captioning, --restore moves every file in "<root>_uncaptioned" (images
+and their new .txt files) back to the same place in the tree and removes the
 emptied folders.
 
 Usage:
@@ -20,7 +29,20 @@ import sys
 import time
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
-OUT_NAME = "_uncaptioned"
+OUT_SUFFIX = "_uncaptioned"     # <root>_uncaptioned next to the root
+OLD_OUT_NAME = "_uncaptioned"   # the same folder inside the root until 2026-10-11
+# The output folders of the dataset tools, at any depth: _controls holds the
+# face masks (masks before 2026-10-11), faces the face crops, and the rest
+# hold copies or originals that have their captions elsewhere.
+EXCLUDES = {OLD_OUT_NAME, "_controls", "masks", "faces", "_backup", "_duplicates", "_prep",
+            "_classify", "_embeddings", "_reframed"}
+MARK = "_dataset_tools.json"    # marks a folder the dataset tools made next to a dataset
+
+
+def skipped(entry):
+    name = entry.name
+    return (name.startswith(".") or name.casefold() in EXCLUDES
+            or os.path.isfile(os.path.join(entry.path, MARK)))
 
 
 def move(src, dst, dry_run, label):
@@ -59,7 +81,8 @@ def extract(root, out, dry_run, quiet):
                 for entry in it:
                     try:
                         if entry.is_dir(follow_symlinks=False):
-                            if os.path.normcase(entry.path) != os.path.normcase(out):
+                            if (os.path.normcase(entry.path) != os.path.normcase(out)
+                                    and not skipped(entry)):
                                 subdirs.append(entry.path)
                             continue
                     except OSError:
@@ -111,14 +134,31 @@ def restore(root, out, dry_run):
     return moved, failed
 
 
+def move_old_out(root, out, dry_run):
+    """An old <root>/_uncaptioned: renamed to out when out is not there yet.
+    -> the folders that --restore has to empty: out and, when both exist, old."""
+    old = os.path.join(root, OLD_OUT_NAME)
+    if not os.path.isdir(old):
+        return [out]
+    if not os.path.lexists(out):
+        if dry_run:
+            print(f"Would move {old} out of the folder, to {out}")
+            return [old]
+        os.rename(old, out)
+        print(f"Moved {old} out of the folder, to {out}")
+        return [out]
+    print(f"Both {old} and {out} exist; --restore empties both", file=sys.stderr)
+    return [out, old]
+
+
 def main():
     ap = argparse.ArgumentParser(
         description=f"Recursively move png/jpg/jpeg/gif/webp images with no "
-                    f".txt sidecar into {OUT_NAME}, keeping the folder tree.")
+                    f".txt sidecar into <folder>{OUT_SUFFIX} next to the folder, keeping the folder tree.")
     ap.add_argument("folder", nargs="?", default=".",
                     help="root folder (default: current folder)")
     ap.add_argument("-r", "--restore", action="store_true",
-                    help=f"move everything in {OUT_NAME} back into the tree")
+                    help=f"move everything in <folder>{OUT_SUFFIX} back into the tree")
     ap.add_argument("-n", "--dry-run", action="store_true",
                     help="only list what would be moved")
     ap.add_argument("-q", "--quiet", action="store_true",
@@ -131,16 +171,24 @@ def main():
     root = os.path.abspath(args.folder)
     if not os.path.isdir(root):
         sys.exit(f"Not a folder: {root}")
-    out = os.path.join(root, OUT_NAME)
+    if os.path.dirname(root) == root:
+        sys.exit(f"{root}: a drive root has no folder next to it for {OUT_SUFFIX}; use a subfolder")
+    out = root + OUT_SUFFIX
+    outs = move_old_out(root, out, args.dry_run)
     mode = " (dry run, nothing is moved)" if args.dry_run else ""
     verb = "Would move" if args.dry_run else "Moved"
     t0 = time.perf_counter()
 
     if args.restore:
-        if not os.path.isdir(out):
+        outs = [o for o in outs if os.path.isdir(o)]
+        if not outs:
             sys.exit(f"Nothing to restore, no folder: {out}")
-        print(f"===== Restoring {out} into {root}{mode} =====")
-        moved, failed = restore(root, out, args.dry_run)
+        moved = failed = 0
+        for o in outs:
+            print(f"===== Restoring {o} into {root}{mode} =====")
+            m, f = restore(root, o, args.dry_run)
+            moved += m
+            failed += f
         line = f"{verb} back: {moved}"
     else:
         print(f"===== Moving uncaptioned images in {root} and all subfolders "

@@ -75,7 +75,8 @@ OUT_SUFFIX = "_watermark_removed"
 IMAGE_EXTS = {".jpg", ".jpeg", ".jpe", ".jfif", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 # Folders never scanned, at any depth: the output folders of the dataset tools,
 # and a folder holding BACKUP_MARK (the backup of a subfolder).
-DEFAULT_EXCLUDES = [OLD_BACKUP_DIRNAME, "_duplicates", "_prep", "_classify", "_embeddings", "masks", "faces"]
+DEFAULT_EXCLUDES = [OLD_BACKUP_DIRNAME, "_duplicates", "_prep", "_classify", "_embeddings",
+                    "_controls", "masks", "faces"]
 DEFAULT_CONF = 0.1
 DEFAULT_DILATE = 15
 DEFAULT_MAX_SIZE = 2048                           # longest side of a LaMa window; larger windows are scaled down

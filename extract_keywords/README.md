@@ -50,11 +50,11 @@ The run prints how many captions have each keyword, so you can see what each one
 ## What a run does
 
 1. Searches the `.txt` caption of every image in the dataset and its subfolders. Images are `.jpg`, `.jpeg`, `.jpe`, `.jfif`, `.png`, `.webp`, `.bmp`, `.tif`, `.tiff`, `.gif`, `.avif`, `.heic` and `.heif`.
-2. Skips the folders `_backup`, `_duplicates`, `_prep`, `_classify`, `_embeddings`, `_flatten_dataset`, `masks` and `faces`, at any depth. These are the output folders of the dataset tools. A backup folder of the dataset tools, marked by `_dataset_tools.json`, is skipped too. Links and junctions are not followed.
+2. Skips the folders `_backup`, `_duplicates`, `_prep`, `_classify`, `_embeddings`, `_flatten_dataset`, `_controls`, `masks` and `faces`, at any depth. These are the output folders of the dataset tools. A folder the dataset tools made next to a dataset (marked by `_dataset_tools.json`) is skipped too. Links and junctions are not followed.
 3. Writes the list of files to move to `<new folder>\_extract_keywords\manifest.json`, then moves them. Each file keeps its subfolder path: `D:\photos\2024\beach\a.jpg` goes to `D:\photos_1940s\2024\beach\a.jpg`.
 4. Removes the subfolders of the dataset that are empty after the run. A subfolder that was empty before the run stays.
 
-With an image go all the files of the same name in its folder: its caption, other images of the same name (`a.jpg` and `a.png`) and other sidecars (`a.npz`). A face mask made by `face_masks` (`<subfolder>\masks\<name>.png`) moves to the same place in the new folder.
+With an image go all the files of the same name in its folder: its caption, other images of the same name (`a.jpg` and `a.png`) and other sidecars (`a.npz`). Every face mask of the image made by `face_masks` (`<subfolder>\_controls\<name>.<ext>`, with `<ext>` one of `.jpg`, `.jpeg`, `.png`, `.webp`) moves to the same place in the new folder. A mask in an old `masks` folder (before 2026-10-11) moves to `_controls` in the new folder, and `--undo` puts it back into `masks`.
 
 A caption without an image is not searched and stays where it is; the run lists these captions.
 
