@@ -113,7 +113,7 @@ JOB_EXAMPLE = {
         "borders": {"dark": True, "min_area": rb.DEFAULT_MIN_AREA},
         "watermark": {"conf": wm.DEFAULT_CONF, "dilate": wm.DEFAULT_DILATE, "mode": "inpaint",
                       "trim_min_keep": wm.DEFAULT_TRIM_MIN_KEEP, "max_size": wm.DEFAULT_MAX_SIZE},
-        "reframe": {"ratios": rf.AR_FAMILIES, "overrides": True},
+        "reframe": {"ratios": rf.AR_FAMILIES, "mode": rf.DEFAULT_MODE, "overrides": True},
         "jpeg_cleanup": {"threshold": jc.DEFAULT_THRESHOLD, "qf_offset": jc.DEFAULT_QF_OFFSET,
                          "min_block_drop": jc.DEFAULT_MIN_BLOCK_DROP, "min_qf_gain": jc.DEFAULT_MIN_QF_GAIN,
                          "max_pixels": jc.DEFAULT_MAX_PIXELS},
@@ -396,7 +396,8 @@ class Stages:
         self.watermark = ({"conf": wm.DEFAULT_CONF, "dilate": wm.DEFAULT_DILATE, "mode": "inpaint",
                            "trim_min_keep": wm.DEFAULT_TRIM_MIN_KEEP, "max_size": wm.DEFAULT_MAX_SIZE,
                            **(s.get("watermark") or {})} if "watermark" in s else None)
-        self.reframe = {"ratios": list(rf.AR_FAMILIES), "overrides": True, **(s.get("reframe") or {})} if "reframe" in s else None
+        self.reframe = ({"ratios": list(rf.AR_FAMILIES), "mode": rf.DEFAULT_MODE, "overrides": True, **(s.get("reframe") or {})}
+                        if "reframe" in s else None)
         self.cleanup = ({"threshold": jc.DEFAULT_THRESHOLD, "qf_offset": jc.DEFAULT_QF_OFFSET,
                          "min_block_drop": jc.DEFAULT_MIN_BLOCK_DROP, "min_qf_gain": jc.DEFAULT_MIN_QF_GAIN,
                          "max_pixels": jc.DEFAULT_MAX_PIXELS, **(s.get("jpeg_cleanup") or {})}
@@ -408,6 +409,8 @@ class Stages:
             bad = [r for r in self.reframe["ratios"] if r not in rf.AR_FAMILIES]
             if bad:
                 raise SystemExit(f"reframe: unknown ratio(s) {', '.join(bad)}; choose from {', '.join(rf.AR_FAMILIES)}")
+            if self.reframe["mode"] not in rf.MODES:
+                raise SystemExit(f"reframe: unknown mode {self.reframe['mode']!r}; choose from {', '.join(rf.MODES)}")
 
 
 def detection_pass(name: str, items: list, caches: Caches, signature, compute, threads: int,
@@ -571,7 +574,8 @@ def compose(it: Item, caches: Caches, stages: Stages) -> dict:
             sel = rf.select_subject(det, stages.overrides.get(it.rel.lower()))
             crop = None
             if sel["verdict"] == "crop":
-                crop = rf.plan_crop(det, sel, {"orientation": 1, "stored": [W, H]}, stages.reframe["ratios"], False)
+                crop = rf.plan_crop(det, sel, {"orientation": 1, "stored": [W, H]}, stages.reframe["ratios"], False,
+                                    stages.reframe["mode"])
             cropping = bool(crop) and crop["verdict"] == "crop"
             notes["reframe"] = {"verdict": "crop" if cropping else "keep",
                                 "reason": sel["reason"] if cropping or not crop else crop["reason"],

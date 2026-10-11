@@ -704,6 +704,20 @@ MIN_SAVING = 0.10             # leave the photo unchanged if the crop keeps more
 FIT_MIN_COVER = 0.98          # without margins, a ratio must keep this share of the group
 CUT_MIN, CUT_MAX = 0.03, 0.97  # a person with this share of the box inside the crop is cut
 
+# Crop modes: which of the allowed ratios plan_crop may choose.
+#   best_fit  the tightest ratio that holds the group with its margins
+#   square    1:1 only; when the whole group does not fit, the crop may end
+#             below the hips (HIP_CUT head sizes under the lowest hip of the
+#             members) and keep head and torso, with the head line and the
+#             side margins as before
+#   closest   the ratio nearest the photo's own; its portrait or landscape
+#             twin is allowed too when that crop stays in the photo's k2prep
+#             resolution tier, and the tighter of the two wins
+MODES = ["best_fit", "square", "closest"]
+DEFAULT_MODE = "best_fit"
+HIP_CUT = 0.5                 # square: the cut this many head sizes below the lowest hip
+SWAPPED = {"9:16": "16:9", "16:9": "9:16", "2:3": "3:2", "3:2": "2:3", "4:5": "5:4", "5:4": "4:5"}
+
 
 @lru_cache(maxsize=None)
 def generate_buckets(resolution: int, steps: int = RESO_STEPS):
@@ -940,13 +954,24 @@ def place_axis(pref, lo, hi, size, others, crop_of):
     return min(cands, key=lambda c: (round(cut_cost(crop_of(c), others), 6), abs(c - pref)))
 
 
-def plan_crop(det: dict, sel: dict, head: dict, families, lossless: bool) -> dict:
-    """-> {"verdict": "crop", "box": display box, "family", "flags": [...], ...}
+def fit_crop(det: dict, sel: dict, head: dict, families, lossless: bool, cut: float | None = None,
+             tight: bool = True) -> dict:
+    """The tightest of the families that holds the group with its margins,
+    placed and sized as the README describes. cut: a y below which the group
+    is let go (square mode: the crop may end there instead of at the feet).
+    tight: when no ratio holds the margins, allow the largest crop without
+    them that still keeps FIT_MIN_COVER of the group (step 2); without it
+    such a group does not fit.
+    -> {"verdict": "crop", "box": display box, "family", "flags": [...], ...}
     or {"verdict": "keep", "reason": ...}"""
     people, w, h = det["people"], det["w"], det["h"]
     members = sel["members"]
     area, bare, hs = subject_area(people, members, w, h)
     flags = []
+    if cut is not None and cut < area[3]:
+        area = [area[0], area[1], area[2], max(area[1] + 1.0, cut)]
+        bare = [bare[0], bare[1], bare[2], min(bare[3], area[3])]
+        flags.append("cut below the hips")
     aw, ah = area[2] - area[0], area[3] - area[1]
 
     # 1. the tightest ratio that holds the group with its margins
@@ -958,6 +983,8 @@ def plan_crop(det: dict, sel: dict, head: dict, families, lossless: bool) -> dic
             key = (cw * ch, abs(math.log(r) - math.log(aw / ah)))
             if best is None or key < best[0]:
                 best = (key, fam, min(cw, w), min(ch, h))
+    if best is None and not tight:
+        return {"verdict": "keep", "reason": "the group does not fit any ratio with its margins"}
     if best is None:
         # 2. no ratio holds the margins: the largest crop of each ratio, placed
         # over the group; keep it if it holds almost all of the group itself
@@ -1032,6 +1059,85 @@ def plan_crop(det: dict, sel: dict, head: dict, families, lossless: bool) -> dic
     return out
 
 
+def hip_cut_y(people, members, hs: float) -> float | None:
+    """Where a square crop may end instead of at the feet: HIP_CUT head sizes
+    below the lowest visible hip keypoint of the members. A member without
+    visible hips keeps its whole box (nothing of it may be cut). None when no
+    member has hips to cut below."""
+    cut, any_hips = 0.0, False
+    for k in members:
+        pe = people[k]
+        kp = pe.get("kp")
+        hips = [kp[KP[n]][1] for n in ("l_hip", "r_hip") if kp is not None and kp[KP[n]][2] >= KP_OK]
+        if hips:
+            cut, any_hips = max(cut, max(hips) + HIP_CUT * hs), True
+        else:
+            cut = max(cut, pe["box"][3])
+    return cut if any_hips else None
+
+
+def closest_family(ratio: float, families) -> str:
+    """The family whose nominal ratio is nearest ratio, as k2prep assigns one."""
+    return min(families, key=lambda f: abs(AR_NOMINAL[AR_FAMILIES.index(f)] - ratio))
+
+
+def crop_tier(w: int, h: int, family: str):
+    fit = assign_tier(w, h, family)
+    return None if fit is None else fit[0]
+
+
+def plan_crop(det: dict, sel: dict, head: dict, families, lossless: bool, mode: str = DEFAULT_MODE) -> dict:
+    """The crop of the subject group in one of the MODES (see there). families:
+    the ratios the mode may choose from. -> fit_crop's result."""
+    if mode not in MODES:
+        raise ValueError(f"unknown mode {mode!r}; the modes are {', '.join(MODES)}")
+    if mode == "best_fit":
+        return fit_crop(det, sel, head, families, lossless)
+    people, w, h = det["people"], det["w"], det["h"]
+    if mode == "square":
+        if "1:1" not in families:
+            return {"verdict": "keep", "reason": "square mode, but 1:1 is not among the ratios"}
+        # in turn: the whole group with its margins; head and torso with the
+        # margins; the whole group without margins; head and torso without
+        full = fit_crop(det, sel, head, ["1:1"], lossless, tight=False)
+        if full["verdict"] == "crop" or not full["reason"].startswith("the group does not fit"):
+            return full
+        _, _, hs = subject_area(people, sel["members"], w, h)
+        cut = hip_cut_y(people, sel["members"], hs)
+        if cut is None:
+            return fit_crop(det, sel, head, ["1:1"], lossless)
+        torso = fit_crop(det, sel, head, ["1:1"], lossless, cut=cut, tight=False)
+        if torso["verdict"] == "crop" or not torso["reason"].startswith("the group does not fit"):
+            return torso
+        full = fit_crop(det, sel, head, ["1:1"], lossless)
+        if full["verdict"] == "crop" or not full["reason"].startswith("the group does not fit"):
+            return full
+        torso = fit_crop(det, sel, head, ["1:1"], lossless, cut=cut)
+        if torso["verdict"] == "keep":
+            torso["reason"] = torso["reason"].replace("the group does not fit any ratio",
+                                                      "not even the head and torso fit 1:1")
+        return torso
+    # closest: the family nearest the photo's own ratio, and its swapped twin
+    # when that crop keeps the photo's resolution tier
+    fam = closest_family(w / h, families)
+    own = fit_crop(det, sel, head, [fam], lossless)
+    twin = SWAPPED.get(fam)
+    if twin is None or twin not in families:
+        return own
+    other = fit_crop(det, sel, head, [twin], lossless)
+    if other["verdict"] != "crop":
+        return own
+    bw, bh = other["size"]
+    if crop_tier(bw, bh, twin) != crop_tier(w, h, fam):
+        if own["verdict"] == "crop":
+            return own
+        return dict(own, reason=own["reason"] + f" ({twin} would leave the photo's resolution tier)")
+    if own["verdict"] != "crop" or bw * bh < own["size"][0] * own["size"][1]:
+        other["flags"] = other["flags"] + [f"{twin} instead of {fam}: the photo's ratio turned"]
+        return other
+    return own
+
+
 # ---------------------------------------------------------------------------
 # Per-image API
 # ---------------------------------------------------------------------------
@@ -1064,6 +1170,7 @@ def plan(array: np.ndarray | None, head: dict, options: dict | None = None) -> d
       models    the detectors (default: models_lazy())
       det       cached detections of this photo (detect's dict); else detect runs
       families  aspect ratios to choose from (default: all of AR_FAMILIES)
+      mode      best_fit, square or closest (see MODES; default best_fit)
       lossless  plan a lossless JPEG crop on the MCU grid (default True)
       override  (action, [people]) from overrides.txt, or None
     -> {"det": the detections with their people, "sel": select_subject's
@@ -1088,7 +1195,8 @@ def plan(array: np.ndarray | None, head: dict, options: dict | None = None) -> d
     sel = select_subject(det, opts.get("override"))
     crop = None
     if sel["verdict"] == "crop":
-        crop = plan_crop(det, sel, head, opts.get("families") or list(AR_FAMILIES), opts.get("lossless", True))
+        crop = plan_crop(det, sel, head, opts.get("families") or list(AR_FAMILIES), opts.get("lossless", True),
+                         opts.get("mode") or DEFAULT_MODE)
     cropping = bool(crop) and crop["verdict"] == "crop"
     return {"det": det, "sel": sel, "crop": crop, "fresh": fresh,
             "verdict": "crop" if cropping else "keep",
@@ -1681,6 +1789,10 @@ def main(argv=None) -> int:
                     help="draw the subject choice, with numbered people, into <out>/_verdicts")
     ap.add_argument("--ratios", default=",".join(AR_FAMILIES),
                     help="aspect ratios to choose from, comma-separated (default: all seven k2prep ratios)")
+    ap.add_argument("--mode", choices=MODES, default=DEFAULT_MODE,
+                    help="best_fit: the tightest ratio that holds the subject with its margins (default); "
+                         "square: 1:1 only, cut below the hips when the whole group does not fit; "
+                         "closest: the ratio nearest the photo's own, turned when the crop keeps the photo's tier")
     ap.add_argument("--reencode", action="store_true",
                     help="plan JPEG crops for re-encoding instead of a lossless DCT crop")
     ap.add_argument("--dry-run", action="store_true", help="write plan.json and the previews only")
@@ -1767,7 +1879,7 @@ def main(argv=None) -> int:
                 or args.verdicts
             img = load_image(path) if need_img else None
             p = plan(None if img is None else np.asarray(img), image_header(path),
-                     {"models": models, "det": det, "families": families,
+                     {"models": models, "det": det, "families": families, "mode": args.mode,
                       "lossless": not (args.reencode or args.resize), "override": overrides.get(rel.lower())})
             det, sel, crop = p["det"], p["sel"], p["crop"]
             if fresh:

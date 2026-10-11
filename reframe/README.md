@@ -46,6 +46,7 @@ Each folder is processed with all its subfolders. Folders whose names start with
 | `--png` | off | with `--resize`: write PNG instead of JPEG |
 | `--reencode` | off | crop JPEG photos by decoding and saving them again, not losslessly |
 | `--ratios` | all seven | the aspect ratios to choose from, for example `--ratios 2:3,4:5,1:1,5:4,3:2` |
+| `--mode` | `best_fit` | how the ratio is chosen: `best_fit`, `square` or `closest`, see [Crop modes](#crop-modes) |
 | `--skip-unchanged` | off | do not copy the photos that are not cropped |
 | `--overwrite` | off | write all outputs again, also the ones that are up to date |
 | `--out DIR` | `<folder>\_reframed` | another output folder; with one input folder only |
@@ -126,6 +127,16 @@ The rules were set on 29 photos where every person was labelled by eye, and they
 3. **Placement.** The highest head goes to the upper third of the crop where there is room, and the group is centred from left to right. Then the crop moves left, right, up or down so that its edges cut through as few passers-by as possible.
 4. **Size.** A crop smaller than k2prep's 512 bucket is made larger. If the photo is too small for that, it stays unchanged.
 5. **Savings.** If the crop would keep more than 90% of the photo, the photo stays unchanged.
+
+## Crop modes
+
+`--mode` says how the aspect ratio is chosen among the allowed ratios. The margins, the placement, the size floor and the savings rule are the same in every mode.
+
+**`best_fit`** (the default) is the rule above: the tightest ratio that holds the group with its margins.
+
+**`square`** always crops to 1:1. When the whole group with its margins fits a square, the crop is the one `best_fit` would make with 1:1 as the only ratio. When it does not fit, which is the usual case for standing people, the crop may end below the hips and keep head and torso. The cut goes 0.5 head sizes below the lowest hip keypoint of the group's members; a member whose hips are not visible keeps its whole box, so nothing of that person is cut. The headroom above the highest head, the side margins and the head line placement stay as in the rule above. The crop is flagged `cut below the hips`. Only when head and torso do not fit with their margins either does the mode fall back to the no-margin rule of step 2, first for the whole group, then for head and torso. If no member has visible hips, the whole group is tried as in `best_fit`. When nothing fits, the photo stays unchanged. The mode needs 1:1 among the ratios.
+
+**`closest`** keeps the orientation and the look of the photo: the ratio is the one of the allowed ratios nearest the photo's own, as k2prep assigns it, with the subject inside and the margins around it. The portrait or landscape twin of that ratio (2:3 for 3:2, 9:16 for 16:9, 4:5 for 5:4) is tried too, for a standing person in a landscape photo, say. It is taken only when it is the tighter crop, or the only one that holds the group, and when it stays in the same k2prep resolution tier (1024, 768 or 512) as the photo itself, so that the turned crop trains at the size the photo would have. The crop is then flagged, for example `2:3 instead of 3:2: the photo's ratio turned`. When neither ratio holds the group, the photo stays unchanged.
 
 ## Corrections
 

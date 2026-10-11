@@ -40,7 +40,7 @@ run.bat --job job.json [--dry-run] [--undo] [--threads N]
  "stages": {
   "borders": {"dark": true, "min_area": 65536},
   "watermark": {"conf": 0.1, "dilate": 15, "mode": "inpaint", "trim_min_keep": 0.5, "max_size": 2048},
-  "reframe": {"ratios": ["9:16", "2:3", "4:5", "1:1", "5:4", "3:2", "16:9"], "overrides": true},
+  "reframe": {"ratios": ["9:16", "2:3", "4:5", "1:1", "5:4", "3:2", "16:9"], "mode": "best_fit", "overrides": true},
   "jpeg_cleanup": {"threshold": 80, "qf_offset": 10, "min_block_drop": 0.1, "min_qf_gain": 25, "max_pixels": 4194304},
   "face_masks": {"conf": 0.3, "grow": 1.35, "feather": 12, "include_hair": false, "invert": false}
  },
@@ -57,7 +57,7 @@ run.bat --job job.json [--dry-run] [--undo] [--threads N]
 |---|---|
 | `folder` | the dataset folder, scanned at any depth; the output folders of the tools (`_backup`, `_duplicates`, `_prep`, `_classify`, `_embeddings`, `masks`, `faces`) are skipped, `exclude` adds names |
 | `files` | optional: only these images, as paths relative to the folder |
-| `stages` | the stages to run with their options; every option has the default of its tool; `reframe.overrides` reads `overrides.txt` in the folder as reframe does |
+| `stages` | the stages to run with their options; every option has the default of its tool; `reframe.overrides` reads `overrides.txt` in the folder as reframe does; `reframe.mode` is `best_fit`, `square` or `closest`, as reframe's `--mode` ([crop modes](../reframe/README.md#crop-modes)) |
 | `output` | `{"mode": "in_place"}` changes the dataset folder; `{"mode": "parallel", "folder": "..."}` writes the whole tree into that folder, which must be outside the dataset, and copies the unchanged images and all captions along |
 | `save_png` | write every touched image as PNG |
 | `dry_run` | the detection passes, the plan and the previews; change nothing (also `--dry-run`) |
