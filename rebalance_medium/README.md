@@ -1,6 +1,6 @@
 # Rebalance medium
 
-`rebalance_medium.py` teaches a model what a prompt without a medium means. When every caption of a dataset opens with its medium (`A color photograph from 1975 of ...`, `A black-and-white photograph from 1962 of ...`), a prompt that names no medium is out of distribution, and the model falls back to the medium that is cheaper to predict, usually black-and-white. The tool moves a share of the colour and black-and-white images into a sibling dataset folder and removes the medium word from their captions there. By default it moves 40 % of the colour images and 20 % of the black-and-white images; the difference counters the bias towards black-and-white.
+`rebalance_medium.py` teaches a model what a prompt without a medium means. When every caption of a dataset opens with its medium (`A color photograph from 1975 of ...`, `A black-and-white photograph from 1962 of ...`), a prompt that names no medium is out of distribution, and the model falls back to the medium that is cheaper to predict, usually black-and-white. The tool moves a share of the colour and black-and-white images into a sibling dataset folder and removes the medium word from their captions there. By default 30 % of the captions lose the medium, and 60 % of those are colour, whatever the sizes of the two classes; the colour majority counters the bias towards black-and-white.
 
 It is made for a training run in [Ostris AI Toolkit](https://github.com/ostris/ai-toolkit) that is already in progress. The latent cache of each moved image moves with it and stays valid. The original caption files and the text-embedding caches, which are keyed by the caption text, are kept in a backup folder outside the dataset and come back with `--undo`.
 
@@ -28,8 +28,11 @@ The first command is a dry run: it shows how many images would move, writes the 
 
 | option | what it does |
 |---|---|
-| `--color PCT` | percent of the colour images to move, default 40 |
-| `--bw PCT` | percent of the black-and-white images to move, default 20 |
+| `--drop-share PCT` | percent of the colour and black-and-white captions that lose the medium, default 30 |
+| `--color-share PCT` | percent of colour images among them, default 60 |
+| `--max-class-pct PCT` | at most this percent of either class moves, default 50; the drop share is lowered to keep it |
+| `--color PCT` | instead of the shares: percent of the colour images to move (40 when only `--bw` is given) |
+| `--bw PCT` | instead of the shares: percent of the black-and-white images to move (20 when only `--color` is given) |
 | `--seed N` | the random seed of the draw, default 0 |
 | `--dest NAME` | the destination folder, next to the dataset folder (section [Folders](#folders)) |
 | `--manifest PATH` | the manifest, default `<dataset>_rebalance.json` next to the dataset folder |
@@ -65,7 +68,26 @@ A caption can end with a Russian translation after `., `, for example `... Low-a
 
 ## Which images move
 
-The images of each class are drawn from the whole dataset at random: the rounded share of the colour images (`--color`) and of the black-and-white images (`--bw`). The draw is the same on every computer for the same dataset and `--seed`. A subfolder can lose more or fewer of its images than the share.
+What the model learns for a prompt without a medium comes from the captions that lose it: the "medium not stated" set. Its colour share is what counts, so the tool sets that set directly:
+
+- `--drop-share`: the percent of all colour and black-and-white captions that lose the medium, default 30.
+- `--color-share`: the percent of colour images in that set, default 60. Above 50 counters the bias towards black-and-white.
+
+From these, with C colour and B black-and-white images: moved = drop share × (C + B), colour moved = colour share × moved, black-and-white moved = the rest.
+
+| colour | black-and-white | moved | colour moved | black-and-white moved |
+|---|---|---|---|---|
+| 5,000 | 5,000 | 3,000 | 1,800 (36 %) | 1,200 (24 %) |
+| 3,000 | 7,000 | 2,500 (cap) | 1,500 (50 %) | 1,000 (14 %) |
+| 3,000 | 7,000, `--max-class-pct 60` | 3,000 | 1,800 (60 %) | 1,200 (17 %) |
+
+The images that keep their medium are what make "color photograph" and "black-and-white photograph" strong prompt words. So `--max-class-pct` (default 50) limits how much of either class moves. When the shares would take more, the drop share is lowered until both classes are within the limit, and the colour share stays: in the second row 30 % would take 60 % of the colour images, so the drop share becomes 25 %.
+
+`--color` and `--bw` give the percent of each class instead, as the first version of the tool did. They cannot be given with the share options.
+
+The summary of every run shows the selection both ways: the percent of each class that moves, the colour share of the "medium not stated" set, and the colour share of the captions that keep their medium. It also says when the limit lowered the drop share. Ambiguous captions without a known medium are already "not stated"; their number is shown next to the set.
+
+The images of each class are drawn from the whole dataset at random. The draw is the same on every computer for the same dataset and `--seed`. A subfolder can lose more or fewer of its images than the share. With repeats: the shares hold in training when the destination gets the same repeat setting as the dataset.
 
 The dataset is searched with all its subfolders. A subfolder is used when it holds at least one image with its caption: `<name>.jpg`, `.jpeg`, `.png` or `.webp` with `<name>.txt` next to it. Images without a caption in such a subfolder are counted and never moved. The folders `_latent_cache`, `_t_e_cache` and `_backup`, and every folder whose name starts with `.`, are not searched. Links and junctions are not followed.
 
@@ -98,7 +120,7 @@ Every original file of a moved image is kept in one of the folders: the image an
 
 A run made before the original captions were backed up as files keeps them in the manifest only. Give the same `--apply` command again: it writes the missing caption files to the backup folder from the manifest and moves nothing else.
 
-A run stops before it moves anything when the destination or the backup folder exists. An interrupted run (Ctrl+C, a crash, a full disk) goes on from where it stopped when you give the same command again; images that moved are not moved twice. When the manifest records moved images, a run with other settings stops, and so does a dry run, which would write over the manifest; run `--undo` first, or give another `--manifest`. A run also stops when the manifest lists moved images that are in the dataset again.
+A run stops before it moves anything when the destination or the backup folder exists. An interrupted run (Ctrl+C, a crash, a full disk) goes on from where it stopped when you give the same command again; images that moved are not moved twice. Without selection options, a resumed run takes the selection of the manifest, also of a run made by the first version (`--color 40 --bw 20`). When the manifest records moved images, a run with other settings stops, and so does a dry run, which would write over the manifest; run `--undo` first, or give another `--manifest`. A run also stops when the manifest lists moved images that are in the dataset again.
 
 The tool moves files and never copies them, so the destination and the backup folder should be on the same drive as the dataset. Across drives every file is copied and then deleted, which is slower.
 

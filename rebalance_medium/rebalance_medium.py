@@ -10,12 +10,19 @@ dataset folder, with a caption that no longer names the medium.
 
 Every caption opens with its medium: "A color photograph from 1975 of ...",
 "A black-and-white photograph ...", with up to three words around the medium
-word ("A high-angle color photograph", "A color studio photograph"). --color
-percent of the colour images and --bw percent of the black-and-white images
-are drawn at random (--seed) from the whole dataset. Each moves to the same
-subfolder of the destination, and its caption there loses the medium word
-("A high-angle photograph"). The captions of the images that stay are not
-touched.
+word ("A high-angle color photograph", "A color studio photograph").
+
+How many move is set by the "medium not stated" set the model learns from:
+--drop-share percent of the colour and black-and-white captions lose the
+medium (default 30), and --color-share percent of those are colour (default
+60), whatever the sizes of the two classes. --max-class-pct (default 50) keeps
+at least half of each class with its medium, so "color photograph" and
+"black-and-white photograph" stay strong; when the shares would take more,
+the drop share is lowered and the colour share kept. --color and --bw give
+the percent of each class instead. The images are drawn at random (--seed)
+from the whole dataset. Each moves to the same subfolder of the destination,
+and its caption there loses the medium word ("A high-angle photograph"). The
+captions of the images that stay are not touched.
 
 The caches of Ostris AI Toolkit go with the images. A latent cache file is
 named after the image and its crop, never its folder, so it moves with the
@@ -29,8 +36,9 @@ Without --apply nothing moves: the plan is written to the manifest
 (<input>_rebalance.json next to the input folder) and summarised. An
 interrupted --apply resumes from the manifest when run again.
 
-Usage:    python rebalance_medium.py FOLDER [--color PCT] [--bw PCT] [--seed N]
-          [--dest NAME] [--manifest PATH] [--strip-russian] [--apply]
+Usage:    python rebalance_medium.py FOLDER [--drop-share PCT] [--color-share PCT]
+          [--max-class-pct PCT | --color PCT --bw PCT] [--seed N] [--dest NAME]
+          [--manifest PATH] [--strip-russian] [--apply]
           python rebalance_medium.py FOLDER --undo [--manifest PATH]
 Install:  nothing; Python 3.10 or newer
 """
@@ -46,7 +54,7 @@ import time
 from pathlib import Path
 
 TOOL = "rebalance_medium"
-MANIFEST_VERSION = 1
+MANIFEST_VERSION = 2                # 2: "selection" and "plan"; 1 had only color_pct and bw_pct
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 CAPTION_EXT = ".txt"
 LATENT_DIRNAME = "_latent_cache"    # AI Toolkit: <stem>_<hash>.safetensors, keyed by file name and crop
@@ -61,7 +69,9 @@ SAVE_EVERY = 100                    # images between manifest writes
 LIST_LIMIT = 20                     # lines of any list printed
 RMDIR_TRIES, RMDIR_WAIT = 20, 0.1   # an emptied folder Windows still holds: tries, seconds between
 CLASSES = ("color", "bw", "ambiguous", "no_caption")
-SETTINGS = ("input", "dest", "seed", "color_pct", "bw_pct", "strip_russian")
+SETTINGS = ("input", "dest", "seed", "strip_russian")      # and the selection, compared apart
+DROP_SHARE, COLOR_SHARE, MAX_CLASS_PCT = 30, 60, 50        # the default selection: shares
+COLOR_PCT, BW_PCT = 40, 20          # per class, when only one of --color and --bw is given
 
 
 # --- captions -----------------------------------------------------------------
@@ -248,17 +258,57 @@ def eligible(it: dict) -> bool:
     return it["class"] in ("color", "bw") and not it.get("shared_name")
 
 
-def select(items: list[dict], color_pct: float, bw_pct: float, seed: int, russian: bool):
-    """Draw each class from the whole dataset: the rounded share of its images,
-    from a sorted list shuffled with the seed, so a run is the same on every
+def round_half_up(x: float) -> int:
+    return int(x + 0.5 + 1e-9)
+
+
+def class_counts(items: list[dict]) -> dict:
+    """The images that can move, per class."""
+    return {c: sum(1 for it in items if it["class"] == c and eligible(it)) for c in ("color", "bw")}
+
+
+def plan_counts(n: dict, sel: dict) -> dict:
+    """How many images of each class move. Per class: the rounded percent of
+    each. Shares: drop_share percent of all colour and black-and-white images,
+    color_share percent of them colour; the drop share is lowered until no class
+    loses more than max_class_pct percent of its images, and the colour share
+    stays."""
+    if sel["mode"] == "per_class":
+        return {"color": round_half_up(n["color"] * sel["color_pct"] / 100),
+                "bw": round_half_up(n["bw"] * sel["bw_pct"] / 100), "drop_share": None, "lowered": False}
+    cs, ds, cap = sel["color_share"] / 100, sel["drop_share"] / 100, sel["max_class_pct"] / 100
+    total = n["color"] + n["bw"]
+    if cs > 0 and ds > 0 and not n["color"]:
+        raise Refused("no colour image can move; give --color-share 0, or --color and --bw")
+    if cs < 1 and ds > 0 and not n["bw"]:
+        raise Refused("no black-and-white image can move; give --color-share 100, or --color and --bw")
+    if not total:
+        return {"color": 0, "bw": 0, "drop_share": 0, "lowered": False}
+    limits = [ds]
+    if cs > 0:
+        limits.append(cap * n["color"] / (cs * total))
+    if cs < 1:
+        limits.append(cap * n["bw"] / ((1 - cs) * total))
+    used = min(limits)
+    moved = round_half_up(used * total)
+    k_color = round_half_up(cs * moved)
+    k_bw = moved - k_color
+    # rounding can pass the cap by one image; never more than the cap allows
+    k_color = min(k_color, int(cap * n["color"] + 1e-9))
+    k_bw = min(k_bw, int(cap * n["bw"] + 1e-9))
+    return {"color": k_color, "bw": k_bw, "drop_share": round(100 * used, 2), "lowered": used < ds - 1e-12}
+
+
+def select(items: list[dict], counts: dict, seed: int, russian: bool):
+    """Draw the counted images of each class from the whole dataset: from a
+    sorted list shuffled with the seed, so a run is the same on every
     platform."""
     rng = random.Random(seed)
     by_rel = {it["rel"]: it for it in items}
-    for cls, pct in (("color", color_pct), ("bw", bw_pct)):
+    for cls in ("color", "bw"):
         pool = sorted(it["rel"] for it in items if it["class"] == cls and eligible(it))
-        k = int(len(pool) * pct / 100 + 0.5 + 1e-9)
         rng.shuffle(pool)
-        for rel in pool[:k]:
+        for rel in pool[:counts[cls]]:
             it = by_rel[rel]
             it["selected"] = True
             it["caption_new"] = new_caption(it["caption_old"], classify(it["caption_old"])[1], russian)
@@ -303,12 +353,25 @@ def print_summary(m: dict):
           f"ambiguous {c['ambiguous']}, no_caption {c['no_caption']}")
     print(f"  Russian tail names the medium: {s['russian_medium']}"
           f"{' (stripped from moved captions)' if m['strip_russian'] else ''}")
-    print(f"  selected: color {sel['color']} of {c['color']} ({pct(sel['color'], c['color'])}), "
+    sl, plan = manifest_selection(m), m.get("plan", {})
+    if sl["mode"] == "shares":
+        line = (f"  selection: shares: drop {sl['drop_share']} % of the captions, {sl['color_share']} % of them "
+                f"colour, at most {sl['max_class_pct']} % of a class")
+        if plan.get("lowered"):
+            line += f"; the cap lowered the drop share to {plan['drop_share']} %"
+        print(line)
+    else:
+        print(f"  selection: per class: color {sl['color_pct']} %, bw {sl['bw_pct']} %")
+    print(f"  moved: color {sel['color']} of {c['color']} ({pct(sel['color'], c['color'])}), "
           f"bw {sel['bw']} of {c['bw']} ({pct(sel['bw'], c['bw'])})")
     total = s["stated_after"] + s["dropped"]
-    print(f"  after the move: medium stated {s['stated_after']} ({pct(s['stated_after'], total)}) "
-          f"in the input folder: color {c['color'] - sel['color']}, bw {c['bw'] - sel['bw']}; "
-          f"medium dropped {s['dropped']} ({pct(s['dropped'], total)}) in the destination")
+    stated_color = c["color"] - sel["color"]
+    print(f"  medium dropped, in the destination: {s['dropped']} ({pct(s['dropped'], total)} of the captions), "
+          f"{pct(sel['color'], s['dropped'])} colour"
+          + (f"; also without a known medium: {c['ambiguous']} ambiguous captions" if c["ambiguous"] else ""))
+    print(f"  medium stated, in the input folder after the move: {s['stated_after']} "
+          f"({pct(s['stated_after'], total)}): color {stated_color}, bw {c['bw'] - sel['bw']}, "
+          f"{pct(stated_color, s['stated_after'])} colour")
     print(f"  latent cache files to move: {s['latent_cache_files']}; to back up: {s['dropped']} original captions "
           f"and {s['te_cache_files']} text-embedding cache files")
     print(f"  folders touched: {s['folders_touched']}")
@@ -342,8 +405,14 @@ def read_manifest(path: Path) -> dict | None:
         return json.load(fh)
 
 
+def manifest_selection(m: dict) -> dict:
+    """The selection options of a manifest; a version 1 manifest had per-class
+    percents only."""
+    return m.get("selection") or {"mode": "per_class", "color_pct": m["color_pct"], "bw_pct": m["bw_pct"]}
+
+
 def same_settings(m: dict, settings: dict) -> bool:
-    return all(m.get(k) == settings[k] for k in SETTINGS)
+    return all(m.get(k) == settings[k] for k in SETTINGS) and manifest_selection(m) == settings["selection"]
 
 
 # --- moves --------------------------------------------------------------------
@@ -534,9 +603,15 @@ def remove_empty_dirs(dirs: set[Path], stop: Path):
 
 def plan_run(src: Path, settings: dict) -> dict:
     items, links = scan(src)
-    select(items, settings["color_pct"], settings["bw_pct"], settings["seed"], settings["strip_russian"])
+    n = class_counts(items)
+    plan = plan_counts(n, settings["selection"])
+    select(items, plan, settings["seed"], settings["strip_russian"])
+    summary = summarize(items)
+    c = summary["classes"]          # the percent of each whole class, as the summary prints it
     m = {"tool": TOOL, "version": MANIFEST_VERSION, **settings,
-         "created": time.strftime("%Y-%m-%dT%H:%M:%S"), "summary": summarize(items), "items": items}
+         "color_pct": round(100 * plan["color"] / c["color"], 2) if c["color"] else 0,
+         "bw_pct": round(100 * plan["bw"] / c["bw"], 2) if c["bw"] else 0, "plan": plan,
+         "created": time.strftime("%Y-%m-%dT%H:%M:%S"), "summary": summary, "items": items}
     print_list("links and junctions, not followed", links)
     return m
 
@@ -562,13 +637,17 @@ def check_stale(m: dict, src: Path):
                       f"(first: {stale[0]})")
 
 
-def run_apply(src: Path, dst: Path, mpath: Path, settings: dict) -> bool:
+def run_apply(src: Path, dst: Path, mpath: Path, settings: dict, chosen: bool) -> bool:
+    """chosen: the selection was given on the command line; when it was not, a
+    resumed run takes the manifest's."""
     bk = Path(settings["backup"])
     m = read_manifest(mpath)
     resume = m is not None and any(
         it["status"] == "moved" or (it["selected"] and it["status"] == "planned" and dst.exists())
         for it in m["items"])
     if resume:
+        if not chosen:
+            settings["selection"] = manifest_selection(m)
         if not same_settings(m, settings):
             raise Refused(f"{mpath} records an applied run with other settings; run --undo first")
         check_stale(m, src)
@@ -708,10 +787,20 @@ def main(argv=None) -> int:
         description="Move a share of the colour and black-and-white photographs of a dataset, with captions "
                     "that no longer name the medium, into a sibling dataset folder. A dry run without --apply.")
     ap.add_argument("folder", help="the dataset folder, with all its subfolders")
-    ap.add_argument("--color", type=percent, default=40, metavar="PCT",
-                    help="percent of the colour images to move (default 40)")
-    ap.add_argument("--bw", type=percent, default=20, metavar="PCT",
-                    help="percent of the black-and-white images to move (default 20)")
+    ap.add_argument("--drop-share", type=percent, metavar="PCT",
+                    help=f"percent of the colour and black-and-white captions that lose the medium "
+                         f"(default {DROP_SHARE})")
+    ap.add_argument("--color-share", type=percent, metavar="PCT",
+                    help=f"percent of colour images among those (default {COLOR_SHARE})")
+    ap.add_argument("--max-class-pct", type=percent, metavar="PCT",
+                    help=f"at most this percent of either class moves; the drop share is lowered to keep it "
+                         f"(default {MAX_CLASS_PCT})")
+    ap.add_argument("--color", type=percent, metavar="PCT",
+                    help=f"instead of the shares: percent of the colour images to move (default {COLOR_PCT} "
+                         f"when only --bw is given)")
+    ap.add_argument("--bw", type=percent, metavar="PCT",
+                    help=f"instead of the shares: percent of the black-and-white images to move (default "
+                         f"{BW_PCT} when only --color is given)")
     ap.add_argument("--dest", metavar="NAME", help="the destination folder, next to the input folder "
                                                    "(default <name>_media-rebalanced_<bucket>)")
     ap.add_argument("--seed", type=int, default=0, help="random seed (default 0)")
@@ -723,6 +812,18 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     if args.apply and args.undo:
         ap.error("--apply and --undo do not go together")
+    per_class = args.color is not None or args.bw is not None
+    shares = any(v is not None for v in (args.drop_share, args.color_share, args.max_class_pct))
+    if per_class and shares:
+        ap.error("--color and --bw do not go together with --drop-share, --color-share and --max-class-pct")
+    if per_class:
+        selection = {"mode": "per_class", "color_pct": COLOR_PCT if args.color is None else args.color,
+                     "bw_pct": BW_PCT if args.bw is None else args.bw}
+    else:
+        selection = {"mode": "shares",
+                     "drop_share": DROP_SHARE if args.drop_share is None else args.drop_share,
+                     "color_share": COLOR_SHARE if args.color_share is None else args.color_share,
+                     "max_class_pct": MAX_CLASS_PCT if args.max_class_pct is None else args.max_class_pct}
 
     src = Path(args.folder).resolve()
     if not src.is_dir():
@@ -738,7 +839,7 @@ def main(argv=None) -> int:
         print(f"the destination {dst} must be outside the backup folder {bk}")
         return 1
     settings = {"input": str(src), "dest": str(dst), "backup": str(bk), "seed": args.seed,
-                "color_pct": args.color, "bw_pct": args.bw, "strip_russian": args.strip_russian}
+                "strip_russian": args.strip_russian, "selection": selection}
     print(f"input:    {src}")
     try:
         if args.undo:
@@ -746,9 +847,11 @@ def main(argv=None) -> int:
         else:
             print(f"dest:     {dst}")
             print(f"backup:   {bk}")
-            print(f"move:     color {args.color} %, bw {args.bw} %, seed {args.seed}"
-                  f"{', Russian medium words stripped' if args.strip_russian else ''}")
-            ok = run_apply(src, dst, mpath, settings) if args.apply else run_dry(src, dst, mpath, settings)
+            print(f"seed:     {args.seed}{', Russian medium words stripped' if args.strip_russian else ''}")
+            if args.apply:
+                ok = run_apply(src, dst, mpath, settings, chosen=per_class or shares)
+            else:
+                ok = run_dry(src, dst, mpath, settings)
     except Refused as e:
         print(f"refused: {e}")
         return 1
