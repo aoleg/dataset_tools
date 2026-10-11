@@ -6,13 +6,15 @@ Every folder given is a root and is scanned at any depth. Light and dark frames,
 thin edge lines and banners with text at the top or bottom are cut off. JPEG
 files are cropped losslessly (whole DCT blocks); PNG and other lossless formats
 to the exact pixel; other lossy formats are cropped into a PNG. Before a crop,
-the original and its sidecars are copied to <root>/_backup/<same relative path>.
-An image whose crop would be smaller than --min-area is not cropped; it moves to
-the same _backup tree with its sidecars.
+the original and its sidecars are copied to <root>_backup/<same relative path>,
+next to the root and outside it, so a trainer never sees them. An image whose
+crop would be smaller than --min-area is not cropped; it moves to the same
+backup tree with its sidecars. A _backup folder inside the root, where the
+backup was before, is moved out on the next run.
 
-Without --dry-run the crops are made: originals go to _backup first, every
-step is logged in _backup/_remove_borders/log.jsonl, and --undo puts the last
-run of each folder back.
+Without --dry-run the crops are made: originals go to the backup first, every
+step is logged in <root>_backup/_remove_borders/log.jsonl, and --undo puts the
+last run of each folder back.
 
 Usage:    python remove_borders.py <folder> [<folder> ...] [--dry-run [--no-sheets]]
           [--sheets] [--undo] [--exclude NAME] [--sidecars LIST] [--min-area N]
@@ -41,8 +43,10 @@ from PIL import Image, ImageDraw, ImageFont
 
 Image.MAX_IMAGE_PIXELS = None     # large scans are normal input, not an attack
 
-BACKUP_DIRNAME = "_backup"
-RUN_DIRNAME = "_remove_borders"   # inside _backup: plan, log, report, cache, sheets
+BACKUP_SUFFIX = "_backup"         # <root>_backup next to the root: originals, sidecars, run folders
+OLD_BACKUP_DIRNAME = "_backup"    # the backup inside the root until 2026-10-11; moved out by claim_backup
+BACKUP_MARK = "_dataset_tools.json"  # marks a backup folder of the dataset tools; such a folder is never scanned
+RUN_DIRNAME = "_remove_borders"   # inside the backup folder: plan, log, report, cache, sheets
 REPORT_NAME = "report.csv"
 PLAN_NAME = "plan.json"
 SHEETS_DIRNAME = "sheets"
@@ -54,12 +58,14 @@ MASKS_DIRNAME = "masks"           # face_masks: <dir>/masks/<stem>.png, the size
 IMAGE_EXTS = {".jpg", ".jpeg", ".jpe", ".jfif", ".png", ".webp", ".bmp", ".tif", ".tiff",
               ".gif", ".avif", ".heic", ".heif"}
 # Folders never scanned, at any depth: the output folders of the dataset tools.
-# _backup is this tool's own, _duplicates is deduplicate's, _prep is k2prep's,
-# _classify and _embeddings are classify's, masks and faces are face_masks'.
-# Any other folder is scanned, whatever its name; --exclude adds names.
-DEFAULT_EXCLUDES = [BACKUP_DIRNAME, "_duplicates", "_prep", "_classify", "_embeddings", "masks", "faces"]
+# _backup is the old backup folder of this tool and the others, _duplicates is
+# deduplicate's, _prep is k2prep's, _classify and _embeddings are classify's,
+# masks and faces are face_masks'. A folder holding BACKUP_MARK (the backup of
+# a subfolder, <subfolder>_backup) is skipped too. Any other folder is
+# scanned, whatever its name; --exclude adds names.
+DEFAULT_EXCLUDES = [OLD_BACKUP_DIRNAME, "_duplicates", "_prep", "_classify", "_embeddings", "masks", "faces"]
 DEFAULT_SIDECARS = ".txt"
-DEFAULT_MIN_AREA = 256 * 256      # smaller than this after a crop: moved to _backup, not cropped
+DEFAULT_MIN_AREA = 256 * 256      # smaller than this after a crop: moved to the backup, not cropped
 DEFAULT_THREADS = 8
 
 # How a crop can be made, by file format.
@@ -108,14 +114,15 @@ def action_of(head: dict, result: dict) -> str:
 
 def scan(root: Path, excludes, sidecar_exts) -> list[Item]:
     """The images under root at any depth, with their sidecars and masks.
-    Folders are skipped by exact name (case-insensitive), at any depth."""
+    Folders are skipped by exact name (case-insensitive), at any depth, and
+    so is a backup folder of the dataset tools."""
     excl = {e.casefold() for e in excludes}
     exts = {e.casefold() for e in sidecar_exts}
     items = []
     for dirpath, dirnames, filenames in os.walk(root):
         here = Path(dirpath)
         masks_dir = next((d for d in dirnames if d.casefold() == MASKS_DIRNAME), None)
-        dirnames[:] = sorted(d for d in dirnames if d.casefold() not in excl)
+        dirnames[:] = sorted(d for d in dirnames if d.casefold() not in excl and not is_backup_dir(here / d))
         side_by_stem: dict[str, list[str]] = {}
         images_by_stem: dict[str, int] = {}
         for fn in filenames:
@@ -1092,7 +1099,7 @@ def report_rows(items) -> list[list]:
 
 
 def write_report(root: Path, items) -> Path:
-    run_dir = root / BACKUP_DIRNAME / RUN_DIRNAME
+    run_dir = backup_dir(root) / RUN_DIRNAME
     run_dir.mkdir(parents=True, exist_ok=True)
     path = run_dir / REPORT_NAME
     tmp = path.with_name(path.name + ".part")
@@ -1105,7 +1112,7 @@ def write_report(root: Path, items) -> Path:
 
 
 def write_plan(root: Path, items, dark: bool) -> Path:
-    path = root / BACKUP_DIRNAME / RUN_DIRNAME / PLAN_NAME
+    path = backup_dir(root) / RUN_DIRNAME / PLAN_NAME
     path.parent.mkdir(parents=True, exist_ok=True)
     data ={"detector": DETECTOR_VERSION, "dark": dark,
             "images": {it.rel: {"action": it.action, **it.result} for it in items if it.result}}
@@ -1234,7 +1241,7 @@ def write_sheets(root: Path, items, threads: int) -> tuple[Path, int]:
     """Contact sheets of every image to crop or review, one set per group:
     sheets/frame_001.jpg, border_..., banner_..., review_... The sheets of the
     last run are replaced."""
-    out = root / BACKUP_DIRNAME / RUN_DIRNAME / SHEETS_DIRNAME
+    out = backup_dir(root) / RUN_DIRNAME / SHEETS_DIRNAME
     if out.is_dir():
         for f in out.glob("*.jpg"):
             f.unlink()
@@ -1262,9 +1269,90 @@ def write_sheets(root: Path, items, threads: int) -> tuple[Path, int]:
     return out, written
 
 
+# --- the backup folder ------------------------------------------------------------
+# The originals, the logs and the caches live in <root>_backup next to the
+# root, not inside it: AI Toolkit trains on every image under the dataset
+# folder, _backup included. The folder is shared by every tool of this
+# repository and holds BACKUP_MARK; a folder of that name without the mark is
+# someone else's and is never written into. A _backup folder inside the root,
+# from before, is moved into it on the first run, dry run or undo. Log records
+# name backup files relative to the backup folder; records from before name
+# them relative to the root, as _backup/<path> (see from_log).
+
+def backup_dir(root: Path) -> Path:
+    return root.with_name(root.name + BACKUP_SUFFIX)
+
+
+def is_backup_dir(path: Path) -> bool:
+    return (path / BACKUP_MARK).is_file()
+
+
+def claim_backup(root: Path, create: bool = True, say=print) -> Path:
+    """The backup folder of root, checked, with an old _backup moved into it.
+    create=False (an undo): the folder is not made when there is nothing to
+    move into it. say: where the note of a move goes."""
+    if root.parent == root:
+        raise SystemExit(f"{root}: a drive root has no folder next to it for its backup; use a subfolder")
+    if is_backup_dir(root):
+        raise SystemExit(f"{root} is the backup folder of a dataset, not a dataset")
+    bdir = backup_dir(root)
+    if bdir.exists() and not is_backup_dir(bdir) and (not bdir.is_dir() or any(bdir.iterdir())):
+        raise SystemExit(f"{bdir} exists and was not made by the dataset tools; rename it or move it away, "
+                         f"the backup of {root.name} goes there")
+    old = root / OLD_BACKUP_DIRNAME
+    if old.is_dir():
+        left = move_old_backup(old, bdir)
+        say(f"{root.name}: the backup moved out of the dataset, from {old} to {bdir}"
+            + (f"; {left} files that differ from the ones in {bdir.name} stay in {old}" if left else ""))
+    if create or bdir.is_dir():
+        bdir.mkdir(exist_ok=True)
+        if not is_backup_dir(bdir):
+            (bdir / BACKUP_MARK).write_text(json.dumps({"made_by": "dataset_tools", "dataset": root.name}) + "\n",
+                                            encoding="utf-8")
+    return bdir
+
+
+def move_old_backup(old: Path, bdir: Path) -> int:
+    """Move an old _backup into bdir: one rename when bdir is not there yet,
+    else file by file, never over a file in bdir (one with the same bytes is
+    dropped, one with other bytes stays in old). -> the files left in old."""
+    left = 0
+    try:
+        if not bdir.exists():
+            os.rename(old, bdir)
+            return 0
+        for dirpath, dirnames, filenames in os.walk(old):
+            for fn in filenames:
+                src = Path(dirpath) / fn
+                dst = bdir / src.relative_to(old)
+                if not dst.exists():
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(src, dst)
+                elif same_bytes(src, dst):
+                    make_writable(src)
+                    src.unlink()
+                else:
+                    left += 1
+    except OSError as e:
+        raise SystemExit(f"cannot move {old} to {bdir}: {e}")
+    for dirpath, dirnames, filenames in os.walk(old, topdown=False):
+        try:
+            Path(dirpath).rmdir()
+        except OSError:
+            pass
+    return left
+
+
+def from_log(bdir: Path, where: str) -> Path:
+    """A backup file named in a log record: relative to the backup folder, or,
+    in a record from before the backup moved out, _backup/<path>."""
+    prefix = OLD_BACKUP_DIRNAME + "/"
+    return bdir / (where[len(prefix):] if where.startswith(prefix) else where)
+
+
 # --- real run -------------------------------------------------------------------
 # Order per image: backup copies first, then the write, so the original is
-# always in _backup before the image changes. A backup that exists already is
+# always in the backup before the image changes. A backup that exists already is
 # never overwritten (it holds the first original). Every image's job is logged
 # before it starts and again when it ends, so an interrupted run can be undone.
 
@@ -1321,7 +1409,7 @@ def move_keep(src: Path, dst: Path) -> Path:
 
 
 def backup_of(root: Path, path: Path) -> Path:
-    return root / BACKUP_DIRNAME / path.relative_to(root)
+    return backup_dir(root) / path.relative_to(root)
 
 
 def crop_job(job: dict) -> dict:
@@ -1345,14 +1433,14 @@ def crop_job(job: dict) -> dict:
         if out.get("mask"):
             rec["mask_note"] = out["mask"]
         if lossy:
-            rec["moved"] = move_keep(src, backup_of(root, src)).relative_to(root).as_posix()
+            rec["moved"] = move_keep(src, backup_of(root, src)).relative_to(backup_dir(root)).as_posix()
     except Exception as e:  # noqa: BLE001 - one bad file is reported, not fatal
         rec["error"] = f"{type(e).__name__}: {e}".strip()
     return rec
 
 
 def move_out(root: Path, it) -> dict:
-    """A too-small image: the image, its sidecars and its mask move to _backup.
+    """A too-small image: the image, its sidecars and its mask move to the backup.
     A sidecar that another image shares (a.jpg and a.png with one a.txt) is
     copied instead, so the other image keeps it."""
     rec = {"op": "move", "rel": it.rel, "moved": {}}
@@ -1364,7 +1452,8 @@ def move_out(root: Path, it) -> dict:
             if shared:
                 rec["moved"][f.relative_to(root).as_posix()] = "copy:" + copy_keep(f, backup_of(root, f))
             else:
-                rec["moved"][f.relative_to(root).as_posix()] = move_keep(f, backup_of(root, f)).relative_to(root).as_posix()
+                rec["moved"][f.relative_to(root).as_posix()] = (
+                    move_keep(f, backup_of(root, f)).relative_to(backup_dir(root)).as_posix())
     except Exception as e:  # noqa: BLE001
         rec["error"] = f"{type(e).__name__}: {e}".strip()
     return rec
@@ -1374,7 +1463,7 @@ class RunLog:
     """log.jsonl in the run folder: one JSON object per line, flushed as written."""
 
     def __init__(self, root: Path):
-        self.path = root / BACKUP_DIRNAME / RUN_DIRNAME / LOG_NAME
+        self.path = backup_dir(root) / RUN_DIRNAME / LOG_NAME
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.f = open(self.path, "a", encoding="utf-8")
 
@@ -1406,7 +1495,7 @@ def real_run(root: Path, items, threads: int) -> dict:
             log.write({"op": "intent", "rel": it.rel, "action": "move"})
             rec = move_out(root, it)
             log.write(rec)
-            it.result["done"] = "error: " + rec["error"] if "error" in rec else "moved to " + BACKUP_DIRNAME
+            it.result["done"] = "error: " + rec["error"] if "error" in rec else "moved to the backup"
             counts["failed" if "error" in rec else "moved"] += 1
         for it in crops:
             log.write({"op": "intent", "rel": it.rel, "action": "crop", "write": it.result["plan"]["write"],
@@ -1434,7 +1523,7 @@ def real_run(root: Path, items, threads: int) -> dict:
 # --- undo -------------------------------------------------------------------------
 
 def read_log(root: Path) -> list[dict]:
-    path = root / BACKUP_DIRNAME / RUN_DIRNAME / LOG_NAME
+    path = backup_dir(root) / RUN_DIRNAME / LOG_NAME
     if not path.exists():
         return []
     out = []
@@ -1458,9 +1547,9 @@ def last_run(entries: list[dict]) -> tuple[str | None, list[dict]]:
 
 
 def restore_file(root: Path, rel: str, keep_backup: bool) -> str:
-    """Put _backup/rel back at rel. keep_backup: copy instead of move (the
-    backup is an earlier run's original). -> what happened."""
-    src, dst = root / BACKUP_DIRNAME / rel, root / rel
+    """Put the backup of rel back at rel. keep_backup: copy instead of move
+    (the backup is an earlier run's original). -> what happened."""
+    src, dst = backup_dir(root) / rel, root / rel
     if not src.exists():
         return "no backup"
     make_writable(dst)
@@ -1482,7 +1571,7 @@ def undo_root(root: Path) -> dict:
         return counts
     done = {r["rel"]: r for r in recs if r.get("op") in ("crop", "move")}
     intents = [r for r in recs if r.get("op") == "intent"]
-    bdir = root / BACKUP_DIRNAME
+    bdir = backup_dir(root)
     for intent in reversed(intents):
         rel = intent["rel"]
         rec = done.get(rel, {})
@@ -1497,14 +1586,14 @@ def undo_root(root: Path) -> dict:
                     print(f"  not moved back, {orig} exists again")
                     continue
                 (root / orig).parent.mkdir(parents=True, exist_ok=True)
-                os.replace(root / where, root / orig)
+                os.replace(from_log(bdir, where), root / orig)
             counts["moved back"] += 1
             continue
         # a crop: the image (or, for a lossy format, the original moved out and the PNG written)
         if intent.get("write") == "png":
             # Without a record (the run died) the steps are inferred: the PNG name was
-            # free when the run started, and the original goes to _backup under its own name.
-            moved = root / (rec.get("moved") or f"{BACKUP_DIRNAME}/{rel}")
+            # free when the run started, and the original goes to the backup under its own name.
+            moved = from_log(bdir, rec.get("moved") or rel)
             if not (root / rel).exists() and moved.exists():
                 os.replace(moved, root / rel)
                 counts["restored"] += 1
@@ -1606,7 +1695,7 @@ def file_key(path: Path) -> list[int]:
 
 
 def load_cache(root: Path, dark: bool) -> dict:
-    path = root / BACKUP_DIRNAME / RUN_DIRNAME / CACHE_NAME
+    path = backup_dir(root) / RUN_DIRNAME / CACHE_NAME
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -1622,7 +1711,7 @@ def save_cache(root: Path, items, dark: bool) -> None:
         r = it.result
         if r and not r.get("error") and it.key:
             files[it.rel] = {"key": it.key, "result": {k: v for k, v in r.items() if k not in ("plan", "done")}}
-    path = root / BACKUP_DIRNAME / RUN_DIRNAME / CACHE_NAME
+    path = backup_dir(root) / RUN_DIRNAME / CACHE_NAME
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".part")
     tmp.write_text(json.dumps({"detector": DETECTOR_VERSION, "dark": dark, "files": files}, ensure_ascii=False),
@@ -1696,7 +1785,7 @@ def main(argv=None) -> int:
     ap.add_argument("--sidecars", default=DEFAULT_SIDECARS, metavar="LIST",
                     help=f"sidecar extensions, comma-separated (default {DEFAULT_SIDECARS})")
     ap.add_argument("--min-area", type=int, default=DEFAULT_MIN_AREA, metavar="N",
-                    help=f"an image smaller than N pixels after its crop moves to {BACKUP_DIRNAME} instead "
+                    help="an image smaller than N pixels after its crop moves to the backup instead "
                          f"(default {DEFAULT_MIN_AREA})")
     ap.add_argument("--no-dark", action="store_true", help="leave dark frames and borders alone")
     ap.add_argument("--reanalyse", action="store_true", help="ignore the analysis cache of the last run")
@@ -1712,6 +1801,7 @@ def main(argv=None) -> int:
 
     if args.undo:
         for root in roots:
+            claim_backup(root, create=False)
             c = undo_root(root)
             if not any(c.values()):
                 print(f"{root}: no run to undo")
@@ -1722,6 +1812,7 @@ def main(argv=None) -> int:
 
     failed = 0
     for root in roots:
+        claim_backup(root)
         items = scan(root, excludes, sidecar_exts)
         with ThreadPoolExecutor(max_workers=args.threads) as pool:
             for n, (it, head) in enumerate(zip(items, pool.map(read_header, (it.path for it in items))), 1):
@@ -1745,7 +1836,7 @@ def main(argv=None) -> int:
         if not args.dry_run:
             c = real_run(root, items, args.threads)
             failed += c["failed"]
-            print(f"  done:    {c['cropped']} cropped, {c['moved']} moved to {BACKUP_DIRNAME} (too small), "
+            print(f"  done:    {c['cropped']} cropped, {c['moved']} moved to {backup_dir(root).name} (too small), "
                   f"{c['failed']} failed" + (f", {c['skipped']} skipped" if c["skipped"] else ""))
         write_plan(root, items, not args.no_dark)
         print(f"  report:  {write_report(root, items)}")

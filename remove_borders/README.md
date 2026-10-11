@@ -1,6 +1,6 @@
 # Remove borders
 
-`remove_borders.py` finds images with borders in a large dataset and cuts the borders off, in place. It finds light and dark frames (also thin ones of 1 to 2 px, slanted ones from rotated scans, and a print on a card scanned on a white bed), borders on one or two sides, and banners with text at the bottom or top, such as the grey strip with a site address and an uploader name that photo-sharing sites add. JPEG files are cropped losslessly: the compressed data is cut, never decoded and saved again. Before an image changes, the original and its caption go to a `_backup` folder, and `--undo` puts everything back.
+`remove_borders.py` finds images with borders in a large dataset and cuts the borders off, in place. It finds light and dark frames (also thin ones of 1 to 2 px, slanted ones from rotated scans, and a print on a card scanned on a white bed), borders on one or two sides, and banners with text at the bottom or top, such as the grey strip with a site address and an uploader name that photo-sharing sites add. JPEG files are cropped losslessly: the compressed data is cut, never decoded and saved again. Before an image changes, the original and its caption go to the backup folder `<folder>_backup` next to the dataset folder, and `--undo` puts everything back.
 
 The tool is for training datasets where a border would teach the model to draw one. It leaves an image alone when it is not sure: a product shot on a white background, a sky across the top of a photo or a coloured band that belongs to a poster's design is not a border.
 
@@ -25,9 +25,9 @@ run.bat D:\photos
 run.bat D:\photos --undo
 ```
 
-The first command analyses every image and writes a report and contact sheets into `D:\photos\_backup\_remove_borders\`, without changing an image. The second makes the crops. It reuses the analysis of the dry run for every file that has not changed since, so it starts cropping at once. The third puts back everything the last run changed.
+The first command analyses every image and writes a report and contact sheets into `D:\photos_backup\_remove_borders\`, without changing an image. The second makes the crops. It reuses the analysis of the dry run for every file that has not changed since, so it starts cropping at once. The third puts back everything the last run changed.
 
-Each folder on the command line is scanned with all its subfolders and has its own `_backup` folder. Do not give a folder together with one of its subfolders.
+Each folder on the command line is scanned with all its subfolders and has its own backup folder next to it. Do not give a folder together with one of its subfolders.
 
 | option | what it does |
 |---|---|
@@ -37,17 +37,17 @@ Each folder on the command line is scanned with all its subfolders and has its o
 | `--undo` | put back everything the last run of each folder changed |
 | `--exclude NAME` | another folder name to skip, at any depth; may repeat |
 | `--sidecars LIST` | the extensions of the files that travel with an image, comma-separated (default `.txt`) |
-| `--min-area N` | an image smaller than N pixels after its crop is not cropped but moved to `_backup` (default 65536, which is 256 x 256) |
+| `--min-area N` | an image smaller than N pixels after its crop is not cropped but moved to the backup folder (default 65536, which is 256 x 256) |
 | `--no-dark` | leave dark frames and borders alone |
 | `--reanalyse` | ignore the analysis of the last run and analyse every image again |
 | `--threads N` | worker processes (default 8) |
 
 ## What a run does
 
-1. Scans the folder with all its subfolders. Images are `.jpg`, `.jpeg`, `.jpe`, `.jfif`, `.png`, `.webp`, `.bmp`, `.tif`, `.tiff`, `.gif`, `.avif`, `.heic` and `.heif`. A `.txt` file with the same name as an image is its caption. Folders named `_backup`, `_duplicates`, `_prep`, `_classify`, `_embeddings`, `masks` and `faces` are skipped, at any depth; every other folder is scanned, also one whose name starts with `_`. Animated images and files that cannot be read are skipped and listed.
+1. Scans the folder with all its subfolders. Images are `.jpg`, `.jpeg`, `.jpe`, `.jfif`, `.png`, `.webp`, `.bmp`, `.tif`, `.tiff`, `.gif`, `.avif`, `.heic` and `.heif`. A `.txt` file with the same name as an image is its caption. Folders named `_backup`, `_duplicates`, `_prep`, `_classify`, `_embeddings`, `masks` and `faces` are skipped, at any depth, and so is a backup folder of the dataset tools (marked by `_dataset_tools.json`); every other folder is scanned, also one whose name starts with `_`. Animated images and files that cannot be read are skipped and listed.
 2. Analyses every image (section [What counts as a border](#what-counts-as-a-border)) and plans the crop (section [How an image is cropped](#how-an-image-is-cropped)).
-3. Writes `plan.json`, `report.csv` and `cache.json` into `<folder>\_backup\_remove_borders\`, and the contact sheets into its `sheets\` folder. With `--dry-run` the run stops here.
-4. For every image to crop: copies the image, its captions and its face mask to `_backup` under the same relative path, then writes the crop in place. An image too small after its crop moves to `_backup` with its captions instead.
+3. Writes `plan.json`, `report.csv` and `cache.json` into `<folder>_backup\_remove_borders\`, and the contact sheets into its `sheets\` folder. With `--dry-run` the run stops here.
+4. For every image to crop: copies the image, its captions and its face mask to `<folder>_backup` under the same relative path, then writes the crop in place. An image too small after its crop moves to the backup folder with its captions instead.
 5. Logs every step in `log.jsonl` and adds the result of every image to `report.csv`.
 
 The run prints a progress line every 500 images with the time left. Ctrl+C stops it: the images being cropped at that moment are finished, the rest are not started, and `--undo` puts back what was done.
@@ -70,7 +70,7 @@ Mid tones are never borders. The colour of a border is matched within 24 levels 
 |---|---|
 | JPEG, MPO | lossless: the DCT blocks outside the box are dropped, the rest is copied unchanged. The left and top edges move inward to the next block boundary (8 or 16 px), so the border goes completely; this can cost up to 15 px of picture there. The right and bottom edges are exact. EXIF stays, without its thumbnail and with the new size; the ICC profile stays. |
 | PNG, lossless WebP, TIFF, GIF, BMP | exact to the pixel, saved in the same format and mode, with palette, transparency, ICC profile, EXIF and PNG text. 16-bit PNG stays 16-bit. |
-| lossy WebP, AVIF and other lossy formats | exact to the pixel of the decoded image, saved as `<name>.png` next to it; the original moves to `_backup`, the caption stays for the PNG. When `<name>.png` exists, the image is skipped. |
+| lossy WebP, AVIF and other lossy formats | exact to the pixel of the decoded image, saved as `<name>.png` next to it; the original moves to the backup folder, the caption stays for the PNG. When `<name>.png` exists, the image is skipped. |
 
 A thin line on a JPEG is cut only when the crop keeps the image in the same k2prep bucket (aspect-ratio family and resolution tier of 1024, 768 or 512). The block alignment at the left or top can take more than the line, and that must not cost an image its tier. When the bucket would change, the line stays and the report says so. An image too small for the 512 tier anyway is cut.
 
@@ -78,10 +78,11 @@ A face mask made by `face_masks` (`<folder>\masks\<name>.png`) is cropped with t
 
 Every write goes to a `.part` file first and replaces the image in one step. The image keeps its modification time and its read-only flag.
 
-## The `_backup` folder
+## The backup folder
 
 ```
-<folder>\_backup\
+<folder>_backup\
+  _dataset_tools.json                 marks the folder as the backup folder of the dataset tools
   <relative path>\<image>             the original of a cropped image, or a too-small image
   <relative path>\<name>.txt          its captions
   <relative path>\masks\<name>.png    its face mask
@@ -93,7 +94,9 @@ Every write goes to a `.part` file first and replaces the image in one step. The
     sheets\                           contact sheets of the last dry run (or real run with --sheets)
 ```
 
-A backup that exists is never overwritten, so `_backup` keeps the first original of an image even after several runs. The other dataset tools skip `_backup`. When you are sure of the crops, delete the backup files to free the space; keep `_remove_borders` if you may want `--undo` for the newest run.
+The backup folder is next to the dataset folder, not inside it, so a trainer that reads every subfolder (Ostris AI Toolkit) does not train on the originals or the contact sheets. It is shared with the other dataset tools; see [The backup folder](../README.md#the-backup-folder) in the main README. A `_backup` folder inside the dataset, where the backup was until 2026-10-11, is moved to `<folder>_backup` on the next run, dry run or undo, and the undo log of an old run still works. A folder named `<folder>_backup` that the tools did not make stops the run.
+
+A backup that exists is never overwritten, so the backup folder keeps the first original of an image even after several runs. When you are sure of the crops, delete the backup files to free the space; keep `_remove_borders` if you may want `--undo` for the newest run. Move or rename the dataset folder and its backup folder together.
 
 ## Checking the crops
 
@@ -105,7 +108,7 @@ The contact sheets show every image to crop, grouped as `frame_NNN.jpg`, `border
 
 ## Undo
 
-`--undo` takes the last run that is not undone yet. A cropped image gets its original back from `_backup`; a lossy image gets its original back and the PNG is deleted; a too-small image moves back with its captions and mask. Captions are never overwritten: a caption edited after the run keeps the edit. Each `--undo` takes one run further back. An interrupted run can be undone too, since every image is logged before its crop starts.
+`--undo` takes the last run that is not undone yet. A cropped image gets its original back from the backup folder; a lossy image gets its original back and the PNG is deleted; a too-small image moves back with its captions and mask. Captions are never overwritten: a caption edited after the run keeps the edit. Each `--undo` takes one run further back. An interrupted run can be undone too, since every image is logged before its crop starts.
 
 A second run can find a little more on a few images: when a frame fades into the picture over many rows, the first cut ends inside the fade, and its pale rest is a thin line on the next run. A third run finds nothing.
 

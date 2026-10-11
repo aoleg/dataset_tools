@@ -50,7 +50,7 @@ The run prints how many captions have each keyword, so you can see what each one
 ## What a run does
 
 1. Searches the `.txt` caption of every image in the dataset and its subfolders. Images are `.jpg`, `.jpeg`, `.jpe`, `.jfif`, `.png`, `.webp`, `.bmp`, `.tif`, `.tiff`, `.gif`, `.avif`, `.heic` and `.heif`.
-2. Skips the folders `_backup`, `_duplicates`, `_prep`, `_classify`, `_embeddings`, `_flatten_dataset`, `masks` and `faces`, at any depth. These are the output folders of the dataset tools. Links and junctions are not followed.
+2. Skips the folders `_backup`, `_duplicates`, `_prep`, `_classify`, `_embeddings`, `_flatten_dataset`, `masks` and `faces`, at any depth. These are the output folders of the dataset tools. A backup folder of the dataset tools, marked by `_dataset_tools.json`, is skipped too. Links and junctions are not followed.
 3. Writes the list of files to move to `<new folder>\_extract_keywords\manifest.json`, then moves them. Each file keeps its subfolder path: `D:\photos\2024\beach\a.jpg` goes to `D:\photos_1940s\2024\beach\a.jpg`.
 4. Removes the subfolders of the dataset that are empty after the run. A subfolder that was empty before the run stays.
 

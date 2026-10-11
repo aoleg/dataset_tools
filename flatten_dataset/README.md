@@ -56,7 +56,7 @@ A file directly in the folder gets `<folder>-datasetNNNNNN.<ext>`.
 ## What a run does
 
 1. Scans the folder with all its subfolders. Images are `.jpg`, `.jpeg`, `.jpe`, `.jfif`, `.png`, `.webp`, `.bmp`, `.tif`, `.tiff`, `.gif`, `.avif`, `.heic` and `.heif`. A `.txt` file with the same name as an image is its caption. Two images with the same name and different extensions (`a.jpg` and `a.png`) share their caption, so they get the same new name with their own extensions.
-2. Skips the folders `_flatten_dataset`, `_backup`, `_duplicates`, `_prep`, `_classify`, `_embeddings`, `masks` and `faces`, at any depth. These are the output folders of the dataset tools. Every other folder is flattened, also one whose name starts with `_`. Links and junctions are not followed.
+2. Skips the folders `_flatten_dataset`, `_backup`, `_duplicates`, `_prep`, `_classify`, `_embeddings`, `masks` and `faces`, at any depth. These are the output folders of the dataset tools. A backup folder of the dataset tools, marked by `_dataset_tools.json`, is skipped too. Every other folder is flattened, also one whose name starts with `_`. Links and junctions are not followed.
 3. Plans every rename and checks the plan. When a file that stays in the folder already has a new name (for example a caption without an image), nothing is renamed.
 4. Writes the plan to `<folder>\_flatten_dataset\manifest.json`, then renames the files.
 5. Removes the subfolders that are empty after the run. A subfolder that was empty before the run stays.

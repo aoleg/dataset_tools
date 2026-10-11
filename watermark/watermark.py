@@ -13,8 +13,10 @@ watermark are copied unchanged with their captions, painted JPEGs are written
 as JPEG at quality 97 without chroma subsampling, painted images of other
 formats as PNG (--png writes every painted image as PNG). --dry-run writes a
 report of the detections and, with --previews, the masks drawn over the images
-into <folder>/_backup/_watermark; the detections are cached there, so a real
-run after a dry run detects nothing again.
+into <folder>_backup/_watermark, next to the folder and outside it, so a
+trainer never sees them; the detections are cached there, so a real run after
+a dry run detects nothing again. A _backup folder inside the folder, where the
+backup of the dataset tools was before, is moved out on the next run.
 
 Detector: corzent/yolov12x-dino3-watermark-detection (YOLOv12 with a DINOv3
 backbone, loaded through dino3_compat.py), fetched from Hugging Face on first
@@ -30,11 +32,13 @@ Install:  install.bat (torch from the PyTorch CUDA index, ultralytics, transform
 """
 import argparse
 import csv
+import filecmp
 import json
 import math
 import os
 import shutil
 import signal
+import stat
 import sys
 import tempfile
 import time
@@ -59,16 +63,19 @@ DETECTOR_ORDER = ["dino3", "yolo11"]              # the first that loads is used
 LAMA_URL = "https://github.com/enesmsahin/simple-lama-inpainting/releases/download/v0.1.0/big-lama.pt"
 LAMA_FILE = "big-lama.pt"                         # in the torch hub checkpoints folder, where simple-lama keeps it
 
-BACKUP_DIRNAME = "_backup"
-RUN_DIRNAME = "_watermark"                        # inside _backup: cache, report, previews
+BACKUP_SUFFIX = "_backup"                         # <folder>_backup next to the folder, shared with the other tools
+OLD_BACKUP_DIRNAME = "_backup"                    # that backup inside the folder until 2026-10-11; moved out
+BACKUP_MARK = "_dataset_tools.json"               # marks a backup folder of the dataset tools; never scanned
+RUN_DIRNAME = "_watermark"                        # inside the backup folder: cache, report, previews
 CACHE_NAME = "cache.json"
 REPORT_NAME = "report.csv"
 PREVIEW_DIRNAME = "previews"
 LOG_NAME = "log.jsonl"
 OUT_SUFFIX = "_watermark_removed"
 IMAGE_EXTS = {".jpg", ".jpeg", ".jpe", ".jfif", ".png", ".webp", ".bmp", ".tif", ".tiff"}
-# Folders never scanned, at any depth: the output folders of the dataset tools.
-DEFAULT_EXCLUDES = [BACKUP_DIRNAME, "_duplicates", "_prep", "_classify", "_embeddings", "masks", "faces"]
+# Folders never scanned, at any depth: the output folders of the dataset tools,
+# and a folder holding BACKUP_MARK (the backup of a subfolder).
+DEFAULT_EXCLUDES = [OLD_BACKUP_DIRNAME, "_duplicates", "_prep", "_classify", "_embeddings", "masks", "faces"]
 DEFAULT_CONF = 0.1
 DEFAULT_DILATE = 15
 DEFAULT_MAX_SIZE = 2048                           # longest side of a LaMa window; larger windows are scaled down
@@ -363,7 +370,8 @@ def scan(root: Path, excludes) -> list[Path]:
     excl = {e.casefold() for e in excludes}
     out = []
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = sorted(d for d in dirnames if d.casefold() not in excl)
+        dirnames[:] = sorted(d for d in dirnames
+                             if d.casefold() not in excl and not is_backup_dir(Path(dirpath) / d))
         for fn in sorted(filenames):
             if os.path.splitext(fn)[1].casefold() in IMAGE_EXTS:
                 out.append(Path(dirpath) / fn)
@@ -573,8 +581,88 @@ def file_key(path: Path) -> list[int]:
     return [st.st_size, st.st_mtime_ns, st.st_ino]
 
 
+# The backup folder of the dataset tools, <folder>_backup next to the folder
+# and marked by BACKUP_MARK, holds this tool's run folder. The same as in
+# remove_borders, which also explains the rules.
+
+def backup_dir(root: Path) -> Path:
+    return root.with_name(root.name + BACKUP_SUFFIX)
+
+
+def is_backup_dir(path: Path) -> bool:
+    return (path / BACKUP_MARK).is_file()
+
+
+def claim_backup(root: Path, create: bool = True, say=print) -> Path:
+    """The backup folder of root, checked, with an old _backup moved into it.
+    create=False (an undo): the folder is not made when there is nothing to
+    move into it. say: where the note of a move goes."""
+    if root.parent == root:
+        raise SystemExit(f"{root}: a drive root has no folder next to it for its backup; use a subfolder")
+    if is_backup_dir(root):
+        raise SystemExit(f"{root} is the backup folder of a dataset, not a dataset")
+    bdir = backup_dir(root)
+    if bdir.exists() and not is_backup_dir(bdir) and (not bdir.is_dir() or any(bdir.iterdir())):
+        raise SystemExit(f"{bdir} exists and was not made by the dataset tools; rename it or move it away, "
+                         f"the backup of {root.name} goes there")
+    old = root / OLD_BACKUP_DIRNAME
+    if old.is_dir():
+        left = move_old_backup(old, bdir)
+        say(f"{root.name}: the backup moved out of the dataset, from {old} to {bdir}"
+            + (f"; {left} files that differ from the ones in {bdir.name} stay in {old}" if left else ""))
+    if create or bdir.is_dir():
+        bdir.mkdir(exist_ok=True)
+        if not is_backup_dir(bdir):
+            (bdir / BACKUP_MARK).write_text(json.dumps({"made_by": "dataset_tools", "dataset": root.name}) + "\n",
+                                            encoding="utf-8")
+    return bdir
+
+
+def move_old_backup(old: Path, bdir: Path) -> int:
+    """Move an old _backup into bdir: one rename when bdir is not there yet,
+    else file by file, never over a file in bdir (one with the same bytes is
+    dropped, one with other bytes stays in old). -> the files left in old."""
+    left = 0
+    try:
+        if not bdir.exists():
+            os.rename(old, bdir)
+            return 0
+        for dirpath, dirnames, filenames in os.walk(old):
+            for fn in filenames:
+                src = Path(dirpath) / fn
+                dst = bdir / src.relative_to(old)
+                if not dst.exists():
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(src, dst)
+                elif same_bytes(src, dst):
+                    make_writable(src)
+                    src.unlink()
+                else:
+                    left += 1
+    except OSError as e:
+        raise SystemExit(f"cannot move {old} to {bdir}: {e}")
+    for dirpath, dirnames, filenames in os.walk(old, topdown=False):
+        try:
+            Path(dirpath).rmdir()
+        except OSError:
+            pass
+    return left
+
+
+def same_bytes(a: Path, b: Path) -> bool:
+    try:
+        return a.stat().st_size == b.stat().st_size and filecmp.cmp(a, b, shallow=False)
+    except OSError:
+        return False
+
+
+def make_writable(path: Path) -> None:
+    if path.exists() and not os.access(path, os.W_OK):
+        os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+
+
 def run_dir(root: Path) -> Path:
-    return root / BACKUP_DIRNAME / RUN_DIRNAME
+    return backup_dir(root) / RUN_DIRNAME
 
 
 def cache_signature(detector: str, conf: float) -> dict:
@@ -844,6 +932,9 @@ def main(argv=None) -> int:
         out = Path(args.out).resolve() if args.out else root.parent / (root.name + OUT_SUFFIX)
         if out == root or out.is_relative_to(root):
             ap.error(f"the output folder {out} is inside {root}; give --out outside it")
+        if out == backup_dir(root) or out.is_relative_to(backup_dir(root)):
+            ap.error(f"the output folder {out} is the backup folder of {root}; give another --out")
+        claim_backup(root)
         failed += process_folder(root, out, args)
     return 1 if failed else 0
 

@@ -57,6 +57,7 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".jpe", ".jfif", ".png", ".webp", ".bmp", ".tif",
 # the mask of an image moves with it to <root>/masks.
 DEFAULT_EXCLUDES = [TOOL_DIRNAME, "_backup", "_duplicates", "_prep", "_classify", "_embeddings",
                     MASKS_DIRNAME, "faces"]
+BACKUP_MARK = "_dataset_tools.json"  # marks <dataset>_backup, the backup folder of the other tools: never scanned
 
 CYRILLIC = {
     "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "yo", "ж": "zh",
@@ -165,7 +166,7 @@ def scan(root: Path, excludes, sidecar_exts):
             elif e.is_dir():
                 if e.name.casefold() == MASKS_DIRNAME:
                     masks_dir = e.name
-                if e.name.casefold() not in excl:
+                if e.name.casefold() not in excl and not os.path.isfile(os.path.join(e.path, BACKUP_MARK)):
                     subdirs.append(e.name)
             elif e.is_file():
                 files.append(e.name)

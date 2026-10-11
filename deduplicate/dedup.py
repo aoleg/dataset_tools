@@ -59,9 +59,13 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".gif",
 # Folders never scanned, at any depth: the output folders of the dataset tools.
 # _duplicates is this tool's own, _prep is k2prep's, _classify and _embeddings
 # are classify's, masks and faces are face_masks' (near-identical images by
-# design), _backup is remove_borders' (the originals of cropped images). Any
-# other folder is scanned, whatever its name; --exclude adds names.
+# design), _backup is where the repair tools kept the originals of the images
+# they changed, before that backup moved out to <dataset>_backup. A folder
+# holding BACKUP_MARK (the backup of a subfolder, <subfolder>_backup) is
+# skipped too. Any other folder is scanned, whatever its name; --exclude adds
+# names.
 DEFAULT_EXCLUDES = ["_duplicates", "_prep", "_classify", "_embeddings", "masks", "faces", "_backup"]
+BACKUP_MARK = "_dataset_tools.json"  # marks <dataset>_backup, the backup folder of the other tools: never scanned
 
 # --- matching, calibrated on 690 real poster and photo downloads -------------
 # pHash and dHash are 64-bit; distances are Hamming distances. pHash distances
@@ -398,7 +402,8 @@ def scan(roots, excludes, roles=None):
     for ri, root in enumerate(roots):
         role = roles[ri] if roles else 0
         for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = sorted(d for d in dirnames if d.casefold() not in excl)
+            dirnames[:] = sorted(d for d in dirnames if d.casefold() not in excl
+                                 and not os.path.isfile(os.path.join(dirpath, d, BACKUP_MARK)))
             stems = {}
             for fn in filenames:
                 stem, ext = os.path.splitext(fn)

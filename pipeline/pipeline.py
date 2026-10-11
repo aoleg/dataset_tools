@@ -23,7 +23,7 @@ Passes, in this order, each over all the images of the job (or its file list):
              the crop (LaMa), restore (FBCNN) when the verdict says so, write
              once (a lossless crop of the file when no pixel stage touched the
              image), then the face mask of the final image into masks/
-Every detection is cached per image in <folder>/_backup/_pipeline/cache.json,
+Every detection is cached per image in <folder>_backup/_pipeline/cache.json,
 keyed by the file's size and time and the model's signature, so a pass whose
 results are cached loads no model, and a real run after a dry run detects
 nothing again. A dry run is every pass but the last; it writes plan.json and
@@ -32,11 +32,11 @@ masks). The detection passes only read the images; the apply pass changes
 files and must run alone.
 
 Two output modes: "in_place" changes the dataset folder, with the original of
-every changed image and its caption copied to <folder>/_backup/<same
+every changed image and its caption copied to <folder>_backup/<same
 relative path> before the write, never over an original that is there
 already (one backup per image, the untouched original, shared with the other
-tools), and the run logged in _backup/_pipeline/log.jsonl, so that --undo
-returns the images of the last run to their originals; "parallel" writes the
+tools), and the run logged in <folder>_backup/_pipeline/log.jsonl, so that
+--undo returns the images of the last run to their originals; "parallel" writes the
 whole tree into a new folder with the unchanged images and the captions
 copied along. Captions are never deleted or changed by a run; the log says
 which images changed, so they can be captioned again.
@@ -45,10 +45,17 @@ An undo with a file list ("undo": true with "files") returns exactly those
 images to their originals, whichever tool made the backup: the original is
 copied back, a renamed output (a JPEG written as PNG) removed, the mask
 restored from its backup or removed, the backup caption restored over the
-caption in place, and the backup copies deleted, because _backup holds only
+caption in place, and the backup copies deleted, because the backup holds only
 the originals of changed images. "delete_captions_without_backup" says what
 happens to a caption of an image whose backup has none: deleted (true) or
 kept (false, the default). An image without a backup is reported as skipped.
+
+The backup folder <folder>_backup is next to the dataset folder, outside it,
+so a trainer that walks every subfolder never sees the originals, the caches
+or the previews; it is shared with the other tools (see remove_borders'
+claim_backup). A _backup folder inside the dataset, where the backup was
+before, is moved out at the start of a run or an undo, and a copy of the job
+is kept in <folder>_backup/_pipeline/job.json.
 
 Progress goes to stdout as JSON lines: one per image per pass (pass, index,
 total, path), a summary per pass, and a final summary.
@@ -87,8 +94,8 @@ import reframe as rf  # noqa: E402
 import jpeg_cleanup as jc  # noqa: E402
 import make_face_masks as fm  # noqa: E402
 
-BACKUP_DIRNAME = "_backup"
-RUN_DIRNAME = "_pipeline"                         # inside _backup: log, cache, plan, report, previews
+RUN_DIRNAME = "_pipeline"                         # inside <folder>_backup: log, cache, plan, report, previews, job
+JOB_NAME = "job.json"
 LOG_NAME = "log.jsonl"
 CACHE_NAME = "cache.json"
 PLAN_NAME = "plan.json"
@@ -201,7 +208,8 @@ def scan(job: Job) -> list[Item]:
     else:
         excl = {e.casefold() for e in job.excludes}
         for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = sorted(d for d in dirnames if d.casefold() not in excl)
+            dirnames[:] = sorted(d for d in dirnames
+                                 if d.casefold() not in excl and not rb.is_backup_dir(Path(dirpath) / d))
             for fn in sorted(filenames):
                 if os.path.splitext(fn)[1].casefold() in IMAGE_EXTS:
                     p = Path(dirpath) / fn
@@ -300,12 +308,12 @@ def align_box(display_box, head: dict, inward_display_sides: set) -> tuple[list,
 # --- caches -----------------------------------------------------------------------------
 
 class Caches:
-    """Per-file caches in _backup/_pipeline/cache.json: the header and, per
+    """Per-file caches in <folder>_backup/_pipeline/cache.json: the header and, per
     pass, the result under a signature of the pass's inputs. An entry holds
     while the file's size and time stay."""
 
     def __init__(self, root: Path):
-        self.path = root / BACKUP_DIRNAME / RUN_DIRNAME / CACHE_NAME
+        self.path = rb.backup_dir(root) / RUN_DIRNAME / CACHE_NAME
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
             self.files = data.get("files", {}) if data.get("version") == CACHE_VERSION else {}
@@ -669,7 +677,7 @@ def finish_plan(entry: dict) -> None:
 
 
 def write_plan(root: Path, job: Job, entries: dict) -> Path:
-    path = root / BACKUP_DIRNAME / RUN_DIRNAME / PLAN_NAME
+    path = rb.backup_dir(root) / RUN_DIRNAME / PLAN_NAME
     path.parent.mkdir(parents=True, exist_ok=True)
     slim = {}
     for rel, e in entries.items():
@@ -686,12 +694,12 @@ def write_plan(root: Path, job: Job, entries: dict) -> Path:
 # --- previews (dry run) ------------------------------------------------------------------
 
 class Previews:
-    """The pictures of a dry run in _backup/_pipeline/previews: the reframe
+    """The pictures of a dry run in <folder>_backup/_pipeline/previews: the reframe
     verdicts, the watermark masks, and contact sheets of the border crops and
     the cleanup restorations, drawn the way the tools draw them."""
 
     def __init__(self, root: Path, threads: int):
-        self.dir = root / BACKUP_DIRNAME / RUN_DIRNAME / PREVIEWS_DIRNAME
+        self.dir = rb.backup_dir(root) / RUN_DIRNAME / PREVIEWS_DIRNAME
         if self.dir.is_dir():
             shutil.rmtree(self.dir)
         self.dir.mkdir(parents=True, exist_ok=True)
@@ -826,8 +834,8 @@ def write_job(job: dict) -> dict:
         head = job["head"]
         st = os.stat(src)
         if in_place and job["write"] != "none":
-            rec["backup"] = copy_keep(src, root / BACKUP_DIRNAME / job["rel"])
-            rec["sidecars"] = {Path(sc).relative_to(root).as_posix(): copy_keep(Path(sc), root / BACKUP_DIRNAME / Path(sc).relative_to(root))
+            rec["backup"] = copy_keep(src, rb.backup_dir(root) / job["rel"])
+            rec["sidecars"] = {Path(sc).relative_to(root).as_posix(): copy_keep(Path(sc), rb.backup_dir(root) / Path(sc).relative_to(root))
                                for sc in job["sidecars"]}
         if job["write"] == "none":
             if not in_place:
@@ -850,14 +858,14 @@ def write_job(job: dict) -> dict:
                 for sc in job["sidecars"]:
                     copy_keep(Path(sc), dst.parent / Path(sc).name)
             elif dst != src:
-                make_writable(src)                        # the image changed its name: the original is in _backup
+                make_writable(src)                        # the image changed its name: the original is in the backup
                 src.unlink()
                 rec["removed"] = job["rel"]
         rec["out"] = dst.relative_to(root if in_place else Path(job["target"])).as_posix()
         if job.get("mask") is not None:
             mpath = Path(job["mask_path"])
             if in_place and mpath.exists():
-                rec["mask_backup"] = copy_keep(mpath, root / BACKUP_DIRNAME / mpath.relative_to(root))
+                rec["mask_backup"] = copy_keep(mpath, rb.backup_dir(root) / mpath.relative_to(root))
             mpath.parent.mkdir(parents=True, exist_ok=True)
             # two images with one stem (a.jpg, a.png) share one mask: each
             # worker writes its own part file, the last one to finish wins
@@ -871,12 +879,12 @@ def write_job(job: dict) -> dict:
         # the writes are atomic, so the image in place is intact: a backup this
         # job copied for it is not needed and goes again
         try:
-            bk = root / BACKUP_DIRNAME / job["rel"]
+            bk = rb.backup_dir(root) / job["rel"]
             if rec.get("backup") == "copied" and src.is_file() and same_bytes(src, bk):
                 bk.unlink()
                 rec["backup"] = "removed"
             for sc, status in list((rec.get("sidecars") or {}).items()):
-                b = root / BACKUP_DIRNAME / sc
+                b = rb.backup_dir(root) / sc
                 if status == "copied" and b.is_file() and same_bytes(b, root / sc):
                     b.unlink()
                     rec["sidecars"][sc] = "removed"
@@ -891,7 +899,7 @@ def ignore_ctrl_c() -> None:
 
 class RunLog:
     def __init__(self, root: Path):
-        self.path = root / BACKUP_DIRNAME / RUN_DIRNAME / LOG_NAME
+        self.path = rb.backup_dir(root) / RUN_DIRNAME / LOG_NAME
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.f = open(self.path, "a", encoding="utf-8")
 
@@ -904,7 +912,7 @@ class RunLog:
 
 
 def read_log(root: Path) -> list[dict]:
-    path = root / BACKUP_DIRNAME / RUN_DIRNAME / LOG_NAME
+    path = rb.backup_dir(root) / RUN_DIRNAME / LOG_NAME
     if not path.exists():
         return []
     out = []
@@ -930,7 +938,7 @@ def last_run(entries: list[dict]) -> tuple[dict | None, list[dict]]:
 
 def undo(root: Path) -> dict:
     """Return the images of the last run to their originals: in place, every
-    image written from _backup (the one untouched original, so an earlier
+    image written from the backup (the one untouched original, so an earlier
     run's change goes too), a renamed output removed, the masks restored or
     removed; in parallel mode, the files written into the target removed.
     A backup this run made is removed; one that was there before stays. -> counts."""
@@ -962,7 +970,7 @@ def undo(root: Path) -> dict:
                     cap.unlink()
             continue
         if intent["write"] != "none":
-            bk = root / BACKUP_DIRNAME / intent["rel"]
+            bk = rb.backup_dir(root) / intent["rel"]
             if not bk.exists():
                 counts["no backup"] += 1
                 emit({"warning": f"no backup for {intent['rel']}"})
@@ -982,7 +990,7 @@ def undo(root: Path) -> dict:
                     bk.unlink()
                 counts["restored"] += 1
             for sc, status in (rec.get("sidecars") or {}).items():
-                b = root / BACKUP_DIRNAME / sc
+                b = rb.backup_dir(root) / sc
                 if not (root / sc).exists() and b.exists():
                     os.replace(b, root / sc)
                 elif status == "copied" and b.exists() and same_bytes(b, root / sc):
@@ -990,7 +998,7 @@ def undo(root: Path) -> dict:
                     b.unlink()
         if rec.get("mask"):
             m = root / rec["mask"]
-            mb = root / BACKUP_DIRNAME / rec["mask"]
+            mb = rb.backup_dir(root) / rec["mask"]
             if rec.get("mask_backup") in ("copied", "same", "kept") and mb.exists():
                 make_writable(m)
                 tmp = rb.part_path(m)
@@ -1010,7 +1018,7 @@ def undo(root: Path) -> dict:
     log = RunLog(root)
     log.write({"undo": head["run"], "time": time.strftime("%Y-%m-%d %H:%M:%S"), **counts})
     log.close()
-    rb.remove_empty_dirs(root / BACKUP_DIRNAME)
+    rb.remove_empty_dirs(rb.backup_dir(root))
     return counts
 
 
@@ -1069,18 +1077,18 @@ def restore_from_backup(bk: Path, dst: Path) -> None:
 
 def undo_files(root: Path, files: list, delete_captions: bool) -> dict:
     """Return the listed images to their originals, whichever tool made the
-    backup. Per image, when _backup/<rel> exists: a renamed output (the
+    backup. Per image, when <folder>_backup/<rel> exists: a renamed output (the
     pipeline's PNG for a JPEG, from the log, or the PNG next to an image
     that is missing under its own name) is removed; the original is copied
     back; the mask is restored from its backup, or removed when the pipeline
     made it; the backup caption is restored over the caption in place, and a
     caption without a backup is deleted or kept as delete_captions says;
-    the backup copies go, because _backup holds only the originals of changed
+    the backup copies go, because the backup holds only the originals of changed
     images. An image without a backup is skipped. One JSON line per file.
     -> counts."""
     latest = latest_records(read_log(root))
     by_out = {r["out"]: rel for rel, r in latest.items() if r.get("out") and r["out"] != rel}
-    bdir = root / BACKUP_DIRNAME
+    bdir = rb.backup_dir(root)
     counts = {"files": 0, "restored": 0, "skipped": 0, "failed": 0, "masks restored": 0, "masks removed": 0,
               "captions restored": 0, "captions deleted": 0}
     restored = []
@@ -1397,7 +1405,7 @@ def run(job: Job) -> int:
     log.write({"run": run_id, "time": time.strftime("%Y-%m-%d %H:%M:%S"), "mode": job.mode,
                "target": str(job.target) if job.target else "", "stages": job.stages, "save_png": job.save_png,
                "images": len(items)})
-    report_path = root / BACKUP_DIRNAME / RUN_DIRNAME / REPORT_NAME
+    report_path = rb.backup_dir(root) / RUN_DIRNAME / REPORT_NAME
     report = open(report_path, "w", encoding="utf-8")
     done = {"changed": 0, "unchanged": 0, "skipped": 0, "failed": 0, "masks": 0}
     try:
@@ -1426,6 +1434,14 @@ def peak_vram() -> dict:
     return {}
 
 
+def keep_job(path: Path, root: Path) -> None:
+    """A copy of the job file in the run folder, for the record."""
+    dst = rb.backup_dir(root) / RUN_DIRNAME / JOB_NAME
+    if path.resolve() != dst.resolve():
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(path, dst)
+
+
 def main(argv=None) -> int:
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -1447,6 +1463,9 @@ def main(argv=None) -> int:
     if not args.job:
         ap.error("--job is required")
     job = read_job(Path(args.job), args)
+    rb.claim_backup(job.root, create=not job.undo, say=lambda note: emit({"warning": note}))
+    if not job.undo:
+        keep_job(Path(args.job), job.root)
     if job.undo:
         c = undo_files(job.root, job.files, job.delete_captions) if job.files else undo(job.root)
         emit({"summary": True, "undo": True, **c})

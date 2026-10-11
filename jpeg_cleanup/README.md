@@ -1,6 +1,6 @@
 # JPEG cleanup
 
-Finds the images of a dataset that were saved with heavy JPEG compression, restores them with [FBCNN](https://github.com/jiaxi-jiang/FBCNN), and replaces only those where the restoration removes enough of the damage. Originals and captions go to `_backup`; `--review` draws them next to the restored files, and `--undo` puts them back.
+Finds the images of a dataset that were saved with heavy JPEG compression, restores them with [FBCNN](https://github.com/jiaxi-jiang/FBCNN), and replaces only those where the restoration removes enough of the damage. Originals and captions go to the backup folder `<folder>_backup` next to the dataset folder; `--review` draws them next to the restored files, and `--undo` puts them back.
 
 ## Why
 
@@ -31,13 +31,13 @@ A typical artifact-removal script runs the model over a folder and overwrites ev
 
 - **Measures first.** `extract.bat` copies the poor images into one folder per quality band, outside the dataset, so the threshold is set by eye on the dataset itself. The dataset stays untouched.
 - **Leaves good images alone.** An image at or above the threshold (QF 80 by default) is never restored, and one above 2048 x 2048 is never touched.
-- **Saves a restoration only for a real benefit.** Every restoration is judged in memory with two measures that film grain cannot fake. Without enough benefit the image stays as it is, and nothing goes to `_backup`.
+- **Saves a restoration only for a real benefit.** Every restoration is judged in memory with two measures that film grain cannot fake. Without enough benefit the image stays as it is, and nothing goes to the backup folder.
 - **Keeps the grain.** FBCNN is told a quality 10 points above the image's own, so it removes a little less, and black-and-white images go through the colour model.
 - **Skips what it cannot fix.** Formats with their own kind of compression (lossy WebP, AVIF, HEIC, GIF), transparent, animated, CMYK and 16-bit images are listed and left alone.
 - **Shows the result first.** `--dry-run` writes a report and contact sheets with every image before and after, at 100% and magnified, split into the restorations it would save and the ones it would leave. A real run saves exactly what its dry run listed.
-- **Backs up before it writes.** The original and its captions go to `_backup` under the same relative path. A backup is never overwritten, and an earlier original from another tool keeps its place.
+- **Backs up before it writes.** The original and its captions go to `<folder>_backup` under the same relative path. A backup is never overwritten, and an earlier original from another tool keeps its place.
 - **Writes safely.** Each image is logged before it is touched. The restoration goes to a `.part` file and replaces the image in one step, with the original's name, times, read-only flag, EXIF block and ICC profile.
-- **Shows what it wrote.** `--review` draws the contact sheets of the last run from the originals in `_backup` and the files now in place.
+- **Shows what it wrote.** `--review` draws the contact sheets of the last run from the originals in the backup folder and the files now in place.
 - **Undoes a run.** `--undo` puts back the last run, also one that was interrupted.
 - **Runs offline.** The models are downloaded once and checked against their SHA-256 sums.
 
@@ -45,7 +45,7 @@ A typical artifact-removal script runs the model over a folder and overwrites ev
 
 1. Run `install.bat` once.
 2. Run `extract.bat <dataset>` and look through the band folders in `<dataset>_jpeg_extract`, from the lowest up, to find the QF where the images stop looking compressed. New `--bands` re-sort the copies in seconds.
-3. Run `run.bat <dataset> --dry-run --threshold <QF>` and look through the contact sheets in `<dataset>\_backup\_jpeg_cleanup\sheets`. The `fix_*` sheets show what would be saved, the `nofix_*` sheets what would be left.
+3. Run `run.bat <dataset> --dry-run --threshold <QF>` and look through the contact sheets in `<dataset>_backup\_jpeg_cleanup\sheets`. The `fix_*` sheets show what would be saved, the `nofix_*` sheets what would be left.
 4. Run `run.bat <dataset> --threshold <QF>`, then `run.bat <dataset> --review` to look at what was written.
 5. If you do not like the result, run `run.bat <dataset> --undo`.
 
@@ -91,7 +91,7 @@ The first command measures every image of `D:\photos` and its subfolders and cop
 
 What a run does:
 
-1. Scans the folder at any depth. Images are `.jpg`, `.jpeg`, `.jpe`, `.jfif`, `.png`, `.webp`, `.bmp`, `.tif`, `.tiff`, `.gif`, `.avif`, `.heic` and `.heif`. A `.txt` file with the same name as an image is its caption. Folders named `_backup`, `_duplicates`, `_prep`, `_classify`, `_embeddings`, `masks` and `faces` are skipped, at any depth.
+1. Scans the folder at any depth. Images are `.jpg`, `.jpeg`, `.jpe`, `.jfif`, `.png`, `.webp`, `.bmp`, `.tif`, `.tiff`, `.gif`, `.avif`, `.heic` and `.heif`. A `.txt` file with the same name as an image is its caption. Folders named `_backup`, `_duplicates`, `_prep`, `_classify`, `_embeddings`, `masks` and `faces` are skipped, at any depth, and so is a backup folder of the dataset tools (marked by `_dataset_tools.json`).
 2. Measures the QF of every image on its stored pixels, before EXIF rotation, so the 8 x 8 grid stays where the model expects it. A black-and-white image (one channel, or three channels within 2 levels of each other) is measured with both models, and the gray model decides. An unchanged image is taken from the cache.
 3. Puts each image in the band of the first limit above its QF. With the default limits, band `60` holds QF under 60, `70` holds 60 to 69.9, `80` holds 70 to 79.9 and `85` holds 80 to 84.9. Each image is in one band, so neighbouring bands can be compared side by side; a threshold of 80 takes the bands `60`, `70` and `80`.
 4. Copies each image of a band, with its captions, as `q<QF>__<name>` (for example `q057__photo.jpg` and `q057__photo.txt`), so a folder sorted by name is sorted by QF. When two images of different folders have the same name and QF, the second gets `~2`.
@@ -136,7 +136,7 @@ run.bat D:\photos --review
 run.bat D:\photos --undo
 ```
 
-The first command restores every image of `D:\photos` with a QF under 80 in memory, judges each restoration, and writes the report and the contact sheets into `D:\photos\_backup\_jpeg_cleanup\`. The second also shows the restorations at offsets 0 and 20 on the sheets, to choose `--qf-offset` by eye. The third makes the fix. The fourth draws the contact sheets of that run from the backups. The fifth puts back what the last run changed.
+The first command restores every image of `D:\photos` with a QF under 80 in memory, judges each restoration, and writes the report and the contact sheets into `D:\photos_backup\_jpeg_cleanup\`. The second also shows the restorations at offsets 0 and 20 on the sheets, to choose `--qf-offset` by eye. The third makes the fix. The fourth draws the contact sheets of that run from the backups. The fifth puts back what the last run changed.
 
 | option | what it does |
 |---|---|
@@ -149,7 +149,7 @@ The first command restores every image of `D:\photos` with a QF under 80 in memo
 | `--no-sheets` | with `--dry-run`: the report only |
 | `--sheets` | with a real run: the sheets too |
 | `--quality Q` | the JPEG quality of a restored JPEG (default 97) |
-| `--review` | draw the contact sheets of the last run: each original in `_backup` next to the file now in place |
+| `--review` | draw the contact sheets of the last run: each original in the backup folder next to the file now in place |
 | `--undo` | put back what the last run of each folder changed |
 
 `--max-pixels`, `--exclude`, `--sidecars`, `--reanalyse` and `--threads` work as for `extract.bat`, and the QF measurements come from the same cache.
@@ -160,7 +160,7 @@ What the fix does with each image under the threshold:
 2. Encodes the result as it would be written: a JPEG source as JPEG at `--quality` with full-resolution colour (4:4:4, so the re-save adds no colour bleeding), a PNG, BMP, TIFF or lossless WebP source in its own format. The re-save at 97 differs from the restoration by 46 to 51 dB PSNR, far below the artifacts removed.
 3. Measures the QF of the result, the blockiness before and after, and the mean change from the original.
 4. Judges whether the restoration is worth saving. If it is not, the image and its captions stay untouched.
-5. In a real run, if it is: logs the image, copies the original and its captions to `_backup`, writes the restoration to a `.part` file and puts it in place of the image in one step. The image keeps its name, modification time, read-only flag, EXIF block (with the orientation) and ICC profile; a gray result leaves out an RGB profile, which does not fit it.
+5. In a real run, if it is: logs the image, copies the original and its captions to `<folder>_backup`, writes the restoration to a `.part` file and puts it in place of the image in one step. The image keeps its name, modification time, read-only flag, EXIF block (with the orientation) and ICC profile; a gray result leaves out an RGB profile, which does not fit it.
 
 The restorations are computed deterministically, so a real run saves exactly what its dry run listed as `fix`. A second run reads the restored images at QF 90 or so and leaves them alone.
 
@@ -179,13 +179,15 @@ On the 3,258 images under QF 80 of the dataset above, the rule saved 68 of 75 un
 
 ### Backup and undo
 
-The original of a restored image goes to `_backup\<relative path>`, with copies of its captions. When `_backup` already holds an original of that path (from `remove_borders`, the pipeline, or an earlier run), that one stays: a backup is the one untouched original of an image, shared by every tool, and it is never overwritten.
+The original of a restored image goes to `<folder>_backup\<relative path>`, next to the dataset folder and outside it, with copies of its captions. When the backup folder already holds an original of that path (from `remove_borders`, the pipeline, or an earlier run), that one stays: a backup is the one untouched original of an image, shared by every tool, and it is never overwritten.
 
-`--undo` takes the last run that is not undone yet and returns every image it restored to its original in `_backup`, newest first; an earlier run's change to the same image goes with it, since the only backup is the original. A backup the run made is removed; one that was there before stays. Caption copies the run made are removed while the caption in place is unchanged, and a missing caption comes back. Each `--undo` goes one run further back. A run that wrote nothing logs no run.
+`--undo` takes the last run that is not undone yet and returns every image it restored to its original in the backup folder, newest first; an earlier run's change to the same image goes with it, since the only backup is the original. A backup the run made is removed; one that was there before stays. Caption copies the run made are removed while the caption in place is unchanged, and a missing caption comes back. Each `--undo` goes one run further back. A run that wrote nothing logs no run.
+
+The backup folder is shared with the other dataset tools; see [The backup folder](../README.md#the-backup-folder) in the main README. A `_backup` folder inside the dataset, where the backup was until 2026-10-11, is moved to `<folder>_backup` on the next run, dry run, undo or review, and the undo log of an old run still works. A folder named `<folder>_backup` that the tools did not make stops the run.
 
 ### Contact sheets
 
-`fix_NNNN_qLO-HI.jpg` for the restorations worth saving and `nofix_NNNN_qLO-HI.jpg` for the ones left alone, 8 images per sheet in QF order, in `_backup\_jpeg_cleanup\sheets`. The label of each row says SAVE with the reason, or LEAVE, with the QF, blockiness and change. Each row has a thumbnail with the crop marked in red, a 256 x 256 crop at 100% (the original, then each restoration), and the most changed 96 x 96 part of that crop, magnified 3 times. The crop sits where the restoration changed the image most: on a blocky image where the blocks were, on a grainy one where the most grain went. Judge both: the artifacts should be gone, and the grain of a film photo or the dots of a print should stay. The sheets are JPEG at quality 95 with 4:4:4 colour. A run deletes the sheets of the last one. A real run draws sheets only with `--sheets`; `--review` draws them afterwards, from the log of the last run that is not undone: every image it wrote, the original from where the run kept it next to the file in place, with columns `original` and `written`. It reads files only, so it needs no GPU (417 images take about 10 seconds).
+`fix_NNNN_qLO-HI.jpg` for the restorations worth saving and `nofix_NNNN_qLO-HI.jpg` for the ones left alone, 8 images per sheet in QF order, in `<folder>_backup\_jpeg_cleanup\sheets`. The label of each row says SAVE with the reason, or LEAVE, with the QF, blockiness and change. Each row has a thumbnail with the crop marked in red, a 256 x 256 crop at 100% (the original, then each restoration), and the most changed 96 x 96 part of that crop, magnified 3 times. The crop sits where the restoration changed the image most: on a blocky image where the blocks were, on a grainy one where the most grain went. Judge both: the artifacts should be gone, and the grain of a film photo or the dots of a print should stay. The sheets are JPEG at quality 95 with 4:4:4 colour. A run deletes the sheets of the last one. A real run draws sheets only with `--sheets`; `--review` draws them afterwards, from the log of the last run that is not undone: every image it wrote, the original from where the run kept it next to the file in place, with columns `original` and `written`. It reads files only, so it needs no GPU (417 images take about 10 seconds).
 
 ## Output
 
@@ -196,7 +198,8 @@ The original of a restored image goes to `_backup\<relative path>`, with copies 
   extract.csv                one row per image of the dataset
   summary.txt                counts per band, a QF histogram, the skipped images
   manifest.json              the files the last extract copied
-<folder>\_backup\
+<folder>_backup\
+  _dataset_tools.json        marks the folder as the backup folder of the dataset tools
   <relative path>\<image>    the original of a restored image
   <relative path>\<name>.txt its captions
   _jpeg_cleanup\
@@ -212,7 +215,7 @@ The original of a restored image goes to `_backup\<relative path>`, with copies 
 
 Both files are UTF-8 with a byte order mark, so Excel shows Cyrillic names correctly.
 
-`extract.bat` and `--dry-run` write only into `_backup\_jpeg_cleanup`. The other dataset tools skip `_backup`. When you are sure of the fix, delete the backup files to free the space, and keep `_jpeg_cleanup` while you may want `--undo`.
+`extract.bat` and `--dry-run` write only into `<folder>_backup\_jpeg_cleanup`, outside the dataset. When you are sure of the fix, delete the backup files to free the space, and keep `_jpeg_cleanup` while you may want `--undo`.
 
 ## Speed
 

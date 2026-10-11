@@ -59,7 +59,8 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 CAPTION_EXT = ".txt"
 LATENT_DIRNAME = "_latent_cache"    # AI Toolkit: <stem>_<hash>.safetensors, keyed by file name and crop
 TE_DIRNAME = "_t_e_cache"           # AI Toolkit: <stem>_<hash>.safetensors, keyed by caption text
-BACKUP_DIRNAME = "_backup"          # the other dataset tools' originals: never scanned, never moved
+BACKUP_DIRNAME = "_backup"          # the other dataset tools' old backup: never scanned, never moved
+BACKUP_MARK = "_dataset_tools.json"  # marks <dataset>_backup, the backup folder of the other tools: never scanned
 SIZE_DB_NAME = ".aitk_size.json"    # AI Toolkit's image size cache in a dataset folder
 SKIP_DIRS = {d.casefold() for d in (LATENT_DIRNAME, TE_DIRNAME, BACKUP_DIRNAME)}
 DEST_SUFFIX = "media-rebalanced"
@@ -209,7 +210,8 @@ def scan(root: Path):
             if is_link(e):
                 links.append("/".join(parts + (e.name,)))
             elif e.is_dir(follow_symlinks=False):
-                if not e.name.startswith(".") and e.name.casefold() not in SKIP_DIRS:
+                if (not e.name.startswith(".") and e.name.casefold() not in SKIP_DIRS
+                        and not os.path.isfile(os.path.join(e.path, BACKUP_MARK))):
                     subdirs.append(e.name)
             elif e.is_file(follow_symlinks=False):
                 files.append(e.name)

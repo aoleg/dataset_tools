@@ -8,7 +8,7 @@ scanned at any depth, its JPEG quality factor (QF) is predicted from the stored
 pixels, and each image under the highest band limit is copied with its sidecars
 into one folder per band, outside the dataset, so a threshold can be chosen by
 eye. The dataset itself is never changed; the only file written into it is the
-measurement cache in <folder>/_backup/_jpeg_cleanup/cache.json.
+measurement cache in <folder>_backup/_jpeg_cleanup/cache.json, next to it.
 
 An extract folder given instead of a dataset folder is sorted again in place,
 from its extract.csv and its manifest, without the dataset: new band limits
@@ -17,12 +17,14 @@ move the copies between the band folders.
 The fix: every image with a QF under --threshold is restored in memory, at
 its QF plus --qf-offset, encoded as it would be written, and judged: only a
 restoration that removes enough of the artifacts is saved. Its original and
-captions go to <folder>/_backup/<same relative path> first; the restoration
+captions go to <folder>_backup/<same relative path> first, next to the
+dataset folder and outside it, so a trainer never sees them; the restoration
 then replaces the image under its own name. --dry-run does all of it but the
 writing and draws contact sheets (before and after, at 100% and magnified);
 --undo puts back what the last run changed; --review draws the sheets of the
-last run from the originals in _backup and the files in place. The report, the log and the sheets
-are in <folder>/_backup/_jpeg_cleanup.
+last run from the originals in the backup and the files in place. The report,
+the log and the sheets are in <folder>_backup/_jpeg_cleanup. A _backup folder
+inside the dataset, where the backup was before, is moved out on the next run.
 
 Usage:    python jpeg_cleanup.py --extract <folder> [<folder> ...] [--out DIR]
           [--bands LIST] [--max-pixels N] [--exclude NAME] [--sidecars LIST]
@@ -69,15 +71,17 @@ MODELS = {
     "gray": ("fbcnn_gray_double.pth", 287745895, "4444b8b2393649a4acd5d8730410ec3106d15b6e262a49081e4e87b44cfa5cea"),
 }
 
-BACKUP_DIRNAME = "_backup"
-RUN_DIRNAME = "_jpeg_cleanup"     # inside _backup: the measurement cache
+BACKUP_SUFFIX = "_backup"         # <folder>_backup next to the folder: originals, sidecars, run folders
+OLD_BACKUP_DIRNAME = "_backup"    # the backup inside the folder until 2026-10-11; moved out by claim_backup
+BACKUP_MARK = "_dataset_tools.json"  # marks a backup folder of the dataset tools; such a folder is never scanned
+RUN_DIRNAME = "_jpeg_cleanup"     # inside the backup folder: the measurement cache
 CACHE_NAME = "cache.json"         # measurements by file, reused while a file is unchanged
 EXTRACT_SUFFIX = "_jpeg_extract"  # default output: <dataset folder>_jpeg_extract next to it
 EXTRACT_CSV = "extract.csv"
 SUMMARY_NAME = "summary.txt"
-REPORT_NAME = "report.csv"        # inside _backup/_jpeg_cleanup: the fix, one row per image
-SHEETS_DIRNAME = "sheets"         # inside _backup/_jpeg_cleanup: the contact sheets of the last fix run
-LOG_NAME = "log.jsonl"            # inside _backup/_jpeg_cleanup: every real run and undo; --undo reads it
+REPORT_NAME = "report.csv"        # inside <folder>_backup/_jpeg_cleanup: the fix, one row per image
+SHEETS_DIRNAME = "sheets"         # inside <folder>_backup/_jpeg_cleanup: the contact sheets of the last fix run
+LOG_NAME = "log.jsonl"            # inside <folder>_backup/_jpeg_cleanup: every real run and undo; --undo reads it
 MANIFEST_NAME = "manifest.json"   # the files the last extract copied, removed by the next one
 MOVES_NAME = "moves.json"         # the moves of a re-sort in progress; the next run finishes them
 PROGRESS_EVERY = 500              # images between progress lines
@@ -85,10 +89,12 @@ PROGRESS_EVERY = 500              # images between progress lines
 IMAGE_EXTS = {".jpg", ".jpeg", ".jpe", ".jfif", ".png", ".webp", ".bmp", ".tif", ".tiff",
               ".gif", ".avif", ".heic", ".heif"}
 # Folders never scanned, at any depth: the output folders of the dataset tools.
-# _backup is remove_borders' and this tool's, _duplicates is deduplicate's, _prep
-# is k2prep's, _classify and _embeddings are classify's, masks and faces are
-# face_masks'. Any other folder is scanned; --exclude adds names.
-DEFAULT_EXCLUDES = [BACKUP_DIRNAME, "_duplicates", "_prep", "_classify", "_embeddings", "masks", "faces"]
+# _backup is the old backup folder of this tool and the others, _duplicates is
+# deduplicate's, _prep is k2prep's, _classify and _embeddings are classify's,
+# masks and faces are face_masks'. A folder holding BACKUP_MARK (the backup of
+# a subfolder, <subfolder>_backup) is skipped too. Any other folder is
+# scanned; --exclude adds names.
+DEFAULT_EXCLUDES = [OLD_BACKUP_DIRNAME, "_duplicates", "_prep", "_classify", "_embeddings", "masks", "faces"]
 DEFAULT_SIDECARS = ".txt"
 DEFAULT_BANDS = "60,70,80,85"
 DEFAULT_MAX_PIXELS = 2048 * 2048  # larger images are skipped: the downscale to 1024^2 hides their artifacts
@@ -135,13 +141,14 @@ class Item:
 
 def scan(root: Path, excludes, sidecar_exts) -> list[Item]:
     """The images under root at any depth, with their sidecars. Folders are
-    skipped by exact name (case-insensitive), at any depth."""
+    skipped by exact name (case-insensitive), at any depth, and so is a
+    backup folder of the dataset tools."""
     excl = {e.casefold() for e in excludes}
     exts = {e.casefold() for e in sidecar_exts}
     items = []
     for dirpath, dirnames, filenames in os.walk(root):
         here = Path(dirpath)
-        dirnames[:] = sorted(d for d in dirnames if d.casefold() not in excl)
+        dirnames[:] = sorted(d for d in dirnames if d.casefold() not in excl and not is_backup_dir(here / d))
         side_by_stem: dict[str, list[str]] = {}
         for fn in filenames:
             stem, ext = os.path.splitext(fn)
@@ -441,7 +448,7 @@ def file_key(path: Path) -> list[int]:
 
 
 def cache_path(root: Path) -> Path:
-    return root / BACKUP_DIRNAME / RUN_DIRNAME / CACHE_NAME
+    return backup_dir(root) / RUN_DIRNAME / CACHE_NAME
 
 
 def load_cache(root: Path) -> dict:
@@ -1191,7 +1198,7 @@ FIX_FIELDS = ["path", "format", "mode", "width", "height", "gray", "header_q", "
 
 
 def write_report(root: Path, items) -> Path:
-    path = root / BACKUP_DIRNAME / RUN_DIRNAME / REPORT_NAME
+    path = backup_dir(root) / RUN_DIRNAME / REPORT_NAME
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".part")
     with open(tmp, "w", encoding="utf-8-sig", newline="") as f:
@@ -1208,9 +1215,91 @@ def write_report(root: Path, items) -> Path:
     return path
 
 
+# --- the backup folder ------------------------------------------------------------
+# The originals, the logs and the caches live in <folder>_backup next to the
+# dataset folder, not inside it: AI Toolkit trains on every image under the
+# dataset folder, _backup included. The folder is shared by every tool of
+# this repository and holds BACKUP_MARK; a folder of that name without the
+# mark is someone else's and is never written into. A _backup folder inside
+# the dataset, from before, is moved into it on the first run, dry run, undo
+# or review. Log records name backup files relative to the backup folder;
+# records from before name them relative to the dataset folder, as
+# _backup/<path> (see from_log). The same as in remove_borders.
+
+def backup_dir(root: Path) -> Path:
+    return root.with_name(root.name + BACKUP_SUFFIX)
+
+
+def is_backup_dir(path: Path) -> bool:
+    return (path / BACKUP_MARK).is_file()
+
+
+def claim_backup(root: Path, create: bool = True, say=print) -> Path:
+    """The backup folder of root, checked, with an old _backup moved into it.
+    create=False (an undo): the folder is not made when there is nothing to
+    move into it. say: where the note of a move goes."""
+    if root.parent == root:
+        raise SystemExit(f"{root}: a drive root has no folder next to it for its backup; use a subfolder")
+    if is_backup_dir(root):
+        raise SystemExit(f"{root} is the backup folder of a dataset, not a dataset")
+    bdir = backup_dir(root)
+    if bdir.exists() and not is_backup_dir(bdir) and (not bdir.is_dir() or any(bdir.iterdir())):
+        raise SystemExit(f"{bdir} exists and was not made by the dataset tools; rename it or move it away, "
+                         f"the backup of {root.name} goes there")
+    old = root / OLD_BACKUP_DIRNAME
+    if old.is_dir():
+        left = move_old_backup(old, bdir)
+        say(f"{root.name}: the backup moved out of the dataset, from {old} to {bdir}"
+            + (f"; {left} files that differ from the ones in {bdir.name} stay in {old}" if left else ""))
+    if create or bdir.is_dir():
+        bdir.mkdir(exist_ok=True)
+        if not is_backup_dir(bdir):
+            (bdir / BACKUP_MARK).write_text(json.dumps({"made_by": "dataset_tools", "dataset": root.name}) + "\n",
+                                            encoding="utf-8")
+    return bdir
+
+
+def move_old_backup(old: Path, bdir: Path) -> int:
+    """Move an old _backup into bdir: one rename when bdir is not there yet,
+    else file by file, never over a file in bdir (one with the same bytes is
+    dropped, one with other bytes stays in old). -> the files left in old."""
+    left = 0
+    try:
+        if not bdir.exists():
+            os.rename(old, bdir)
+            return 0
+        for dirpath, dirnames, filenames in os.walk(old):
+            for fn in filenames:
+                src = Path(dirpath) / fn
+                dst = bdir / src.relative_to(old)
+                if not dst.exists():
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(src, dst)
+                elif same_bytes(src, dst):
+                    make_writable(src)
+                    src.unlink()
+                else:
+                    left += 1
+    except OSError as e:
+        raise SystemExit(f"cannot move {old} to {bdir}: {e}")
+    for dirpath, dirnames, filenames in os.walk(old, topdown=False):
+        try:
+            Path(dirpath).rmdir()
+        except OSError:
+            pass
+    return left
+
+
+def from_log(bdir: Path, where: str) -> Path:
+    """A backup file named in a log record: relative to the backup folder, or,
+    in a record from before the backup moved out, _backup/<path>."""
+    prefix = OLD_BACKUP_DIRNAME + "/"
+    return bdir / (where[len(prefix):] if where.startswith(prefix) else where)
+
+
 # --- writing, backup and undo ------------------------------------------------------
 # A real run logs every image before it touches it, so --undo can put back an
-# interrupted run too. The original goes to _backup/<relative path>; when an
+# interrupted run too. The original goes to <folder>_backup/<relative path>; when an
 # earlier original of that path is there already (from remove_borders, say, or
 # an earlier run), it stays: a backup is the one untouched original of an
 # image, shared by every tool, and the undo returns the image to it.
@@ -1219,7 +1308,7 @@ class RunLog:
     """log.jsonl in the run folder: one JSON object per line, flushed as written."""
 
     def __init__(self, root: Path):
-        self.path = root / BACKUP_DIRNAME / RUN_DIRNAME / LOG_NAME
+        self.path = backup_dir(root) / RUN_DIRNAME / LOG_NAME
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.f = open(self.path, "a", encoding="utf-8")
 
@@ -1264,8 +1353,8 @@ def finish_write(tmp: Path, dst: Path, src_stat: os.stat_result) -> None:
 
 
 def backup_place(root: Path, it, run_id: str) -> Path:
-    """_backup/<relative path>, whether or not an original is there already."""
-    return root / BACKUP_DIRNAME / it.rel
+    """<folder>_backup/<relative path>, whether or not an original is there already."""
+    return backup_dir(root) / it.rel
 
 
 def write_fix(root: Path, it, data: bytes, bk: Path) -> dict:
@@ -1276,7 +1365,7 @@ def write_fix(root: Path, it, data: bytes, bk: Path) -> dict:
     try:
         st = os.stat(it.path)
         rec["image"] = copy_keep(it.path, bk)
-        rec["sidecars"] = {sc.relative_to(root).as_posix(): copy_keep(sc, root / BACKUP_DIRNAME / sc.relative_to(root))
+        rec["sidecars"] = {sc.relative_to(root).as_posix(): copy_keep(sc, backup_dir(root) / sc.relative_to(root))
                            for sc in it.sidecars}
         tmp = part_path(it.path)
         tmp.write_bytes(data)
@@ -1289,7 +1378,7 @@ def write_fix(root: Path, it, data: bytes, bk: Path) -> dict:
 
 
 def read_log(root: Path) -> list[dict]:
-    path = root / BACKUP_DIRNAME / RUN_DIRNAME / LOG_NAME
+    path = backup_dir(root) / RUN_DIRNAME / LOG_NAME
     if not path.exists():
         return []
     out = []
@@ -1314,7 +1403,7 @@ def last_run(entries: list[dict]) -> tuple[str | None, list[dict]]:
 
 def undo_root(root: Path) -> dict:
     """Put back what the last run of root changed, newest first. An image gets
-    its original back from _backup (the one untouched original, so an earlier
+    its original back from the backup (the one untouched original, so an earlier
     run's change to the image goes too); a backup this run made is removed,
     one that was there before stays. A caption backup this run made is
     removed when the caption in place has the same bytes. -> counts."""
@@ -1323,10 +1412,10 @@ def undo_root(root: Path) -> dict:
     if run_id is None:
         return counts
     done = {r["rel"]: r for r in recs if r.get("op") == "fix"}
-    bdir = root / BACKUP_DIRNAME
+    bdir = backup_dir(root)
     for intent in reversed([r for r in recs if r.get("op") == "intent"]):
         rel, rec = intent["rel"], done.get(intent["rel"], {})
-        bk, dst = root / intent["backup"], root / rel
+        bk, dst = from_log(bdir, intent["backup"]), root / rel
         if not bk.exists():
             counts["no backup"] += 1
             print(f"  not restored, no backup: {rel}")
@@ -1370,12 +1459,12 @@ def review_root(root: Path, threads: int) -> tuple[int, int, int] | None:
     intents = {r["rel"]: r for r in recs if r.get("op") == "intent"}
     done = sorted((r for r in recs if r.get("op") == "fix" and "error" not in r and r["rel"] in intents),
                   key=lambda r: (r.get("qf", 0), r["rel"]))
-    sheet_dir = root / BACKUP_DIRNAME / RUN_DIRNAME / SHEETS_DIRNAME
+    sheet_dir = backup_dir(root) / RUN_DIRNAME / SHEETS_DIRNAME
     clear_sheets(sheet_dir)
     sheets = SheetWriter(sheet_dir, [], "fix", heads=["original", "written"])
 
     def tile(rec):
-        a = decode(root / intents[rec["rel"]]["backup"], 1 << 62)
+        a = decode(from_log(backup_dir(root), intents[rec["rel"]]["backup"]), 1 << 62)
         b = decode(root / rec["rel"], 1 << 62)
         if a["skip"] or b["skip"]:
             return None, "original: " + a["skip"] if a["skip"] else "written file: " + b["skip"]
@@ -1411,6 +1500,7 @@ def fix_folder(root: Path, args, model_box: list) -> int:
     t0 = time.perf_counter()
     dry = args.dry_run
     sidecar_exts = [e if e.startswith(".") else "." + e for e in (s.strip() for s in args.sidecars.split(",")) if e]
+    claim_backup(root)
     items = scan(root, DEFAULT_EXCLUDES + args.exclude, sidecar_exts)
     print(f"{root}: {len(items):,} images found", flush=True)
     reused = measure_items(root, items, args.max_pixels, args.threads, args.reanalyse, model_box)
@@ -1420,7 +1510,7 @@ def fix_folder(root: Path, args, model_box: list) -> int:
         it.status, it.fix = fix_action(it, args.threshold, args.max_pixels), {}
     todo = sorted((it for it in items if it.status == "fix"), key=lambda it: (it.m["qf"], it.rel))
     offsets = [args.qf_offset] + [o for o in args.sheet_offsets if o != args.qf_offset]
-    sheet_dir = root / BACKUP_DIRNAME / RUN_DIRNAME / SHEETS_DIRNAME
+    sheet_dir = backup_dir(root) / RUN_DIRNAME / SHEETS_DIRNAME
     clear_sheets(sheet_dir)
     want_sheets = not args.no_sheets if dry else args.sheets
     # one set of sheets for the restorations worth saving, one for the rest
@@ -1456,7 +1546,7 @@ def fix_folder(root: Path, args, model_box: list) -> int:
                             log.write({"run": run_id, "time": time.strftime("%Y-%m-%d %H:%M:%S"),
                                        "threshold": args.threshold, "qf_offset": args.qf_offset})
                         bk = backup_place(root, it, run_id)
-                        log.write({"op": "intent", "rel": it.rel, "backup": bk.relative_to(root).as_posix(),
+                        log.write({"op": "intent", "rel": it.rel, "backup": bk.relative_to(backup_dir(root)).as_posix(),
                                    "fresh": not bk.exists(),
                                    "sidecars": [sc.relative_to(root).as_posix() for sc in it.sidecars]})
                         rec = write_fix(root, it, data, bk)
@@ -1511,7 +1601,7 @@ def fix_folder(root: Path, args, model_box: list) -> int:
     if dry:
         print("  dry run: no image was changed")
     else:
-        print(f"  done:    {written:,} images restored in place, originals in {root / BACKUP_DIRNAME}"
+        print(f"  done:    {written:,} images restored in place, originals in {backup_dir(root)}"
               + (f"; {failed:,} failed (see the report)" if failed else ""))
         if written and sheets is None:
             print("  sheets:  none in a real run without --sheets; --review draws them from the backups")
@@ -1568,6 +1658,7 @@ def extract_dataset(root: Path, out: Path, args, model_box: list) -> None:
     t0 = time.perf_counter()
     bands = args.bands or parse_bands(DEFAULT_BANDS)
     sidecar_exts = [e if e.startswith(".") else "." + e for e in (s.strip() for s in args.sidecars.split(",")) if e]
+    claim_backup(root)
     items = scan(root, DEFAULT_EXCLUDES + args.exclude, sidecar_exts)
     print(f"{root}: {len(items):,} images found", flush=True)
     reused = measure_items(root, items, args.max_pixels, args.threads, args.reanalyse, model_box)
@@ -1632,7 +1723,7 @@ def fix(args) -> int:
     """The fix of every folder. A dry run takes an extract folder too: its
     copies have the bytes of their sources, so the report and the sheets show
     what a run on the dataset would do, and the dry run writes only into its
-    _backup folder, which a re-sort of the extract leaves alone. A real run
+    backup folder next to it, which a re-sort of the extract leaves alone. A real run
     does not: it would turn the copies into something their extract.csv no
     longer describes."""
     roots = check_roots(args.folders)
@@ -1647,6 +1738,7 @@ def fix(args) -> int:
 
 def undo(args) -> int:
     for root in check_roots(args.folders):
+        claim_backup(root, create=False)
         c = undo_root(root)
         if not any(c.values()):
             print(f"{root}: no run to undo")
@@ -1658,13 +1750,14 @@ def undo(args) -> int:
 
 def review(args) -> int:
     for root in check_roots(args.folders):
+        claim_backup(root, create=False)
         res = review_root(root, args.threads)
         if res is None:
             print(f"{root}: no run to review")
         else:
             n, drawn, total = res
             print(f"{root}: {drawn:,} of {total:,} restored images drawn on {n} sheets in "
-                  f"{root / BACKUP_DIRNAME / RUN_DIRNAME / SHEETS_DIRNAME}")
+                  f"{backup_dir(root) / RUN_DIRNAME / SHEETS_DIRNAME}")
     return 0
 
 
@@ -1678,7 +1771,7 @@ def main(argv=None) -> int:
                     help="the fix in memory: write the report and the contact sheets, change no image")
     ap.add_argument("--undo", action="store_true", help="put back what the last fix of each folder changed")
     ap.add_argument("--review", action="store_true",
-                    help="contact sheets of the last fix: each original in _backup next to the file now in place")
+                    help="contact sheets of the last fix: each original in the backup next to the file now in place")
     ap.add_argument("--threshold", type=qf_arg, default=DEFAULT_THRESHOLD, metavar="QF",
                     help=f"fix images with a QF under this (default {DEFAULT_THRESHOLD})")
     ap.add_argument("--qf-offset", type=int, default=DEFAULT_QF_OFFSET, metavar="N",

@@ -66,6 +66,7 @@ OUTPUT_VERSION = 1                # bump when the files written for a plan chang
 OVERRIDES_NAME = "overrides.txt"
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
+BACKUP_MARK = "_dataset_tools.json"  # marks <dataset>_backup, the backup folder of the other tools: never scanned
 
 # name -> (source, file). "hf" files come from Bingsu/adetailer on Hugging Face,
 # "ultralytics" files from the ultralytics GitHub assets.
@@ -1702,13 +1703,15 @@ def draw_verdict(img: Image.Image, det: dict, sel: dict, dest: Path, plan: dict 
 # ---------------------------------------------------------------------------
 
 def scan(root: Path, out_dir: Path | None = None):
-    """Images under root; folders whose names start with "_", and the output
-    folder, are skipped."""
+    """Images under root; folders whose names start with "_", the output
+    folder, and the backup folder of a subfolder (<subfolder>_backup, marked
+    by BACKUP_MARK) are skipped."""
     out = []
     skip = out_dir.resolve() if out_dir else None
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = sorted(d for d in dirnames if not d.startswith("_")
-                             and (skip is None or (Path(dirpath) / d).resolve() != skip))
+                             and (skip is None or (Path(dirpath) / d).resolve() != skip)
+                             and not os.path.isfile(os.path.join(dirpath, d, BACKUP_MARK)))
         for fn in sorted(filenames):
             if os.path.splitext(fn)[1].lower() in IMAGE_EXTS:
                 out.append(Path(dirpath) / fn)

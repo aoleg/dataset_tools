@@ -5,7 +5,7 @@ title Remove borders
 
 rem Usage: run.bat <folder> [<folder> ...] [options]
 rem A folder dropped onto this file is scanned and its borders are cut off in
-rem place; the originals go to <folder>\_backup. All arguments go to
+rem place; the originals go to <folder>_backup. All arguments go to
 rem remove_borders.py unchanged; run.bat --help lists the options.
 
 rem Keep the window open at the end when started by double-click or drag-and-drop

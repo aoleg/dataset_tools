@@ -55,7 +55,8 @@ EMBED_DIRNAME = "_embeddings"
 RUN_DIRNAME = "_classify"
 UNSURE_DIRNAME = "_unsure"
 DEDUP_DIRNAME = "_duplicates"
-BACKUP_DIRNAME = "_backup"     # remove_borders: originals of cropped images
+BACKUP_DIRNAME = "_backup"     # the repair tools' originals, before they moved out to <dataset>_backup
+BACKUP_MARK = "_dataset_tools.json"  # marks <dataset>_backup, the backup folder of the other tools: never scanned
 # Skipped by exact name only. Dataset subfolders may start with "_" too.
 SKIP_DIRNAMES = {EMBED_DIRNAME, RUN_DIRNAME, UNSURE_DIRNAME, DEDUP_DIRNAME, BACKUP_DIRNAME}
 
@@ -99,6 +100,7 @@ def scan_root(root: Path, sidecar_exts: set[str], skip_abs: set[Path] = frozense
         dirnames[:] = sorted(
             d for d in dirnames
             if d not in skip_names and (here / d).resolve() not in skip_abs
+            and not (here / d / BACKUP_MARK).is_file()
         )
         by_stem: dict[str, list[str]] = {}
         for fn in filenames:

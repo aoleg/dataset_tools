@@ -89,7 +89,7 @@ The summary of every run shows the selection both ways: the percent of each clas
 
 The images of each class are drawn from the whole dataset at random. The draw is the same on every computer for the same dataset and `--seed`. A subfolder can lose more or fewer of its images than the share. With repeats: the shares hold in training when the destination gets the same repeat setting as the dataset.
 
-The dataset is searched with all its subfolders. A subfolder is used when it holds at least one image with its caption: `<name>.jpg`, `.jpeg`, `.png` or `.webp` with `<name>.txt` next to it. Images without a caption in such a subfolder are counted and never moved. The folders `_latent_cache`, `_t_e_cache` and `_backup`, and every folder whose name starts with `.`, are not searched. Links and junctions are not followed.
+The dataset is searched with all its subfolders. A subfolder is used when it holds at least one image with its caption: `<name>.jpg`, `.jpeg`, `.png` or `.webp` with `<name>.txt` next to it. Images without a caption in such a subfolder are counted and never moved. The folders `_latent_cache`, `_t_e_cache` and `_backup`, every folder whose name starts with `.`, and a backup folder of the dataset tools (marked by `_dataset_tools.json`) are not searched. Links and junctions are not followed.
 
 Two images with the same name and different extensions (`a.jpg` and `a.png`) share one caption and one cache name, so neither of them moves.
 
