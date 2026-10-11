@@ -20,10 +20,10 @@ touched.
 The caches of Ostris AI Toolkit go with the images. A latent cache file is
 named after the image and its crop, never its folder, so it moves with the
 image and stays valid. A text-embedding cache file is named after the caption
-text, so it is useless for the new caption: it goes to
-<input>_rebalance_backup/<subfolder>/_t_e_cache next to the input folder, out
-of the dataset, and --undo puts it back with the image and its original
-caption.
+text, so it is useless for the new caption. The original caption file and
+the text-embedding cache files go to <input>_rebalance_backup/<subfolder>
+next to the input folder, out of the dataset; --undo puts them back with the
+image, and they also allow a restore by hand.
 
 Without --apply nothing moves: the plan is written to the manifest
 (<input>_rebalance.json next to the input folder) and summarised. An
@@ -55,10 +55,11 @@ BACKUP_DIRNAME = "_backup"          # the other dataset tools' originals: never 
 SIZE_DB_NAME = ".aitk_size.json"    # AI Toolkit's image size cache in a dataset folder
 SKIP_DIRS = {d.casefold() for d in (LATENT_DIRNAME, TE_DIRNAME, BACKUP_DIRNAME)}
 DEST_SUFFIX = "media-rebalanced"
-BACKUP_SUFFIX = "_rebalance_backup"  # <input>_rebalance_backup: the text-embedding caches of moved images
+BACKUP_SUFFIX = "_rebalance_backup"  # <input>_rebalance_backup: original captions and text-embedding caches
 MANIFEST_SUFFIX = "_rebalance.json"
 SAVE_EVERY = 100                    # images between manifest writes
 LIST_LIMIT = 20                     # lines of any list printed
+RMDIR_TRIES, RMDIR_WAIT = 20, 0.1   # an emptied folder Windows still holds: tries, seconds between
 CLASSES = ("color", "bw", "ambiguous", "no_caption")
 SETTINGS = ("input", "dest", "seed", "color_pct", "bw_pct", "strip_russian")
 
@@ -308,8 +309,8 @@ def print_summary(m: dict):
     print(f"  after the move: medium stated {s['stated_after']} ({pct(s['stated_after'], total)}) "
           f"in the input folder: color {c['color'] - sel['color']}, bw {c['bw'] - sel['bw']}; "
           f"medium dropped {s['dropped']} ({pct(s['dropped'], total)}) in the destination")
-    print(f"  latent cache files to move: {s['latent_cache_files']}, "
-          f"text-embedding cache files to back up: {s['te_cache_files']}")
+    print(f"  latent cache files to move: {s['latent_cache_files']}; to back up: {s['dropped']} original captions "
+          f"and {s['te_cache_files']} text-embedding cache files")
     print(f"  folders touched: {s['folders_touched']}")
     if s["shared_name"]:
         print(f"  not moved, another image has the same name: {s['shared_name']}")
@@ -370,7 +371,7 @@ def paths(it: dict, src: Path, dst: Path, bk: Path) -> dict:
     sdir, ddir = src / rel.parent, dst / rel.parent
     return {"sdir": sdir, "ddir": ddir, "simg": sdir / rel.name, "dimg": ddir / rel.name,
             "scap": sdir / it["caption_file"], "dcap": ddir / (rel.stem + CAPTION_EXT),
-            "bte": bk / rel.parent / TE_DIRNAME}
+            "bcap": bk / rel.parent / it["caption_file"], "bte": bk / rel.parent / TE_DIRNAME}
 
 
 def text_or_none(path: Path) -> str | None:
@@ -393,6 +394,9 @@ def apply_item(it: dict, src: Path, dst: Path, bk: Path, counts: dict):
     dcap = text_or_none(p["dcap"])
     if dcap is not None and dcap != it["caption_new"]:
         raise OSError(f"another caption is in the destination: {p['dcap']}")
+    bcap = text_or_none(p["bcap"])
+    if bcap is not None and bcap != it["caption_old"]:
+        raise OSError(f"another caption is in the backup folder: {p['bcap']}")
 
     if it["latent_cache"]:
         (p["ddir"] / LATENT_DIRNAME).mkdir(parents=True, exist_ok=True)
@@ -400,7 +404,12 @@ def apply_item(it: dict, src: Path, dst: Path, bk: Path, counts: dict):
         move(p["simg"], p["dimg"])
     write_text(p["dcap"], it["caption_new"])
     if scap is not None:
-        p["scap"].unlink()
+        if bcap is None:
+            move(p["scap"], p["bcap"])      # the original caption file itself, kept for a restore by hand
+        else:
+            p["scap"].unlink()              # its backup is there already, the same text
+    elif bcap is None:
+        write_text(p["bcap"], it["caption_old"])
     for name in it["latent_cache"]:
         s, d = p["sdir"] / LATENT_DIRNAME / name, p["ddir"] / LATENT_DIRNAME / name
         if s.exists():
@@ -418,7 +427,8 @@ def apply_item(it: dict, src: Path, dst: Path, bk: Path, counts: dict):
 
 
 def undo_item(it: dict, src: Path, dst: Path, bk: Path, counts: dict, notes: list[str]):
-    """Put one image back with its original caption, its latent caches and its
+    """Put one image back with its original caption (the backed-up file, or the
+    manifest's text when that file is gone), its latent caches and its
     text-embedding caches; delete the text-embedding caches made for the new
     caption."""
     p = paths(it, src, dst, bk)
@@ -432,8 +442,18 @@ def undo_item(it: dict, src: Path, dst: Path, bk: Path, counts: dict, notes: lis
 
     if p["dimg"].exists():
         move(p["dimg"], p["simg"])
-    if scap is None:
+    bcap = text_or_none(p["bcap"])
+    if scap is None and bcap is not None:
+        move(p["bcap"], p["scap"])
+        if bcap != it["caption_old"]:
+            notes.append(f"{it['rel']}: the backed-up caption was edited; the edited one is back in the input folder")
+    elif scap is None:
         write_text(p["scap"], it["caption_old"])
+    elif bcap is not None:
+        if bcap == it["caption_old"]:
+            p["bcap"].unlink()              # the same text is in place already
+        else:
+            notes.append(f"{it['rel']}: the backed-up caption was edited; it stays in the backup folder")
     dcap = text_or_none(p["dcap"])
     if dcap is not None:
         if dcap == it["caption_new"]:
@@ -464,6 +484,40 @@ def undo_item(it: dict, src: Path, dst: Path, bk: Path, counts: dict, notes: lis
     it["status"] = "restored"
 
 
+def remove_dir(d: Path) -> bool:
+    """Remove a folder that holds no files. Windows can hold a folder whose files
+    were just deleted for a moment (a virus scanner or the search indexer still
+    has a handle), so a folder without files is tried again for up to 2 s."""
+    for _ in range(RMDIR_TRIES):
+        try:
+            os.rmdir(d)
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError:
+            if any(p.is_file() for p in d.rglob("*")):
+                return False
+            time.sleep(RMDIR_WAIT)
+    return False
+
+
+def clear_folder(root: Path) -> list[str]:
+    """Delete root when no file is left in it but AI Toolkit's size cache, which
+    goes too; else return the files left."""
+    if not root.is_dir():
+        return []
+    files = sorted(p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file())
+    if files == [SIZE_DB_NAME]:         # the trainer's size cache of the destination, nothing else
+        (root / SIZE_DB_NAME).unlink()
+        files = []
+    if files:
+        return files
+    for d in sorted((p for p in root.rglob("*") if p.is_dir()), key=lambda p: len(p.parts), reverse=True):
+        remove_dir(d)
+    remove_dir(root)
+    return []
+
+
 def remove_empty_dirs(dirs: set[Path], stop: Path):
     """Remove each folder that is empty, deepest first, and then its parents up
     to stop (kept)."""
@@ -473,10 +527,7 @@ def remove_empty_dirs(dirs: set[Path], stop: Path):
             chain.add(d)
             d = d.parent
     for d in sorted(chain, key=lambda p: len(p.parts), reverse=True):
-        try:
-            os.rmdir(d)
-        except OSError:
-            pass
+        remove_dir(d)
 
 
 # --- runs ---------------------------------------------------------------------
@@ -488,6 +539,20 @@ def plan_run(src: Path, settings: dict) -> dict:
          "created": time.strftime("%Y-%m-%dT%H:%M:%S"), "summary": summarize(items), "items": items}
     print_list("links and junctions, not followed", links)
     return m
+
+
+def backfill_captions(m: dict, src: Path, dst: Path, bk: Path) -> int:
+    """Write the original caption of every moved image whose backup file is
+    missing, from the manifest: a run made before the captions were backed up
+    gets them on its next --apply."""
+    n = 0
+    for it in m["items"]:
+        if it["status"] == "moved":
+            p = paths(it, src, dst, bk)
+            if not p["bcap"].exists() and not p["scap"].exists():
+                write_text(p["bcap"], it["caption_old"])
+                n += 1
+    return n
 
 
 def check_stale(m: dict, src: Path):
@@ -516,6 +581,9 @@ def run_apply(src: Path, dst: Path, mpath: Path, settings: dict) -> bool:
         m = plan_run(src, settings)
     todo = [it for it in m["items"] if it["selected"] and it["status"] == "planned"]
     write_manifest(mpath, m)
+    backfilled = backfill_captions(m, src, dst, bk)
+    if backfilled:
+        print(f"  original captions written to the backup folder from the manifest: {backfilled}")
     counts = {"latent": 0, "te": 0}
     errors, done = [], 0
     try:
@@ -534,7 +602,7 @@ def run_apply(src: Path, dst: Path, mpath: Path, settings: dict) -> bool:
         write_manifest(mpath, m)
     print_summary(m)
     print(f"  moved now: {done} images, {counts['latent']} latent cache files; "
-          f"{counts['te']} text-embedding cache files backed up to {bk}")
+          f"original captions and {counts['te']} text-embedding cache files backed up to {bk}")
     moved = sum(1 for it in m["items"] if it["status"] == "moved")
     print(f"  moved in all: {moved} images into {dst}")
     if errors:
@@ -577,32 +645,20 @@ def run_undo(src: Path, mpath: Path) -> bool:
         dirs |= {dst / rel / LATENT_DIRNAME, dst / rel / TE_DIRNAME, bk / rel / TE_DIRNAME}
     remove_empty_dirs({d for d in dirs if d.is_relative_to(dst)}, dst)
     remove_empty_dirs({d for d in dirs if d.is_relative_to(bk)}, bk)
-    try:
-        bk.rmdir()
-    except OSError:
-        pass
-    left = []
-    if dst.is_dir():
-        rest = [e.name for e in os.scandir(dst)]
-        if rest == [SIZE_DB_NAME]:              # the trainer's size cache of the destination, nothing else
-            (dst / SIZE_DB_NAME).unlink()
-            rest = []
-        if not rest:
-            dst.rmdir()
-        else:
-            left = [p.relative_to(dst).as_posix() for p in dst.rglob("*") if p.is_file()]
+    left = clear_folder(dst)
+    left_bk = clear_folder(bk)
     print_summary(m)
     print(f"  moved back: {done} images with their original captions, {counts['latent']} latent cache files, "
           f"{counts['te']} text-embedding cache files from {bk.name}; "
           f"{counts['te_deleted']} text-embedding cache files of the new captions deleted")
     print_list("notes", notes)
-    if dst.exists():
-        print_list(f"{dst} stays; files left in it", left)
-    else:
-        print(f"  {dst} is empty and deleted")
-    if bk.exists():
-        print_list(f"{bk} stays; files left in it",
-                   [p.relative_to(bk).as_posix() for p in bk.rglob("*") if p.is_file()])
+    for folder, files in ((dst, left), (bk, left_bk)):
+        if not folder.exists():
+            print(f"  {folder} is empty and deleted")
+        elif files:
+            print_list(f"{folder} stays; files left in it", files)
+        else:
+            print(f"  {folder} is empty, but Windows still holds it; delete it later")
     if errors:
         print_list("could not move back", errors)
         print(f"{len(errors)} images were not moved back; fix the cause and run --undo again")

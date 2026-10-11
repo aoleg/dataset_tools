@@ -2,7 +2,7 @@
 
 `rebalance_medium.py` teaches a model what a prompt without a medium means. When every caption of a dataset opens with its medium (`A color photograph from 1975 of ...`, `A black-and-white photograph from 1962 of ...`), a prompt that names no medium is out of distribution, and the model falls back to the medium that is cheaper to predict, usually black-and-white. The tool moves a share of the colour and black-and-white images into a sibling dataset folder and removes the medium word from their captions there. By default it moves 40 % of the colour images and 20 % of the black-and-white images; the difference counters the bias towards black-and-white.
 
-It is made for a training run in [Ostris AI Toolkit](https://github.com/ostris/ai-toolkit) that is already in progress. The latent cache of each moved image moves with it and stays valid. The text-embedding cache, which is keyed by the caption text, is parked outside the dataset and comes back with `--undo`.
+It is made for a training run in [Ostris AI Toolkit](https://github.com/ostris/ai-toolkit) that is already in progress. The latent cache of each moved image moves with it and stays valid. The original caption files and the text-embedding caches, which are keyed by the caption text, are kept in a backup folder outside the dataset and come back with `--undo`.
 
 ## Install
 
@@ -79,7 +79,7 @@ All folders are next to the dataset folder:
 |---|---|
 | `1_main-dataset_1024` | the dataset; it keeps the images that do not move, with their captions unchanged |
 | `1_main-dataset_media-rebalanced_1024` | the moved images with their new captions and their latent caches, in the same subfolders |
-| `1_main-dataset_1024_rebalance_backup` | the text-embedding caches of the moved images, in the same subfolders |
+| `1_main-dataset_1024_rebalance_backup` | the original caption files and the text-embedding caches of the moved images, in the same subfolders |
 | `1_main-dataset_1024_rebalance.json` | the manifest: every image, its class, its old and new caption, its caches and its state |
 
 The destination name is the dataset name with `_media-rebalanced` before its last `_<number>`, or after the name when it does not end in a number: `photos` becomes `photos_media-rebalanced`. `--dest NAME` gives another name.
@@ -89,10 +89,14 @@ The destination name is the dataset name with `_media-rebalanced` before its las
 1. Searches the dataset and draws the images, as a dry run does, and writes the plan to the manifest before the first move.
 2. For each drawn image:
    - moves the image to the same subfolder of the destination;
-   - writes the new caption next to it, then deletes the old caption from the dataset;
+   - writes the new caption next to it, then moves the original caption file from the dataset to the same subfolder of the backup folder;
    - moves its files in `_latent_cache` to `_latent_cache` in the destination. AI Toolkit names a latent cache file after the image file name and its crop, never its folder, so the file stays valid;
    - moves its files in `_t_e_cache` to the backup folder. AI Toolkit names a text-embedding cache file after the caption text, so these files do not match the new caption. The trainer makes new ones for the destination.
 3. Writes the manifest after every 100 images and at the end.
+
+Every original file of a moved image is kept in one of the folders: the image and its latent caches in the destination, its original caption and its text-embedding caches in the backup folder. No file is deleted.
+
+A run made before the original captions were backed up as files keeps them in the manifest only. Give the same `--apply` command again: it writes the missing caption files to the backup folder from the manifest and moves nothing else.
 
 A run stops before it moves anything when the destination or the backup folder exists. An interrupted run (Ctrl+C, a crash, a full disk) goes on from where it stopped when you give the same command again; images that moved are not moved twice. When the manifest records moved images, a run with other settings stops, and so does a dry run, which would write over the manifest; run `--undo` first, or give another `--manifest`. A run also stops when the manifest lists moved images that are in the dataset again.
 
@@ -102,14 +106,22 @@ The tool moves files and never copies them, so the destination and the backup fo
 
 `--undo` reads the manifest and, for each moved image:
 
-- moves the image back and writes its original caption back, byte for byte;
+- moves the image back, and its original caption file from the backup folder. When that file is missing, the caption is written from the manifest, byte for byte;
 - moves its latent caches back from the destination, also the ones that the trainer made there;
 - moves its text-embedding caches back from the backup folder, so the trainer finds them again and does not encode the original captions;
 - deletes the text-embedding caches that the trainer made in the destination for the new caption.
 
 Then it deletes the empty subfolders of the destination and the backup folder, and the folders themselves when they are empty. AI Toolkit's size cache `.aitk_size.json` in the destination is deleted when it is the last file there. Files that you added are listed and stay.
 
-When a caption in the destination was edited after the move, the original caption still goes back to the dataset, and the edited one stays in the destination and is listed. An interrupted undo can be started again.
+When a caption in the destination was edited after the move, the original caption still goes back to the dataset, and the edited one stays in the destination and is listed. When a backed-up caption was edited, the edited one goes back and is listed. An interrupted undo can be started again.
+
+## Restore by hand
+
+The folders hold every file, so the dataset can be restored without the tool and without the manifest:
+
+1. Move every file of the destination except the `.txt` captions (the images and the `_latent_cache` folders) back into the dataset folder, keeping the subfolders. Skip `.aitk_size.json`.
+2. Copy or move the contents of the backup folder into the dataset folder, keeping the subfolders. This puts back the original captions and the `_t_e_cache` files.
+3. Delete the destination folder, the backup folder and the manifest.
 
 ## Training with the result
 
@@ -121,5 +133,5 @@ When a caption in the destination was edited after the move, the original captio
 ## Limits
 
 - Captions are read as UTF-8. A caption in another encoding is ambiguous and does not move.
-- Keep the manifest and the backup folder for as long as you may want `--undo`.
+- Keep the manifest and the backup folder for as long as you may want `--undo`. Without the manifest, restore by hand.
 - A run of another tool that renames or moves files in the dataset or the destination between `--apply` and `--undo` changes the paths that the manifest knows. Undo that run first.
