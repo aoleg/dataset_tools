@@ -38,8 +38,17 @@ already (one backup per image, the untouched original, shared with the other
 tools), and the run logged in _backup/_pipeline/log.jsonl, so that --undo
 returns the images of the last run to their originals; "parallel" writes the
 whole tree into a new folder with the unchanged images and the captions
-copied along. Captions are never deleted or changed; the log says which images
-changed, so they can be captioned again.
+copied along. Captions are never deleted or changed by a run; the log says
+which images changed, so they can be captioned again.
+
+An undo with a file list ("undo": true with "files") returns exactly those
+images to their originals, whichever tool made the backup: the original is
+copied back, a renamed output (a JPEG written as PNG) removed, the mask
+restored from its backup or removed, the backup caption restored over the
+caption in place, and the backup copies deleted, because _backup holds only
+the originals of changed images. "delete_captions_without_backup" says what
+happens to a caption of an image whose backup has none: deleted (true) or
+kept (false, the default). An image without a backup is reported as skipped.
 
 Progress goes to stdout as JSON lines: one per image per pass (pass, index,
 total, path), a summary per pass, and a final summary.
@@ -114,6 +123,7 @@ JOB_EXAMPLE = {
     "save_png": False,
     "dry_run": False,
     "undo": False,
+    "delete_captions_without_backup": False,
     "threads": DEFAULT_THREADS,
 }
 
@@ -136,6 +146,7 @@ class Job:
     save_png: bool
     dry_run: bool
     undo: bool
+    delete_captions: bool                         # per-file undo: a caption whose backup has none goes
     threads: int
     excludes: list
 
@@ -163,8 +174,8 @@ def read_job(path: Path, args) -> Job:
     threads = args.threads or int(data.get("threads") or DEFAULT_THREADS)
     return Job(root=root, files=data.get("files"), stages=stages, mode=mode, target=target,
                save_png=bool(data.get("save_png")), dry_run=bool(args.dry_run or data.get("dry_run")),
-               undo=bool(args.undo or data.get("undo")), threads=max(1, min(32, threads)),
-               excludes=DEFAULT_EXCLUDES + list(data.get("exclude") or []))
+               undo=bool(args.undo or data.get("undo")), delete_captions=bool(data.get("delete_captions_without_backup")),
+               threads=max(1, min(32, threads)), excludes=DEFAULT_EXCLUDES + list(data.get("exclude") or []))
 
 
 # --- scan and decode ----------------------------------------------------------------
@@ -999,6 +1010,154 @@ def undo(root: Path) -> dict:
     return counts
 
 
+def latest_records(entries: list[dict]) -> dict:
+    """The latest successful in-place write of every image in the log, by
+    the image's path: what the apply pass recorded (its output name, its
+    mask and whether the mask had a backup). The records of an undone run
+    and of an image returned by a per-file undo are dropped."""
+    latest, by_run, run_id, in_place = {}, {}, None, True
+    for e in entries:
+        if "run" in e:
+            run_id, in_place = e["run"], e.get("mode", "in_place") == "in_place"
+        elif "undo" in e:
+            for rel in by_run.pop(e["undo"], []):
+                if latest.get(rel, {}).get("run") == e["undo"]:
+                    del latest[rel]
+        elif "undo_files" in e:
+            for rel in e["undo_files"]:
+                latest.pop(rel, None)
+        elif e.get("op") == "done" and "error" not in e and in_place and run_id is not None:
+            latest[e["rel"]] = dict(e, run=run_id)
+            by_run.setdefault(run_id, []).append(e["rel"])
+    return latest
+
+
+def rel_of(root: Path, raw) -> str | None:
+    """A file of the job's list as a path relative to the folder, or None
+    when it lies outside it."""
+    p = Path(str(raw))
+    if p.is_absolute():
+        try:
+            p = p.resolve().relative_to(root)
+        except ValueError:
+            return None
+    if ".." in p.parts:
+        return None
+    return p.as_posix()
+
+
+def mask_rel_of(rel: str) -> str:
+    """Where the tools keep the mask of an image: masks/<stem>.png next to it."""
+    p = Path(rel)
+    return (p.parent / MASKS_DIRNAME / (p.stem + ".png")).as_posix()
+
+
+def restore_from_backup(bk: Path, dst: Path) -> None:
+    """Put the backup's bytes at dst (atomically, over a read-only file too)
+    and delete the backup: the file is the original again."""
+    make_writable(dst)
+    tmp = rb.part_path(dst)
+    shutil.copy2(bk, tmp)
+    os.replace(tmp, dst)
+    make_writable(bk)
+    bk.unlink()
+
+
+def undo_files(root: Path, files: list, delete_captions: bool) -> dict:
+    """Return the listed images to their originals, whichever tool made the
+    backup. Per image, when _backup/<rel> exists: a renamed output (the
+    pipeline's PNG for a JPEG, from the log, or the PNG next to an image
+    that is missing under its own name) is removed; the original is copied
+    back; the mask is restored from its backup, or removed when the pipeline
+    made it; the backup caption is restored over the caption in place, and a
+    caption without a backup is deleted or kept as delete_captions says;
+    the backup copies go, because _backup holds only the originals of changed
+    images. An image without a backup is skipped. One JSON line per file.
+    -> counts."""
+    latest = latest_records(read_log(root))
+    by_out = {r["out"]: rel for rel, r in latest.items() if r.get("out") and r["out"] != rel}
+    bdir = root / BACKUP_DIRNAME
+    counts = {"files": 0, "restored": 0, "skipped": 0, "failed": 0, "masks restored": 0, "masks removed": 0,
+              "captions restored": 0, "captions deleted": 0}
+    restored = []
+    for raw in files:
+        counts["files"] += 1
+        rel = rel_of(root, raw)
+        line = {"undo": True, "path": rel if rel is not None else str(raw)}
+        if rel is None:
+            line["skipped"] = "outside the folder"
+            counts["skipped"] += 1
+            emit(line)
+            continue
+        if not (bdir / rel).is_file() and rel in by_out:
+            rel = by_out[rel]                      # the output of a renamed image names its original
+            line["path"], line["output_of"] = rel, line["path"]
+        bk = bdir / rel
+        if not bk.is_file():
+            line["skipped"] = "no backup"
+            counts["skipped"] += 1
+            emit(line)
+            continue
+        try:
+            rec = latest.get(rel, {})
+            dst = root / rel
+            out_rel = rec["out"] if rec.get("out") and rec["out"] != rel else None
+            if out_rel is None and not dst.exists():
+                png = Path(rel).with_suffix(".png").as_posix()
+                if (root / png).is_file():         # another tool's PNG of a lossy format
+                    out_rel = png
+            if out_rel and (root / out_rel).is_file():
+                make_writable(root / out_rel)
+                (root / out_rel).unlink()
+                line["removed"] = out_rel
+            restore_from_backup(bk, dst)
+            line["restored"] = rel
+            # the mask: back from its backup, else gone when the pipeline made it
+            mask_rel = rec.get("mask") or mask_rel_of(out_rel or rel)
+            m, mb = root / mask_rel, bdir / mask_rel
+            if mb.is_file():
+                restore_from_backup(mb, m)
+                line["mask"] = "restored"
+                counts["masks restored"] += 1
+            elif rec.get("mask") and m.is_file():
+                make_writable(m)
+                m.unlink()
+                line["mask"] = "removed"
+                counts["masks removed"] += 1
+                try:
+                    m.parent.rmdir()
+                except OSError:
+                    pass
+            # the caption
+            cap_rel = Path(rel).with_suffix(".txt").as_posix()
+            cap, cb = root / cap_rel, bdir / cap_rel
+            if cb.is_file():
+                restore_from_backup(cb, cap)
+                line["caption"] = "restored"
+                counts["captions restored"] += 1
+            elif cap.is_file():
+                if delete_captions:
+                    make_writable(cap)
+                    cap.unlink()
+                    line["caption"] = "deleted"
+                    counts["captions deleted"] += 1
+                else:
+                    line["caption"] = "kept"
+            counts["restored"] += 1
+            restored.append(rel)
+        except Exception as e:  # noqa: BLE001 - one bad file is reported, not fatal
+            line["error"] = f"{type(e).__name__}: {e}"
+            counts["failed"] += 1
+        emit(line)
+    if restored:
+        log = RunLog(root)
+        log.write({"undo_files": restored, "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                   "delete_captions_without_backup": delete_captions, **counts})
+        log.close()
+    rb.remove_empty_dirs(bdir)
+    return counts
+
+
 # --- the apply pass ---------------------------------------------------------------------------
 
 def restore_array(array: np.ndarray, head: dict, m: dict, opts: dict) -> np.ndarray:
@@ -1272,7 +1431,9 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Run the repair tools over a dataset from a job file, one model at a time.")
     ap.add_argument("--job", required=False, metavar="FILE", help="the job as JSON (see --example)")
     ap.add_argument("--dry-run", action="store_true", help="the detection passes, the plan and the previews; change nothing")
-    ap.add_argument("--undo", action="store_true", help="return the images of the last run of the job's folder to their originals")
+    ap.add_argument("--undo", action="store_true",
+                    help="return the images of the last run of the job's folder to their originals, "
+                         "or the images of the job's file list")
     ap.add_argument("--threads", type=int, default=0, metavar="N", help="decoder threads and writer processes")
     ap.add_argument("--example", action="store_true", help="print an example job and exit")
     args = ap.parse_args(argv)
@@ -1283,9 +1444,9 @@ def main(argv=None) -> int:
         ap.error("--job is required")
     job = read_job(Path(args.job), args)
     if job.undo:
-        c = undo(job.root)
+        c = undo_files(job.root, job.files, job.delete_captions) if job.files else undo(job.root)
         emit({"summary": True, "undo": True, **c})
-        return 0
+        return 1 if c.get("failed") else 0
     return run(job)
 
 

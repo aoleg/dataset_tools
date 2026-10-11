@@ -48,6 +48,7 @@ run.bat --job job.json [--dry-run] [--undo] [--threads N]
  "save_png": false,
  "dry_run": false,
  "undo": false,
+ "delete_captions_without_backup": false,
  "threads": 4
 }
 ```
@@ -60,18 +61,23 @@ run.bat --job job.json [--dry-run] [--undo] [--threads N]
 | `output` | `{"mode": "in_place"}` changes the dataset folder; `{"mode": "parallel", "folder": "..."}` writes the whole tree into that folder, which must be outside the dataset, and copies the unchanged images and all captions along |
 | `save_png` | write every touched image as PNG |
 | `dry_run` | the detection passes, the plan and the previews; change nothing (also `--dry-run`) |
-| `undo` | return the images of the last run of the folder to their originals (also `--undo`) |
+| `undo` | return the images of the last run of the folder to their originals (also `--undo`); with `files`, return exactly those images to their originals instead, whichever tool made the backup |
+| `delete_captions_without_backup` | with `undo` and `files`: delete the caption of an image whose backup has none (`true`), or keep it (`false`, the default) |
 | `threads` | decoder threads and writer processes (also `--threads`); the models run one image at a time |
 
 ## Output
 
 Each pass prints one JSON line per image with `pass`, `index`, `total` and `path` (relative to the folder): a detection pass adds `cached` when the result was in the cache, or `skipped` or `error`; the compose pass adds `changed` (the stages that change the image, empty when none does), `notes` (what each stage found) and `box` (the crop in upright pixels, when there is one); the apply pass adds `write` (`lossless`, `array` or `none`), `written` (the path of the output), `mask`, and `removed` when a JPEG became a PNG. Each pass ends with a summary line (`"summary": true` with the pass name and its counts), and the run with a final summary: the counts, the seconds, and the peak VRAM. The plan goes to `_backup/_pipeline/plan.json`, the apply lines also to `_backup/_pipeline/report.jsonl`.
 
+An undo with a file list prints one line per file with `undo`, `path` and either `restored` (with `removed` for a renamed output, `mask` as `restored` or `removed`, `caption` as `restored`, `deleted` or `kept`), `skipped` with the reason (`no backup`, `outside the folder`) or `error`; then a summary with the counts. A file named by its output (`a.png` for an `a.jpg` that became a PNG) is restored as the original, and the line says so in `output_of`. The exit code is 1 when any file failed.
+
 ## Backup and undo
 
 A backup is the one untouched original of an image, shared with the other tools: `<folder>/_backup/<same relative path>`, with its caption next to it. In place, the apply pass copies the original there right before its single write, once per image however many stages change it, and never over an original that is there already (from remove_borders, jpeg_cleanup or an earlier pipeline run). A mask that exists already is backed up the same way. The run is logged in `_backup/_pipeline/log.jsonl`, one line per image before and after its write, so `--undo` works after an interruption too.
 
 `--undo` returns the images of the last run to their originals: every image the run wrote comes back from `_backup`, a renamed output (a JPEG written as PNG) is removed, the masks are restored or removed, and in parallel mode the files written into the output folder are removed. Since the only backup is the original, undoing a later run also reverts earlier runs' changes to the same image. Backups that the run copied are removed by the undo; earlier ones stay. Each `--undo` goes one run further back.
+
+**Per-file undo.** A job with `"undo": true` and `files` returns exactly the listed images to their originals, whichever tool made the backup (a pipeline run, or remove_borders or jpeg_cleanup on their own). For each image with a backup: a renamed output is removed (the PNG the log records for it, or the PNG next to an image that is missing under its own name), the original is copied back, the mask is restored from its backup or removed when the pipeline made it, and the backup caption is restored over the caption in place. Then the backup copies are deleted, because `_backup` holds only the originals of changed images. A caption of an image whose backup has none is deleted with `"delete_captions_without_backup": true` and kept with `false`. An image without a backup is skipped. The run logs of the tools then refer to files already restored, which their own `--undo` tolerates: those files count as having no backup, and the rest of the run is returned as usual.
 
 ## Previews
 
