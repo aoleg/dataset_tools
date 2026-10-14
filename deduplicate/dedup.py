@@ -24,10 +24,19 @@ or overwritten. The same picture in several sorted folders keeps every folder's
 slot and gives each the best copy (--sorted-copies keep), or keeps one (one).
 Copies that match by features only are listed for review and left alone.
 
+Watermarks (--watermark): the watermark tool's detector (../watermark) runs on
+the copies of every group, after scoring, and its boxes are recorded in
+hashes.json next to the hashes and scores. A copy whose strongest detection is
+WM_CONF or more carries a watermark, one below WM_CLEAN is clean, in between it
+is uncertain. For now the plan only reports which groups hold a watermarked
+and a clean copy; the ranking does not act on it yet.
+
 Usage:    python dedup.py <folder> [<folder> ...] [--sorted FOLDER] [--sorted-copies keep|one]
           [--promote-margin X] [--match loose|strict|exact] [--dry-run] [--undo]
           [--exclude NAME] [--workers N] [--gpu] [--review]
+          [--watermark] [--watermark-conf X] [--watermark-clean X]
 Install:  pip install Pillow numpy imagehash opencv-python-headless
+          --watermark needs the watermark tool's install (torch, ultralytics, transformers)
 """
 import argparse
 import hashlib
@@ -125,6 +134,29 @@ TIE = 0.1                # scores closer than this are equal
 # bucket step; the same-bucket cases below 1.0 were resolution bumps inside the
 # 1024 bucket that the bucketed score cannot see. Reporting only until phase 1.
 PROMOTE_MARGIN = 1.0
+
+# --- watermarks (--watermark) --------------------------------------------------
+# The DINOv3 watermark detector of the watermark tool (../watermark), on the
+# copies of every group. Calibrated on 2026-10-14 on 2,101 Telegram photos
+# with caption watermarks, 128 with an emblem badge and 1,027 curated images:
+# the caption text scores 0.3 or more on 75% of the photos and gets no box at
+# all on 16% (faint grey corner text; the badge is never seen). Printed text
+# in the picture (posters, postcards, documents) scores 0.2-0.85 too, but it
+# is in every copy of the picture and cancels inside a group. Downscaling a
+# watermarked photo to 768 px keeps its confidence; at 512 px a single
+# threshold of 0.3 split 7% of the pairs (big copy flagged, small copy not),
+# the gap below splits 1.3%, and 0.2% at 768 px. So a copy at WM_CONF or
+# more is watermarked, below WM_CLEAN clean, in between uncertain, and the
+# watermark rule only ever acts between a watermarked and a clean copy. The
+# boxes are cached at WM_FLOOR with their confidence, so both thresholds can
+# change without detecting again. YOLOv11 (the tool's fallback detector)
+# scored 55% on the same photos and is not used here.
+WM_CONF = 0.3
+WM_CLEAN = 0.1
+WM_FLOOR = 0.01
+WM_VERSION = 1              # with the detector name and floor: the cache entry's key
+WM_DETECTOR = "dino3"
+REPO = Path(__file__).resolve().parent.parent
 
 
 # ---------------------------------------------------------------------------
@@ -618,6 +650,128 @@ def run_pool(fn, items, workers, label):
 
 
 # ---------------------------------------------------------------------------
+# Watermarks: the detector of the watermark tool, imported on first use (it
+# pulls in torch, which the worker processes must not load)
+# ---------------------------------------------------------------------------
+
+class WatermarkError(RuntimeError):
+    """The detector cannot run; the run stops before anything moves."""
+
+
+def watermark_ready() -> str | None:
+    """None when --watermark can run, else what is missing and what to do."""
+    tool = REPO / "watermark" / "watermark.py"
+    if not tool.is_file():
+        return f"--watermark needs the watermark tool next to this one: {tool} is missing"
+    for mod in ("torch", "ultralytics", "transformers", "huggingface_hub"):
+        try:
+            __import__(mod)
+        except ImportError:
+            return (f"--watermark needs the dependencies of the watermark tool, and {mod} is not installed. "
+                    f"Run install.bat in the watermark folder ({tool.parent}) and try again.")
+    return None
+
+
+def watermark_module():
+    folder = REPO / "watermark"
+    if str(folder) not in sys.path:
+        sys.path.insert(0, str(folder))
+    import watermark
+    return watermark
+
+
+def load_detector():
+    """The DINOv3 detector: from watermark/models, else the Hugging Face cache,
+    else downloaded into watermark/models (never into this folder). -> (module, model)"""
+    wm = watermark_module()
+    from huggingface_hub import hf_hub_download
+    from huggingface_hub.utils import LocalEntryNotFoundError
+    try:
+        wm.detector_path(WM_DETECTOR, download=False)
+    except LocalEntryNotFoundError:
+        repo, repo_type, fname = wm.DETECTORS[WM_DETECTOR]
+        print(f"  downloading {fname} from {repo} into {wm.MODELS_DIR}", flush=True)
+        wm.MODELS_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            hf_hub_download(repo, fname, repo_type=repo_type, local_dir=str(wm.MODELS_DIR))
+        except Exception as ex:  # noqa: BLE001
+            raise WatermarkError(f"the watermark detector could not be downloaded ({type(ex).__name__}: {ex}); "
+                                 f"run install.bat in {wm.MODELS_DIR.parent}") from ex
+    try:
+        _, model = wm.load_detector([WM_DETECTOR])
+    except RuntimeError as ex:
+        raise WatermarkError(str(ex)) from ex
+    import torch
+    if not torch.cuda.is_available():
+        print("  no CUDA device: the watermark detector runs on the CPU", flush=True)
+    return wm, model
+
+
+def wm_entry_ok(entry, floor: float) -> bool:
+    """A cached detection serves any thresholds at or above its floor."""
+    return bool(entry) and entry.get("version") == WM_VERSION and entry.get("detector") == WM_DETECTOR \
+        and "boxes" in entry and entry.get("floor", 1.0) <= floor
+
+
+def wm_conf(data) -> float | None:
+    """The strongest detection of an image, or None without a detection."""
+    e = data.get("watermark")
+    if not e or "boxes" not in e:
+        return None
+    return max((b[4] for b in e["boxes"]), default=0.0)
+
+
+def wm_class(data, thr) -> str | None:
+    """watermarked, uncertain or clean under thr = (conf, clean); None without a detection."""
+    c = wm_conf(data)
+    if c is None:
+        return None
+    return "watermarked" if c >= thr[0] else "clean" if c < thr[1] else "uncertain"
+
+
+def detect_watermarks(items, floor: float, say=print) -> None:
+    """Detect on the items without a cached detection and store the boxes in
+    it.data["watermark"]. Identical bytes are detected once. The detector runs
+    one image at a time in this process; decoding runs in threads."""
+    from concurrent.futures import ThreadPoolExecutor
+    need = [it for it in items if not wm_entry_ok(it.data.get("watermark"), floor)]
+    first = {}
+    for it in need:
+        first.setdefault(it.data["sha256"], it)
+    uniq = list(first.values())
+    say(f"watermarks: detecting on {len(uniq)} image(s) ({len(items) - len(need)} from cache, "
+        f"{len(need) - len(uniq)} identical copies)")
+    if not uniq:
+        return
+    wm, model = load_detector()
+
+    def load(it):
+        try:
+            return wm.load_image(it.path), None
+        except Exception as ex:  # noqa: BLE001
+            return None, f"{type(ex).__name__}: {ex}"
+
+    by_sha, done = {}, 0
+    prog = Progress("detected", len(uniq))
+    with ThreadPoolExecutor(4) as ex:
+        for i in range(0, len(uniq), 16):
+            chunk = uniq[i:i + 16]
+            for it, (arr, err) in zip(chunk, ex.map(load, chunk)):
+                entry = {"version": WM_VERSION, "detector": WM_DETECTOR, "floor": floor}
+                if arr is None:
+                    entry["error"] = err
+                    say(f"  could not detect: {it.path}: {err}")
+                else:
+                    entry["boxes"] = wm.detect(model, arr, floor)
+                by_sha[it.data["sha256"]] = entry
+                done += 1
+                prog.update(done)
+    prog.finish()
+    for it in need:
+        it.data["watermark"] = by_sha[it.data["sha256"]]
+
+
+# ---------------------------------------------------------------------------
 # Matching and grouping
 # ---------------------------------------------------------------------------
 
@@ -1099,13 +1253,14 @@ def caption_shared(it, items, moving) -> bool:
     return any(o.caption == it.caption and o.idx != it.idx and o.idx not in moving for o in items)
 
 
-def describe(it):
+def describe(it, wm_thr=None):
     s = it.data.get("score_info", {})
     return {"path": str(it.path), "role": "sorted" if it.role == 1 else "unsorted",
             "w": it.data.get("w"), "h": it.data.get("h"),
             "tier": s.get("tier"), "score": s.get("score"), "caption": it.caption is not None,
             "mtime": datetime.fromtimestamp(it.mtime / 1e9).isoformat(timespec="seconds"),
-            "bytes": it.size}
+            "bytes": it.size,
+            **({"watermark": wm_class(it.data, wm_thr), "watermark_conf": wm_conf(it.data)} if wm_thr else {})}
 
 
 def role_report(keeper, losers, items, edges, margin):
@@ -1263,6 +1418,7 @@ def decide_group(group, items, edges, with_roles, margin, policy="keep"):
     """
     keeper, losers, reason, steps = group
     d = {"keeper": keeper, "losers": list(losers), "reason": reason, "steps": steps,
+         "members": [keeper] + list(losers), "quality_keeper": keeper,
          "report": {}, "skip": None, "promote": None, "sync": [], "slots": [], "slot_like": set()}
     if not with_roles:
         return d
@@ -1456,7 +1612,26 @@ def main(argv=None) -> int:
     ap.add_argument("--gpu", action="store_true",
                     help="match the feature descriptors on the GPU with torch; needs the torch that one of "
                          "the GPU tools installed into the shared venv, else the CPU is used")
+    ap.add_argument("--watermark", action="store_true",
+                    help="run the watermark tool's detector on the copies of every group and record the "
+                         "boxes in hashes.json; the plan reports the groups that hold a watermarked and a "
+                         "clean copy (reporting only for now). Needs the watermark tool installed "
+                         "(install.bat in the watermark folder)")
+    ap.add_argument("--watermark-conf", type=float, default=WM_CONF, metavar="X",
+                    help=f"a copy whose strongest detection is X or more carries a watermark (default {WM_CONF:g})")
+    ap.add_argument("--watermark-clean", type=float, default=WM_CLEAN, metavar="X",
+                    help=f"a copy whose strongest detection is below X is clean (default {WM_CLEAN:g}); "
+                         "between the two thresholds a copy is uncertain and never decides")
     args = ap.parse_args(argv)
+    wm_thr = (args.watermark_conf, args.watermark_clean) if args.watermark else None
+    if args.watermark:
+        if not 0 < args.watermark_clean <= args.watermark_conf <= 1:
+            ap.error("--watermark-clean must be above 0 and at most --watermark-conf, which is at most 1")
+        problem = watermark_ready()
+        if problem:
+            print(problem)
+            return 2
+    wm_floor = min(WM_FLOOR, args.watermark_clean)
 
     roots, roles = [], []
     for role, folders in ((0, args.folders), (1, args.sorted)):
@@ -1534,8 +1709,15 @@ def main(argv=None) -> int:
         for i in idxs:
             if "error" in good[i].data["score_info"]:
                 print(f"  could not score, left in place: {good[i].path}: {good[i].data['score_info']['error']}")
+        if args.watermark:
+            detect_watermarks([good[i] for i in idxs if "error" not in good[i].data["score_info"]], wm_floor)
 
-    groups = plan_groups(good, edges, scorer)
+    try:
+        groups = plan_groups(good, edges, scorer)
+    except WatermarkError as ex:
+        save_caches(roots, items)
+        print(f"{ex}\nNothing moved; the hashes and scores so far are cached.")
+        return 2
     save_caches(roots, items)
 
     # 3. plan: decide every group, then choose every destination against the
@@ -1595,15 +1777,33 @@ def main(argv=None) -> int:
     plan = {"written": datetime.now().isoformat(timespec="seconds"), "match": args.match,
             "folders": [str(r) for r, ro in zip(roots, roles) if ro == 0],
             "sorted_folders": [str(r) for r, ro in zip(roots, roles) if ro == 1],
-            "promote_margin": args.promote_margin, "sorted_copies": args.sorted_copies, "groups": []}
+            "promote_margin": args.promote_margin, "sorted_copies": args.sorted_copies,
+            **({"watermark": {"detector": WM_DETECTOR, "conf": args.watermark_conf, "clean": args.watermark_clean,
+                              "acts": False}} if args.watermark else {}),
+            "groups": []}
     verdicts, layouts = {}, {}
+    wm_both, wm_keep = [], []        # groups with a watermarked and a clean copy; those keeping a watermarked one
+
+    def watermark_report(d):
+        """Reporting only: the classes in the group and whether the kept copy
+        carries a watermark while a clean copy exists."""
+        classes = {i: wm_class(good[i].data, wm_thr) for i in d["members"]}
+        rep = {c: sum(1 for v in classes.values() if v == c) for c in ("watermarked", "uncertain", "clean")}
+        rep["undetected"] = sum(1 for v in classes.values() if v is None)
+        if rep["watermarked"] and rep["clean"]:
+            wm_both.append(d)
+            rep["kept_copy"] = classes[d["keeper"]]
+            if classes[d["keeper"]] == "watermarked":
+                wm_keep.append(d)
+                rep["note"] = "the kept copy carries a watermark while a clean copy exists"
+        return rep
 
     def copy_info(k, i, steps):
         it = good[i]
         p = int(bin(int(k.data["phash"], 16) ^ int(it.data["phash"], 16)).count("1"))
         dd = int(bin(int(k.data["dhash"], 16) ^ int(it.data["dhash"], 16)).count("1"))
         direct = edges.get((min(k.idx, i), max(k.idx, i)))
-        return {**describe(it), "exact": it.data["sha256"] == k.data["sha256"],
+        return {**describe(it, wm_thr), "exact": it.data["sha256"] == k.data["sha256"],
                 "phash_distance": p, "dhash_distance": dd, "steps_from_kept": steps.get(i),
                 "match": direct[0] if direct else "through other copies",
                 **({"features": {x: direct[1][x] for x in ("inliers", "cover", "ncc") if x in direct[1]}}
@@ -1611,7 +1811,8 @@ def main(argv=None) -> int:
 
     for d in decisions:
         k = good[d["keeper"]]
-        entry = {"keep": describe(k), "reason": d["reason"], **d["report"]}
+        entry = {"keep": describe(k, wm_thr), "reason": d["reason"], **d["report"],
+                 **({"watermark": watermark_report(d)} if args.watermark else {})}
         rep = d["report"]
         if rep.get("roles") == "mixed":
             v = rep["verdict"].split(":")[0]
@@ -1650,7 +1851,9 @@ def main(argv=None) -> int:
                        "review_groups": len(skipped), "captions_copied_to_kept": len(caption_copies),
                        **({"mixed_verdicts": verdicts, "sorted_only_layouts": layouts,
                            "promotions": len(promotions), "promotions_renamed": n_ren, "slots_synced": n_sync,
-                           "slots_left_as_they_are": n_left, "sorted_copies_out": n_out} if with_roles else {})}
+                           "slots_left_as_they_are": n_left, "sorted_copies_out": n_out} if with_roles else {}),
+                       **({"groups_with_watermarked_and_clean": len(wm_both),
+                           "groups_keeping_a_watermarked_copy": len(wm_keep)} if args.watermark else {})}
     for root in roots:
         write_json(out_dir(root) / PLAN_NAME, plan)
     print(f"{len(groups)} group(s); {n_moves} worse cop{'y' if n_moves == 1 else 'ies'} to move, "
@@ -1686,6 +1889,11 @@ def main(argv=None) -> int:
         if n_out:
             print(f"  {n_out} sorted cop{'y moves' if n_out == 1 else 'ies move'} out"
                   + (" (one slot per picture)" if args.sorted_copies == "one" else " (a better copy stays in the same folder)"))
+    if args.watermark:
+        print(f"watermarks: {len(wm_both)} group(s) hold a watermarked and a clean copy "
+              f"(watermarked at {args.watermark_conf:g} or more, clean below {args.watermark_clean:g})"
+              + (f"; {len(wm_keep)} of them keep a watermarked copy" if wm_both else "")
+              + "; reporting only, the ranking does not act on it yet")
 
     if args.dry_run:
         print(f"Dry run: nothing moved. Plan: {out_dir(roots[0]) / PLAN_NAME}")
