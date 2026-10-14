@@ -20,11 +20,12 @@ The detections are cached in `<folder>_backup/_watermark/cache.json`, in the bac
 |---|---|---|
 | `yolov12x-dino3-watermark-detection.pt` | [corzent/yolov12x-dino3-watermark-detection](https://huggingface.co/corzent/yolov12x-dino3-watermark-detection) | detection (default) |
 | `yolo11x-train28-best.pt` | [fancyfeast/joycaption-watermark-detection](https://huggingface.co/spaces/fancyfeast/joycaption-watermark-detection) | detection, when the first cannot be loaded |
+| `yolo11x-watermark-detection.pt` | [corzent/yolo11x_watermark_detection](https://huggingface.co/corzent/yolo11x_watermark_detection) (`best.pt`) | the second detector of the [deduplicate](../deduplicate/README.md) tool, `--detector yolo11x` here: stock ultralytics at 640 px, sees emblem badges the DINOv3 model does not, with more false positives on objects |
 | `big-lama.pt` | [simple-lama-inpainting](https://github.com/enesmsahin/simple-lama-inpainting) release v0.1.0 (the TorchScript export of [LaMa](https://github.com/advimman/lama)) | painting |
 
 The DINOv3 checkpoint was trained with the [DINOV3-YOLOV12](https://github.com/Sompote/DINOV3-YOLOV12) fork of ultralytics. `dino3_compat.py` lets stock ultralytics load and run it: it provides the fork's `DINO3Backbone` layer for inference and teaches the area-attention layer the fork's weight layout. It needs `transformers` and takes about twice the time of the YOLOv11 model per image. The shim is tried on a small image when the model is loaded; if a change of ultralytics or transformers breaks it, the run says so and uses the YOLOv11 detector instead. `--detector yolo11` chooses it outright.
 
-The detectors are downloaded into the Hugging Face cache on first use and looked up there first, with the network off, on every later run; a checkpoint copied into `models/` next to `watermark.py` is used before the cache. LaMa goes into the torch hub checkpoints folder (`%USERPROFILE%\.cache\torch\hub\checkpoints`), where simple-lama-inpainting keeps it, so a copy it fetched is reused. The LaMa model is loaded with the 30 lines of simple-lama-inpainting's loader built in here, because that package pins Pillow below 10 and would downgrade the shared `venv`.
+The detectors are downloaded into the Hugging Face cache on first use and looked up there first, with the network off, on every later run; a checkpoint copied into `models/` next to `watermark.py` is used before the cache. The deduplicate tool keeps its two detectors (`dino3` and `yolo11x`) in `models/` only and downloads a missing one there; `--fetch-models` fetches them too. LaMa goes into the torch hub checkpoints folder (`%USERPROFILE%\.cache\torch\hub\checkpoints`), where simple-lama-inpainting keeps it, so a copy it fetched is reused. The LaMa model is loaded with the 30 lines of simple-lama-inpainting's loader built in here, because that package pins Pillow below 10 and would downgrade the shared `venv`.
 
 ## Install
 
@@ -48,7 +49,7 @@ run.bat <folder> [<folder> ...] [options]
 | `--skip-clean` | do not copy the images without a watermark |
 | `--dry-run` | detect only: write the report, and with `--previews` the masks drawn over the images |
 | `--overwrite` | write outputs that exist already |
-| `--detector dino3\|yolo11` | use this detector only |
+| `--detector dino3\|yolo11\|yolo11x` | use this detector only |
 | `--reanalyse` | ignore the detection cache |
 | `--threads N` | decoder threads and writer processes (default 4); detection runs one image at a time |
 | `--fetch-models` | download the detector and LaMa and load them once |
@@ -65,4 +66,4 @@ run.bat <folder> [<folder> ...] [options]
 | `dino3_compat.py` | lets stock ultralytics load the DINOv3-YOLOv12 checkpoint |
 | `install.bat`, `run.bat` | install into the shared `venv`, run with it |
 | `requirements.txt` | the PyPI dependencies; torch is not in it |
-| `models/` | optional local copies of the checkpoints, used before the caches (git-ignored) |
+| `models/` | local copies of the checkpoints, used before the caches (git-ignored); the deduplicate tool's two detectors always live here |

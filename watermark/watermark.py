@@ -55,9 +55,17 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))                 # dino3_compat.py lives next to this file
 MODELS_DIR = HERE / "models"                      # a checkpoint put here is used before the Hugging Face cache
 # name: (Hugging Face repo, repo type, file)
+# name: (Hugging Face repo, repo type, file on the Hub, file name in models/)
 DETECTORS = {
-    "dino3": ("corzent/yolov12x-dino3-watermark-detection", "model", "yolov12x-dino3-watermark-detection.pt"),
-    "yolo11": ("fancyfeast/joycaption-watermark-detection", "space", "yolo11x-train28-best.pt"),
+    "dino3": ("corzent/yolov12x-dino3-watermark-detection", "model", "yolov12x-dino3-watermark-detection.pt",
+              "yolov12x-dino3-watermark-detection.pt"),
+    "yolo11": ("fancyfeast/joycaption-watermark-detection", "space", "yolo11x-train28-best.pt",
+               "yolo11x-train28-best.pt"),
+    # the same author's YOLO11x fine-tune of the yolo11 detector: stock ultralytics,
+    # run at the default 640 px (better than its card's 1280 on every calibration set);
+    # sees emblem badges the DINOv3 model never sees, at the price of object false
+    # positives. The dedup tool runs it next to dino3 by default (see its README).
+    "yolo11x": ("corzent/yolo11x_watermark_detection", "model", "best.pt", "yolo11x-watermark-detection.pt"),
 }
 DETECTOR_ORDER = ["dino3", "yolo11"]              # the first that loads is used
 LAMA_URL = "https://github.com/enesmsahin/simple-lama-inpainting/releases/download/v0.1.0/big-lama.pt"
@@ -97,8 +105,8 @@ def detector_path(name: str, download: bool = True) -> Path:
     the Hugging Face cache; with download, fetched into the cache when it is
     in neither. A plain hf_hub_download asks the Hub on every call, so the
     cache is tried first with the network off."""
-    repo, repo_type, fname = DETECTORS[name]
-    local = MODELS_DIR / fname
+    repo, repo_type, fname, local_name = DETECTORS[name]
+    local = MODELS_DIR / local_name
     if local.exists():
         return local
     from huggingface_hub import hf_hub_download
@@ -110,6 +118,26 @@ def detector_path(name: str, download: bool = True) -> Path:
             raise
         print(f"downloading {fname} from {repo}", flush=True)
         return Path(hf_hub_download(repo, fname, repo_type=repo_type))
+
+
+def detector_local(name: str, download: bool = True) -> Path:
+    """The checkpoint of a detector in models/ next to this file, downloaded
+    into it when missing (never into the Hugging Face cache): what the dedup
+    tool uses, so that its detectors live in one known place."""
+    repo, repo_type, fname, local_name = DETECTORS[name]
+    local = MODELS_DIR / local_name
+    if local.exists():
+        return local
+    if not download:
+        raise FileNotFoundError(f"{local} is missing; run install.bat or watermark.py --fetch-models")
+    from huggingface_hub import hf_hub_download
+    print(f"downloading {fname} from {repo} into {MODELS_DIR}", flush=True)
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    got = Path(hf_hub_download(repo, fname, repo_type=repo_type, local_dir=str(MODELS_DIR)))
+    if got != local:
+        os.replace(got, local)
+    shutil.rmtree(MODELS_DIR / ".cache", ignore_errors=True)    # the Hub's bookkeeping, not needed
+    return local
 
 
 def lama_path(download: bool = True) -> Path:
@@ -903,7 +931,9 @@ def main(argv=None) -> int:
     ap.add_argument("--dry-run", action="store_true", help="detect only: write the report, and with --previews the masks")
     ap.add_argument("--previews", action="store_true", help="with --dry-run: draw the masks over the images")
     ap.add_argument("--overwrite", action="store_true", help="write outputs that exist already")
-    ap.add_argument("--detector", choices=list(DETECTORS), help="use this detector only (default: dino3, else yolo11)")
+    ap.add_argument("--detector", choices=list(DETECTORS),
+                    help="use this detector only (default: dino3, else yolo11; yolo11x is the detector the "
+                         "dedup tool runs next to dino3, better on emblem badges, more object false positives)")
     ap.add_argument("--exclude", action="append", default=[], metavar="NAME",
                     help="another folder name to skip at any depth; may repeat. Always skipped: " + ", ".join(DEFAULT_EXCLUDES))
     ap.add_argument("--reanalyse", action="store_true", help="ignore the detection cache")
@@ -915,6 +945,9 @@ def main(argv=None) -> int:
     if args.fetch_models:
         name, _ = load_detector([args.detector] if args.detector else None)
         print(f"detector: {name} ({detector_path(name, False)})")
+        # the dedup tool runs dino3 and yolo11x from models/ by default
+        for extra in ("dino3", "yolo11x"):
+            print(f"models/: {extra} ({detector_local(extra)})")
         Lama()
         print(f"lama: {lama_path(False)}")
         print("models load OK")

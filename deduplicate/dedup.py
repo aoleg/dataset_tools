@@ -24,11 +24,11 @@ or overwritten. The same picture in several sorted folders keeps every folder's
 slot and gives each the best copy (--sorted-copies keep), or keeps one (one).
 Copies that match by features only are listed for review and left alone.
 
-Watermarks (--watermark): the watermark tool's detector (../watermark) runs on
-the copies of every group, after scoring, and its boxes are recorded in
-hashes.json next to the hashes and scores. A copy whose strongest detection is
-WM_CONF or more carries a watermark, one below WM_CLEAN is clean, in between it
-is uncertain. In a group that holds a watermarked and a clean copy the
+Watermarks (--watermark): the watermark tool's detectors (../watermark; both of
+them by default, --watermark-detector picks one) run on the copies of every
+group, after scoring, and their boxes are recorded in hashes.json next to the
+hashes and scores. A copy whose strongest detection is WM_CONF or more carries
+a watermark, one below WM_CLEAN is clean, in between it is uncertain. In a group that holds a watermarked and a clean copy the
 watermarked copies step aside, whatever their quality, and the best of the
 rest stays. A clean unsorted copy replaces a watermarked sorted copy when it
 is a bucket up, or in the same bucket and not more than PROMOTE_MARGIN worse;
@@ -41,7 +41,7 @@ those copies.
 Usage:    python dedup.py <folder> [<folder> ...] [--sorted FOLDER] [--sorted-copies keep|one]
           [--promote-margin X] [--match loose|strict|exact] [--dry-run] [--undo]
           [--exclude NAME] [--workers N] [--gpu] [--review]
-          [--watermark] [--watermark-conf X] [--watermark-clean X]
+          [--watermark] [--watermark-conf X] [--watermark-clean X] [--watermark-detector dino3|yolo11x|both]
 Install:  pip install Pillow numpy imagehash opencv-python-headless
           --watermark needs the watermark tool's install (torch, ultralytics, transformers)
 """
@@ -143,26 +143,34 @@ TIE = 0.1                # scores closer than this are equal
 PROMOTE_MARGIN = 1.0
 
 # --- watermarks (--watermark) --------------------------------------------------
-# The DINOv3 watermark detector of the watermark tool (../watermark), on the
-# copies of every group. Calibrated on 2026-10-14 on 2,101 Telegram photos
-# with caption watermarks, 128 with an emblem badge and 1,027 curated images:
-# the caption text scores 0.3 or more on 75% of the photos and gets no box at
-# all on 16% (faint grey corner text; the badge is never seen). Printed text
-# in the picture (posters, postcards, documents) scores 0.2-0.85 too, but it
-# is in every copy of the picture and cancels inside a group. Downscaling a
-# watermarked photo to 768 px keeps its confidence; at 512 px a single
-# threshold of 0.3 split 7% of the pairs (big copy flagged, small copy not),
-# the gap below splits 1.3%, and 0.2% at 768 px. So a copy at WM_CONF or
-# more is watermarked, below WM_CLEAN clean, in between uncertain, and the
+# The watermark detectors of the watermark tool (../watermark), on the copies
+# of every group; the strongest detection of any of them counts. Calibrated
+# on 2026-10-14 on 2,101 Telegram photos with caption watermarks, 128 with an
+# emblem badge and 1,027 curated images, at conf 0.3:
+#   dino3 (DINOv3-YOLOv12x) sees 75% of the captions, 14% of the badges, and
+#     flags 16.5% of the curated images; 16% of the captions (faint grey
+#     corner text) get no box at all.
+#   yolo11x (the same author's YOLO11x fine-tune, at the default 640 px; its
+#     card's 1280 px is worse on every set) sees 79% and 51%, flags 19.3%:
+#     its extra flags are object false positives (car fronts, lanterns,
+#     tins), it misses the RIA Novosti stamp, and its badge hits shrink away
+#     when downscaled (19% split at 512 px).
+#   both, the strongest of the two: 85%, 57%, 23.7%.
+# Printed text in the picture (posters, postcards, documents) scores 0.2-0.85
+# too, but it is in every copy of the picture and cancels inside a group.
+# Downscaling a captioned photo to 768 px keeps its confidence; at 512 px a
+# single threshold of 0.3 split 7% of the pairs (big copy flagged, small copy
+# not), the gap below splits 1.3%, and 0.2% at 768 px. So a copy at WM_CONF
+# or more is watermarked, below WM_CLEAN clean, in between uncertain, and the
 # watermark rule only ever acts between a watermarked and a clean copy. The
-# boxes are cached at WM_FLOOR with their confidence, so both thresholds can
-# change without detecting again. YOLOv11 (the tool's fallback detector)
-# scored 55% on the same photos and is not used here.
+# boxes are cached per detector at WM_FLOOR with their confidence, so the
+# thresholds and the detector choice can change without detecting again. The
+# tool's yolo11 fallback detector scored 55% on the captions and is not used.
 WM_CONF = 0.3
 WM_CLEAN = 0.1
 WM_FLOOR = 0.01
-WM_VERSION = 1              # with the detector name and floor: the cache entry's key
-WM_DETECTOR = "dino3"
+WM_VERSION = 1              # with the floor: the cache entry's key; the boxes are kept per detector name
+WM_DETECTORS = ["dino3", "yolo11x"]       # --watermark-detector both (the default)
 REPO = Path(__file__).resolve().parent.parent
 # A watermarked copy that loses only because of its watermark and is
 # significantly better than the copy that stays (a bucket up, or the promote
@@ -702,50 +710,53 @@ def watermark_module():
     return watermark
 
 
-def load_detector():
-    """The DINOv3 detector: from watermark/models, else the Hugging Face cache,
-    else downloaded into watermark/models (never into this folder). -> (module, model)"""
+def load_detector(name: str):
+    """One detector of the watermark tool, from watermark/models, downloaded
+    into it when missing (never into this folder). -> model"""
     wm = watermark_module()
-    from huggingface_hub import hf_hub_download
-    from huggingface_hub.utils import LocalEntryNotFoundError
     try:
-        wm.detector_path(WM_DETECTOR, download=False)
-    except LocalEntryNotFoundError:
-        repo, repo_type, fname = wm.DETECTORS[WM_DETECTOR]
-        print(f"  downloading {fname} from {repo} into {wm.MODELS_DIR}", flush=True)
-        wm.MODELS_DIR.mkdir(parents=True, exist_ok=True)
-        try:
-            hf_hub_download(repo, fname, repo_type=repo_type, local_dir=str(wm.MODELS_DIR))
-        except Exception as ex:  # noqa: BLE001
-            raise WatermarkError(f"the watermark detector could not be downloaded ({type(ex).__name__}: {ex}); "
-                                 f"run install.bat in {wm.MODELS_DIR.parent}") from ex
+        wm.detector_local(name)
+    except Exception as ex:  # noqa: BLE001
+        raise WatermarkError(f"the watermark detector {name} could not be downloaded ({type(ex).__name__}: {ex}); "
+                             f"run install.bat in {wm.MODELS_DIR.parent}") from ex
     try:
-        _, model = wm.load_detector([WM_DETECTOR])
+        _, model = wm.load_detector([name])
     except RuntimeError as ex:
         raise WatermarkError(str(ex)) from ex
-    import torch
-    if not torch.cuda.is_available():
-        print("  no CUDA device: the watermark detector runs on the CPU", flush=True)
-    return wm, model
+    return model
 
 
-def wm_entry_ok(entry, floor: float) -> bool:
-    """A cached detection serves any thresholds at or above its floor."""
-    return bool(entry) and entry.get("version") == WM_VERSION and entry.get("detector") == WM_DETECTOR \
-        and "boxes" in entry and entry.get("floor", 1.0) <= floor
+def wm_boxes(entry) -> dict:
+    """The cached boxes per detector name, {} for no entry. Entries written
+    before the second detector ("detector": name, "boxes": [...]) are read too."""
+    if not entry:
+        return {}
+    if "detectors" in entry:
+        return entry["detectors"]
+    if "boxes" in entry and "detector" in entry:
+        return {entry["detector"]: entry["boxes"]}
+    return {}
 
 
-def wm_conf(data) -> float | None:
-    """The strongest detection of an image, or None without a detection."""
-    e = data.get("watermark")
-    if not e or "boxes" not in e:
+def wm_entry_ok(entry, floor: float, names) -> bool:
+    """A cached entry serves a run when it holds every requested detector at a
+    floor at or below the run's (so any thresholds above it)."""
+    return bool(entry) and entry.get("version") == WM_VERSION and entry.get("floor", 1.0) <= floor \
+        and all(n in wm_boxes(entry) for n in names)
+
+
+def wm_conf(data, names) -> float | None:
+    """The strongest detection of the requested detectors, or None when one of
+    them has not run on the image."""
+    boxes = wm_boxes(data.get("watermark"))
+    if not all(n in boxes for n in names):
         return None
-    return max((b[4] for b in e["boxes"]), default=0.0)
+    return max((b[4] for n in names for b in boxes[n]), default=0.0)
 
 
 def wm_class(data, thr) -> str | None:
-    """watermarked, uncertain or clean under thr = (conf, clean); None without a detection."""
-    c = wm_conf(data)
+    """watermarked, uncertain or clean under thr = (conf, clean, names); None without a detection."""
+    c = wm_conf(data, thr[2])
     if c is None:
         return None
     return "watermarked" if c >= thr[0] else "clean" if c < thr[1] else "uncertain"
@@ -762,21 +773,33 @@ def wm_label(info: dict) -> str:
     return word + (f" {conf:.2f}" if conf is not None else "")
 
 
-def detect_watermarks(items, floor: float, say=print) -> None:
-    """Detect on the items without a cached detection and store the boxes in
-    it.data["watermark"]. Identical bytes are detected once. The detector runs
-    one image at a time in this process; decoding runs in threads."""
+def detect_watermarks(items, floor: float, names, say=print) -> None:
+    """Run the requested detectors on the items whose cached entry lacks one of
+    them, and store the boxes per detector in it.data["watermark"]. Identical
+    bytes are detected once; a detector already in the entry at a floor at or
+    below the run's is not run again. The models run one image at a time in
+    this process; decoding runs in threads."""
     from concurrent.futures import ThreadPoolExecutor
-    need = [it for it in items if not wm_entry_ok(it.data.get("watermark"), floor)]
-    first = {}
-    for it in need:
-        first.setdefault(it.data["sha256"], it)
-    uniq = list(first.values())
-    say(f"watermarks: detecting on {len(uniq)} image(s) ({len(items) - len(need)} from cache, "
-        f"{len(need) - len(uniq)} identical copies)")
+
+    def missing(it):
+        e = it.data.get("watermark")
+        if not e or e.get("version") != WM_VERSION or e.get("floor", 1.0) > floor:
+            return list(names)
+        have = wm_boxes(e)
+        return [n for n in names if n not in have]
+
+    need = {it.data["sha256"]: it for it in items if missing(it)}
+    uniq = list(need.values())
+    n_need = sum(1 for it in items if missing(it))
+    say(f"watermarks: detecting on {len(uniq)} image(s) with {' and '.join(names)} "
+        f"({len(items) - n_need} from cache, {n_need - len(uniq)} identical copies)")
     if not uniq:
         return
-    wm, model = load_detector()
+    wm = watermark_module()
+    models = {}
+    import torch
+    if not torch.cuda.is_available():
+        say("  no CUDA device: the watermark detectors run on the CPU")
 
     def load(it):
         try:
@@ -790,18 +813,24 @@ def detect_watermarks(items, floor: float, say=print) -> None:
         for i in range(0, len(uniq), 16):
             chunk = uniq[i:i + 16]
             for it, (arr, err) in zip(chunk, ex.map(load, chunk)):
-                entry = {"version": WM_VERSION, "detector": WM_DETECTOR, "floor": floor}
+                old = it.data.get("watermark")
+                keep = wm_boxes(old) if old and old.get("version") == WM_VERSION and old.get("floor", 1.0) <= floor else {}
+                entry = {"version": WM_VERSION, "floor": floor, "detectors": dict(keep)}
                 if arr is None:
                     entry["error"] = err
                     say(f"  could not detect: {it.path}: {err}")
                 else:
-                    entry["boxes"] = wm.detect(model, arr, floor)
+                    for n in missing(it):
+                        if n not in models:
+                            models[n] = load_detector(n)
+                        entry["detectors"][n] = wm.detect(models[n], arr, floor)
                 by_sha[it.data["sha256"]] = entry
                 done += 1
                 prog.update(done)
     prog.finish()
-    for it in need:
-        it.data["watermark"] = by_sha[it.data["sha256"]]
+    for it in items:
+        if it.data["sha256"] in by_sha:
+            it.data["watermark"] = by_sha[it.data["sha256"]]
 
 
 # --- the replacement folder -------------------------------------------------------
@@ -1399,7 +1428,7 @@ def describe(it, wm_thr=None):
             "tier": s.get("tier"), "score": s.get("score"), "caption": it.caption is not None,
             "mtime": datetime.fromtimestamp(it.mtime / 1e9).isoformat(timespec="seconds"),
             "bytes": it.size,
-            **({"watermark": wm_class(it.data, wm_thr), "watermark_conf": wm_conf(it.data)} if wm_thr else {})}
+            **({"watermark": wm_class(it.data, wm_thr), "watermark_conf": wm_conf(it.data, wm_thr[2])} if wm_thr else {})}
 
 
 def quality_rank(members, items, wm_thr):
@@ -1815,8 +1844,13 @@ def main(argv=None) -> int:
     ap.add_argument("--watermark-clean", type=float, default=WM_CLEAN, metavar="X",
                     help=f"a copy whose strongest detection is below X is clean (default {WM_CLEAN:g}); "
                          "between the two thresholds a copy is uncertain and never decides")
+    ap.add_argument("--watermark-detector", choices=WM_DETECTORS + ["both"], default="both",
+                    help="which detector of the watermark tool decides: dino3 (DINOv3-YOLOv12, fewer object "
+                         "false positives), yolo11x (sees emblem badges), or both (default): the strongest "
+                         "detection of either counts")
     args = ap.parse_args(argv)
-    wm_thr = (args.watermark_conf, args.watermark_clean) if args.watermark else None
+    wm_names = list(WM_DETECTORS) if args.watermark_detector == "both" else [args.watermark_detector]
+    wm_thr = (args.watermark_conf, args.watermark_clean, wm_names) if args.watermark else None
     if args.watermark:
         if not 0 < args.watermark_clean <= args.watermark_conf <= 1:
             ap.error("--watermark-clean must be above 0 and at most --watermark-conf, which is at most 1")
@@ -1905,7 +1939,7 @@ def main(argv=None) -> int:
             if "error" in good[i].data["score_info"]:
                 print(f"  could not score, left in place: {good[i].path}: {good[i].data['score_info']['error']}")
         if args.watermark:
-            detect_watermarks([good[i] for i in idxs if "error" not in good[i].data["score_info"]], wm_floor)
+            detect_watermarks([good[i] for i in idxs if "error" not in good[i].data["score_info"]], wm_floor, wm_names)
 
     try:
         groups = plan_groups(good, edges, scorer, wm_thr)
@@ -1983,13 +2017,13 @@ def main(argv=None) -> int:
                 d["repl_copies"].append({"from": str(r.path), "to": str(dst), "replaces": str(target),
                                          "root": root, "converted_to": conv, "caption": with_caption,
                                          "match": m[0] if m else "indirect", "why": d["replacement"]["why"],
-                                         "watermark_conf": wm_conf(r.data), "loser_idx": r.idx})
+                                         "watermark_conf": wm_conf(r.data, wm_names), "loser_idx": r.idx})
 
     plan = {"written": datetime.now().isoformat(timespec="seconds"), "match": args.match,
             "folders": [str(r) for r, ro in zip(roots, roles) if ro == 0],
             "sorted_folders": [str(r) for r, ro in zip(roots, roles) if ro == 1],
             "promote_margin": args.promote_margin, "sorted_copies": args.sorted_copies,
-            **({"watermark": {"detector": WM_DETECTOR, "conf": args.watermark_conf, "clean": args.watermark_clean,
+            **({"watermark": {"detectors": wm_names, "conf": args.watermark_conf, "clean": args.watermark_clean,
                               "replacement_folders": [str(repl_dir(r)) for r in roots]}} if args.watermark else {}),
             "groups": []}
     verdicts, layouts = {}, {}
@@ -2110,7 +2144,7 @@ def main(argv=None) -> int:
                   + (" (one slot per picture)" if args.sorted_copies == "one" else " (a better copy stays in the same folder)"))
     if args.watermark:
         n_repl = sum(len(d.get("repl_copies", [])) for d in acted)
-        print(f"watermarks: {len(wm_both)} group(s) hold a watermarked and a clean copy "
+        print(f"watermarks ({' and '.join(wm_names)}): {len(wm_both)} group(s) hold a watermarked and a clean copy "
               f"(watermarked at {args.watermark_conf:g} or more, clean below {args.watermark_clean:g})"
               + (f"; in {len(wm_decided)} of them the watermark decides against the better copy" if wm_both else ""))
         if n_repl:
