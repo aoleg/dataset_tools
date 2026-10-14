@@ -101,18 +101,26 @@ def main(argv=None) -> int:
         k = g["keep"]
         what = "kept" if "move" in g else "best copy (group left for review)"
         lines.append(f"[{n:04d}] {what}: {k['path']}")
-        lines.append(f"       {k.get('w')}x{k.get('h')}  tier {k.get('tier')}  score {k.get('score')}  reason: {g.get('reason')}"
+        kwm = dedup.wm_label(k)
+        lines.append(f"       {k.get('w')}x{k.get('h')}  tier {k.get('tier')}  score {k.get('score')}"
+                     + (f"  {kwm}" if kwm else "") + f"  reason: {g.get('reason')}"
                      + (f"  REVIEW: {g['review']}" if "review" in g else ""))
-        tiles = [tile(Path(k["path"]), f"KEPT {Path(k['path']).name} {k.get('w')}x{k.get('h')} t{k.get('tier')} {k.get('score')}", args.height)]
+        tiles = [tile(Path(k["path"]), f"KEPT {Path(k['path']).name} {k.get('w')}x{k.get('h')} t{k.get('tier')} {k.get('score')}"
+                      + (f" {kwm}" if kwm else ""), args.height)]
         for m in moves:
             now = dedup.logged_path(m.get("to") or m["path"], roots)
             src = now if now.exists() else Path(m["path"])
             kind = m.get("match", "?") + (" (identical)" if m.get("exact") else "")
+            mwm = dedup.wm_label(m)
             lines.append(f"       copy: {m['path']}")
             lines.append(f"             now at: {m.get('to', '(not moved)')}")
-            lines.append(f"             {m.get('w')}x{m.get('h')}  tier {m.get('tier')}  score {m.get('score')}  match: {kind}"
+            lines.append(f"             {m.get('w')}x{m.get('h')}  tier {m.get('tier')}  score {m.get('score')}"
+                         + (f"  {mwm}" if mwm else "") + f"  match: {kind}"
                          + (f"  phash {m.get('phash_distance')} dhash {m.get('dhash_distance')}" if "phash_distance" in m else ""))
-            tiles.append(tile(src, f"{'moved' if 'move' in g else 'copy'} {Path(m['path']).name} {m.get('w')}x{m.get('h')} t{m.get('tier')} {m.get('score')} {kind}", args.height))
+            tiles.append(tile(src, f"{'moved' if 'move' in g else 'copy'} {Path(m['path']).name} {m.get('w')}x{m.get('h')} t{m.get('tier')} {m.get('score')}"
+                              + (f" {mwm}" if mwm else "") + f" {kind}", args.height))
+        for rc in g.get("replacement", []):
+            lines.append(f"       replacement ({rc.get('why')}, {rc.get('match')}): {rc.get('to')}")
         lines.append("")
         W = sum(t.width for t in tiles) + 8 * (len(tiles) - 1)
         sheet = Image.new("RGB", (W, args.height + 34), "red")

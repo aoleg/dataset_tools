@@ -8,7 +8,7 @@ A folder can also be a curated collection, given with `--sorted`. Then a better 
 
 ## Install
 
-On Windows, run `install.bat`. It needs Python 3.10 or newer. It creates the shared `..\venv` folder when it is missing and installs Pillow, numpy, imagehash and OpenCV into it. It needs no GPU. The virtual environment is shared by all tools of this repository: it is the `venv` folder in the repository root, next to the tool folders, and each tool's `install.bat` installs only its own dependencies into it.
+On Windows, run `install.bat`. It needs Python 3.10 or newer. It creates the shared `..\venv` folder when it is missing and installs Pillow, numpy, imagehash and OpenCV into it. It needs no GPU. The virtual environment is shared by all tools of this repository: it is the `venv` folder in the repository root, next to the tool folders, and each tool's `install.bat` installs only its own dependencies into it. Only `--watermark` needs more: the [watermark](../watermark/README.md) tool's `install.bat`, which brings torch, ultralytics, transformers and the detector into the same `venv`.
 
 Without `install.bat`:
 
@@ -45,6 +45,9 @@ You can also drop a folder onto `run.bat` in Explorer. There is no prompt: the t
 | `--workers N` | CPU count - 1 | number of worker processes |
 | `--gpu` | off | match the feature descriptors on the GPU with torch. torch is not part of this tool's requirements; it is in the shared `venv` once one of the GPU tools has been installed. Without torch or without a CUDA device the CPU is used, with a note. The results are the same either way. |
 | `--review` | off | after the run, open the review tool full screen to check the groups by eye and change the kept copy. See [Review full screen](#review-full-screen-and-change-the-kept-copy). Not after `--dry-run`, because nothing has moved. |
+| `--watermark` | off | run the watermark detector of the [watermark](../watermark/README.md) tool on the copies of every group: a clean copy stays over a watermarked one whatever their size, and the better watermarked copies are collected for cleaning. See [Watermarks](#watermarks). Needs the watermark tool installed. |
+| `--watermark-conf X` | 0.3 | a copy whose strongest detection is X or more carries a watermark |
+| `--watermark-clean X` | 0.1 | a copy whose strongest detection is below X is clean; between the two thresholds a copy is uncertain and never decides |
 
 Example of a run followed by the review:
 
@@ -180,6 +183,25 @@ A sorted tree can hold one picture under several categories, and the copies can 
 
 The dry run shows the final name of every file, also the ` (N)` names. `--undo` needs the same `--sorted` arguments as the run.
 
+## Watermarks
+
+The score does not see a watermark, so without help a large watermarked download beats a smaller clean copy, and with `--sorted` it replaces the clean copy in the collection. `--watermark` runs the detector of the [watermark](../watermark/README.md) tool on the copies of every group, after scoring, and lets the result decide.
+
+Every copy gets one of three classes from its strongest detection: watermarked at `--watermark-conf` (0.3) or more, clean below `--watermark-clean` (0.1), uncertain in between. The rules act only between a clearly watermarked and a clearly clean copy. A group without such a pair follows the usual rules, so an uncertain copy never decides, and neither does a copy the detector did not see.
+
+- In a group with a watermarked and a clean copy, the watermarked copies step aside whatever their bucket and score, and the best of the rest stays. A clean 512 copy beats a watermarked 1024 copy.
+- A watermarked copy from an unsorted folder never replaces a clean copy in a sorted folder.
+- A clean unsorted copy replaces a watermarked sorted copy when it reaches a larger bucket, or the same bucket with a score not more than `--promote-margin` below. The margin is a tolerance here, not a requirement. A clean copy from a smaller bucket, or more than the margin worse, goes to the review list, and nothing moves in that group.
+- The framing guard is unchanged: a clean copy that matches the sorted copy by features only goes to the review list. Heavy watermarks often break the hash match, so expect such groups there.
+
+A watermarked copy that is much better than the copy that stays, a bucket up or `--promote-margin` or more higher in the same bucket, is not only moved to `_duplicates`. A copy of it also goes to `<folder>_replacements` next to the folder of the copy it would replace, under that copy's relative path, stem and extension, with a copy of that copy's caption. When the formats differ, the copy is converted to the target's format: JPEG at quality 97 without chroma subsampling, PNG lossless. Run the watermark tool on that folder and copy the cleaned files over the originals; the names match, so nothing sits next to anything. `replacements.json` in the folder lists for each file which file it replaces, the match kind, the detection confidence and why it qualified. A replacement that matched by features only may differ in framing, so look at it before you copy it over. The folder carries no `_dataset_tools.json` mark, because the watermark tool refuses a marked folder; no tool of this repository scans it unless you give it. `--undo` removes the replacement copies it wrote, unless their bytes changed since, and removes the folder when it is empty.
+
+The detections go into `hashes.json` next to the hashes and scores, with every box and its confidence down to 0.01, so a run with other thresholds reuses them. A run without `--watermark` keeps them and ignores them. The plan shows the class and the confidence of every copy, and the summary counts the groups that hold a watermarked and a clean copy, the groups in which the watermark decided against the better copy, and the replacement copies. `compare.bat` and `review.bat` show the class next to the score.
+
+The detector is the DINOv3 one of the watermark tool, found in `watermark\models`, else in the Hugging Face cache, else downloaded into `watermark\models`. It runs on the GPU, one image at a time, only on the images that have a copy, about 20 images per second. `--watermark` needs the watermark tool's dependencies (torch, ultralytics, transformers) in the shared `venv`; without them the run stops at once and points to `install.bat` in the watermark folder.
+
+The thresholds were set on 2,101 Telegram photos with caption watermarks, 128 with an emblem badge, and 1,027 curated images. The caption text scores 0.3 or more on 75% of the photos and gets no box at all on 16%, faint grey corner text, and the emblem badge is never seen; those copies fall back to the usual rules. Printed text in the picture, on posters, postcards and documents, scores between 0.2 and 0.85 too, but it is in every copy of the picture and cancels inside a group. A watermarked photo downscaled to 768 px keeps its confidence; at 512 px a single threshold of 0.3 split 7% of the pairs, big copy flagged and small copy not, the two thresholds split 1.3%, and 0.2% at 768 px. The YOLOv11 detector of the watermark tool scored 55% on the same photos and is not used.
+
 ## How it decides
 
 ### Which images are copies
@@ -202,6 +224,7 @@ Quality is measured the k2prep way: each copy is cropped and resized to the buck
 3. Exception: a copy from a smaller bucket stays if it scores 3 or more points higher than the larger copy. A badly compressed large copy then loses to a clean smaller one.
 4. Scores less than 0.1 apart count as equal. Then a copy in a sorted folder stays; then the copy with a `.txt` caption; if both or neither have one, the oldest file (modification time) stays; then the first folder on the command line, then the first path in alphabetical order.
 5. With sorted folders, a copy from an unsorted folder replaces a copy in a sorted folder only when it reaches a larger bucket or scores `--promote-margin` higher in the same bucket, and only on a hash match. Otherwise the sorted copy stays although the unsorted copy scored higher. The margin was set on a real collection: below 1.0, the same-bucket differences were resolution steps inside the 1024 bucket, which the bucketed score cannot see.
+6. With `--watermark`, a clean copy stays over a watermarked one before any of the above, and a clean unsorted copy replaces a watermarked sorted copy unless it is a bucket down or more than the margin worse. See [Watermarks](#watermarks).
 
 A caption does not make a copy win: quality decides. The caption is copied instead, as described in [Where the files go](#where-the-files-go).
 
@@ -213,7 +236,7 @@ On 11,561 photos with 67,108 candidate pairs, 23 worker processes: hashing 15 se
 
 - Two different works that share the same central photo, for example two photomontage posters built on one photograph, can match.
 - A mirrored copy does not match. A copy cropped by 10% or more on each side is not caught by the hashes. It matches only through the feature check, and only if it is still among the 30 nearest hash candidates of the other copy.
-- A watermarked copy matches the clean copy, but the score does not see the watermark. If the watermarked copy is larger, it stays.
+- A watermarked copy matches the clean copy, but the score does not see the watermark. Without `--watermark`, the larger copy stays even when it is the watermarked one. With it, the detector misses faint corner text and emblem badges, and those copies are judged by the score alone.
 - The tool reads image content only. It does not compare captions.
 - A photo of a print, or a catalogue page with a printed footer, is told apart from a clean scan only when the hashes disagree and the feature check has to decide. When the hashes agree, the score decides, and the footer comes along into a sorted folder.
 - Moving files breaks references to them, for example in the `metadata.csv` of the image search downloader. A promotion into a sorted folder keeps the sorted name, so references into the sorted folder keep working.

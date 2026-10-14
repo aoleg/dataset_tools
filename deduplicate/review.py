@@ -284,7 +284,9 @@ def run_ui(rv: Review, snapshot: str | None = None) -> int:
                 state = "in place"
             root = rv.root_of(m.orig)
             line1 = f"{state}:  {m.orig.name}"
+            wm = dedup.wm_label(info)
             line2 = (f"{info.get('w')}x{info.get('h')}   bucket {info.get('tier')}   score {info.get('score')}"
+                     + (f"   {wm}" if wm else "")
                      + (f"   {info['match']}" if info.get("match") else "") + f"   [{root.name}]")
             return line1, line2
 

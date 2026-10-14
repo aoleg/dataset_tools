@@ -751,6 +751,17 @@ def wm_class(data, thr) -> str | None:
     return "watermarked" if c >= thr[0] else "clean" if c < thr[1] else "uncertain"
 
 
+def wm_label(info: dict) -> str:
+    """A short label for a plan entry's watermark class, for the viewers;
+    empty for a plan written without --watermark."""
+    c = info.get("watermark")
+    if not c:
+        return ""
+    conf = info.get("watermark_conf")
+    word = {"watermarked": "WATERMARK", "uncertain": "watermark?", "clean": "clean"}[c]
+    return word + (f" {conf:.2f}" if conf is not None else "")
+
+
 def detect_watermarks(items, floor: float, say=print) -> None:
     """Detect on the items without a cached detection and store the boxes in
     it.data["watermark"]. Identical bytes are detected once. The detector runs
