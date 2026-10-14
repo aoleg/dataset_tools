@@ -150,8 +150,8 @@ PROMOTE_MARGIN = 1.0
 #   dino3 (DINOv3-YOLOv12x) sees 75% of the captions, 14% of the badges, and
 #     flags 16.5% of the curated images; 16% of the captions (faint grey
 #     corner text) get no box at all.
-#   yolo11x (the same author's YOLO11x fine-tune, at the default 640 px; its
-#     card's 1280 px is worse on every set) sees 79% and 51%, flags 19.3%:
+#   yolo11x (the same author's YOLO11x fine-tune, run at 640 px; at its own
+#     1280 px it is slower and worse on every set) sees 79% and 51%, flags 19.3%:
 #     its extra flags are object false positives (car fronts, lanterns,
 #     tins), it misses the RIA Novosti stamp, and its badge hits shrink away
 #     when downscaled (19% split at 512 px).

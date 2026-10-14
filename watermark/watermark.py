@@ -55,17 +55,22 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))                 # dino3_compat.py lives next to this file
 MODELS_DIR = HERE / "models"                      # a checkpoint put here is used before the Hugging Face cache
 # name: (Hugging Face repo, repo type, file)
-# name: (Hugging Face repo, repo type, file on the Hub, file name in models/)
+# name: (Hugging Face repo, repo type, file on the Hub, file name in models/,
+# input size or None). A checkpoint carries the size it was trained at and
+# predicts at that size unless told otherwise: dino3 at 1024, yolo11 and
+# yolo11x at 1280.
 DETECTORS = {
     "dino3": ("corzent/yolov12x-dino3-watermark-detection", "model", "yolov12x-dino3-watermark-detection.pt",
-              "yolov12x-dino3-watermark-detection.pt"),
+              "yolov12x-dino3-watermark-detection.pt", None),
     "yolo11": ("fancyfeast/joycaption-watermark-detection", "space", "yolo11x-train28-best.pt",
-               "yolo11x-train28-best.pt"),
-    # the same author's YOLO11x fine-tune of the yolo11 detector: stock ultralytics,
-    # run at the default 640 px (better than its card's 1280 on every calibration set);
-    # sees emblem badges the DINOv3 model never sees, at the price of object false
-    # positives. The dedup tool runs it next to dino3 by default (see its README).
-    "yolo11x": ("corzent/yolo11x_watermark_detection", "model", "best.pt", "yolo11x-watermark-detection.pt"),
+               "yolo11x-train28-best.pt", None),
+    # the same author's YOLO11x fine-tune of the yolo11 detector, stock ultralytics.
+    # Run at 640 px: at its own 1280 it was slower and worse on every calibration
+    # set (71% of Telegram captions and 27% of emblem badges at conf 0.3, against
+    # 79% and 51% at 640). It sees emblem badges the DINOv3 model never sees, at
+    # the price of object false positives. The dedup tool runs it next to dino3
+    # by default (see its README).
+    "yolo11x": ("corzent/yolo11x_watermark_detection", "model", "best.pt", "yolo11x-watermark-detection.pt", 640),
 }
 DETECTOR_ORDER = ["dino3", "yolo11"]              # the first that loads is used
 LAMA_URL = "https://github.com/enesmsahin/simple-lama-inpainting/releases/download/v0.1.0/big-lama.pt"
@@ -105,7 +110,7 @@ def detector_path(name: str, download: bool = True) -> Path:
     the Hugging Face cache; with download, fetched into the cache when it is
     in neither. A plain hf_hub_download asks the Hub on every call, so the
     cache is tried first with the network off."""
-    repo, repo_type, fname, local_name = DETECTORS[name]
+    repo, repo_type, fname, local_name, _ = DETECTORS[name]
     local = MODELS_DIR / local_name
     if local.exists():
         return local
@@ -124,7 +129,7 @@ def detector_local(name: str, download: bool = True) -> Path:
     """The checkpoint of a detector in models/ next to this file, downloaded
     into it when missing (never into the Hugging Face cache): what the dedup
     tool uses, so that its detectors live in one known place."""
-    repo, repo_type, fname, local_name = DETECTORS[name]
+    repo, repo_type, fname, local_name, _ = DETECTORS[name]
     local = MODELS_DIR / local_name
     if local.exists():
         return local
@@ -171,6 +176,9 @@ def load_detector(names=None, download: bool = True):
         try:
             path = detector_path(name, download)
             model = YOLO(str(path))
+            imgsz = DETECTORS[name][4]
+            if imgsz:
+                model.overrides["imgsz"] = imgsz        # instead of the size the checkpoint was trained at
             model.predict(np.zeros((64, 64, 3), np.uint8), conf=0.5, verbose=False)
             return name, model
         except Exception as e:  # noqa: BLE001 - the next detector is tried
