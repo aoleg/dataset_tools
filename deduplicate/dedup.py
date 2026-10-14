@@ -28,8 +28,15 @@ Watermarks (--watermark): the watermark tool's detector (../watermark) runs on
 the copies of every group, after scoring, and its boxes are recorded in
 hashes.json next to the hashes and scores. A copy whose strongest detection is
 WM_CONF or more carries a watermark, one below WM_CLEAN is clean, in between it
-is uncertain. For now the plan only reports which groups hold a watermarked
-and a clean copy; the ranking does not act on it yet.
+is uncertain. In a group that holds a watermarked and a clean copy the
+watermarked copies step aside, whatever their quality, and the best of the
+rest stays. A clean unsorted copy replaces a watermarked sorted copy when it
+is a bucket up, or in the same bucket and not more than PROMOTE_MARGIN worse;
+a watermarked unsorted copy never displaces a clean sorted one. A watermarked
+copy much better than the copy that stays (a bucket up, or the margin or more
+higher) is copied into <root>_replacements under the name of the copy it would
+replace, to be cleaned with the watermark tool and dropped in; --undo removes
+those copies.
 
 Usage:    python dedup.py <folder> [<folder> ...] [--sorted FOLDER] [--sorted-copies keep|one]
           [--promote-margin X] [--match loose|strict|exact] [--dry-run] [--undo]
@@ -157,6 +164,21 @@ WM_FLOOR = 0.01
 WM_VERSION = 1              # with the detector name and floor: the cache entry's key
 WM_DETECTOR = "dino3"
 REPO = Path(__file__).resolve().parent.parent
+# A watermarked copy that loses only because of its watermark and is
+# significantly better than the copy that stays (a bucket up, or the promote
+# margin or more higher in the same bucket) is copied into <root>_replacements
+# next to the root of the copy it would replace, under that copy's relative
+# path, stem and extension, with that copy's caption: run the watermark tool
+# on the folder and drop the cleaned files in. The folder carries no
+# BACKUP_MARK, because the watermark tool refuses a marked root; it is a
+# sibling that no tool walks into unless it is given. A copy of another
+# format is converted to the target's (JPEG at quality 97 without chroma
+# subsampling, PNG lossless), so the file the watermark tool writes back has
+# exactly the slot's name.
+REPL_SUFFIX = "_replacements"
+REPL_MANIFEST = "replacements.json"
+REPL_FORMATS = {".jpg": "JPEG", ".jpeg": "JPEG", ".jpe": "JPEG", ".jfif": "JPEG", ".png": "PNG",
+                ".webp": "WEBP", ".bmp": "BMP", ".tif": "TIFF", ".tiff": "TIFF"}
 
 
 # ---------------------------------------------------------------------------
@@ -771,6 +793,87 @@ def detect_watermarks(items, floor: float, say=print) -> None:
         it.data["watermark"] = by_sha[it.data["sha256"]]
 
 
+# --- the replacement folder -------------------------------------------------------
+
+def repl_dir(root: Path) -> Path:
+    return root.with_name(root.name + REPL_SUFFIX)
+
+
+def claim_repl(root: Path) -> Path:
+    """<root>_replacements, checked: an existing folder without the manifest
+    that holds anything is not this tool's and stops the run."""
+    d = repl_dir(root)
+    if d.exists() and not (d / REPL_MANIFEST).is_file() and (not d.is_dir() or any(d.iterdir())):
+        raise SystemExit(f"{d} exists and was not made by this tool; rename it or move it away, "
+                         f"the replacement copies for {root} go there")
+    return d
+
+
+def repl_conversion(src_format: str, target: Path):
+    """(suffix, format or None): how the replacement for `target` is written.
+    None: a byte copy under the target's extension. A target format Pillow
+    cannot write becomes PNG under a .png name (not a drop-in)."""
+    src = "JPEG" if src_format == "MPO" else src_format
+    tgt = REPL_FORMATS.get(target.suffix.lower())
+    if tgt is None:
+        return ".png", "PNG"
+    return target.suffix, (None if src == tgt else tgt)
+
+
+def write_replacement(src: Path, dst: Path, fmt) -> None:
+    """A byte copy (fmt None), or the upright pixels in fmt without EXIF."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if fmt is None:
+        shutil.copy2(src, dst)
+        return
+    with Image.open(src) as im:
+        icc = im.info.get("icc_profile")
+        img = ImageOps.exif_transpose(im)
+        if fmt == "JPEG":
+            to_rgb(img).save(dst, "JPEG", quality=97, subsampling=0, icc_profile=icc)
+        else:
+            if img.mode not in ("RGB", "RGBA", "L", "LA", "P"):
+                img = to_rgb(img)
+            img.save(dst, fmt, icc_profile=icc)
+
+
+def update_manifest(folder: Path, entries) -> None:
+    """replacements.json in the folder: one entry per file, newest wins."""
+    path = folder / REPL_MANIFEST
+    try:
+        data = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    except ValueError:
+        data = {}
+    files = {e["to"]: e for e in data.get("files", [])}
+    for e in entries:
+        files[e["to"]] = e
+    write_json(path, {"tool": "dedup.py", "what": "better copies that carry a watermark: run the watermark tool "
+                      "on this folder and drop the cleaned files in over the files they replace",
+                      "written": datetime.now().isoformat(timespec="seconds"),
+                      "files": sorted(files.values(), key=lambda e: e["to"].casefold())})
+
+
+def prune_manifest(folder: Path) -> None:
+    """After an undo: drop the manifest entries whose file is gone; remove the
+    manifest and the folder when nothing is left."""
+    path = folder / REPL_MANIFEST
+    if not path.is_file():
+        return
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except ValueError:
+        return
+    left = [e for e in data.get("files", []) if Path(e["to"]).exists()]
+    if left:
+        if len(left) != len(data.get("files", [])):
+            write_json(path, {**data, "files": left})
+        return
+    path.unlink()
+    for dirpath, _, _ in os.walk(folder, topdown=False):
+        if not os.listdir(dirpath):
+            os.rmdir(dirpath)
+
+
 # ---------------------------------------------------------------------------
 # Matching and grouping
 # ---------------------------------------------------------------------------
@@ -1150,7 +1253,32 @@ def components(nodes, adj):
     return out
 
 
-def pick_keeper(members, items):
+def group_classes(members, items, wm_thr):
+    """The watermark class of every member, and whether the group is split: it
+    holds a watermarked and a clean copy. Only in a split group do the
+    watermarked copies step aside; uncertain and undetected copies never decide."""
+    if not wm_thr:
+        return {}, False
+    classes = {i: wm_class(items[i].data, wm_thr) for i in members}
+    vals = set(classes.values())
+    return classes, ("watermarked" in vals and "clean" in vals)
+
+
+def pick_keeper(members, items, wm_thr=None):
+    """Best copy by quality (rank_members); in a split group the watermarked
+    copies step aside first and the best of the rest wins. Returns (keeper, reason)."""
+    classes, split = group_classes(members, items, wm_thr)
+    if not split:
+        return rank_members(members, items)
+    pool = [i for i in members if classes[i] != "watermarked"]
+    top, reason = rank_members(pool, items)
+    q_top, _ = rank_members(members, items)
+    if classes[q_top] == "watermarked":
+        reason = "no watermark" + (f"; {reason}" if len(pool) > 1 else "")
+    return top, reason
+
+
+def rank_members(members, items):
     """Best copy: largest tier, then score; a lower-tier copy that scores GUARD
     or more above wins instead. Ties (score within TIE): a copy in a sorted
     folder, then caption, then oldest modification time, then path order.
@@ -1187,7 +1315,7 @@ def pick_keeper(members, items):
     return top, reason
 
 
-def plan_groups(items, edges, scorer):
+def plan_groups(items, edges, scorer, wm_thr=None):
     """Groups of copies: every image connected through matches is in the group,
     and all but the keeper move. Images that could not be scored stay in place
     and do not connect others."""
@@ -1202,7 +1330,7 @@ def plan_groups(items, edges, scorer):
     for comp in components(set(adj), adj):
         if len(comp) < 2:
             continue
-        keeper, reason = pick_keeper(comp, items)
+        keeper, reason = pick_keeper(comp, items, wm_thr)
         # steps from the keeper, for the plan: 1 = matches the keeper directly
         steps, frontier = {keeper: 0}, [keeper]
         while frontier:
@@ -1263,25 +1391,37 @@ def describe(it, wm_thr=None):
             **({"watermark": wm_class(it.data, wm_thr), "watermark_conf": wm_conf(it.data)} if wm_thr else {})}
 
 
-def role_report(keeper, losers, items, edges, margin):
-    """What the sorted/unsorted rules would do with this group. Reporting only
-    (phase 0 of the feature): nothing acts on the verdict yet.
+def quality_rank(members, items, wm_thr):
+    """The rank key of a group: (not set aside, tier, score). In a split group
+    (a watermarked and a clean copy) the watermarked copies rank below every
+    other copy. Returns (rank, classes, split)."""
+    classes, split = group_classes(members, items, wm_thr)
+
+    def rank(i):
+        si = items[i].data["score_info"]
+        return (not (split and classes[i] == "watermarked"), si["tier"], si["score"])
+    return rank, classes, split
+
+
+def role_report(keeper, losers, items, edges, margin, wm_thr=None):
+    """What the sorted/unsorted rules do with this group.
 
     Mixed groups: the quality deltas between the best copy of each role, the
     match kind to the slot the keeper would take, and a verdict: promote,
-    within margin, sorted copy kept, or review. Sorted-only groups: whether
-    the copies share one directory, and whether every match is an exact or
-    hash match (slot sync would apply) or a feature match (review).
+    within margin, sorted copy kept, or review. When the sorted copies carry
+    a watermark and the keeper is clean, the margin is a tolerance: the clean
+    copy replaces the watermarked one when it is a bucket up, or in the same
+    bucket and not more than the margin worse; a bucket down or worse than
+    that goes to review. Sorted-only groups: whether the copies share one
+    directory, and whether every match is an exact or hash match (slot sync
+    applies) or a feature match (review).
     """
     members = [keeper] + list(losers)
     s = [i for i in members if items[i].role == 1]
     u = [i for i in members if items[i].role == 0]
     if not s:
         return {"roles": "unsorted"}
-
-    def rank(i):
-        si = items[i].data["score_info"]
-        return (si["tier"], si["score"])
+    rank, classes, split = quality_rank(members, items, wm_thr)
 
     def kind(a, b):
         e = edges.get((min(a, b), max(a, b)))
@@ -1297,11 +1437,13 @@ def role_report(keeper, losers, items, edges, margin):
 
     best_s = max(s, key=rank)
     u_ref = keeper if items[keeper].role == 0 else max(u, key=rank)
-    (ts, ss), (tu, su) = rank(best_s), rank(u_ref)
+    (_, ts, ss), (_, tu, su) = rank(best_s), rank(u_ref)
     rep = {"roles": "mixed", "best_sorted": str(items[best_s].path), "best_unsorted": str(items[u_ref].path),
            "tier_delta": tu - ts, "score_delta": round(su - ss, 2)}
     if items[keeper].role == 1:
         rep.update(match=kind(keeper, u_ref), verdict="sorted copy kept")
+        if split and classes[u_ref] == "watermarked":
+            rep["why"] = "the unsorted copy carries a watermark"
         return rep
     # The slot the keeper would take: the best sorted copy it matches directly
     # by hash or content; failing that, the best one it matches directly at all.
@@ -1311,10 +1453,22 @@ def role_report(keeper, losers, items, edges, margin):
     slot = max(clean or any_direct or s, key=rank)
     m = direct[slot]
     rep.update(slot=str(items[slot].path), match=m)
+    # the sorted copies carry a watermark and the keeper is clean: the margin
+    # is a tolerance, not a requirement
+    wm_slot = split and classes[best_s] == "watermarked" and classes[keeper] == "clean"
     if m == "indirect":
         rep["verdict"] = "review: indirect match"
     elif m == "features":
         rep["verdict"] = "review: framing differs"
+    elif wm_slot:
+        if tu > ts:
+            rep["verdict"] = "promote: replaces a watermarked copy (larger bucket)"
+        elif tu < ts:
+            rep["verdict"] = "review: clean copy in a smaller bucket than the watermarked one"
+        elif su - ss >= -margin:
+            rep["verdict"] = f"promote: replaces a watermarked copy (score {su - ss:+.2f})"
+        else:
+            rep["verdict"] = "review: clean copy scores much lower than the watermarked one"
     elif tu < ts:
         rep["verdict"] = "review: guard keeper in a smaller bucket"
     elif tu > ts:
@@ -1391,7 +1545,31 @@ def steps_from(start, members, edges):
     return steps
 
 
-def decide_group(group, items, edges, with_roles, margin, policy="keep"):
+def replacement_for(d, items, margin, classes, split):
+    """In a split group, the best watermarked copy that is significantly better
+    than the copy that stays (a bucket up, or the margin or more higher in the
+    same bucket): it goes to the replacement folder, to be cleaned and dropped
+    in. Returns {"idx", "why"} or None."""
+    if not split:
+        return None
+    aside = [i for i in d["members"] if classes[i] == "watermarked"]
+    if not aside:
+        return None
+
+    def q(i):
+        si = items[i].data["score_info"]
+        return (si["tier"], si["score"])
+
+    cand = max(aside, key=q)
+    (tc, sc), (tb, sb) = q(cand), q(d["keeper"])
+    if tc > tb:
+        return {"idx": cand, "why": "a bucket up"}
+    if tc == tb and sc - sb >= margin:
+        return {"idx": cand, "why": f"score +{sc - sb:.2f}"}
+    return None
+
+
+def decide_group(group, items, edges, with_roles, margin, policy="keep", wm_thr=None):
     """What to do with one group. Without sorted folders: the keeper stays and
     the losers move, as always. With them (see README, "Sorted folders"):
 
@@ -1414,24 +1592,24 @@ def decide_group(group, items, edges, with_roles, margin, policy="keep"):
     including replaced slot images), slot_like (losers whose caption stays for
     the copy that replaces them), promote (the primary slot of a promoted
     keeper), sync (slots that get a copy), slots (the report per sorted copy),
-    reason, steps, report, and skip (why nothing moves) for review groups.
+    reason, steps, report, skip (why nothing moves) for review groups, and
+    replacement (a watermarked copy significantly better than the keeper).
     """
     keeper, losers, reason, steps = group
-    d = {"keeper": keeper, "losers": list(losers), "reason": reason, "steps": steps,
-         "members": [keeper] + list(losers), "quality_keeper": keeper,
-         "report": {}, "skip": None, "promote": None, "sync": [], "slots": [], "slot_like": set()}
+    members = [keeper] + list(losers)
+    d = {"keeper": keeper, "losers": list(losers), "reason": reason, "steps": steps, "members": members,
+         "report": {}, "skip": None, "promote": None, "sync": [], "slots": [], "slot_like": set(),
+         "replacement": None}
+    rank, classes, split = quality_rank(members, items, wm_thr)
     if not with_roles:
+        d["replacement"] = replacement_for(d, items, margin, classes, split)
         return d
-    rep = role_report(keeper, losers, items, edges, margin)
+    rep = role_report(keeper, losers, items, edges, margin, wm_thr)
     d["report"] = rep
     if rep["roles"] == "unsorted":
+        d["replacement"] = replacement_for(d, items, margin, classes, split)
         return d
-    members = [keeper] + list(losers)
     s = [i for i in members if items[i].role == 1]
-
-    def rank(i):
-        si = items[i].data["score_info"]
-        return (si["tier"], si["score"])
 
     def kind(a, b):
         e = edges.get((min(a, b), max(a, b)))
@@ -1487,6 +1665,7 @@ def decide_group(group, items, edges, with_roles, margin, policy="keep"):
     d["slot_like"] = set(d["sync"]) | ({primary} if primary is not None else set())
     if best != keeper:
         d["steps"] = steps_from(best, members, edges)
+    d["replacement"] = replacement_for(d, items, margin, classes, split)
     return d
 
 
@@ -1556,7 +1735,7 @@ def undo(roots) -> int:
                     restored += 1
                 elif dst.exists():
                     skipped += 1
-                    print(f"  copied caption was edited since, left in place: {dst}")
+                    print(f"  copied file was changed since, left in place: {dst}")
                 continue
             if dst.exists() and not src.exists():
                 move_file(dst, src)
@@ -1567,6 +1746,7 @@ def undo(roots) -> int:
         log.rename(log.with_name(f"moves-undone-{datetime.now():%Y%m%d-%H%M%S}.jsonl"))
         print(f"{root}: restored {restored} file(s)")
         failed += skipped
+        prune_manifest(repl_dir(root))
     return 0 if not failed else 1
 
 
@@ -1613,10 +1793,12 @@ def main(argv=None) -> int:
                     help="match the feature descriptors on the GPU with torch; needs the torch that one of "
                          "the GPU tools installed into the shared venv, else the CPU is used")
     ap.add_argument("--watermark", action="store_true",
-                    help="run the watermark tool's detector on the copies of every group and record the "
-                         "boxes in hashes.json; the plan reports the groups that hold a watermarked and a "
-                         "clean copy (reporting only for now). Needs the watermark tool installed "
-                         "(install.bat in the watermark folder)")
+                    help="run the watermark tool's detector on the copies of every group: a clean copy "
+                         "always beats a watermarked one, a clean copy replaces a watermarked sorted copy "
+                         "unless it is a bucket down or more than the margin worse, and a watermarked copy "
+                         "much better than the one that stays is copied into <root>_replacements to be "
+                         "cleaned and dropped in. Needs the watermark tool installed (install.bat in the "
+                         "watermark folder)")
     ap.add_argument("--watermark-conf", type=float, default=WM_CONF, metavar="X",
                     help=f"a copy whose strongest detection is X or more carries a watermark (default {WM_CONF:g})")
     ap.add_argument("--watermark-clean", type=float, default=WM_CLEAN, metavar="X",
@@ -1652,6 +1834,8 @@ def main(argv=None) -> int:
 
     for r in roots:
         claim_out(r, create=not args.undo)
+        if args.watermark:
+            claim_repl(r)
     if args.undo:
         return undo(roots)
 
@@ -1713,7 +1897,7 @@ def main(argv=None) -> int:
             detect_watermarks([good[i] for i in idxs if "error" not in good[i].data["score_info"]], wm_floor)
 
     try:
-        groups = plan_groups(good, edges, scorer)
+        groups = plan_groups(good, edges, scorer, wm_thr)
     except WatermarkError as ex:
         save_caches(roots, items)
         print(f"{ex}\nNothing moved; the hashes and scores so far are cached.")
@@ -1724,7 +1908,7 @@ def main(argv=None) -> int:
     #    planned state. Move-outs are planned before promotions, because they
     #    run before them (a promotion may take a name a move-out frees).
     with_roles = bool(args.sorted)
-    decisions = [decide_group(g, good, edges, with_roles, args.promote_margin, args.sorted_copies)
+    decisions = [decide_group(g, good, edges, with_roles, args.promote_margin, args.sorted_copies, wm_thr)
                  for g in sorted(groups, key=lambda g: (good[g[0]].root_idx, good[g[0]].rel))]
     acted = [d for d in decisions if d["skip"] is None]
     moving = {i for d in acted for i in d["losers"]}
@@ -1773,29 +1957,48 @@ def main(argv=None) -> int:
             pc = plan_placement(d["keeper"], i, good, names, leaving, "copy", best_caption)
             pc["from"] = str(final)
             d["syncs"].append(pc)
+        # the replacement copy: one per place the kept copy ends up in, under
+        # that place's name, in the replacement folder of that place's root
+        d["repl_copies"] = []
+        if d["replacement"]:
+            r = good[d["replacement"]["idx"]]
+            fmt = r.data["score_info"].get("format", "")
+            targets = [(final, has_caption)] + [(Path(pc["to"]), pc["has_caption"]) for pc in d["syncs"]]
+            for target, with_caption in targets:
+                root = next(rr for rr in roots if target.is_relative_to(rr))
+                suffix, conv = repl_conversion(fmt, target)
+                dst = repl_dir(root) / target.relative_to(root).with_suffix(suffix)
+                m = edges.get((min(d["keeper"], r.idx), max(d["keeper"], r.idx)))
+                d["repl_copies"].append({"from": str(r.path), "to": str(dst), "replaces": str(target),
+                                         "root": root, "converted_to": conv, "caption": with_caption,
+                                         "match": m[0] if m else "indirect", "why": d["replacement"]["why"],
+                                         "watermark_conf": wm_conf(r.data), "loser_idx": r.idx})
 
     plan = {"written": datetime.now().isoformat(timespec="seconds"), "match": args.match,
             "folders": [str(r) for r, ro in zip(roots, roles) if ro == 0],
             "sorted_folders": [str(r) for r, ro in zip(roots, roles) if ro == 1],
             "promote_margin": args.promote_margin, "sorted_copies": args.sorted_copies,
             **({"watermark": {"detector": WM_DETECTOR, "conf": args.watermark_conf, "clean": args.watermark_clean,
-                              "acts": False}} if args.watermark else {}),
+                              "replacement_folders": [str(repl_dir(r)) for r in roots]}} if args.watermark else {}),
             "groups": []}
     verdicts, layouts = {}, {}
-    wm_both, wm_keep = [], []        # groups with a watermarked and a clean copy; those keeping a watermarked one
+    wm_both, wm_decided = [], []     # groups with a watermarked and a clean copy; those the watermark decided
 
     def watermark_report(d):
-        """Reporting only: the classes in the group and whether the kept copy
-        carries a watermark while a clean copy exists."""
+        """The classes in the group, and whether the watermark decided it:
+        the best copy by quality alone carries one and a clean copy exists."""
         classes = {i: wm_class(good[i].data, wm_thr) for i in d["members"]}
         rep = {c: sum(1 for v in classes.values() if v == c) for c in ("watermarked", "uncertain", "clean")}
         rep["undetected"] = sum(1 for v in classes.values() if v is None)
         if rep["watermarked"] and rep["clean"]:
             wm_both.append(d)
             rep["kept_copy"] = classes[d["keeper"]]
-            if classes[d["keeper"]] == "watermarked":
-                wm_keep.append(d)
-                rep["note"] = "the kept copy carries a watermark while a clean copy exists"
+            q_top, _ = rank_members(d["members"], good)
+            if classes[q_top] == "watermarked":
+                wm_decided.append(d)
+                rep["decided"] = "the best copy by quality alone carries a watermark; a clean copy stays"
+        if d["replacement"]:
+            rep["replacement"] = str(good[d["replacement"]["idx"]].path)
         return rep
 
     def copy_info(k, i, steps):
@@ -1836,6 +2039,9 @@ def main(argv=None) -> int:
             entry["move"] = [{**copy_info(k, m["idx"], d["steps"]), "to": str(m["to"]),
                               **({"caption_to": str(m["cap_to"]), "caption_action": m["cap_mode"]} if m["cap_mode"] else {})}
                              for m in d["moves"]]
+            if d.get("repl_copies"):
+                entry["replacement"] = [{x: (str(v) if x == "root" else v) for x, v in rc.items() if x != "loser_idx"}
+                                        for rc in d["repl_copies"]]
         plan["groups"].append(entry)
 
     n_moves = len(moving)
@@ -1853,7 +2059,9 @@ def main(argv=None) -> int:
                            "promotions": len(promotions), "promotions_renamed": n_ren, "slots_synced": n_sync,
                            "slots_left_as_they_are": n_left, "sorted_copies_out": n_out} if with_roles else {}),
                        **({"groups_with_watermarked_and_clean": len(wm_both),
-                           "groups_keeping_a_watermarked_copy": len(wm_keep)} if args.watermark else {})}
+                           "groups_decided_by_the_watermark": len(wm_decided),
+                           "replacement_copies": sum(len(d.get("repl_copies", [])) for d in acted)}
+                          if args.watermark else {})}
     for root in roots:
         write_json(out_dir(root) / PLAN_NAME, plan)
     print(f"{len(groups)} group(s); {n_moves} worse cop{'y' if n_moves == 1 else 'ies'} to move, "
@@ -1890,10 +2098,13 @@ def main(argv=None) -> int:
             print(f"  {n_out} sorted cop{'y moves' if n_out == 1 else 'ies move'} out"
                   + (" (one slot per picture)" if args.sorted_copies == "one" else " (a better copy stays in the same folder)"))
     if args.watermark:
+        n_repl = sum(len(d.get("repl_copies", [])) for d in acted)
         print(f"watermarks: {len(wm_both)} group(s) hold a watermarked and a clean copy "
               f"(watermarked at {args.watermark_conf:g} or more, clean below {args.watermark_clean:g})"
-              + (f"; {len(wm_keep)} of them keep a watermarked copy" if wm_both else "")
-              + "; reporting only, the ranking does not act on it yet")
+              + (f"; in {len(wm_decided)} of them the watermark decides against the better copy" if wm_both else ""))
+        if n_repl:
+            print(f"  {n_repl} replacement cop{'y' if n_repl == 1 else 'ies'}: a watermarked copy much better than "
+                  f"the one that stays, under that one's name in <root>{REPL_SUFFIX}, to clean and drop in")
 
     if args.dry_run:
         print(f"Dry run: nothing moved. Plan: {out_dir(roots[0]) / PLAN_NAME}")
@@ -1908,7 +2119,7 @@ def main(argv=None) -> int:
     #    then the caption actions of the promotions. A promotion is logged in the
     #    sorted root's log, after the move-out it depends on, so --undo replays
     #    the sequence in the right order.
-    moved = {r: [0, 0, 0, 0, 0, 0] for r in roots}  # images, captions, bytes, captions copied, promoted in, synced
+    moved = {r: [0, 0, 0, 0, 0, 0, 0] for r in roots}  # images, captions, bytes, captions copied, promoted in, synced, replacements
     logs = {}
 
     def log_for(root):
@@ -2010,6 +2221,40 @@ def main(argv=None) -> int:
                 pc["to"] = str(dst)
                 for c in pc["captions"]:
                     copy_caption(Path(c["from"]), Path(c["to"]), slot.root, c["reason"])
+        manifests = {}
+        for d in acted:                                            # pass 5: replacement copies
+            for rc in d.get("repl_copies", []):
+                src, dst, root = Path(rc["from"]), Path(rc["to"]), rc["root"]
+                # the copy moved out in pass 1: its new place is in the plan
+                mv = next((m for m in d["moves"] if m["idx"] == rc["loser_idx"]), None)
+                moved_to = Path(mv["to"]) if mv else None
+                if moved_to is not None and moved_to.exists():
+                    src = moved_to
+                if not src.exists():
+                    print(f"  GONE before the copy, no replacement written: {rc['from']} -> {dst}")
+                    continue
+                try:
+                    write_replacement(src, dst, rc["converted_to"])
+                except Exception as ex:  # noqa: BLE001
+                    print(f"  could not write the replacement {dst}: {type(ex).__name__}: {ex}")
+                    continue
+                log(root, action="copy", **{"from": str(src), "to": str(dst)}, sha256=file_sha256(dst),
+                    replaces=rc["replaces"], reason="replacement: " + rc["why"] + ", carries a watermark")
+                moved[root][6] += 1
+                # its caption: the one of the place it replaces, else the copy's own
+                cap_dst = dst.with_suffix(".txt")
+                own = [Path(mv["cap_to"])] if mv and mv["cap_to"] else []
+                own.append(Path(rc["from"]).with_suffix(".txt"))
+                for cap in [Path(rc["replaces"]).with_suffix(".txt")] + own:
+                    if cap.exists():
+                        copy_caption(cap, cap_dst, root, "caption for a replacement copy")
+                        break
+                manifests.setdefault(root, []).append(
+                    {"to": str(dst), "from": rc["from"], "replaces": rc["replaces"], "match": rc["match"],
+                     "why": rc["why"], "watermark_conf": rc["watermark_conf"],
+                     "converted_to": rc["converted_to"], "written": datetime.now().isoformat(timespec="seconds")})
+        for root, entries in manifests.items():
+            update_manifest(repl_dir(root), entries)
     finally:
         for f in logs.values():
             f.close()
@@ -2026,11 +2271,12 @@ def main(argv=None) -> int:
     for root, entries in carried.items():
         carry_cache(root, entries)
 
-    for root, (n_img, n_cap, n_b, n_copied, n_in, n_sync) in moved.items():
+    for root, (n_img, n_cap, n_b, n_copied, n_in, n_sync, n_repl) in moved.items():
         print(f"{root}: moved {n_img} image(s) and {n_cap} caption(s), {n_b / 1e6:.1f} MB "
               f"-> {out_dir(root)}" + (f"; copied {n_copied} caption(s) to kept images" if n_copied else "")
               + (f"; {n_in} image(s) promoted into it" if n_in else "")
-              + (f"; {n_sync} slot(s) synced" if n_sync else ""))
+              + (f"; {n_sync} slot(s) synced" if n_sync else "")
+              + (f"; {n_repl} replacement cop{'y' if n_repl == 1 else 'ies'} in {repl_dir(root)}" if n_repl else ""))
     print(f"Done in {time.time() - t0:.0f}s. Undo with --undo.")
     if args.review:
         import subprocess
