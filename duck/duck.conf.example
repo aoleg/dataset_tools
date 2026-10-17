@@ -1,0 +1,22 @@
+; duck configuration. Copy this file to duck.conf (same folder as duck.py) and
+; set the folders. Relative paths are resolved against the duck folder.
+
+[paths]
+; Folder holding the dataset's .parquet files, one entry per dataset
+; (names as listed by: run.bat --list-datasets).
+
+; kakaobrain/coyo-700m: the "data" folder of the Hugging Face repo (128 files, 126 GB)
+coyo700m = T:\DATASETS\coyo-700m\data
+
+; CaptionEmporium/coyo-hd-11m-llavanext: the folder written by tools\arrow_to_parquet.py
+coyo-hd-11m = T:\DATASETS\coyo-hd-11m-llavanext\parquet
+
+; tomg-group-umd/pixelprose: the "data" folder of the Hugging Face repo (22 files, 9 GB)
+pixelprose = T:\DATASETS\pixelprose\data
+
+[output]
+; Where run.bat writes its CSVs: <results>\<dataset>\<terms>-<start>.csv
+results = results
+
+; Where download.bat puts images: <downloads>\<csv name>\
+downloads = downloads

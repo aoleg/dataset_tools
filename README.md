@@ -8,6 +8,7 @@ Tools that prepare image datasets for LoRA and fine-tune training, mainly with [
 | [telegram_dataset](telegram_dataset/README.md) | Turns the photos of a Telegram channel export into images with clean one-line captions. |
 | [taggui_captioning](taggui_captioning/README.md) | A TagGUI prompt that turns a photo and its editor's caption into an English text-to-image prompt, with the TagGUI settings it needs. |
 | [ddg_images](ddg_images/README.md) | Downloads the image results of Bing, DuckDuckGo or SearXNG searches, page by page, removes duplicates and logs every image to a CSV file. |
+| [duck](duck/README.md) | Searches three public image-caption datasets, COYO-700M, coyo-hd-11m-llavanext and PixelProse, by caption terms and by size, aesthetic, watermark and face filters, with DuckDB over the Parquet files their authors publish (no index, no upload), and writes a CSV; `download.bat` fetches the images with img2dataset, each with its caption as a `.txt` next to it. One `run.bat --dataset <name>` for all three, a `duck.conf` for the dataset folders, and a spec file per dataset to add another. |
 | [deduplicate](deduplicate/README.md) | Finds copies of the same picture across folders (hashes plus a feature check for crops, borders and mock-ups) and moves the worse copies, with their captions, to a `<folder>_duplicates` folder next to each folder; a kept copy without a caption gets a copy of one. A curated collection given with `--sorted` receives the better copies from raw folders under its own names and keeps its captions. `compare.bat` shows which files were judged copies of which, side by side, for a check by eye; `review.bat` (or `--review` after a run) opens the groups full screen and lets you change the kept copy with a click. `--undo` puts everything back, including review changes. `--gpu` matches the image features on the GPU when torch is in the shared venv, which cuts the slow stage from minutes to seconds on large sets. `--watermark` runs the watermark tool's two detectors on the copies: a clean copy stays over a watermarked one whatever their size, a clean copy replaces a watermarked one in the collection, and the better copies that carry a watermark are collected in `<folder>_replacements` under the names they would replace, to clean with the watermark tool and copy over. |
 | [reframe](reframe/README.md) | Crops photos of people to the subject (one person or a group, without passers-by) in a [k2prep](k2prep/README.md) aspect ratio; lossless for JPEG, and with `--resize` straight into k2prep buckets, for Ostris AI Toolkit (`--ostris`) or musubi-tuner (`--musubi`). |
 | [classify](classify/README.md) | Sorts a dataset into category folders from a folder of hand-sorted examples per category: every image is embedded once with SigLIP 2, a classifier is trained on the examples, and each image is copied with its caption into its category folder, or into `_unsure` when the classifier is not confident. A dry run writes a report with a confusion matrix, a confidence histogram and contact sheets; `--undo` puts everything back. |
@@ -28,13 +29,15 @@ The stages of a dataset and the tools that come in at each of them. Tools marked
 
 ```
  1. COLLECT  (side by side)
-  ________________________________    ________________________________
- | telegram_dataset               |  | ddg_images                     |
- |   Telegram channel export ->   |  |   Bing / DDG / SearXNG image   |
- |   photos, one-line captions    |  |   search results, CSV log      |
- |________________________________|  |________________________________|
-                  |                                   |
-                  +-----------------+-----------------+
+  ____________________    ____________________    ____________________
+ | telegram_dataset   |  | ddg_images         |  | duck               |
+ |   Telegram channel |  |   Bing / DDG /     |  |   caption search of|
+ |   export -> photos,|  |   SearXNG image    |  |   COYO, coyo-hd-11m|
+ |   one-line captions|  |   search results,  |  |   and PixelProse ->|
+ |                    |  |   CSV log          |  |   images + captions|
+ |____________________|  |____________________|  |____________________|
+            |                       |                       |
+            +-----------------------+-----------------------+
                                     v
  2. GATHER  (in this order)
   __________________________________________________________________
@@ -171,6 +174,7 @@ All tools share one virtual environment: the `venv` folder in the repository roo
 | `move_alone` | nothing, it is a batch file |
 | `scripts` | Python only, nothing to install |
 | `ddg_images` | the `ddgs` package for the Bing and DuckDuckGo backends; the SearXNG backend needs nothing |
+| `duck` | DuckDB, img2dataset (installed from GitHub, so git must be on PATH) and huggingface_hub; runs on the CPU. The datasets themselves are downloaded separately, 9 to 126 GB each; see [its README](duck/README.md) |
 | `deduplicate` | Pillow, numpy, imagehash, OpenCV; runs on the CPU. With `--gpu` it uses the torch of the GPU tools when one of them is installed, and falls back to the CPU otherwise. With `--watermark` it needs the watermark tool installed, for its detector and torch. |
 | `remove_borders` | Pillow, numpy, jpeglib, OpenCV; runs on the CPU |
 | `k2prep` | Pillow, numpy, tqdm; runs on the CPU. `--sort --vl` also asks a local vision model server (llama.cpp, koboldcpp or LM Studio), set in `.env` |

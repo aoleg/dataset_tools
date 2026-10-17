@@ -1,0 +1,6 @@
+# local configuration and everything a run produces
+duck.conf
+results/
+downloads/
+*.csv
+__pycache__/

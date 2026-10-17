@@ -1,0 +1,18 @@
+duckdb>=1.1
+
+# Provides the "hf" command used in the README to download the datasets.
+huggingface_hub>=1.0
+
+# Install img2dataset from git, NOT from PyPI.
+#
+# The PyPI wheel and git main both call themselves 1.47.0, but only git main carries
+# commit 95523bc ("Option to ignore SSL certificate", PR #397). That commit passes an
+# explicit ssl.create_default_context() to urlopen, which is what stops WordPress Photon
+# URLs (i0.wp.com, very common in COYO-700M) from failing with a bogus
+# "HTTP Error 404: Not Found". The PyPI build lets http.client build the context instead,
+# and its ClientHello (post_handshake_auth plus an http/1.1-only ALPN list) gets rejected
+# by the CDN. Reinstalling from PyPI silently reintroduces the 404s.
+#
+# Requires git on PATH. To pin instead of tracking the branch, replace @main with
+# @95523bc7579745a1749b8132d408b9fea89a338e
+img2dataset @ git+https://github.com/rom1504/img2dataset.git@main
