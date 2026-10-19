@@ -24,7 +24,7 @@ set "TORCH_INDEX=https://download.pytorch.org/whl/cu132"
 set "PYTHON="
 where python >nul 2>nul && set "PYTHON=python"
 if not defined PYTHON (
-    where py >nul 2>nul && set "PYTHON=py -3.13"
+    where py >nul 2>nul && set "PYTHON=py -3"
 )
 if not defined PYTHON (
     echo [ERROR] Python was not found. Install Python 3.13 from https://www.python.org/downloads/
