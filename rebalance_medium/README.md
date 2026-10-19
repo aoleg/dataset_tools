@@ -4,6 +4,8 @@
 
 It is made for a training run in [Ostris AI Toolkit](https://github.com/ostris/ai-toolkit) that is already in progress. The latent cache of each moved image moves with it and stays valid. The original caption files and the text-embedding caches, which are keyed by the caption text, are kept in a backup folder outside the dataset and come back with `--undo`.
 
+The folder also holds `extract_media.py`, which moves every image whose caption contains a keyword, with all its files and caches, into a dataset folder of its own (section [Extract by keyword](#extract-by-keyword)).
+
 ## Install
 
 Nothing to install. The tool needs Python 3.10 or newer. `run.bat` uses the shared `..\venv` when it exists, and the Python on PATH when it does not.
@@ -151,6 +153,53 @@ The folders hold every file, so the dataset can be restored without the tool and
 2. Run `--apply`.
 3. Add the destination folder to the job as a new dataset, with the same resolution and repeat settings as the dataset folder. With other settings the latent caches do not match and are made again.
 4. Resume the job. The trainer finds the latent caches of the moved images in place and encodes the new captions once.
+
+## Extract by keyword
+
+`extract_media.py` moves the images whose captions contain a keyword out of a dataset into `<dataset>_<keyword>` next to it, in the same subfolders, with every file that belongs to them. Nothing is rewritten, so the new folder can be trained at once as a dataset of its own, with its caches in place.
+
+```
+extract_media.bat <dataset folder> <keyword> [<keyword> ...]
+extract_media.bat <dataset folder> <keyword> [<keyword> ...] --apply
+extract_media.bat <dataset folder> <keyword> [<keyword> ...] --undo
+```
+
+Example:
+
+```
+extract_media.bat D:\train\1_main-dataset_1024 "black-and-white"
+extract_media.bat D:\train\1_main-dataset_1024 "black-and-white" --apply
+extract_media.bat D:\train\1_main-dataset_1024 "black-and-white" --undo
+```
+
+The first command is a dry run: it lists the matching captions, writes the plan to `D:\train\1_main-dataset_1024_black-and-white_extract.json` and moves nothing. The second moves the images into `D:\train\1_main-dataset_1024_black-and-white`. The third moves everything back. Give `--undo` the same keywords as the run, because they name the folder and the manifest.
+
+| option | what it does |
+|---|---|
+| `--partial` | match inside words too: `car` also finds `cart` |
+| `--case-sensitive` | the letter case must match |
+| `--dest NAME` | the new folder, next to the dataset folder; default `<dataset>_<first keyword>` |
+| `--manifest PATH` | the manifest; default `<new folder>_extract.json` next to the dataset folder |
+| `--apply` | move the files; without it the run is a dry run |
+| `--undo` | move every file of an applied run back |
+
+The keywords work as in [extract_keywords](../extract_keywords/README.md):
+
+- Keywords one after another are alternatives: a caption with any of them matches. `AND` between keywords means that all of them must be in the caption, and binds closer than a space.
+- A keyword matches whole words in any letter case. The words of a keyword may be separated by any spaces, line breaks or hyphens in the caption: `"black-and-white"` also finds `Black and white`, and `"black and white"` finds `black-and-white`.
+- The keyword is searched in the whole caption. `"black-and-white"` also finds `A color photograph of a black-and-white cat`. Check the list of captions in the dry run, or narrow the match with `AND`.
+
+With each matching image go:
+
+- every file of the same name in its folder: other images of that name (`a.jpg` and `a.png`), the caption and other sidecars (`a.npz`);
+- its face masks in the `_controls` folder (or an old `masks` folder) of its folder;
+- its files in `_latent_cache` and `_t_e_cache`. The caption does not change, so both caches stay valid in the new folder.
+
+The dataset is searched with all its subfolders, except `_latent_cache`, `_t_e_cache`, `_controls`, `masks`, the old in-dataset output folders of the dataset tools (`_backup`, `_duplicates`, `_prep` and others), every folder whose name starts with `.` and every folder marked as their own by the dataset tools. Captions without an image are listed and stay. Links and junctions are not followed.
+
+No backup folder is made: every file moves unchanged, so the new folder holds the originals. To restore by hand, move the contents of the new folder back into the dataset folder, keeping the subfolders, and skip `.aitk_size.json`.
+
+`--apply` and `--undo` work as in this tool: the plan is written before the first move, an interrupted run goes on when you give the same command again, and a run stops before it moves anything when the new folder exists, when the manifest records an applied run with other keywords or options, or when an image it lists as moved is in the dataset again. `--undo` also moves back the cache files that the trainer made in the new folder for the moved images, because they are valid in the dataset too. When the old place of a file is taken by a new file, that image stays in the new folder and is listed; move the new file away and run `--undo` again.
 
 ## Limits
 
