@@ -1,0 +1,19 @@
+Write a text-to-image prompt that would reproduce this historical photo.
+
+Existing caption: {tags}
+The Existing caption part comes from the record of this photo in a public archive of historical photographs. It gives, in this order and with empty parts left out: the title, the years the photo is dated to (a single year or a range such as 1959-1962), the place (country, region, city and district in the local language, then the same in English in brackets), the street address, and the uploader's description. The title and the description are in the local language (often Russian, but also Estonian, Latvian, Lithuanian, Ukrainian, Belarusian or another language of the region). The title can be a guess, and the description can tell the later history of the place (for example that a building was demolished afterwards) rather than what the photo shows. The caption carries information that is not visible in the image (date, place, event, names). Read it and use what fits the image.
+
+Rules:
+- Plain English, present tense, one paragraph of 2 to 5 sentences, at most 160 words.
+- Start with the medium and the main subject, for example "A black-and-white photograph of ..." or "A color photograph of ...". Put the date, place, event and names of people from the caption into this first sentence, in standard English spellings: a single year as the year, a range within one decade as that decade ("from the 1970s"), a wider range as the span ("from the 1950s or 1960s"). Name the city and the country, not the district or region, unless the place is known only by its region. Leave out the uploader's opinions and remarks about later events.
+- Then describe what is visible: people with their age (an age range for groups; never say "approximately", give your best guess), clothing, pose and expression; objects and setting and where they are relative to each other.
+- If the photograph is in color, name the color of each major element as you describe it: clothing, vehicles, buildings, signs, sky and ground, as in "a red tram", "a dark green Moskvich", "a pale blue sky". Use plain color names, tie each one to its object, and do not list colors separately. If the photograph is black-and-white, use no color names at all; describe tones as light or dark.
+- End with the camera angle and lighting, then any visible scratches, tears, stains, fading or a color cast. If there are none, say nothing about quality.
+- Name a person only if the caption identifies them and the image agrees. If the caption gives no date, estimate the decade from clothing, vehicles and architecture.
+- Look for watermarks, especially in the bottom part of the image; if and only if a watermark is present, mention it.
+- Transcribe any readable signs or anything that contains text, including Cyrillics and other alphabets, as written.
+- For any small print or illegible lines of text, especially located at the bottom edge of the image, caption them as "small print" and location in the image.
+- Never mention the caption, the archive, the uploader, the viewer, "this image" or "this photograph shows". Do not use "appears to", "seems" or "likely". Describe only what is present.
+
+Example of the form, not the content:
+A black-and-white photograph from the 1960s of the first television set in a village. A group of men aged 20 to 50, some shirtless and others in light-colored shirts and trousers, sit and stand on a concrete porch outside a small white-walled building with a corrugated roof. They all look toward a small television set on a wooden stand to the left. Eye-level view, bright daylight.

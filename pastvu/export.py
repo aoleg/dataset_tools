@@ -16,6 +16,10 @@ def rows(store: Store, scope: str):
         rec = store.record(cid)
         if rec is None:
             continue
+        cap = store.caption(cid)
+        if cap:
+            rec = {**rec, "autocaption": {"caption": cap["caption"], "original": cap["original"], "model": cap["model"],
+                                          "prompt_sha": cap["prompt_sha"]}}
         yield cid, path, category, rec
 
 
@@ -47,6 +51,7 @@ def flat(cid: int, path: str, category: str, rec: dict) -> dict:
         "height": (out.get("size") or [None, None])[1],
         "sha256": out.get("sha256"),
         "caption": sidecars.caption(p),
+        "vlm_caption": (rec.get("autocaption") or {}).get("caption"),
         "record": json.dumps(rec, ensure_ascii=False, default=str),
     }
 
@@ -66,7 +71,8 @@ def export(store: Store, scope: str, dst: Path, fmt: str) -> int:
     schema = pa.schema([("cid", I), ("path", S), ("category", S), ("confidence", F), ("page", S), ("title", S),
                         ("year", I), ("year2", I), ("lat", F), ("lon", F), ("direction", S), ("regions_en", S),
                         ("regions_local", S), ("address", S), ("author", S), ("source", S), ("uploader", S),
-                        ("width", I), ("height", I), ("sha256", S), ("caption", S), ("record", S)])
+                        ("width", I), ("height", I), ("sha256", S), ("caption", S), ("vlm_caption", S),
+                        ("record", S)])
     batch, writer = [], None
     try:
         for cid, path, category, rec in rows(store, scope):

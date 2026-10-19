@@ -97,7 +97,8 @@ def cleanup_interrupted(store: Store, base: Path, scope: str) -> int:
 
 
 class Stream:
-    def __init__(self, client: Client, store: Store, opts: Options, classifier=None, detector=None, lama=None):
+    def __init__(self, client: Client, store: Store, opts: Options, classifier=None, detector=None, lama=None,
+                 caption_client=None, caption_run: int | None = None, vram=None):
         self.client, self.store, self.opts = client, store, opts
         self.classifier = classifier
         self.det_name, self.det = detector or (None, None)
@@ -110,6 +111,8 @@ class Stream:
         self.in_flight = 0
         self.lock = threading.Lock()
         self.display: Display | None = None
+        self.caption_client, self.caption_run, self.vram = caption_client, caption_run, vram
+        self.captioner = None
         enc_model = getattr(getattr(classifier, "encoder", None), "model_id", None)
         self.emb_key = (enc_model, getattr(classifier, "patches", None))
         self.tool = {"name": "dataset_tools/pastvu", "version": TOOL_VERSION, "detector": self.det_name,
@@ -232,11 +235,11 @@ class Stream:
             vec = self.classifier.embed(final)
             verdict = self.classifier.decide(vec)
             s.time("classify", time.perf_counter() - t)
-        return plan, boxes, painted, vec, verdict, final.shape[1], final.shape[0]
+        return plan, boxes, painted, vec, verdict, final.shape[1], final.shape[0], final
 
     # --- writer threads ------------------------------------------------------------
 
-    def write(self, job: Job, plan: dict, boxes: list, painted, vec, verdict, fw: int, fh: int) -> None:
+    def write(self, job: Job, plan: dict, boxes: list, painted, vec, verdict, fw: int, fh: int, final=None) -> None:
         o, s, d = self.opts, self.stats, self.display
         d.set(f"{job.cid}: encoding")
         t = time.perf_counter()
@@ -254,7 +257,8 @@ class Stream:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(data)
-            path.with_suffix(".txt").write_text(sidecars.caption(job.photo, o.txt_fields), encoding="utf-8")
+            facts = sidecars.caption(job.photo, o.txt_fields)
+            path.with_suffix(".txt").write_text(facts, encoding="utf-8")
             sha = hashlib.sha256(data).hexdigest()
             doc = self.record_json(job, plan, boxes, mode, rel, data, sha, fw, fh, verdict)
             if o.json_files:
@@ -275,6 +279,10 @@ class Stream:
             self.store.unclaim(job.cid)
             raise
         s.time("write", time.perf_counter() - t)
+        if self.captioner is not None:
+            # after the photo is committed: a wait here (the VLM is behind) slows the stream, nothing else
+            import autocaption as ac
+            self.captioner.put(ac.Target(job.cid, path, image=final, tags=facts))
         s.add(done=1)
         d.advance(saved=True)
         d.line({"cid": job.cid, "state": DONE, "path": rel, "write": mode, "changed": plan["changed"],
@@ -340,9 +348,19 @@ class Stream:
 
     # --- the run -------------------------------------------------------------------
 
+    def stop_requested_by_captioner(self) -> bool:
+        """The captioner stopped the run because the endpoint failed."""
+        import autocaption as ac
+        return self.captioner is not None and self.captioner.fails_in_row >= ac.MAX_CONSECUTIVE_FAILS
+
     def report(self, t_start: float, final: bool = False) -> str:
         counts = self.store.scope_counts(self.scope)
-        return report_block(self.store.counters(self.scope), self.stats, counts, time.time() - t_start, final)
+        text = report_block(self.store.counters(self.scope), self.stats, counts, time.time() - t_start, final)
+        if self.caption_client is not None:
+            text += f"\n  captioned by the VLM in this run: {int(self.stats.c['captioned']):,}"
+        if self.vram is not None and self.vram.ok:
+            text += "\n  " + self.vram.report()
+        return text
 
     def run(self, cids: list[int], scope_total: int, completed: int) -> dict:
         o = self.opts
@@ -356,8 +374,12 @@ class Stream:
                                                                           if k != "scope"}})
         t_start = time.time()
         processed = 0
-        with Display(scope_total, completed, o.display) as d:
+        with Display(scope_total, completed, o.display, vram=self.vram) as d:
             self.display = d
+            if self.caption_client is not None:
+                import autocaption as ac
+                self.captioner = ac.StreamCaptioner(self.store, self.caption_client, self.caption_run, self.stats,
+                                                    lambda: self.display, self.stop)
             d.print(f"{self.scope}: {len(cids):,} photos to do in this run; {completed:,} of {scope_total:,} done, "
                     f"skipped or saved under another scope before.")
             fetchers = [threading.Thread(target=self.fetch_worker, args=(it, cid_lock, out_q), daemon=True,
@@ -417,6 +439,9 @@ class Stream:
                     wq.put(None)
                 for t in writers:
                     t.join()
+                if self.captioner is not None:
+                    d.set("finishing the captions")
+                    self.captioner.close()
                 d.set("done")
                 d.print(self.report(t_start, final=True))
         c = self.stats.c

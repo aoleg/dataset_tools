@@ -12,6 +12,10 @@ scope in it.
   classifier's embedding of the saved pixels, per photo.
 - counters: per-scope totals for the reports.
 - reclass_runs, reclass_moves: what reclassify moved, for --undo.
+- captions, caption_log, caption_fails, caption_runs: autocaption. captions
+  holds each photo's current VLM caption and the caption it had before the
+  first one (the original); caption_log holds, per run, the text a file had
+  before and after, which --undo writes back.
 
 A photo becomes done in one transaction with its record, its embedding and
 its counters, so a killed process loses nothing that was finished.
@@ -61,6 +65,14 @@ CREATE TABLE IF NOT EXISTS reclass_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT, scope TEXT, started REAL, samples TEXT, moved INTEGER, undone REAL);
 CREATE TABLE IF NOT EXISTS reclass_moves (
     run INTEGER, seq INTEGER, cid INTEGER, src TEXT, dst TEXT, cat_from TEXT, cat_to TEXT, PRIMARY KEY (run, seq));
+CREATE TABLE IF NOT EXISTS captions (
+    cid INTEGER PRIMARY KEY, original TEXT, caption TEXT, run INTEGER, model TEXT, prompt_sha TEXT, time REAL);
+CREATE TABLE IF NOT EXISTS caption_log (
+    run INTEGER, cid INTEGER, before TEXT, after TEXT, PRIMARY KEY (run, cid)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS caption_fails (cid INTEGER PRIMARY KEY, attempts INTEGER, error TEXT, time REAL);
+CREATE TABLE IF NOT EXISTS caption_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, scope TEXT, target TEXT, model TEXT, prompt_sha TEXT, started REAL,
+    ended REAL, captioned INTEGER DEFAULT 0, failed INTEGER DEFAULT 0, undone REAL);
 """
 
 PENDING, WRITING, DONE, SKIPPED, FAILED = "pending", "writing", "done", "skipped", "failed"
@@ -396,3 +408,84 @@ class Store:
     def undo_reclass(self, run: int) -> None:
         with self.lock:
             self.db.execute("UPDATE reclass_runs SET undone=? WHERE id=?", (time.time(), run))
+
+    # --- autocaption ---------------------------------------------------------------------
+
+    def start_caption_run(self, scope: str, target: str, model: str, prompt_sha: str) -> int:
+        with self.lock:
+            cur = self.db.execute("INSERT INTO caption_runs (scope, target, model, prompt_sha, started) VALUES "
+                                  "(?,?,?,?,?)", (scope, target, model, prompt_sha, time.time()))
+            return cur.lastrowid
+
+    def end_caption_run(self, run: int, captioned: int, failed: int) -> None:
+        with self.lock:
+            self.db.execute("UPDATE caption_runs SET ended=?, captioned=?, failed=? WHERE id=?",
+                            (time.time(), captioned, failed, run))
+
+    def caption(self, cid: int) -> dict | None:
+        with self.lock:
+            row = self.db.execute("SELECT cid, original, caption, run, model, prompt_sha FROM captions WHERE cid=?",
+                                  (cid,)).fetchone()
+        return dict(zip(("cid", "original", "caption", "run", "model", "prompt_sha"), row)) if row else None
+
+    def captioned_cids(self, scope: str) -> set[int]:
+        with self.lock:
+            return {r[0] for r in self.db.execute("SELECT c.cid FROM captions c JOIN status s ON s.cid=c.cid "
+                                                  "WHERE s.scope=?", (scope,))}
+
+    def caption_attempts(self) -> dict[int, int]:
+        with self.lock:
+            return dict(self.db.execute("SELECT cid, attempts FROM caption_fails"))
+
+    def save_caption(self, run: int, cid: int, before: str, after: str, model: str, prompt_sha: str) -> None:
+        """A new VLM caption: the backup of the file's previous text in the run's
+        log, the caption itself, and the original kept from the first time."""
+        now = time.time()
+
+        def work(db):
+            db.execute("INSERT OR REPLACE INTO caption_log (run, cid, before, after) VALUES (?,?,?,?)",
+                       (run, cid, before, after))
+            db.execute("INSERT INTO captions (cid, original, caption, run, model, prompt_sha, time) VALUES "
+                       "(?,?,?,?,?,?,?) ON CONFLICT(cid) DO UPDATE SET caption=excluded.caption, run=excluded.run, "
+                       "model=excluded.model, prompt_sha=excluded.prompt_sha, time=excluded.time",
+                       (cid, before, after, run, model, prompt_sha, now))
+            db.execute("DELETE FROM caption_fails WHERE cid=?", (cid,))
+
+        self.tx(work)
+
+    def caption_failed(self, cid: int, error: str) -> None:
+        with self.lock:
+            self.db.execute("INSERT INTO caption_fails (cid, attempts, error, time) VALUES (?,1,?,?) "
+                            "ON CONFLICT(cid) DO UPDATE SET attempts=attempts+1, error=excluded.error, "
+                            "time=excluded.time", (cid, error[:500], time.time()))
+
+    def last_caption_run(self, scope: str) -> dict | None:
+        with self.lock:
+            row = self.db.execute("SELECT r.id, r.target, r.started, (SELECT COUNT(*) FROM caption_log l WHERE "
+                                  "l.run=r.id) FROM caption_runs r WHERE r.scope=? AND r.undone IS NULL AND EXISTS "
+                                  "(SELECT 1 FROM caption_log l WHERE l.run=r.id) ORDER BY r.id DESC LIMIT 1",
+                                  (scope,)).fetchone()
+        return dict(zip(("id", "target", "started", "captioned"), row)) if row else None
+
+    def caption_log_rows(self, run: int) -> list[tuple]:
+        with self.lock:
+            return self.db.execute("SELECT cid, before, after FROM caption_log WHERE run=?", (run,)).fetchall()
+
+    def unsave_caption(self, run: int, cid: int) -> None:
+        """Undo one photo's caption of a run: the photo's caption becomes the one
+        of its latest earlier run that is not undone, or none."""
+
+        def work(db):
+            prev = db.execute("SELECT l.run, l.after FROM caption_log l JOIN caption_runs r ON r.id=l.run WHERE "
+                              "l.cid=? AND l.run<? AND r.undone IS NULL ORDER BY l.run DESC LIMIT 1",
+                              (cid, run)).fetchone()
+            if prev:
+                db.execute("UPDATE captions SET caption=?, run=? WHERE cid=?", (prev[1], prev[0], cid))
+            else:
+                db.execute("DELETE FROM captions WHERE cid=?", (cid,))
+
+        self.tx(work)
+
+    def undo_caption_run(self, run: int) -> None:
+        with self.lock:
+            self.db.execute("UPDATE caption_runs SET undone=? WHERE id=?", (time.time(), run))

@@ -10,6 +10,8 @@ samples folder, the defaults and the region aliases come from pastvu.conf.
     run.bat run --scope belarus_1917-1991             resume
     run.bat reclassify belarus_1917-1991 --dry-run    sort again with the current samples
     run.bat captions belarus_1917-1991                rewrite the captions from the records
+    run.bat autocaption belarus_1917-1991             caption with the VLM of [caption] in the conf
+    run.bat autocaption <base>/belarus_1917-1991/5_transport --limit 100
     run.bat export belarus_1917-1991 --format parquet
     run.bat scopes | aliases | regions --find Minsk | count --region belarus
 
@@ -85,6 +87,37 @@ def scope_arg(base: Path, store: Store, value: str) -> dict:
         known = ", ".join(s["name"] for s in store.scopes()) or "none yet"
         raise SystemExit(f"no scope {name!r} in {base}. Scopes: {known}")
     return sc
+
+
+def target_arg(base: Path, store: Store, value: str) -> tuple[dict, str]:
+    """A scope name, or a folder: the scope's folder or one inside it.
+    -> (scope, path prefix relative to the base, ending in /)."""
+    if "/" not in value and "\\" not in value and store.scope(value):
+        return store.scope(value), value + "/"
+    p = Path(value)
+    p = (p if p.is_absolute() else Path.cwd() / p).resolve()
+    try:
+        rel = p.relative_to(base.resolve())
+    except ValueError:
+        raise SystemExit(f"{p} is not inside the base folder {base}")
+    if not rel.parts:
+        raise SystemExit("give a scope or a folder inside one, not the base folder")
+    sc = scope_arg(base, store, rel.parts[0])
+    if not p.is_dir():
+        raise SystemExit(f"{p} is not a folder")
+    return sc, rel.as_posix().rstrip("/") + "/"
+
+
+def vlm_client(conf: cf.Conf):
+    import autocaption as ac
+    client = ac.VLMClient(conf.caption)
+    try:
+        served = client.check()
+    except ac.EndpointDown as e:
+        raise SystemExit(str(e))
+    print(f"Caption endpoint {client.base}: {served}; prompts {conf.caption.prompt.name} and "
+          f"{conf.caption.system_prompt.name}", flush=True)
+    return client
 
 
 def scope_from_args(args, conf: cf.Conf, client: Client, store: Store) -> dict:
@@ -236,6 +269,13 @@ def cmd_run(args, conf, client) -> int:
                       comments=args.comments,
                       display="json" if args.json_progress else "quiet" if args.quiet else "live")
 
+    caption_client = caption_run = None
+    if args.autocaption:
+        caption_client = vlm_client(conf)
+        caption_run = store.start_caption_run(sc["name"], sc["name"] + "/", caption_client.model,
+                                              caption_client.prompt_sha)
+    import vram as vr
+    vram = vr.VramMonitor().start()
     print("Loading the models ...", flush=True)
     t0 = time.time()
     import numpy as np
@@ -263,11 +303,26 @@ def cmd_run(args, conf, client) -> int:
     counts = store.scope_counts(sc["name"])
     cids = store.pending_cids(sc["name"], args.retries)
     completed = counts["total"] - len(cids)
-    s = sm.Stream(client, store, opts, classifier, detector, lama)
+    if vram.ok:
+        print(f"  {vram.text()}", flush=True)
+    s = sm.Stream(client, store, opts, classifier, detector, lama, caption_client, caption_run, vram)
     res = s.run(cids, counts["total"], completed)
     left = len(store.pending_cids(sc["name"], args.retries))
     print(f"This run: {res['done']:,} saved, {res['skipped']:,} skipped, {res['failed']:,} failed in "
           f"{res['seconds'] / 60:.1f} min. Left to do in {sc['name']}: {left:,}.")
+    if caption_client is not None and not s.stop_requested_by_captioner():
+        # photos saved earlier or left behind: caption them now
+        import autocaption as ac
+        targets, _ = ac.select(store, base, sc["name"], sc["name"] + "/", False, args.retries)
+        if targets:
+            print(f"Captioning {len(targets):,} saved photos of {sc['name']} that have no VLM caption yet ...")
+            from progress import Display
+            run_id = store.start_caption_run(sc["name"], sc["name"] + "/", caption_client.model,
+                                             caption_client.prompt_sha)
+            mode = "json" if args.json_progress else "quiet" if args.quiet else "live"
+            with Display(len(targets), 0, mode, vram=vram) as d:
+                ac.run(store, base, sc["name"], targets, caption_client, d, run_id, args.report_every, vram)
+    vram.stop()
     return 0
 
 
@@ -275,8 +330,12 @@ def cmd_captions(args, conf, client) -> int:
     base, store = open_base(args, conf)
     sc = scope_arg(base, store, args.scope)
     fields = parse_fields(args.txt_fields)
-    n = changed = missing = 0
+    n = changed = missing = vlm = 0
+    autocaptioned = store.captioned_cids(sc["name"])
     for cid, path, category, sha in store.done_rows(sc["name"]):
+        if cid in autocaptioned:
+            vlm += 1
+            continue
         rec = store.record(cid)
         img = base / path
         if rec is None or not img.is_file():
@@ -294,6 +353,9 @@ def cmd_captions(args, conf, client) -> int:
         n += 1
     verb = "would change" if args.dry_run else "changed"
     print(f"{n:,} captions checked, {changed:,} {verb}, {missing:,} photos without a record or image")
+    if vlm:
+        print(f"{vlm:,} photos have a VLM caption and were left alone (autocaption --undo brings their facts "
+              f"line back)")
     return 0
 
 
@@ -325,6 +387,36 @@ def cmd_reclassify(args, conf, client) -> int:
           f"{res['manual']:,} hand-sorted photos recorded where they are, {res['pruned']} empty folders removed. "
           f"--undo puts the moves back.")
     return 0
+
+
+def cmd_autocaption(args, conf, client) -> int:
+    import autocaption as ac
+    import vram as vr
+    from progress import Display
+    base, store = open_base(args, conf)
+    sc, prefix = target_arg(base, store, args.target)
+    if args.undo:
+        res = ac.undo(store, base, sc["name"])
+        print(f"Undid autocaption run {res['run']} ({res['target']}): {res['restored']:,} captions put back, "
+              f"{res['kept']:,} edited since and kept, {res['missing']:,} photos not found")
+        return 0
+    targets, counts = ac.select(store, base, sc["name"], prefix, args.recaption, args.retries)
+    if args.limit is not None:
+        targets = targets[:max(0, args.limit)]
+    print(f"{prefix.rstrip('/')}: {counts['listed']:,} saved photos, {counts['captioned before']:,} captioned before, "
+          f"{counts['gave up']:,} failed {args.retries} times; {len(targets):,} to caption")
+    if not targets:
+        return 0
+    capt = vlm_client(conf)
+    vram = vr.VramMonitor().start()
+    if vram.ok:
+        print(f"  {vram.text()}")
+    run_id = store.start_caption_run(sc["name"], prefix, capt.model, capt.prompt_sha)
+    mode = "json" if args.json_progress else "quiet" if args.quiet else "live"
+    with Display(len(targets), 0, mode, vram=vram) as d:
+        res = ac.run(store, base, sc["name"], targets, capt, d, run_id, args.report_every, vram)
+    vram.stop()
+    return 1 if res.get("stopped") and "Ctrl+C" not in res["stopped"] else 0
 
 
 def cmd_export(args, conf, client) -> int:
@@ -460,6 +552,27 @@ json_files = no
 ; it off (the top score always wins).
 priority_margin = 0.15
 
+[caption]
+; autocaption: a vision-language model writes each caption from the image and
+; its facts line, through an OpenAI-compatible chat endpoint (KoboldCpp, the
+; llama.cpp server, LM Studio). The prompts are files; {tags} in the main prompt
+; is the existing caption.
+api_url = http://localhost:5001/v1
+; Empty: whatever model the endpoint has loaded.
+model =
+api_key =
+system_prompt = tagging/sysprompt.txt
+prompt = tagging/main_prompt.txt
+max_tokens = 400
+temperature = 0.3
+top_p = 0.95
+; The longest side of the image sent to the model, in pixels.
+image_side = 1024
+; Seconds to wait for one caption.
+timeout = 300
+; Let a reasoning model think before it answers (slower).
+reasoning = no
+
 ; Aliases: a name for one or more PastVu region numbers, used with --region.
 ; Three groups: countries (and groups of countries), regions (the first level
 ; under each country), cities and smaller parts (capitals and federal cities,
@@ -579,6 +692,8 @@ def parse_args(argv=None):
     p.add_argument("--report-every", type=int, default=500, metavar="N", help="a report block every N photos")
     p.add_argument("--quiet", action="store_true", help="report blocks only, no live display")
     p.add_argument("--json-progress", action="store_true", help="one JSON line per photo on stdout")
+    p.add_argument("--autocaption", action="store_true",
+                   help="caption each saved photo with the VLM of [caption] in the conf (downloads slow to its pace)")
 
     p = sub.add_parser("captions", help="rewrite the captions of a scope from the records, no downloads")
     p.add_argument("scope", metavar="SCOPE", help="the scope's name or folder")
@@ -597,6 +712,17 @@ def parse_args(argv=None):
     p.add_argument("--override-manual", action="store_true",
                    help="also sort the photos that were moved to another category by hand (default: they stay)")
     p.add_argument("--undo", action="store_true", help="put back the moves of the last reclassify of the scope")
+
+    p = sub.add_parser("autocaption", help="caption saved photos with a VLM, from each image and its caption")
+    p.add_argument("target", metavar="SCOPE|FOLDER", help="a scope's name, or its folder or any folder inside it")
+    p.add_argument("--recaption", action="store_true",
+                   help="caption again the photos that have a VLM caption (from their original caption)")
+    p.add_argument("--undo", action="store_true", help="put back the caption files of the last autocaption of the scope")
+    p.add_argument("--limit", type=int, metavar="N", help="caption at most N photos in this run")
+    p.add_argument("--retries", type=int, default=3, metavar="N", help="attempts for a photo that failed (default 3)")
+    p.add_argument("--report-every", type=int, default=100, metavar="N", help="a report block every N photos")
+    p.add_argument("--quiet", action="store_true", help="report blocks only, no live display")
+    p.add_argument("--json-progress", action="store_true", help="one JSON line per photo on stdout")
 
     p = sub.add_parser("export", help="write the records of a scope as JSON Lines or Parquet")
     p.add_argument("scope", metavar="SCOPE", help="the scope's name or folder")
@@ -618,7 +744,7 @@ def main(argv=None) -> int:
     try:
         cmds = {"regions": cmd_regions, "aliases": cmd_aliases, "count": cmd_count, "scopes": cmd_scopes,
                 "index": cmd_index, "run": cmd_run, "captions": cmd_captions, "reclassify": cmd_reclassify,
-                "export": cmd_export}
+                "export": cmd_export, "autocaption": cmd_autocaption}
         return cmds[args.cmd](args, conf, client)
     finally:
         client.close()

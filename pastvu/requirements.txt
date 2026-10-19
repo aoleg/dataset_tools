@@ -6,3 +6,5 @@ rich>=13.0
 PyTurboJPEG>=2.0
 # only for fetch_turbojpeg.py: the conda package holds a zstd-compressed tar
 zstandard>=0.22
+# GPU memory of the whole device (autocaption next to a local VLM)
+nvidia-ml-py>=12.0

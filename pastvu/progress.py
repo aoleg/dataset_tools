@@ -18,7 +18,7 @@ from rich.progress import BarColumn, MofNCompleteColumn, Progress, TaskProgressC
     TimeRemainingColumn
 from rich.text import Text
 
-STAGES = ["fetch", "detect", "paint", "classify", "encode", "write"]
+STAGES = ["fetch", "detect", "paint", "classify", "encode", "write", "caption"]
 
 
 def hms(seconds: float) -> str:
@@ -96,7 +96,7 @@ def report_block(totals: dict, session: Stats, counts: dict, elapsed: float, fin
 class Display:
     """Status line + progress bar (rich), or plain report lines, or JSON lines."""
 
-    def __init__(self, total: int, completed: int, mode: str = "live"):
+    def __init__(self, total: int, completed: int, mode: str = "live", vram=None):
         self.mode = mode                   # live, quiet or json
         self.status = "starting"
         self.lock = threading.Lock()
@@ -106,6 +106,7 @@ class Display:
                                  TextColumn("left"), TimeRemainingColumn(), console=self.console)
         self.task = self.progress.add_task("pastvu", total=total, completed=completed, rate="")
         self.live = None
+        self.vram = vram
         self.t0 = time.time()
         self.session_done = 0
 
@@ -124,6 +125,8 @@ class Display:
     def _render(self):
         with self.lock:
             status = self.status
+        if self.vram is not None and self.vram.ok:
+            status = f"{status}   |   {self.vram.text()}"
         return Group(Text(status, style="cyan", overflow="ellipsis", no_wrap=True), self.progress)
 
     def set(self, status: str) -> None:

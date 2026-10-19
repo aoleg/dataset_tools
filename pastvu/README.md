@@ -1,12 +1,12 @@
 # PastVu
 
-Downloads historic photographs from [PastVu](https://pastvu.com) by region and years, and prepares each one for a training dataset while it downloads: it cuts the grey PastVu band and any scanned border, paints out watermarks and printed captions, sorts the image into the categories of a [classify](../classify/README.md) samples folder, and writes it with a one-line caption for the captioner. One image after another, with every model kept on the GPU, and with a store that lets a stopped run continue where it was.
+Downloads historic photographs from [PastVu](https://pastvu.com) by region and years, and prepares each one for a training dataset while it downloads: it cuts the grey PastVu band and any scanned border, paints out watermarks and printed captions, sorts the image into the categories of a [classify](../classify/README.md) samples folder, and writes it with a one-line caption of its facts. A local vision-language model can then write the final captions, during the download or afterwards ([Autocaption](#autocaption)). One image after another, with every model kept on the GPU, and with a store that lets a stopped run continue where it was.
 
 The tool uses PastVu's public API (no account, no key). Read [The photographs are not PastVu's](#the-photographs-are-not-pastvus) before you publish images you downloaded with it.
 
 ## Install
 
-Run `install.bat` in the repository root first: it installs remove_borders, watermark and classify, whose code and models this tool uses, and then this tool. Or run `install.bat` in this folder after the root one. It installs `httpx`, `rich`, PyTurboJPEG and `zstandard` into the shared `..\venv`, puts `turbojpeg.dll` into `bin\` (PyTurboJPEG does not include the library, and libjpeg-turbo publishes its Windows builds only as installers, so the installer takes the DLL out of conda-forge's `libjpeg-turbo` package, pinned by version and sha256), and makes `pastvu.conf` from `pastvu.conf.example` when there is none.
+Run `install.bat` in the repository root first: it installs remove_borders, watermark and classify, whose code and models this tool uses, and then this tool. Or run `install.bat` in this folder after the root one. It installs `httpx`, `rich`, PyTurboJPEG, `zstandard` and `nvidia-ml-py` into the shared `..\venv`, puts `turbojpeg.dll` into `bin\` (PyTurboJPEG does not include the library, and libjpeg-turbo publishes its Windows builds only as installers, so the installer takes the DLL out of conda-forge's `libjpeg-turbo` package, pinned by version and sha256), and makes `pastvu.conf` from `pastvu.conf.example` when there is none.
 
 ## The conf file
 
@@ -23,6 +23,11 @@ split = 5000                          at most this many images per folder; 0: no
 fetchers = 4                          download threads
 json_files = no                       also write each record as a JSON file
 priority_margin = 0.15                within this of the top score, the lower-numbered category wins
+
+[caption]                             the VLM of autocaption; see Autocaption
+api_url = http://localhost:5001/v1
+system_prompt = tagging/sysprompt.txt
+prompt = tagging/main_prompt.txt
 ```
 
 The rest of the file is the **aliases**: names for PastVu region numbers, used with `--region`, in three groups. `[aliases.countries]` has the 15 countries of the former Soviet Union (Ukraine with three presets, see [Ukraine, Crimea and Sevastopol](#ukraine-crimea-and-sevastopol)) and the groups `ussr`, `baltics`, `caucasus` and `central_asia`. `[aliases.regions]` has the first level under each country (oblasts, krais, provinces, counties, republics within Russia). `[aliases.cities]` has the capitals and federal cities, then the places of the second level with at least 1,000 photos (city districts, towns, urban okrugs), with the parent's name added where two places share a name (`leninsky_district_minsk`). Each line has a comment with the PastVu title and the photo count when the file was made:
@@ -99,6 +104,7 @@ run.bat run --region <alias> [--region ...] [--years FROM TO | --decade YEAR] [o
 run.bat run --scope <name>
 run.bat reclassify <scope> [--dry-run] [--undo]
 run.bat captions <scope> [--txt-fields LIST] [--dry-run]
+run.bat autocaption <scope or folder> [--limit N] [--recaption] [--undo]
 run.bat export <scope> [--format jsonl|parquet]
 run.bat scopes | aliases | count --region <alias> | regions [--find TEXT]
 ```
@@ -168,6 +174,25 @@ PastVu's placeholder titles ("Где это?", alone or in front of a guess) are
 
 **The record** of each photo is in the store: the PastVu record as the API gives it (title, description, address, author, source, years, coordinates, direction, regions, uploader), the download (URL, size, sha256), what was done (band, border cuts, every watermark detection with its confidence, the painted boxes, the crop, how the file was written) and the classification. `export <scope>` writes the records of a scope as JSON Lines (one full record per line) or, with `--format parquet`, as Parquet with the main fields as columns and the full record as a JSON string. `json_files = yes` in the conf also writes each record to `<base>\_records\<number>\<cid>.json`, where the number is the PastVu number divided by 10,000, so no folder holds more than 10,000 files; `--json-sidecar` writes it next to the image instead.
 
+## Autocaption
+
+```
+run.bat autocaption belarus_1917-1991
+run.bat autocaption D:\pastvu\belarus_1917-1991\5_transport --limit 500
+run.bat autocaption belarus_1917-1991 --undo
+run.bat run --region belarus --autocaption
+```
+
+A vision-language model on your own machine writes each photo's caption from the image and its facts line, and the caption file then holds the model's caption alone: it is built from the facts line, so the date, place and names are in it. The model runs in a separate server with an OpenAI-compatible chat endpoint, such as [KoboldCpp](https://github.com/LostRuins/koboldcpp) with a vision model loaded; `[caption]` in the conf names its address and the two prompt files. The prompts are always files: `tagging\sysprompt.txt`, a short system prompt, and `tagging\main_prompt.txt`, which explains what the facts line is and how a caption is to be written; `{tags}` in it is replaced by the photo's existing caption. The API part is TagGUI's: one request per photo with the image inline (its longest side cut to `image_side`, 1024 px), reasoning switched off, thinking blocks removed from the answer, a retry at half the size when the endpoint rejects a request, and a stop when three photos in a row fail.
+
+`autocaption <target>` captions saved photos, one after another, with the same live display as a download (the photo being captioned, the VRAM in use, a progress bar with the rate and the time left) and report blocks every `--report-every` photos (100): photos captioned, photos per hour, seconds per photo, tokens per second, failures, and the VRAM now and at its peak. The target is a scope's name, its folder, or any folder inside it, such as one category. A photo with a VLM caption is not captioned again, so a stopped run continues where it was when you start it again; `--limit N` takes at most N photos in this run, and `--recaption` captions photos again from their original facts line (with a changed prompt, for example). A photo that fails is tried again on later runs, up to `--retries` (3) times. Ctrl+C finishes the photo being captioned and stops.
+
+**Backups and undo.** Before a caption file is written, its old text goes into the store, and the caption a photo had before its first VLM caption is kept as its original. `autocaption <target> --undo` puts back the caption files of the last autocaption run of the scope, one run at a time; a file you edited since that run keeps your edit. `captions <scope>` leaves photos with a VLM caption alone, and `export` writes the VLM caption next to the facts line.
+
+`run --autocaption` captions each photo as soon as it is saved, from the pixels still in memory, and then the saved photos of the scope that have no VLM caption yet. The downloads slow down to the model's pace: a queue of four photos sits between them, so the downloads never run far ahead. If the endpoint stops answering, the run stops; start `autocaption` later for the photos left.
+
+**Speed and memory.** With Gemma 4 26B-A4B (NVFP4) in KoboldCpp 1.122 on an RTX 5090, a caption takes 2.4 to 3.3 s, about 1,300 photos per hour, against 5 to 9 photos per second for a download alone. The model holds about 23 GB of GPU memory; this tool's models add 2.1 GB, and up to 5.9 GB while LaMa paints a large window, so a download with `--autocaption` peaked at 27 GB of the card's 32. The VRAM shown is the whole card's, read through NVML as nvidia-smi reads it: on Windows a program does not see the memory other programs hold, and the driver does not fail when the card is full but moves memory to system RAM, which slows everything down. The status line warns when less than 1 GB is free.
+
 ## Reclassify
 
 ```
@@ -229,6 +254,7 @@ Each saved photo costs one API call and one image download; a photo skipped as t
 | `--retries N` | 3 | attempts for a photo that failed |
 | `--report-every N` | 500 | a report block every N photos |
 | `--quiet`, `--json-progress` | | report blocks only, or one JSON line per photo |
+| `--autocaption` | off | caption each saved photo with the VLM of `[caption]`; the downloads slow to its pace |
 | `--full-parent` | off | page a large region itself instead of through its children |
 | `--reindex` | off | page the scope again, to find photos published since |
 
@@ -260,6 +286,9 @@ Each record carries what attribution and a takedown need: the PastVu page, the u
 | `encode.py` | the save rules, in memory |
 | `classifier.py` | classify's sorter, one image at a time or in batches |
 | `reclassify.py` | sorting a scope again, and undo |
+| `autocaption.py` | the VLM client, the caption runs, and undo |
+| `vram.py` | the GPU memory of the whole card, through NVML |
+| `tagging\` | the default prompts of autocaption |
 | `export.py` | records as JSON Lines or Parquet |
 | `sidecars.py` | the caption and the record |
 | `progress.py` | the live display and the report blocks |

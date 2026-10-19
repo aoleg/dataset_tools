@@ -36,6 +36,24 @@ ALIAS_NAME = re.compile(r"^[a-z0-9][a-z0-9_]*$")
 
 
 @dataclass
+class CaptionConf:
+    """[caption]: the VLM endpoint and the prompts of autocaption. The prompts
+    are always files (paths relative to the conf's folder), never text in the
+    conf."""
+    api_url: str = "http://localhost:5001/v1"
+    api_key: str = ""
+    model: str = ""                   # empty: whatever the endpoint has loaded
+    system_prompt: Path = HERE / "tagging" / "sysprompt.txt"
+    prompt: Path = HERE / "tagging" / "main_prompt.txt"
+    max_tokens: int = 400
+    temperature: float = 0.3
+    top_p: float = 0.95
+    image_side: int = 1024            # the longest side of the image sent to the VLM
+    timeout: int = 300                # seconds per request
+    reasoning: bool = False           # let a reasoning model think before it answers
+
+
+@dataclass
 class Conf:
     path: Path | None = None
     base: Path | None = None
@@ -45,6 +63,7 @@ class Conf:
     fetchers: int = 4
     json_files: bool = False
     priority_margin: float = 0.15
+    caption: CaptionConf = field(default_factory=CaptionConf)
     aliases: dict[str, list[int]] = field(default_factory=dict)
     groups: dict[str, str] = field(default_factory=dict)      # alias -> its group
 
@@ -106,6 +125,22 @@ def load(path: Path | None = None) -> Conf:
             conf.priority_margin = d.getfloat("priority_margin", fallback=conf.priority_margin)
         except ValueError as e:
             raise SystemExit(f"{path}: [defaults] {e}")
+    if cp.has_section("caption"):
+        c, cc = cp["caption"], conf.caption
+        try:
+            cc.api_url = c.get("api_url", cc.api_url).strip() or cc.api_url
+            cc.api_key = c.get("api_key", cc.api_key).strip()
+            cc.model = c.get("model", cc.model).strip()
+            cc.system_prompt = _path(c.get("system_prompt", ""), root) or cc.system_prompt
+            cc.prompt = _path(c.get("prompt", ""), root) or cc.prompt
+            cc.max_tokens = c.getint("max_tokens", fallback=cc.max_tokens)
+            cc.temperature = c.getfloat("temperature", fallback=cc.temperature)
+            cc.top_p = c.getfloat("top_p", fallback=cc.top_p)
+            cc.image_side = c.getint("image_side", fallback=cc.image_side)
+            cc.timeout = c.getint("timeout", fallback=cc.timeout)
+            cc.reasoning = c.getboolean("reasoning", fallback=cc.reasoning)
+        except ValueError as e:
+            raise SystemExit(f"{path}: [caption] {e}")
     for group in ALIAS_GROUPS:
         sec = f"aliases.{group}"
         if not cp.has_section(sec):

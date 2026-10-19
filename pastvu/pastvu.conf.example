@@ -27,6 +27,27 @@ json_files = no
 ; it off (the top score always wins).
 priority_margin = 0.15
 
+[caption]
+; autocaption: a vision-language model writes each caption from the image and
+; its facts line, through an OpenAI-compatible chat endpoint (KoboldCpp, the
+; llama.cpp server, LM Studio). The prompts are files; {tags} in the main prompt
+; is the existing caption.
+api_url = http://localhost:5001/v1
+; Empty: whatever model the endpoint has loaded.
+model =
+api_key =
+system_prompt = tagging/sysprompt.txt
+prompt = tagging/main_prompt.txt
+max_tokens = 400
+temperature = 0.3
+top_p = 0.95
+; The longest side of the image sent to the model, in pixels.
+image_side = 1024
+; Seconds to wait for one caption.
+timeout = 300
+; Let a reasoning model think before it answers (slower).
+reasoning = no
+
 ; Aliases: a name for one or more PastVu region numbers, used with --region.
 ; Three groups: countries (and groups of countries), regions (the first level
 ; under each country), cities and smaller parts (capitals and federal cities,
@@ -65,14 +86,14 @@ priority_margin = 0.15
 ; your dataset.
 
 [aliases.countries]
-russia                           = 1                    ; Russia / Россия, 1,425,222 photos; in PastVu's tree this contains Crimea and Sevastopol (see the note above)
+russia                           = 1                    ; Russia / Россия, 1,425,263 photos; in PastVu's tree this contains Crimea and Sevastopol (see the note above)
 ukraine                          = 20, 556, 669         ; the modern state of Ukraine in its internationally recognized borders: Ukraine (20), Crimea (556), Sevastopol (669)
 ukrainian_ssr                    = 20, 556, 669         ; the Ukrainian SSR from 1954 to 1991 (see the note above)
 ukraine_pre_1954                 = 20                   ; the Ukrainian SSR before 1954, without Crimea and Sevastopol (see the note above)
 belarus                          = 22                   ; Belarus / Беларусь, 23,422 photos
 moldova                          = 189                  ; Moldova / Молдавия, 5,812 photos
 estonia                          = 267                  ; Estonia / Эстония, 11,489 photos
-latvia                           = 149                  ; Latvia / Латвия, 21,757 photos
+latvia                           = 149                  ; Latvia / Латвия, 21,758 photos
 lithuania                        = 154                  ; Lithuania / Литва, 14,080 photos
 georgia                          = 92                   ; Georgia / Грузия, 33,296 photos
 armenia                          = 45                   ; Armenia / Армения, 6,794 photos
@@ -107,7 +128,7 @@ kostroma_oblast                  = 381                  ; Kostroma Oblast / Ко
 tatarstan                        = 277                  ; Tatarstan / Татарстан, 16,681 photos
 ivanovo_oblast                   = 342                  ; Ivanovo Oblast / Ивановская область, 16,638 photos
 irkutsk_oblast                   = 303                  ; Irkutsk Oblast / Иркутская область, 15,606 photos
-vladimir_oblast                  = 341                  ; Vladimir Oblast / Владимирская область, 15,022 photos
+vladimir_oblast                  = 341                  ; Vladimir Oblast / Владимирская область, 15,023 photos
 ryazan_oblast                    = 347                  ; Ryazan Oblast / Рязанская область, 14,723 photos
 novgorod_oblast                  = 323                  ; Novgorod Oblast / Новгородская область, 14,676 photos
 kirov_oblast                     = 312                  ; Kirov Oblast / Кировская область, 14,655 photos
@@ -120,18 +141,18 @@ kaluga_oblast                    = 343                  ; Kaluga Oblast / Кал
 vologda_oblast                   = 321                  ; Vologda Oblast / Вологодская область, 10,099 photos
 tomsk_oblast                     = 332                  ; Tomsk Oblast / Томская область, 10,000 photos
 samara_oblast                    = 316                  ; Samara Oblast / Самарская область, 9,883 photos
-volgograd_oblast                 = 809                  ; Volgograd Oblast / Волгоградская область, 9,485 photos
+volgograd_oblast                 = 809                  ; Volgograd Oblast / Волгоградская область, 9,518 photos
 smolensk_oblast                  = 348                  ; Smolensk Oblast / Смоленская область, 9,167 photos
 karelia                          = 18                   ; Karelia / Карелия, 9,101 photos
 khabarovsk_krai                  = 310                  ; Khabarovsk Krai / Хабаровский край, 8,578 photos
-murmansk_oblast                  = 322                  ; Murmansk Oblast / Мурманская область, 8,009 photos
+murmansk_oblast                  = 322                  ; Murmansk Oblast / Мурманская область, 8,015 photos
 voronezh_oblast                  = 197                  ; Voronezh Oblast / Воронежская область, 6,675 photos
 penza_oblast                     = 314                  ; Penza Oblast / Пензенская область, 6,560 photos
 tyumen_oblast                    = 335                  ; Tyumen Oblast / Тюменская область, 5,958 photos
 tula_oblast                      = 351                  ; Tula Oblast / Тульская область, 5,627 photos
 saratov_oblast                   = 317                  ; Saratov Oblast / Саратовская область, 5,042 photos
 orenburg_oblast                  = 313                  ; Orenburg Oblast / Оренбургская область, 4,783 photos
-ulyanovsk_oblast                 = 318                  ; Ulyanovsk Oblast / Ульяновская область, 4,776 photos
+ulyanovsk_oblast                 = 318                  ; Ulyanovsk Oblast / Ульяновская область, 4,777 photos
 kurgan_oblast                    = 333                  ; Kurgan Oblast / Курганская область, 3,652 photos
 kemerovo_oblast                  = 330                  ; Kemerovo Oblast / Кемеровская область, 3,298 photos
 sakha                            = 28                   ; Sakha (Yakutia) / Саха (Якутия), 3,076 photos
@@ -257,7 +278,7 @@ polva_county                     = 976                  ; Põlva County / уез
 hiiu_county                      = 968                  ; Hiiu County / уезд Хийумаа, 23 photos
 ; Latvia
 vidzeme                          = 757                  ; Vidzeme / Видземе, 10,653 photos
-courland                         = 759                  ; Courland / Курземе, 8,738 photos
+courland                         = 759                  ; Courland / Курземе, 8,739 photos
 latgale                          = 760                  ; Latgale / Латгалия, 1,587 photos
 zemgale                          = 758                  ; Zemgale / Земгале, 692 photos
 ; Lithuania
@@ -391,7 +412,7 @@ veliky_novgorod                  = 373                  ; Veliky Novgorod / Ве
 irkutsk                          = 379                  ; Irkutsk / Иркутск, 8,119 photos, in Irkutsk Oblast
 north_western_ao                 = 395                  ; North-Western AO / СЗАО, 8,115 photos, in Moscow
 pskov                            = 372                  ; Pskov / Псков, 8,086 photos, in Pskov Oblast
-volgograd                        = 810                  ; Volgograd / Волгоград, 7,458 photos, in Volgograd Oblast
+volgograd                        = 810                  ; Volgograd / Волгоград, 7,487 photos, in Volgograd Oblast
 kalininsky_district_spb          = 697                  ; Kalininsky District SPb / Калининский район СПб, 7,284 photos, in Saint Petersburg
 odintsovsky_urban_area           = 1132                 ; Odintsovsky Urban Area / Одинцовский городской округ, 7,054 photos, in Moscow Oblast
 moskovsky_district_spb           = 704                  ; Moskovsky District SPb / Московский район СПб, 7,042 photos, in Saint Petersburg
@@ -413,7 +434,7 @@ arkhangelsk                      = 866                  ; Arkhangelsk / Арха
 yuzhno_sakhalinsk                = 422                  ; Yuzhno-Sakhalinsk / Южно-Сахалинск, 4,493 photos, in Sakhalin Oblast
 voronezh                         = 198                  ; Voronezh / Воронеж, 4,466 photos, in Voronezh Oblast
 suzdalsky_district               = 884                  ; Suzdalsky District / Суздальский район, 4,368 photos, in Vladimir Oblast
-ulyanovsk                        = 951                  ; Ulyanovsk / Ульяновск, 4,309 photos, in Ulyanovsk Oblast
+ulyanovsk                        = 951                  ; Ulyanovsk / Ульяновск, 4,310 photos, in Ulyanovsk Oblast
 tarsky_district                  = 2505                 ; Tarsky District / Тарский район, 4,291 photos, in Omsk Oblast
 gatchinsky_district              = 521                  ; Gatchinsky District / Гатчинский район, 4,239 photos, in Leningrad Oblast
 zelenograd                       = 384                  ; Zelenograd / Зеленоград, 4,234 photos, in Moscow
@@ -424,7 +445,7 @@ novocherkassk                    = 1479                 ; Novocherkassk / Нов
 krasnogvardeysky_district_spb    = 698                  ; Krasnogvardeysky District SPb / Красногвардейский район СПб, 3,847 photos, in Saint Petersburg
 vladimir                         = 880                  ; Vladimir / Владимир, 3,810 photos, in Vladimir Oblast
 nakhodkinsky_urban_okrug         = 2496                 ; Nakhodkinsky Urban Okrug / Находкинский городской округ, 3,765 photos, in Primorsky Krai
-murmansk                         = 940                  ; Murmansk / Мурманск, 3,754 photos, in Murmansk Oblast
+murmansk                         = 940                  ; Murmansk / Мурманск, 3,760 photos, in Murmansk Oblast
 kislovodsk                       = 773                  ; Kislovodsk / Кисловодск, 3,723 photos, in Stavropol Krai
 reutov                           = 1189                 ; Reutov / Реутов, 3,636 photos, in Moscow Oblast
 vsevolozhsky_district            = 520                  ; Vsevolozhsky District / Всеволожский район, 3,493 photos, in Leningrad Oblast
@@ -489,7 +510,7 @@ ramensky_urban_area              = 1115                 ; Ramensky Urban Area / 
 kimry                            = 1202                 ; Kimry / Кимры, 1,650 photos, in Tver Oblast
 bogorodsky_urban_area            = 1136                 ; Bogorodsky Urban Area / Богородский городской округ, 1,633 photos, in Moscow Oblast
 tikhvinsky_district              = 518                  ; Tikhvinsky District / Тихвинский район, 1,622 photos, in Leningrad Oblast
-murom                            = 883                  ; Murom / Муром, 1,619 photos, in Vladimir Oblast
+murom                            = 883                  ; Murom / Муром, 1,620 photos, in Vladimir Oblast
 stavropol                        = 770                  ; Stavropol / Ставрополь, 1,576 photos, in Stavropol Krai
 oryol                            = 624                  ; Oryol / Орёл, 1,542 photos, in Oryol Oblast
 bratsk                           = 755                  ; Bratsk / Братск, 1,531 photos, in Irkutsk Oblast
@@ -597,7 +618,7 @@ tiraspol                         = 1276                 ; Tiraspol / Тирас�
 tallinn                          = 967                  ; Tallinn / Таллин, 5,571 photos, in Harju County
 narva                            = 982                  ; Narva / Нарва, 1,599 photos, in Ida-Viru County
 ; Latvia
-liepaja                          = 766                  ; Liepaja / Лиепая, 7,694 photos, in Courland
+liepaja                          = 766                  ; Liepaja / Лиепая, 7,695 photos, in Courland
 riga                             = 763                  ; Riga / Рига, 7,615 photos, in Vidzeme
 jurmala                          = 764                  ; Jurmala / Юрмала, 1,648 photos, in Vidzeme
 daugavpils                       = 768                  ; Daugavpils / Даугавпилс, 1,226 photos, in Latgale
