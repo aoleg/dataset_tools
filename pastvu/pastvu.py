@@ -262,6 +262,17 @@ def do_index(args, client: Client, store: Store, sc: dict) -> dict:
     return store.scope(sc["name"])
 
 
+def run_rule(args, store: Store):
+    """The rule a --region run splits by, or None for one scope. In a
+    years/place or place/years base every scope is one decade, so a run over a
+    span of years splits by decade, and --by country means country,decade."""
+    import partition as pt
+    rule = pt.parse_rule(args.by) if getattr(args, "by", None) else None
+    if store.layout() != "flat" and getattr(args, "decade", None) is None:
+        rule = pt.Rule(True, rule.place if rule else None)
+    return rule
+
+
 def family_from_args(args, conf: cf.Conf, client: Client, store: Store, rule) -> tuple[dict, dict]:
     """run --by: index the regions and years of the arguments once and put each
     photo into the scope its rule names, made on first sight.
@@ -410,6 +421,10 @@ def cmd_scopes(args, conf, client) -> int:
 
 def cmd_index(args, conf, client) -> int:
     base, store = open_base(args, conf)
+    rule = run_rule(args, store)
+    if rule:
+        family_from_args(args, conf, client, store, rule)
+        return 0
     sc = scope_from_args(args, conf, client, store)
     do_index(args, client, store, sc)
     return 0
@@ -424,11 +439,11 @@ def cmd_run(args, conf, client) -> int:
 
 def run_locked(args, conf, client, base: Path, store: Store, sm) -> int:
     scopes = None
-    if args.by:
-        import partition as pt
-        if args.scope or not args.region:
-            raise SystemExit("--by takes --region (the regions and years to split), not --scope")
-        sc, scopes = family_from_args(args, conf, client, store, pt.parse_rule(args.by))
+    if args.by and (args.scope or not args.region):
+        raise SystemExit("--by takes --region (the regions and years to split), not --scope")
+    rule = run_rule(args, store) if args.region and not args.scope else None
+    if rule:
+        sc, scopes = family_from_args(args, conf, client, store, rule)
     elif args.scope:
         sc = scope_arg(base, store, args.scope)
         if args.reindex:
@@ -693,6 +708,9 @@ def cmd_regroup(args, conf, client) -> int:
         if not args.by:
             raise SystemExit("regroup needs --by RULE (decade, country, region, country,decade, region,decade) or --undo")
         rule = pt.parse_rule(args.by)
+        if store.layout() != "flat" and not rule.decade:
+            rule = pt.Rule(True, rule.place)
+            print(f"In a {store.layout()} base every scope is one decade: regrouping by {rule.text}")
         whole = not args.target
         sources = scopes_arg(base, store, args.target) if args.target else store.scopes()
         if not sources:
@@ -960,6 +978,10 @@ def parse_args(argv=None):
         p.add_argument("--region", action="append", required=required, metavar="ALIAS|CID|TITLE",
                        help="an alias of the conf, a PastVu region number or a region title; repeat for several")
         when(p)
+        p.add_argument("--by", metavar="RULE",
+                       help="split into scopes by decade, country or region, or country,decade / region,decade "
+                            "(a scope per value, made as photos turn up); a years/place or place/years base always "
+                            "splits a span of years by decade")
         p.add_argument("--name", metavar="NAME", help="the scope's name (default: <aliases>_<years>, e.g. ukraine_1970s)")
         p.add_argument("--split", type=int, metavar="N", help="at most N images per folder, for a new scope "
                                                               "(default: [defaults] split of the conf; 0: no split)")
@@ -980,9 +1002,6 @@ def parse_args(argv=None):
     p = sub.add_parser("run", help="index (with --region) and download, process, sort and write a scope")
     scope_opts(p, False)
     p.add_argument("--scope", metavar="NAME", help="resume a scope by its name or folder")
-    p.add_argument("--by", metavar="RULE",
-                   help="split the download into scopes by decade, country or region, or country,decade / "
-                        "region,decade (with --region; a scope per value, made as photos turn up)")
     p.add_argument("--regroup", action="store_true",
                    help="first move the saved photos the run's scopes list into them, from whatever scope holds them")
     p.add_argument("--samples", metavar="DIR", help="classify samples folder (default: [paths] samples of the conf)")
