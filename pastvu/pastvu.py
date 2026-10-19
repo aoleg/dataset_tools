@@ -42,6 +42,13 @@ GROUPS = {"ussr": [1, 20, 22, 24, 29, 30, 31, 32, 35, 45, 92, 149, 154, 189, 267
 CAPITALS = {"Moscow", "Saint Petersburg", "Sevastopol", "Kiev", "Minsk", "Tashkent", "Astana", "Bishkek", "City of Osh",
             "Ashgabat", "Dushanbe", "Yerevan", "Tbilisi", "Chișinău", "Bălți"}
 CITY_MIN_PHOTOS = 1000
+CRIMEA = [556, 669]          # Crimea and Sevastopol: under Russia in PastVu's tree, listed apart in the conf
+UKRAINE_PRESETS = [          # name, regions, comment
+    ("ukraine", [20, 556, 669], "the modern state of Ukraine in its internationally recognized borders: "
+                                "Ukraine (20), Crimea (556), Sevastopol (669)"),
+    ("ukrainian_ssr", [20, 556, 669], "the Ukrainian SSR from 1954 to 1991 (see the note above)"),
+    ("ukraine_pre_1954", [20], "the Ukrainian SSR before 1954, without Crimea and Sevastopol (see the note above)"),
+]
 
 
 # --- setup -------------------------------------------------------------------------------
@@ -380,23 +387,44 @@ def conf_example(regions: list[dict]) -> str:
     def desc(r: dict) -> str:
         return f"{r['title_en']} / {r['title_local']}, {r['phc']:,} photos"
 
-    countries = [line(name_for(by[c]), [c], desc(by[c])) for c in USSR]
+    countries = []
+    for c in USSR:
+        if c == 20:
+            for n, cids, comment in UKRAINE_PRESETS:
+                taken[n] = -1
+                countries.append(line(n, cids, comment))
+            continue
+        comment = desc(by[c])
+        if c == 1:
+            comment += "; in PastVu's tree this contains Crimea and Sevastopol (see the note above)"
+        countries.append(line(name_for(by[c]), [c], comment))
     countries += [line(g, cids, ", ".join(by[c]["title_en"] for c in cids)) for g, cids in GROUPS.items()]
     region_lines, city_lines = [], []
-    for c in USSR:
-        first = sorted([r for r in regions if r["parents"] == [c]], key=lambda r: -r["phc"])
+
+    def block(header: str, first: list[dict], seconds: list[dict]) -> None:
         regs = [r for r in first if not is_city(r)]
         cities = [r for r in first if is_city(r)]
-        seconds = sorted([r for r in regions if len(r["parents"]) == 2 and r["parents"][0] == c
-                          and r["phc"] >= CITY_MIN_PHOTOS], key=lambda r: -r["phc"])
         if regs:
-            region_lines.append(f"; {by[c]['title_en']}")
-            region_lines += [line(name_for(r), [r["cid"]], desc(r)) for r in regs]
+            region_lines.append(f"; {header}")
+            region_lines.extend(line(name_for(r), [r["cid"]], desc(r)) for r in regs)
         if cities or seconds:
-            city_lines.append(f"; {by[c]['title_en']}")
-            city_lines += [line(name_for(r), [r["cid"]], desc(r)) for r in cities]
-            city_lines += [line(name_for(r, by.get(r["parents"][-1])), [r["cid"]],
-                                f"{desc(r)}, in {by[r['parents'][-1]]['title_en']}") for r in seconds]
+            city_lines.append(f"; {header}")
+            city_lines.extend(line(name_for(r), [r["cid"]], desc(r)) for r in cities)
+            city_lines.extend(line(name_for(r, by.get(r["parents"][-1])), [r["cid"]],
+                                   f"{desc(r)}, in {by[r['parents'][-1]]['title_en']}") for r in seconds)
+
+    def seconds_of(test) -> list[dict]:
+        return sorted([r for r in regions if len(r["parents"]) == 2 and test(r) and r["phc"] >= CITY_MIN_PHOTOS],
+                      key=lambda r: -r["phc"])
+
+    for c in USSR:
+        first = sorted([r for r in regions if r["parents"] == [c] and r["cid"] not in CRIMEA], key=lambda r: -r["phc"])
+        block(by[c]["title_en"], first,
+              seconds_of(lambda r, c=c: r["parents"][0] == c and r["parents"][1] not in CRIMEA))
+        if c == 20:
+            block("Crimea and Sevastopol (see the note above)",
+                  sorted([by[x] for x in CRIMEA if x in by], key=lambda r: -r["phc"]),
+                  seconds_of(lambda r: r["parents"][1] in CRIMEA))
     body = ["[aliases.countries]", *countries, "", "[aliases.regions]", *region_lines, "", "[aliases.cities]",
             *city_lines]
     return CONF_HEAD + "\n".join(body) + "\n"
@@ -439,11 +467,35 @@ priority_margin = 0.15
 ; from the English titles; each comment gives the title and the photo count at
 ; the time this file was made.
 ;
-; The aliases follow PastVu's region tree, which files some territories under
-; another country than you may want and marks them as a territorial dispute:
-; Crimea (556) and Sevastopol (669) are under Russia, Abkhazia and South Ossetia
-; under Georgia, Transnistria under Moldova. "ukraine = 20" does not contain
-; Crimea or Sevastopol. Change the aliases to fit your dataset.
+; Where the aliases leave PastVu's region tree. PastVu's tree files Crimea (556)
+; and Sevastopol (669) under Russia and marks them as a territorial dispute; that
+; is PastVu's wording, kept in the titles below. In this file they are listed
+; apart, and three presets cover Ukraine:
+;   ukraine          = 20, 556, 669   the modern state of Ukraine in its
+;                                     internationally recognized borders
+;   ukrainian_ssr    = 20, 556, 669   the Ukrainian SSR from 1954 to 1991
+;   ukraine_pre_1954 = 20             the Ukrainian SSR before 1954
+; The Crimean Oblast passed from the RSFSR to the Ukrainian SSR by a decree of
+; the Presidium of the Supreme Soviet of the USSR of 19 February 1954. Before
+; that, Crimea was part of the RSFSR: the Crimean ASSR from 1921, the Crimean
+; Oblast from 1945. Sevastopol had been made a city of republican subordination
+; of the RSFSR in 1948. The 1954 decree does not name it, but the city was
+; administered through the Ukrainian SSR from then on, and the 1978 constitution
+; of the Ukrainian SSR lists it among the republic's cities of republican
+; subordination.
+; Neither Soviet preset is exact for every year. ukraine_pre_1954 still contains
+; the regions that joined the Ukrainian SSR in 1939, 1940 and 1945 (western
+; Ukraine, northern Bukovina and southern Bessarabia, Zakarpattia), which between
+; the wars belonged to Poland, Romania and Czechoslovakia. For the Ukrainian SSR
+; as it was when each photo was taken, run ukraine_pre_1954 with --years 1917
+; 1953 and ukrainian_ssr with --years 1954 1991.
+;
+; russia = 1 follows PastVu's tree and so also contains Crimea and Sevastopol. A
+; photo is saved once per base folder: a Crimean photo is downloaded by whichever
+; of the two scopes runs first, and the other skips it. Abkhazia and South
+; Ossetia are filed under Georgia and Transnistria under Moldova, with the same
+; mark; the aliases of those countries contain them. Change any alias to fit
+; your dataset.
 
 """
 

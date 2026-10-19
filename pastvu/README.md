@@ -25,7 +25,7 @@ json_files = no                       also write each record as a JSON file
 priority_margin = 0.15                within this of the top score, the lower-numbered category wins
 ```
 
-The rest of the file is the **aliases**: names for PastVu region numbers, used with `--region`, in three groups. `[aliases.countries]` has the 15 countries of the former Soviet Union and the groups `ussr`, `baltics`, `caucasus` and `central_asia`. `[aliases.regions]` has the first level under each country (oblasts, krais, provinces, counties, republics within Russia). `[aliases.cities]` has the capitals and federal cities, then the places of the second level with at least 1,000 photos (city districts, towns, urban okrugs), with the parent's name added where two places share a name (`leninsky_district_minsk`). Each line has a comment with the PastVu title and the photo count when the file was made:
+The rest of the file is the **aliases**: names for PastVu region numbers, used with `--region`, in three groups. `[aliases.countries]` has the 15 countries of the former Soviet Union (Ukraine with three presets, see [Ukraine, Crimea and Sevastopol](#ukraine-crimea-and-sevastopol)) and the groups `ussr`, `baltics`, `caucasus` and `central_asia`. `[aliases.regions]` has the first level under each country (oblasts, krais, provinces, counties, republics within Russia). `[aliases.cities]` has the capitals and federal cities, then the places of the second level with at least 1,000 photos (city districts, towns, urban okrugs), with the parent's name added where two places share a name (`leninsky_district_minsk`). Each line has a comment with the PastVu title and the photo count when the file was made:
 
 ```
 belarus                          = 22                   ; Belarus / Беларусь, 23,422 photos
@@ -34,7 +34,31 @@ moscow_oblast                    = 4                    ; Moscow Oblast / Мос
 minsk                            = 636                  ; Minsk / Минск, 6,910 photos
 ```
 
-An alias may name several regions. The aliases follow PastVu's region tree, which files some territories under another country than you may want and marks them as a territorial dispute: Crimea (556) and Sevastopol (669) are under Russia, Abkhazia and South Ossetia under Georgia, Transnistria under Moldova. `ukraine = 20` does not contain Crimea or Sevastopol; change the aliases to fit your dataset. `run.bat aliases` lists them with the titles PastVu gives the numbers today, and `run.bat aliases --generate FILE` writes a fresh example from today's region tree.
+An alias may name several regions. `run.bat aliases` lists them with the titles PastVu gives the numbers today, and `run.bat aliases --generate FILE` writes a fresh example from today's region tree. Change any alias to fit your dataset.
+
+### Ukraine, Crimea and Sevastopol
+
+The aliases are built from PastVu's region tree, with one exception. PastVu files Crimea (556) and Sevastopol (669) under Russia and marks both as a territorial dispute; that is PastVu's own wording, and it stays in the region titles that PastVu returns and that `count` and `regions` print. The conf lists Crimea and Sevastopol apart from Russia, and Ukraine has three presets:
+
+| alias | regions | what it means |
+|---|---|---|
+| `ukraine` | 20, 556, 669 | the modern state of Ukraine in its internationally recognized borders |
+| `ukrainian_ssr` | 20, 556, 669 | the Ukrainian SSR from 1954 to 1991 |
+| `ukraine_pre_1954` | 20 | the Ukrainian SSR before 1954 |
+
+`ukraine` and `ukrainian_ssr` name the same regions; the two names say which of the two meanings a dataset follows. The year 1954 comes from these administrative decisions:
+
+- The Crimean Oblast passed from the RSFSR to the Ukrainian SSR by a decree of the Presidium of the Supreme Soviet of the USSR of 19 February 1954. Before that, Crimea was part of the RSFSR: the Crimean ASSR from 1921, the Crimean Oblast from 1945.
+- Sevastopol had been made a city of republican subordination of the RSFSR in 1948. The 1954 decree does not name it, but the city was administered through the Ukrainian SSR from then on, and the 1978 constitution of the Ukrainian SSR lists it among the republic's cities of republican subordination.
+
+Neither Soviet preset is exact for every year. `ukraine_pre_1954` still contains the regions that joined the Ukrainian SSR in 1939, 1940 and 1945 (western Ukraine, northern Bukovina and southern Bessarabia, Zakarpattia), which between the wars belonged to Poland, Romania and Czechoslovakia. For the Ukrainian SSR as it was when each photo was taken, run the two presets for their years:
+
+```
+run.bat run --region ukraine_pre_1954 --years 1917 1953
+run.bat run --region ukrainian_ssr --years 1954 1991
+```
+
+`russia = 1` follows PastVu's tree and so also contains Crimea and Sevastopol. A photo is saved once per base folder, so a Crimean photo is downloaded by whichever of the two scopes runs first, and the other skips it. Abkhazia and South Ossetia are filed under Georgia and Transnistria under Moldova, with the same mark; the aliases of those countries contain them.
 
 `--region` takes an alias first, then a PastVu region number, then a region title (English or local, matched exactly). `run.bat regions --find TEXT` finds numbers and titles.
 

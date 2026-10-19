@@ -34,19 +34,45 @@ priority_margin = 0.15
 ; from the English titles; each comment gives the title and the photo count at
 ; the time this file was made.
 ;
-; The aliases follow PastVu's region tree, which files some territories under
-; another country than you may want and marks them as a territorial dispute:
-; Crimea (556) and Sevastopol (669) are under Russia, Abkhazia and South Ossetia
-; under Georgia, Transnistria under Moldova. "ukraine = 20" does not contain
-; Crimea or Sevastopol. Change the aliases to fit your dataset.
+; Where the aliases leave PastVu's region tree. PastVu's tree files Crimea (556)
+; and Sevastopol (669) under Russia and marks them as a territorial dispute; that
+; is PastVu's wording, kept in the titles below. In this file they are listed
+; apart, and three presets cover Ukraine:
+;   ukraine          = 20, 556, 669   the modern state of Ukraine in its
+;                                     internationally recognized borders
+;   ukrainian_ssr    = 20, 556, 669   the Ukrainian SSR from 1954 to 1991
+;   ukraine_pre_1954 = 20             the Ukrainian SSR before 1954
+; The Crimean Oblast passed from the RSFSR to the Ukrainian SSR by a decree of
+; the Presidium of the Supreme Soviet of the USSR of 19 February 1954. Before
+; that, Crimea was part of the RSFSR: the Crimean ASSR from 1921, the Crimean
+; Oblast from 1945. Sevastopol had been made a city of republican subordination
+; of the RSFSR in 1948. The 1954 decree does not name it, but the city was
+; administered through the Ukrainian SSR from then on, and the 1978 constitution
+; of the Ukrainian SSR lists it among the republic's cities of republican
+; subordination.
+; Neither Soviet preset is exact for every year. ukraine_pre_1954 still contains
+; the regions that joined the Ukrainian SSR in 1939, 1940 and 1945 (western
+; Ukraine, northern Bukovina and southern Bessarabia, Zakarpattia), which between
+; the wars belonged to Poland, Romania and Czechoslovakia. For the Ukrainian SSR
+; as it was when each photo was taken, run ukraine_pre_1954 with --years 1917
+; 1953 and ukrainian_ssr with --years 1954 1991.
+;
+; russia = 1 follows PastVu's tree and so also contains Crimea and Sevastopol. A
+; photo is saved once per base folder: a Crimean photo is downloaded by whichever
+; of the two scopes runs first, and the other skips it. Abkhazia and South
+; Ossetia are filed under Georgia and Transnistria under Moldova, with the same
+; mark; the aliases of those countries contain them. Change any alias to fit
+; your dataset.
 
 [aliases.countries]
-russia                           = 1                    ; Russia / Россия, 1,425,218 photos
-ukraine                          = 20                   ; Ukraine / Украина, 136,271 photos
+russia                           = 1                    ; Russia / Россия, 1,425,222 photos; in PastVu's tree this contains Crimea and Sevastopol (see the note above)
+ukraine                          = 20, 556, 669         ; the modern state of Ukraine in its internationally recognized borders: Ukraine (20), Crimea (556), Sevastopol (669)
+ukrainian_ssr                    = 20, 556, 669         ; the Ukrainian SSR from 1954 to 1991 (see the note above)
+ukraine_pre_1954                 = 20                   ; the Ukrainian SSR before 1954, without Crimea and Sevastopol (see the note above)
 belarus                          = 22                   ; Belarus / Беларусь, 23,422 photos
 moldova                          = 189                  ; Moldova / Молдавия, 5,812 photos
-estonia                          = 267                  ; Estonia / Эстония, 11,480 photos
-latvia                           = 149                  ; Latvia / Латвия, 21,755 photos
+estonia                          = 267                  ; Estonia / Эстония, 11,489 photos
+latvia                           = 149                  ; Latvia / Латвия, 21,757 photos
 lithuania                        = 154                  ; Lithuania / Литва, 14,080 photos
 georgia                          = 92                   ; Georgia / Грузия, 33,296 photos
 armenia                          = 45                   ; Armenia / Армения, 6,794 photos
@@ -63,9 +89,8 @@ central_asia                     = 24, 29, 30, 31, 32   ; Uzbekistan, Kazakhstan
 
 [aliases.regions]
 ; Russia
-moscow_oblast                    = 4                    ; Moscow Oblast / Московская область, 97,530 photos
-crimea                           = 556                  ; Crimea (territorial dispute) / Крым (спорная территория), 59,303 photos
-leningrad_oblast                 = 6                    ; Leningrad Oblast / Ленинградская область, 41,449 photos
+moscow_oblast                    = 4                    ; Moscow Oblast / Московская область, 97,532 photos
+leningrad_oblast                 = 6                    ; Leningrad Oblast / Ленинградская область, 41,451 photos
 krasnodar_krai                   = 27                   ; Krasnodar Krai / Краснодарский край, 39,901 photos
 omsk_oblast                      = 283                  ; Omsk Oblast / Омская область, 32,031 photos
 primorsky_krai                   = 308                  ; Primorsky Krai / Приморский край, 31,905 photos
@@ -170,6 +195,8 @@ mykolaiv_oblast                  = 682                  ; Mykolaiv Oblast / Ни
 vinnytsia_oblast                 = 672                  ; Vinnytsia Oblast / Винницкая область, 613 photos
 volyn_oblast                     = 673                  ; Volyn Oblast / Волынская область, 536 photos
 kirovohrad_oblast                = 679                  ; Kirovohrad Oblast / Кировоградская область, 252 photos
+; Crimea and Sevastopol (see the note above)
+crimea                           = 556                  ; Crimea (territorial dispute) / Крым (спорная территория), 59,303 photos
 ; Belarus
 grodno_oblast                    = 1091                 ; Grodno Oblast / Гродненская область, 4,747 photos
 brest_oblast                     = 1086                 ; Brest Oblast / Брестская область, 3,581 photos
@@ -213,10 +240,10 @@ glodeni_district                 = 3196                 ; Glodeni District / Г�
 singerei_district                = 3219                 ; Sîngerei District / Сынжерейский район, 0 photos
 soldanesti_district              = 3226                 ; Șoldănești District / Шолданештский район, 0 photos
 ; Estonia
-harju_county                     = 966                  ; Harju County / уезд Харьюмаа, 6,007 photos
+harju_county                     = 966                  ; Harju County / уезд Харьюмаа, 6,009 photos
 ida_viru_county                  = 981                  ; Ida-Viru County / уезд Ида-Вирумаа, 2,087 photos
 tartu_county                     = 970                  ; Tartu County / уезд Тартумаа, 915 photos
-parnu_county                     = 974                  ; Pärnu County / уезд Пярнумаа, 653 photos
+parnu_county                     = 974                  ; Pärnu County / уезд Пярнумаа, 654 photos
 laane_county                     = 977                  ; Lääne County / уезд Ляэнемаа, 340 photos
 saare_county                     = 972                  ; Saare County / уезд Сааремаа, 294 photos
 laane_viru_county                = 979                  ; Lääne-Viru County / уезд Ляэне-Вирумаа, 294 photos
@@ -230,7 +257,7 @@ polva_county                     = 976                  ; Põlva County / уез
 hiiu_county                      = 968                  ; Hiiu County / уезд Хийумаа, 23 photos
 ; Latvia
 vidzeme                          = 757                  ; Vidzeme / Видземе, 10,653 photos
-courland                         = 759                  ; Courland / Курземе, 8,736 photos
+courland                         = 759                  ; Courland / Курземе, 8,738 photos
 latgale                          = 760                  ; Latgale / Латгалия, 1,587 photos
 zemgale                          = 758                  ; Zemgale / Земгале, 692 photos
 ; Lithuania
@@ -327,14 +354,12 @@ dasoguz_region                   = 7012                 ; Daşoguz Region / Да
 ; Russia
 moscow                           = 3                    ; Moscow / Москва, 321,815 photos
 saint_petersburg                 = 5                    ; Saint Petersburg / Санкт-Петербург, 200,070 photos
-sevastopol                       = 669                  ; Sevastopol (territorial dispute) / Севастополь (спорная территория), 14,993 photos
-central_ao                       = 387                  ; Central AO / ЦАО, 161,075 photos, in Moscow
+central_ao                       = 387                  ; Central AO / ЦАО, 161,076 photos, in Moscow
 tsentralny_district_spb          = 702                  ; Tsentralny District SPb / Центральный район СПб, 50,929 photos, in Saint Petersburg
 western_ao                       = 394                  ; Western AO / ЗАО, 27,286 photos, in Moscow
 north_eastern_ao                 = 389                  ; North-Eastern AO / СВАО, 24,678 photos, in Moscow
 sochi_urban_okrug                = 922                  ; Sochi Urban Okrug / Городской округ Сочи, 24,633 photos, in Krasnodar Krai
 admiralteysky_district           = 701                  ; Admiralteysky District / Адмиралтейский район, 24,361 photos, in Saint Petersburg
-yalta_city_municipality          = 1622                 ; Yalta city municipality / Ялтинский горсовет, 23,626 photos, in Crimea (territorial dispute)
 petrogradsky_district            = 658                  ; Petrogradsky District / Петроградский район, 23,260 photos, in Saint Petersburg
 omsk                             = 284                  ; Omsk / Омск, 22,810 photos, in Omsk Oblast
 northern_ao                      = 388                  ; Northern AO / САО, 22,645 photos, in Moscow
@@ -342,7 +367,7 @@ southern_ao                      = 392                  ; Southern AO / ЮАО, 
 nizhny_novgorod                  = 502                  ; Nizhny Novgorod / Нижний Новгород, 21,170 photos, in Nizhny Novgorod Oblast
 eastern_ao                       = 390                  ; Eastern AO / ВАО, 21,051 photos, in Moscow
 vladivostok_district             = 823                  ; Vladivostok district / Владивостокский городской округ, 20,948 photos, in Primorsky Krai
-vyborgsky_district_lo            = 505                  ; Vyborgsky District LO / Выборгский район ЛО, 17,176 photos, in Leningrad Oblast
+vyborgsky_district_lo            = 505                  ; Vyborgsky District LO / Выборгский район ЛО, 17,178 photos, in Leningrad Oblast
 rostov_on_don                    = 286                  ; Rostov-on-Don / Ростов-на-Дону, 15,949 photos, in Rostov Oblast
 yekaterinburg                    = 945                  ; Yekaterinburg / Екатеринбург, 14,830 photos, in Sverdlovsk Oblast
 vasileostrovsky_district         = 657                  ; Vasileostrovsky District / Василеостровский район, 14,591 photos, in Saint Petersburg
@@ -366,17 +391,13 @@ veliky_novgorod                  = 373                  ; Veliky Novgorod / Ве
 irkutsk                          = 379                  ; Irkutsk / Иркутск, 8,119 photos, in Irkutsk Oblast
 north_western_ao                 = 395                  ; North-Western AO / СЗАО, 8,115 photos, in Moscow
 pskov                            = 372                  ; Pskov / Псков, 8,086 photos, in Pskov Oblast
-simferopol                       = 1610                 ; Simferopol / Симферополь, 7,771 photos, in Crimea (territorial dispute)
 volgograd                        = 810                  ; Volgograd / Волгоград, 7,458 photos, in Volgograd Oblast
 kalininsky_district_spb          = 697                  ; Kalininsky District SPb / Калининский район СПб, 7,284 photos, in Saint Petersburg
 odintsovsky_urban_area           = 1132                 ; Odintsovsky Urban Area / Одинцовский городской округ, 7,054 photos, in Moscow Oblast
 moskovsky_district_spb           = 704                  ; Moskovsky District SPb / Московский район СПб, 7,042 photos, in Saint Petersburg
 khabarovsk                       = 952                  ; Khabarovsk / Хабаровск, 6,780 photos, in Khabarovsk Krai
-leninsky_district_sevastopol     = 1615                 ; Leninsky District (Sevastopol) / Ленинский район (Севастополь), 6,750 photos, in Sevastopol (territorial dispute)
-feodosia_city_municipality       = 1655                 ; Feodosia city municipality / Феодосийский горсовет, 6,658 photos, in Crimea (territorial dispute)
-sergiyevo_posadsky_urban_area    = 185                  ; Sergiyevo-Posadsky Urban Area / Сергиево-Посадский городской округ, 6,383 photos, in Moscow Oblast
+sergiyevo_posadsky_urban_area    = 185                  ; Sergiyevo-Posadsky Urban Area / Сергиево-Посадский городской округ, 6,385 photos, in Moscow Oblast
 smolensk                         = 380                  ; Smolensk / Смоленск, 6,327 photos, in Smolensk Oblast
-kerch                            = 1659                 ; Kerch / Керчь, 6,307 photos, in Crimea (territorial dispute)
 kirovsky_district_spb            = 700                  ; Kirovsky District SPb / Кировский район СПб, 6,064 photos, in Saint Petersburg
 kurortny_district                = 660                  ; Kurortny District / Курортный район, 6,046 photos, in Saint Petersburg
 serpukhov_urban_area             = 1109                 ; Serpukhov Urban Area / городской округ Серпухов, 5,782 photos, in Moscow Oblast
@@ -404,18 +425,13 @@ krasnogvardeysky_district_spb    = 698                  ; Krasnogvardeysky Distr
 vladimir                         = 880                  ; Vladimir / Владимир, 3,810 photos, in Vladimir Oblast
 nakhodkinsky_urban_okrug         = 2496                 ; Nakhodkinsky Urban Okrug / Находкинский городской округ, 3,765 photos, in Primorsky Krai
 murmansk                         = 940                  ; Murmansk / Мурманск, 3,754 photos, in Murmansk Oblast
-bakhchysaraisky_district         = 1620                 ; Bakhchysaraisky District / Бахчисарайский район, 3,730 photos, in Crimea (territorial dispute)
 kislovodsk                       = 773                  ; Kislovodsk / Кисловодск, 3,723 photos, in Stavropol Krai
 reutov                           = 1189                 ; Reutov / Реутов, 3,636 photos, in Moscow Oblast
-nakhimovsky_district             = 1613                 ; Nakhimovsky District / Нахимовский район, 3,603 photos, in Sevastopol (territorial dispute)
 vsevolozhsky_district            = 520                  ; Vsevolozhsky District / Всеволожский район, 3,493 photos, in Leningrad Oblast
 balashikha_urban_area            = 1180                 ; Balashikha Urban Area / городской округ Балашиха, 3,441 photos, in Moscow Oblast
 khimki_urban_okrug               = 383                  ; Khimki Urban Okrug / городской округ Химки, 3,292 photos, in Moscow Oblast
-yevpatoria_municipality          = 1616                 ; Yevpatoria municipality / Евпаторийский горсовет, 3,245 photos, in Crimea (territorial dispute)
-alushta_city_municipality        = 1651                 ; Alushta city municipality / Алуштинский горсовет, 3,200 photos, in Crimea (territorial dispute)
 podolsk_urban_area               = 1119                 ; Podolsk Urban Area / городской округ Подольск, 3,198 photos, in Moscow Oblast
 mytishchi_urban_okrug            = 1140                 ; Mytishchi Urban Okrug / городской округ Мытищи, 3,169 photos, in Moscow Oblast
-balaklavsky_district             = 1612                 ; Balaklavsky District / Балаклавский район, 3,123 photos, in Sevastopol (territorial dispute)
 gusevsky_district                = 844                  ; Gusevsky District / Гусевский район, 2,994 photos, in Kaliningrad Oblast
 tula_urban_settlement            = 634                  ; Tula Urban Settlement / городской округ Тула, 2,979 photos, in Tula Oblast
 nizhny_tagil                     = 1331                 ; Nizhny Tagil / Нижний Тагил, 2,977 photos, in Sverdlovsk Oblast
@@ -442,7 +458,6 @@ saratov_urban_area               = 3001                 ; Saratov Urban Area / �
 turukhansky_district             = 2588                 ; Turukhansky District / Туруханский район, 2,373 photos, in Krasnoyarsk Krai
 ruzsky_urban_okrug               = 1113                 ; Ruzsky Urban Okrug / Рузский городской округ, 2,359 photos, in Moscow Oblast
 krasnoyarsk                      = 930                  ; Krasnoyarsk / Красноярск, 2,349 photos, in Krasnoyarsk Krai
-sudak_city_municipality          = 1657                 ; Sudak city municipality / Судакский горсовет, 2,346 photos, in Crimea (territorial dispute)
 troitsky_ao                      = 386                  ; Troitsky AO / Троицкий АО, 2,310 photos, in Moscow
 petrozavodsk                     = 912                  ; Petrozavodsk / Петрозаводск, 2,307 photos, in Karelia
 chekhov_urban_okrug              = 1101                 ; Chekhov Urban Okrug / городской округ Чехов, 2,295 photos, in Moscow Oblast
@@ -496,7 +511,6 @@ alexander_area                   = 512                  ; Alexander area / Ал�
 medvezhyegorsky_district         = 1519                 ; Medvezhyegorsky District / Медвежьегорский район, 1,387 photos, in Karelia
 orekhovo_zuyevsky_urban_area     = 1128                 ; Orekhovo-Zuyevsky Urban Area / Орехово-Зуевский городской округ, 1,373 photos, in Moscow Oblast
 naberezhnye_chelny               = 621                  ; Naberezhnye Chelny / Набережные Челны, 1,371 photos, in Tatarstan
-gagarinsky_district_sevastopol   = 1614                 ; Gagarinsky District / Гагаринский район, 1,351 photos, in Sevastopol (territorial dispute)
 sovetsk                          = 838                  ; Sovetsk / Советск, 1,346 photos, in Kaliningrad Oblast
 leninsky_urban_area              = 1151                 ; Leninsky Urban Area / Ленинский городской округ, 1,288 photos, in Moscow Oblast
 lomonosovsky_district            = 523                  ; Lomonosovsky District / Ломоносовский район, 1,280 photos, in Leningrad Oblast
@@ -553,6 +567,20 @@ obolonskyi_district              = 3443                 ; Obolonskyi district / 
 zhytomyr_district                = 8180                 ; Zhytomyr District / Житомирский район, 1,088 photos, in Zhytomyr Oblast
 mariupol                         = 2825                 ; Mariupol / Мариуполь, 1,031 photos, in Donetsk Oblast
 cherkasy_district                = 3874                 ; Cherkasy District / Черкасский район, 1,026 photos, in Cherkasy Oblast
+; Crimea and Sevastopol (see the note above)
+sevastopol                       = 669                  ; Sevastopol (territorial dispute) / Севастополь (спорная территория), 14,993 photos
+yalta_city_municipality          = 1622                 ; Yalta city municipality / Ялтинский горсовет, 23,626 photos, in Crimea (territorial dispute)
+simferopol                       = 1610                 ; Simferopol / Симферополь, 7,771 photos, in Crimea (territorial dispute)
+leninsky_district_sevastopol     = 1615                 ; Leninsky District (Sevastopol) / Ленинский район (Севастополь), 6,750 photos, in Sevastopol (territorial dispute)
+feodosia_city_municipality       = 1655                 ; Feodosia city municipality / Феодосийский горсовет, 6,658 photos, in Crimea (territorial dispute)
+kerch                            = 1659                 ; Kerch / Керчь, 6,307 photos, in Crimea (territorial dispute)
+bakhchysaraisky_district         = 1620                 ; Bakhchysaraisky District / Бахчисарайский район, 3,730 photos, in Crimea (territorial dispute)
+nakhimovsky_district             = 1613                 ; Nakhimovsky District / Нахимовский район, 3,603 photos, in Sevastopol (territorial dispute)
+yevpatoria_municipality          = 1616                 ; Yevpatoria municipality / Евпаторийский горсовет, 3,245 photos, in Crimea (territorial dispute)
+alushta_city_municipality        = 1651                 ; Alushta city municipality / Алуштинский горсовет, 3,200 photos, in Crimea (territorial dispute)
+balaklavsky_district             = 1612                 ; Balaklavsky District / Балаклавский район, 3,123 photos, in Sevastopol (territorial dispute)
+sudak_city_municipality          = 1657                 ; Sudak city municipality / Судакский горсовет, 2,346 photos, in Crimea (territorial dispute)
+gagarinsky_district_sevastopol   = 1614                 ; Gagarinsky District / Гагаринский район, 1,351 photos, in Sevastopol (territorial dispute)
 ; Belarus
 minsk                            = 636                  ; Minsk / Минск, 6,910 photos
 hrodna                           = 1092                 ; Hrodna / Гродно, 2,597 photos, in Grodno Oblast
@@ -566,10 +594,10 @@ chisinau                         = 1277                 ; Chișinău / Киши�
 balti                            = 3199                 ; Bălți / Бельцы, 82 photos
 tiraspol                         = 1276                 ; Tiraspol / Тирасполь, 3,016 photos, in Transnistria (territorial dispute)
 ; Estonia
-tallinn                          = 967                  ; Tallinn / Таллин, 5,569 photos, in Harju County
+tallinn                          = 967                  ; Tallinn / Таллин, 5,571 photos, in Harju County
 narva                            = 982                  ; Narva / Нарва, 1,599 photos, in Ida-Viru County
 ; Latvia
-liepaja                          = 766                  ; Liepaja / Лиепая, 7,692 photos, in Courland
+liepaja                          = 766                  ; Liepaja / Лиепая, 7,694 photos, in Courland
 riga                             = 763                  ; Riga / Рига, 7,615 photos, in Vidzeme
 jurmala                          = 764                  ; Jurmala / Юрмала, 1,648 photos, in Vidzeme
 daugavpils                       = 768                  ; Daugavpils / Даугавпилс, 1,226 photos, in Latgale
