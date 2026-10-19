@@ -89,7 +89,7 @@ Within a detection pass the images are decoded in threads, a few ahead of the mo
 
 ## Install
 
-Run `install.bat` in the repository root. It runs the `install.bat` of remove_borders, reframe, jpeg_cleanup, face_masks and watermark one after the other; each creates the shared `..\venv` when it is missing and installs only its own dependencies, so running it again installs what is missing. The models are downloaded by those installers and found locally from then on.
+Run `install.bat` in the repository root. It runs the `install.bat` of remove_borders, reframe, jpeg_cleanup, face_masks and watermark one after the other, then those of the other tools of the repository (deduplicate, k2prep, ddg_images, classify and duck), which the pipeline does not need; each creates the shared `..\venv` when it is missing and installs only its own dependencies, so running it again installs what is missing. The models are downloaded by those installers and found locally from then on.
 
 ## Project files
 
@@ -97,4 +97,4 @@ Run `install.bat` in the repository root. It runs the `install.bat` of remove_bo
 |---|---|
 | `pipeline.py` | the tool; imports the five tools from their folders |
 | `run.bat` | runs `pipeline.py` with the shared venv and passes all arguments through |
-| `../install.bat` | installs the five tools in sequence |
+| `../install.bat` | installs the five tools in sequence, then the other tools |

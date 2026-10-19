@@ -179,7 +179,9 @@ All tools share one virtual environment: the `venv` folder in the repository roo
 | `remove_borders` | Pillow, numpy, jpeglib, OpenCV; runs on the CPU |
 | `k2prep` | Pillow, numpy, tqdm; runs on the CPU. `--sort --vl` also asks a local vision model server (llama.cpp, koboldcpp or LM Studio), set in `.env` |
 | `face_masks`, `reframe`, `classify`, `jpeg_cleanup`, `watermark` | a CUDA GPU; their `install.bat` installs torch from the PyTorch CUDA index and downloads their models, after which they run offline |
-| `pipeline` | the five tools it runs; the `install.bat` in the repository root installs remove_borders, reframe, jpeg_cleanup, face_masks and watermark one after the other |
+| `pipeline` | the five tools it runs, installed by their `install.bat` |
+
+The `install.bat` in the repository root runs the `install.bat` of every tool in this table that has one, one after the other: remove_borders, reframe, jpeg_cleanup, face_masks and watermark first, then deduplicate, k2prep, ddg_images, classify and duck. Use it to set up everything at once, or run the `install.bat` of single tools.
 
 The GPU tools install the same torch build, so they share it in the `venv`.
 
