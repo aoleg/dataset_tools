@@ -106,6 +106,8 @@ class Store:
         cols = {r[1] for r in self.db.execute("PRAGMA table_info(scopes)")}
         if "label" not in cols:
             self.db.execute("ALTER TABLE scopes ADD COLUMN label TEXT")
+        if "folder" not in cols:
+            self.db.execute("ALTER TABLE scopes ADD COLUMN folder TEXT")
         self.set_meta("schema", SCHEMA_VERSION)
 
     def close(self) -> None:
@@ -178,20 +180,41 @@ class Store:
 
     def scope(self, name: str) -> dict | None:
         with self.lock:
-            row = self.db.execute("SELECT name, regions, years, decade, split, width, created, indexed, label FROM "
-                                  "scopes WHERE name=?", (name,)).fetchone()
+            row = self.db.execute("SELECT name, regions, years, decade, split, width, created, indexed, label, folder "
+                                  "FROM scopes WHERE name=?", (name,)).fetchone()
         if not row:
             return None
         return {"name": row[0], "regions": json.loads(row[1]), "years": tuple(json.loads(row[2])), "decade": row[3],
                 "split": row[4], "width": row[5], "created": row[6], "indexed": row[7],
-                "label": row[8] or row[0].rsplit("_", 1)[0]}
+                "label": row[8] or row[0].rsplit("_", 1)[0], "folder": row[9] or row[0]}
+
+    def layout(self) -> str:
+        """The folder tree of the base: set when its first scope is made; bases
+        from before the option are flat."""
+        return self.get_meta("layout") or "flat"
 
     def add_scope(self, name: str, regions: list[int], years: tuple[int, int], decade: int | None, split: int,
-                  label: str | None = None, width: int = 0) -> dict:
+                  label: str | None = None, width: int = 0, folder: str | None = None) -> dict:
+        """A new scope. Its folder follows the base's layout unless given; two
+        scopes never share a folder or nest one inside the other."""
+        import layout as lay
+        if label is None:
+            tail = "_" + lay.years_label(years, decade)
+            label = name[:-len(tail)] if name.endswith(tail) and len(name) > len(tail) else name
+        if folder is None:
+            folder = lay.scope_folder(self.layout(), name, label, years, decade)
+        if split > 0 and not width:
+            width = 3
+        for other in self.scopes():
+            a, b = other["folder"] + "/", folder + "/"
+            if a.startswith(b) or b.startswith(a):
+                raise SystemExit(f"scope {name} would go into {folder}, which is the folder of scope {other['name']}"
+                                 f" ({other['folder']}); give it another --name")
         with self.lock:
-            self.db.execute("INSERT INTO scopes (name, regions, years, decade, split, width, created, label) VALUES "
-                            "(?,?,?,?,?,?,?,?)", (name, json.dumps(sorted(regions)), json.dumps(list(years)), decade,
-                                                  split, width, time.time(), label))
+            self.db.execute("INSERT INTO scopes (name, regions, years, decade, split, width, created, label, folder) "
+                            "VALUES (?,?,?,?,?,?,?,?,?)",
+                            (name, json.dumps(sorted(regions)), json.dumps(list(years)), decade, split, width,
+                             time.time(), label, folder))
         return self.scope(name)
 
     def ensure_scope(self, name: str, regions, years: tuple[int, int], decade: int | None, split: int, label: str,
@@ -469,6 +492,17 @@ class Store:
         with self.lock:
             return [r[0] for r in self.db.execute("SELECT path FROM status WHERE scope=? AND state IN (?, ?) AND path "
                                                   "IS NOT NULL", (scope, DONE, WRITING))]
+
+    def move_paths(self, rows: list[tuple[int, str, str | None]]) -> None:
+        """New paths of saved photos in one transaction: (cid, path, record JSON or None)."""
+        now = time.time()
+
+        def work(db):
+            for cid, path, record in rows:
+                db.execute("UPDATE status SET path=?, updated=? WHERE cid=?", (path, now, cid))
+                if record is not None:
+                    db.execute("UPDATE records SET json=? WHERE cid=?", (record, cid))
+        self.tx(work)
 
     def move(self, cid: int, path: str, category: str, record: str | None = None) -> None:
         def work(db):

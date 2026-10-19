@@ -4,18 +4,24 @@
 ; Relative paths are resolved against the folder of this file.
 
 [paths]
-; The base folder of the downloads. Each scope gets a folder in it
-; (belarus_1917-1991, ukraine_1970s, ...), and the store pastvu.db sits in it.
+; The base folder of the downloads. Each scope gets a folder in it (see layout
+; below), and the store pastvu.db sits in it.
 base = D:\pastvu
 
 ; The classify samples folder: one subfolder of example images per category.
 samples = D:\samples
 
 [defaults]
+; The folder tree of a base folder: years/place puts a scope into
+; <base>\1970s\russia\, place/years into <base>\russia\1970s\, flat into
+; <base>\russia_1970s\. A base keeps the tree it was made with.
+layout = years/place
 ; Years of a run without --years or --decade (PastVu's overlap rule).
 years = 1917 1991
 ; At most this many images per folder (each with its caption, so twice as many
-; files); 0 puts every image of a category into one folder.
+; files): a category holds its images directly until it would pass this, then
+; they move into the numbered folder 001 and the next go into 002, 003, ...;
+; 0 puts every image of a category into one folder.
 split = 5000
 ; Download threads. 8 is faster and doubles the load on PastVu.
 fetchers = 4

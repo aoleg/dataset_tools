@@ -29,6 +29,8 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from layout import LAYOUTS
+
 HERE = Path(__file__).resolve().parent
 DEFAULT_PATH = HERE / "pastvu.conf"
 ALIAS_GROUPS = ("countries", "regions", "cities")
@@ -63,6 +65,7 @@ class Conf:
     fetchers: int = 4
     json_files: bool = False
     priority_margin: float = 0.15
+    layout: str | None = None          # the folder tree of a new base; None: not in the file (written on first use)
     caption: CaptionConf = field(default_factory=CaptionConf)
     aliases: dict[str, list[int]] = field(default_factory=dict)
     groups: dict[str, str] = field(default_factory=dict)      # alias -> its group
@@ -95,6 +98,37 @@ def parse_cids(value: str, where: str) -> list[int]:
     return out
 
 
+LAYOUT_COMMENT = [
+    "; The folder tree of a base folder: years/place puts a scope into",
+    r"; <base>\1970s\russia\, place/years into <base>\russia\1970s\, flat into",
+    r"; <base>\russia_1970s\. A base keeps the tree it was made with.",
+]
+
+
+def save_layout(path: Path, value: str) -> None:
+    """Write layout = value into [defaults] of the conf file, keeping the rest
+    of the file as it is."""
+    with open(path, encoding="utf-8", newline="") as f:
+        text = f.read()
+    nl = "\r\n" if "\r\n" in text else "\n"
+    lines = text.splitlines()
+    entry = LAYOUT_COMMENT + [f"layout = {value}"]
+    head = next((i for i, l in enumerate(lines) if l.strip().lower() == "[defaults]"), None)
+    if head is None:
+        lines += ["", "[defaults]"] + entry
+    else:
+        end = next((i for i in range(head + 1, len(lines)) if lines[i].strip().startswith("[")), len(lines))
+        old = next((i for i in range(head + 1, end) if lines[i].split("=")[0].strip().lower() == "layout"), None)
+        if old is not None:
+            lines[old] = f"layout = {value}"
+        else:
+            while end > head + 1 and not lines[end - 1].strip():
+                end -= 1
+            lines[end:end] = entry
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write(nl.join(lines) + nl)
+
+
 def load(path: Path | None = None) -> Conf:
     path = Path(path) if path else DEFAULT_PATH
     conf = Conf()
@@ -118,6 +152,11 @@ def load(path: Path | None = None) -> Conf:
             if len(ys) != 2 or not all(y.isdigit() for y in ys):
                 raise SystemExit(f"{path}: [defaults] years must be two years, e.g. 1917 1991")
             conf.years = (int(ys[0]), int(ys[1]))
+        lay = d.get("layout", "").strip().lower()
+        if lay:
+            if lay not in LAYOUTS:
+                raise SystemExit(f"{path}: [defaults] layout must be one of {', '.join(LAYOUTS)}")
+            conf.layout = lay
         try:
             conf.split = d.getint("split", fallback=conf.split)
             conf.fetchers = d.getint("fetchers", fallback=conf.fetchers)

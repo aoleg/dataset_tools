@@ -208,12 +208,23 @@ class Target:
     image: object = None       # the upright pixels, when the stream has them in memory
     tags: str | None = None    # the existing caption, when the caller knows it
     scope: str = ""            # the scope it belongs to (the stream's caption run per scope)
+    base: Path | None = None   # the base folder, to find the photo through the store
+
+
+def current_path(store, t: Target) -> Path:
+    """Where the photo is now: a category that passed the split moves its
+    images into 001 while a caption job may run, so the store decides."""
+    st = store.status(t.cid)
+    if st and st.get("path") and t.base is not None:
+        return t.base / st["path"]
+    return t.path
 
 
 def caption_photo(store, client: VLMClient, run: int, t: Target) -> dict:
     """Caption one saved photo: the text sent as {tags} is the photo's original
     caption when it was captioned before (--recaption), else its caption file;
     the file's old text goes into the store, then the file gets the VLM caption."""
+    t.path = current_path(store, t)
     txt = t.path.with_suffix(".txt")
     before = txt.read_text(encoding="utf-8") if txt.is_file() else ""
     prev = store.caption(t.cid)
@@ -223,6 +234,7 @@ def caption_photo(store, client: VLMClient, run: int, t: Target) -> dict:
         tags = sidecars.caption(rec.get("record") or {})
     image = t.image if t.image is not None else load_upright(t.path)
     text, facts = client.caption(image, tags, t.cid, t.path.parent.name)
+    txt = current_path(store, t).with_suffix(".txt")          # the VLM took seconds: look again
     txt.write_text(text, encoding="utf-8")
     store.save_caption(run, t.cid, before, text, client.model, client.prompt_sha)
     return facts
@@ -244,7 +256,7 @@ def select(store, base: Path, scope: str, prefix: str, recaption: bool, retries:
         if attempts.get(cid, 0) >= retries:
             counts["gave up"] += 1
             continue
-        out.append(Target(cid, base / path))
+        out.append(Target(cid, base / path, base=base))
     return out, counts
 
 
@@ -308,7 +320,8 @@ def run(store, base: Path, scope: str, targets: list[Target], client: VLMClient,
             if intr.stop:
                 stopped = "Ctrl+C"
                 break
-            rel = t.path.relative_to(base / scope).as_posix() if t.path.is_relative_to(base / scope) else t.path.name
+            t.path = current_path(store, t)
+            rel = t.path.relative_to(base).as_posix() if t.path.is_relative_to(base) else t.path.name
             if not t.path.is_file():
                 stats["missing"] += 1
                 display.advance(saved=False)
@@ -397,7 +410,9 @@ class StreamCaptioner:
 
     def run_for(self, scope: str) -> int:
         if scope not in self.runs:
-            rid = self.store.start_caption_run(scope, scope + "/", self.client.model, self.client.prompt_sha)
+            sc = self.store.scope(scope)
+            rid = self.store.start_caption_run(scope, (sc["folder"] if sc else scope) + "/", self.client.model,
+                                               self.client.prompt_sha)
             self.runs[scope] = rid
             self.per_run[rid] = [0, 0]
         return self.runs[scope]

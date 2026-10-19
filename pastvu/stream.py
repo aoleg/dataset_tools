@@ -27,6 +27,7 @@ from pathlib import Path
 import numpy as np
 
 import encode as enc
+import folders
 import layout
 import process as pr
 import sidecars
@@ -65,7 +66,7 @@ class Options:
 
     @property
     def scope_dir(self) -> Path:
-        return self.base / self.scope["name"]
+        return self.base / self.scope["folder"]
 
 
 @dataclass
@@ -107,8 +108,7 @@ class Stream:
         self.lama = lama
         self.scope = opts.scope["name"]
         self.scopes = opts.scopes or {self.scope: opts.scope}
-        self.chunkers = {n: layout.Chunker(sc["split"], sc["width"], [self.scope_rel(p, n) for p in store.scope_paths(n)])
-                         for n, sc in self.scopes.items()}
+        self.chunkers = {n: folders.ScopeChunks(store, opts.base, sc, log=self.log) for n, sc in self.scopes.items()}
         self.stats = Stats()
         self.stop = threading.Event()
         self.in_flight = 0
@@ -123,10 +123,9 @@ class Stream:
                      "priority_margin": getattr(classifier, "priority_margin", None),
                      "patches": getattr(classifier, "patches", None)}
 
-    def scope_rel(self, base_rel: str, scope: str) -> str:
-        """A path relative to the base -> relative to the scope folder."""
-        prefix = scope + "/"
-        return base_rel[len(prefix):] if base_rel.startswith(prefix) else base_rel
+    def log(self, text: str) -> None:
+        d = getattr(self, "display", None)
+        (d.print if d is not None else print)(text)
 
     # --- fetch threads -------------------------------------------------------------
 
@@ -255,7 +254,7 @@ class Stream:
         scope = job.scope
         chunker = self.chunkers[scope]
         rel_scope = chunker.place(folder, f"{job.cid}{ext}")
-        rel = f"{scope}/{rel_scope}"
+        rel = chunker.rel(rel_scope)
         path = o.base / rel
         d.set(f"{job.cid}: saving {rel_scope}")
         t = time.perf_counter()
@@ -279,16 +278,17 @@ class Stream:
                                                     "width": fw, "height": fh, "changed": plan["changed"]},
                               doc, emb, counters)
         except BaseException:
-            chunker.release(rel_scope)
+            chunker.abandon(rel_scope)
             for f in (path, path.with_suffix(".txt"), path.with_suffix(".json")):
                 f.unlink(missing_ok=True)
             self.store.unclaim(job.cid)
             raise
+        chunker.done(rel_scope)          # may move the category's images into 001 now that it passed the split
         s.time("write", time.perf_counter() - t)
         if self.captioner is not None:
             # after the photo is committed: a wait here (the VLM is behind) slows the stream, nothing else
             import autocaption as ac
-            self.captioner.put(ac.Target(job.cid, path, image=final, tags=facts, scope=scope))
+            self.captioner.put(ac.Target(job.cid, path, image=final, tags=facts, scope=scope, base=o.base))
         s.add(done=1)
         d.advance(saved=True)
         d.line({"cid": job.cid, "state": DONE, "path": rel, "write": mode, "changed": plan["changed"],

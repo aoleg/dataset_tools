@@ -22,7 +22,7 @@ You give a place and years, for example “Belarus, 1917 to 1991” or “Ukrain
 4. **Caption:** it writes a short facts line from PastVu’s record: title, years, place and description.
 5. **Describe with a model (optional):** a vision model on your own machine, currently Gemma 4 in KoboldCpp, writes a full English description. It starts from the facts line and adds what is visible in the photo.
 
-Each category is split into numbered folders of at most 5,000 images, so Explorer stays fast.
+Downloads are filed by decade, then by place (`1970s\russia\transport`), or by place first, or in one folder per download, as the settings file says. A category that grows past 5,000 images is split into numbered folders, so Explorer stays fast.
 
 ### Safety and convenience
 
@@ -62,6 +62,7 @@ samples = D:\samples                  the classify samples folder
 
 [defaults]
 years = 1917 1991                     years of a run without --years or --decade
+layout = years/place                  the folder tree: years/place, place/years or flat
 split = 5000                          at most this many images per folder; 0: no split
 fetchers = 4                          download threads
 json_files = no                       also write each record as a JSON file
@@ -155,7 +156,7 @@ run.bat export <scope> [...] [--format jsonl|parquet]
 run.bat scopes | aliases | count --region <alias> | regions [--find TEXT]
 ```
 
-Where a command takes scopes, a scope can be given by its name, by its folder, or by a name pattern with `*` and `?`: `estonia_*` is every scope whose name starts with `estonia_`. In Git Bash or PowerShell, put a pattern in quotes.
+Where a command takes scopes, a scope can be given by its name, by its folder, or by a name pattern with `*` and `?`: `estonia_*` is every scope whose name starts with `estonia_`. A folder that holds scope folders stands for all of them: `1970s` (or `<base>\1970s`) is every scope of the 1970s in a years/place base. In Git Bash or PowerShell, put a pattern in quotes.
 
 Examples:
 
@@ -168,7 +169,7 @@ run.bat run --scope belarus_1917-1991
 run.bat scopes
 ```
 
-A run downloads a **scope**: regions and years. Its name is the aliases (or region names) joined by `+`, an underscore, and the years: `belarus_1917-1991`, `ukraine_1970s`, `minsk+brest_oblast_1945-1960`. More than three regions need `--name` or an alias of their own. The scope's folder is `<base>\<name>`, and running the same command again continues it, as does `run --scope <name>`.
+A run downloads a **scope**: regions and years. Its name is the aliases (or region names) joined by `+`, an underscore, and the years: `belarus_1917-1991`, `ukraine_1970s`, `minsk+brest_oblast_1945-1960`. More than three regions need `--name` or an alias of their own. Running the same command again continues it, as does `run --scope <name>`. The scope's folder follows `layout` in the conf (see [Output](#output)): `<base>\1970s\ukraine\` by default.
 
 `--years` takes the photos whose dating overlaps the years, as PastVu's own filter does: a photo dated 1910-1925 is in 1917-1991. `--decade 1970` takes the photos whose dating starts in 1970-1979, so a photo dated 1965-1975 belongs to the 1960s only, and decade runs never download a photo twice. Only photographs are taken, not paintings.
 
@@ -207,7 +208,7 @@ Both kinds of regroup move files the same way:
 - A saved photo whose file is gone (deleted by hand) is marked not downloaded, and the next run downloads it again.
 - A scope left with no photos, whose listed photos all belong to the new scopes, is removed with its empty folders. Files in it that are not this tool's stay, and so does the folder.
 - The counters of every scope involved are counted again from the records.
-- The moves are logged in the store: `regroup --undo` puts the last regroup (or `run --regroup`) back and makes again the scopes it removed. A reclassify of a moved photo can no longer be undone.
+- The moves are logged in the store: `regroup --undo` puts the last regroup (or `run --regroup`) back and makes again the scopes it removed. A reclassify of a moved photo can no longer be undone. An undo puts each photo back into the category it came from, in a numbered folder with room when that category was chunked in the meantime.
 - Scopes sorted with different samples can mix category names when they are combined; `reclassify` sorts them again.
 
 **`drop SCOPE`** deletes the scope's images and captions and forgets the scope. Its photos count as not downloaded, with no record, embedding or VLM caption, so a later run downloads and processes them from the start; photos it lists that are saved under another scope stay there. A drop cannot be undone: without `--yes` it only shows what it would delete.
@@ -236,19 +237,32 @@ A JPEG crop keeps every coefficient of the kept blocks; the decoded pixels can s
 ```
 <base>\
   pastvu.db                                     the store of every scope
-  belarus_1917-1991\
-    10_environment_outdoors\001\163150.jpg      the image, named by its PastVu number
-    10_environment_outdoors\001\163150.txt      its caption
-    10_environment_outdoors\002\...             the next 5,000 images of the category
-    _unsure\5_transport\001\165001.jpg          below the confidence gate, under its best guess
-  ukraine_1970s\
-    ...
+  1970s\
+    belarus\                                    the scope belarus_1970s
+      50_transport\163150.jpg                   the image, named by its PastVu number
+      50_transport\163150.txt                   its caption
+      90_environment_outdoors\001\165001.jpg    a category past 5,000 images: numbered folders
+      90_environment_outdoors\002\...           the next 5,000 images of the category
+      _unsure\50_transport\165002.jpg           below the confidence gate, under its best guess
+    ukraine\                                    the scope ukraine_1970s
+  1917-1991\
+    estonia\                                    the scope estonia_1917-1991
   _records\016\163150.json                      with json_files = yes only
   _reports\                                     reclassify --dry-run plans
-  belarus_1917-1991_records.jsonl               written by export
+  belarus_1970s_records.jsonl                   written by export
 ```
 
-Each category is split into numbered folders `001`, `002`, ... of at most `split` images (5,000 by default, so 10,000 files with the captions; Explorer slows down in folders much larger than that). A category stays one tree: AI Toolkit and the dataset tools read subfolders, so point them at the category folder. `--split` sets another size for a new scope; with `--no-classify` the numbered folders are directly in the scope folder.
+**The folder tree.** `layout` in `[defaults]` of the conf chooses where a scope's folder goes:
+
+| layout | the folder of `russia_1970s` | the folder of `estonia_1917-1991` |
+|---|---|---|
+| `years/place` (default) | `<base>\1970s\russia\` | `<base>\1917-1991\estonia\` |
+| `place/years` | `<base>\russia\1970s\` | `<base>\estonia\1917-1991\` |
+| `flat` | `<base>\russia_1970s\` | `<base>\estonia_1917-1991\` |
+
+With `years/place` and `run --by country,decade`, each decade is one folder with a folder per country in it, so a trainer can be given one folder per decade and a number of repeats for each. A base folder keeps the tree it was made with: the store records it with the first scope, and a base made before this setting existed is `flat`. When the conf has no `layout` line, the tool writes one into `[defaults]`: the tree of the base when it already has scopes, else `years/place`. A `layout` in the conf that differs from the tree of an existing base is reported and applies to new base folders only.
+
+**Numbered folders.** A category holds its images directly until it would pass `split` images (5,000 by default, so 10,000 files with the captions; Explorer slows down in folders much larger than that). Then its images move into the numbered folder `001`, and the next ones go into `002`, `003`, and so on, each of at most `split` images. The move takes a few seconds and happens during the download, as soon as no image of the category is being written; the store follows each file, and a move cut short by a crash is finished the next time the scope is written to. A category stays chunked when reclassify or regroup later takes images out of it, and the lowest numbered folder with room takes the next image. A category stays one tree: AI Toolkit and the dataset tools read subfolders, so point them at the category folder. `--split` sets another size for a new scope; with `--no-classify` the images and their numbered folders are directly in the scope folder.
 
 **The caption** is one line of facts for the captioner, in the record's language with the English region names added: title, years, regions, address and description, in that order, empty parts left out (`--txt-fields` chooses the parts and their order; `direction` adds the camera direction). Example:
 
@@ -291,7 +305,7 @@ run.bat reclassify
 
 Sorts the saved photos of a scope again with the samples folder as it is now (or `--samples`) and the priority margin of the conf (or `--priority-margin`), and moves each image and its caption into its new category folder, in place. The file keeps its name, so the caption and the record stay joined. The embeddings are in the store, so the GPU is needed only for images without one, and the probe trains in seconds.
 
-A photo you moved to another category by hand keeps its place: reclassify sees that its file is not where the store says, records where it is now, and leaves it there (`--override-manual` sorts it like the rest). A photo whose file is gone is reported and left alone. `--dry-run` prints the moves per category pair and writes them to `<base>\_reports\`. `--undo` puts the moves of the last reclassify back.
+A photo you moved to another category by hand keeps its place: reclassify sees that its file is not where the store says, records where it is now, and leaves it there (`--override-manual` sorts it like the rest). A photo whose file is gone is reported and left alone. `--dry-run` prints the moves per category pair and writes them to `<base>\_reports\`. `--undo` puts the photos of the last reclassify back into the categories they came from.
 
 Several scopes and name patterns are sorted one after another with one load of the classifier. Without a scope, reclassify works on every scope of the base folder; it first asks `This will reclassify N scope folders ... Continue? [y/N]` with the number of saved photos, and `--yes` skips the question. `reclassify --undo` without a scope undoes the last reclassify of every scope that has one, after the same question.
 
@@ -375,8 +389,9 @@ Each record carries what attribution and a takedown need: the PastVu page, the u
 | `index.py` | the index of a scope, and how `--region` is resolved |
 | `partition.py` | the rules of `--by`: which scope a photo belongs to |
 | `regroup.py` | moving photos between scopes, drop, and undo |
+| `folders.py` | finding and moving files, and the move of a category into numbered folders |
 | `runlock.py` | whether the process that holds the lock still runs |
-| `layout.py` | scope names, folders and the numbered-folder allocator |
+| `layout.py` | scope names, the folder tree, and the numbered-folder allocator |
 | `process.py` | header, decode, band, borders, crop composition |
 | `encode.py` | the save rules, in memory |
 | `classifier.py` | classify's sorter, one image at a time or in batches |

@@ -65,7 +65,30 @@ UKRAINE_PRESETS = [          # name, regions, comment
 def open_base(args, conf: cf.Conf) -> tuple[Path, Store]:
     base = Path(args.base).resolve() if getattr(args, "base", None) else conf.need_base()
     base.mkdir(parents=True, exist_ok=True)
-    return base, Store(base / DB_NAME)
+    store = Store(base / DB_NAME)
+    base_layout(conf, store, base)
+    return base, store
+
+
+def base_layout(conf: cf.Conf, store: Store, base: Path) -> str:
+    """The folder tree of the base. A base with scopes keeps the tree it was
+    made with (flat for bases from before the option); an empty one takes the
+    conf's. A conf without the setting gets it written in."""
+    if store.scopes():
+        used = store.layout()
+        if store.get_meta("layout") is None:
+            store.set_meta("layout", used)
+    else:
+        used = conf.layout or layout.DEFAULT_LAYOUT
+        store.set_meta("layout", used)
+    if conf.layout is None:
+        if conf.path:
+            cf.save_layout(conf.path, used)
+            print(f"{conf.path.name}: layout = {used} written into [defaults] (the folder tree of {base})")
+        conf.layout = used
+    elif conf.layout != used:
+        print(f"{base} keeps its folder tree {used}; layout = {conf.layout} in the conf applies to new base folders")
+    return used
 
 
 def memory_store(client: Client) -> Store:
@@ -86,13 +109,21 @@ def years_of(args, conf: cf.Conf) -> tuple[tuple[int, int], int | None]:
     return years, None
 
 
+def is_folder_arg(base: Path, store: Store, value: str) -> bool:
+    return "/" in value or "\\" in value or (not store.scope(value) and (base / value).is_dir())
+
+
 def scope_arg(base: Path, store: Store, value: str) -> dict:
     """A scope by name or by its folder."""
-    name = Path(value).name if ("/" in value or "\\" in value) else value
-    sc = store.scope(name)
+    if is_folder_arg(base, store, value):
+        hits = target_arg(base, store, value)
+        if len(hits) != 1:
+            raise SystemExit(f"{value} holds {len(hits)} scopes: {', '.join(sc['name'] for sc, _ in hits)}; give one")
+        return hits[0][0]
+    sc = store.scope(value)
     if not sc:
         known = ", ".join(s["name"] for s in store.scopes()) or "none yet"
-        raise SystemExit(f"no scope {name!r} in {base}. Scopes: {known}")
+        raise SystemExit(f"no scope {value!r} in {base}. Scopes: {known}")
     return sc
 
 
@@ -108,6 +139,8 @@ def scopes_arg(base: Path, store: Store, values: list[str]) -> list[dict]:
             hits = [sc for sc in store.scopes() if fnmatch.fnmatchcase(sc["name"], v)]
             if not hits:
                 raise SystemExit(f"no scope of {base} matches {v!r}")
+        elif is_folder_arg(base, store, v):
+            hits = [sc for sc, _ in target_arg(base, store, v)]
         else:
             hits = [scope_arg(base, store, v)]
         for sc in hits:
@@ -137,23 +170,37 @@ def locked(store: Store, command: str, mode: str = "exclusive"):
         store.release_lock()
 
 
-def target_arg(base: Path, store: Store, value: str) -> tuple[dict, str]:
-    """A scope name, or a folder: the scope's folder or one inside it.
-    -> (scope, path prefix relative to the base, ending in /)."""
+def target_arg(base: Path, store: Store, value: str) -> list[tuple[dict, str]]:
+    """A scope name, or a folder: a scope's folder, one inside it, or one that
+    holds scope folders (the 1970s folder of a years/place base). A relative
+    folder is taken from the current folder, else from the base.
+    -> [(scope, path prefix relative to the base, ending in /)]."""
     if "/" not in value and "\\" not in value and store.scope(value):
-        return store.scope(value), value + "/"
+        sc = store.scope(value)
+        return [(sc, sc["folder"] + "/")]
     p = Path(value)
-    p = (p if p.is_absolute() else Path.cwd() / p).resolve()
+    if not p.is_absolute():
+        p = Path.cwd() / p if (Path.cwd() / p).exists() or not (base / p).exists() else base / p
+    p = p.resolve()
     try:
         rel = p.relative_to(base.resolve())
     except ValueError:
         raise SystemExit(f"{p} is not inside the base folder {base}")
     if not rel.parts:
-        raise SystemExit("give a scope or a folder inside one, not the base folder")
-    sc = scope_arg(base, store, rel.parts[0])
+        raise SystemExit("give a scope or a folder inside the base folder, not the base folder")
     if not p.is_dir():
         raise SystemExit(f"{p} is not a folder")
-    return sc, rel.as_posix().rstrip("/") + "/"
+    prefix = rel.as_posix().rstrip("/") + "/"
+    hits = []
+    for sc in store.scopes():
+        f = sc["folder"] + "/"
+        if prefix.startswith(f):
+            return [(sc, prefix)]
+        if f.startswith(prefix):
+            hits.append((sc, f))
+    if not hits:
+        raise SystemExit(f"{p} is not the folder of a scope, inside one, or holding any")
+    return hits
 
 
 def vlm_client(conf: cf.Conf):
@@ -190,8 +237,9 @@ def scope_from_args(args, conf: cf.Conf, client: Client, store: Store) -> dict:
     where = ", ".join(ix.region_path(store, r) for r in regions)
     rule = " (by start year)" if decade is not None else ""
     size = f"at most {split:,} images per folder" if split else "no folder split"
-    print(f"New scope {name}: {where}, {layout.years_label(years, decade)}{rule}, {size}")
-    return store.add_scope(name, cids, years, decade, split)
+    sc = store.add_scope(name, cids, years, decade, split, label=args.name or "+".join(labels))
+    print(f"New scope {name} in {sc['folder']}: {where}, {layout.years_label(years, decade)}{rule}, {size}")
+    return sc
 
 
 def do_index(args, client: Client, store: Store, sc: dict) -> dict:
@@ -354,8 +402,9 @@ def cmd_scopes(args, conf, client) -> int:
         print(f"no scopes in {base}")
     for sc in scopes:
         c = store.scope_counts(sc["name"])
+        where = f"  {sc['folder']}" if sc["folder"] != sc["name"] else ""
         print(f"{sc['name']:36} {c['total']:>9,} listed  {c['done']:>9,} saved  {c['skipped']:>7,} skipped  "
-              f"{c['failed']:>5,} failed  {c['elsewhere']:>7,} in other scopes  {c['pending']:>9,} left")
+              f"{c['failed']:>5,} failed  {c['elsewhere']:>7,} in other scopes  {c['pending']:>9,} left{where}")
     return 0
 
 
@@ -462,11 +511,12 @@ def run_locked(args, conf, client, base: Path, store: Store, sm) -> int:
         import autocaption as ac
         from progress import Display
         for name in names:
-            targets, _ = ac.select(store, base, name, name + "/", False, args.retries)
+            prefix = store.scope(name)["folder"] + "/"
+            targets, _ = ac.select(store, base, name, prefix, False, args.retries)
             if not targets:
                 continue
             print(f"Captioning {len(targets):,} saved photos of {name} that have no VLM caption yet ...")
-            run_id = store.start_caption_run(name, name + "/", caption_client.model, caption_client.prompt_sha)
+            run_id = store.start_caption_run(name, prefix, caption_client.model, caption_client.prompt_sha)
             mode = "json" if args.json_progress else "quiet" if args.quiet else "live"
             with Display(len(targets), 0, mode, vram=vram) as d:
                 cres = ac.run(store, base, name, targets, caption_client, d, run_id, args.report_every, vram)
@@ -561,8 +611,8 @@ def cmd_reclassify(args, conf, client) -> int:
 def caption_targets(base: Path, store: Store, values: list[str]) -> list[tuple[dict, str]]:
     out, seen = [], set()
     for v in values:
-        hits = [(sc, sc["name"] + "/") for sc in scopes_arg(base, store, [v])] if is_pattern(v) \
-            else [target_arg(base, store, v)]
+        hits = [(sc, sc["folder"] + "/") for sc in scopes_arg(base, store, [v])] if is_pattern(v) \
+            else target_arg(base, store, v)
         for sc, prefix in hits:
             if prefix not in seen:
                 seen.add(prefix)
@@ -682,7 +732,7 @@ def cmd_drop(args, conf, client) -> int:
             rows = store.owned_rows(sc["name"])
             saved = sum(1 for r in rows if r[1] == DONE)
             print(f"{sc['name']}: {saved:,} saved photos (image and caption files), {len(rows) - saved:,} skipped or "
-                  f"failed, {len(store.members(sc['name'])):,} listed; folder {base / sc['name']}")
+                  f"failed, {len(store.members(sc['name'])):,} listed; folder {base / sc['folder']}")
         if not args.yes:
             print("Nothing deleted. Add --yes to delete these files and forget the scopes; this cannot be undone.")
             return 1
@@ -792,18 +842,24 @@ CONF_HEAD = """\
 ; Relative paths are resolved against the folder of this file.
 
 [paths]
-; The base folder of the downloads. Each scope gets a folder in it
-; (belarus_1917-1991, ukraine_1970s, ...), and the store pastvu.db sits in it.
+; The base folder of the downloads. Each scope gets a folder in it (see layout
+; below), and the store pastvu.db sits in it.
 base = D:\\pastvu
 
 ; The classify samples folder: one subfolder of example images per category.
 samples = D:\\samples
 
 [defaults]
+; The folder tree of a base folder: years/place puts a scope into
+; <base>\\1970s\\russia\\, place/years into <base>\\russia\\1970s\\, flat into
+; <base>\\russia_1970s\\. A base keeps the tree it was made with.
+layout = years/place
 ; Years of a run without --years or --decade (PastVu's overlap rule).
 years = 1917 1991
 ; At most this many images per folder (each with its caption, so twice as many
-; files); 0 puts every image of a category into one folder.
+; files): a category holds its images directly until it would pass this, then
+; they move into the numbered folder 001 and the next go into 002, 003, ...;
+; 0 puts every image of a category into one folder.
 split = 5000
 ; Download threads. 8 is faster and doubles the load on PastVu.
 fetchers = 4

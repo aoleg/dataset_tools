@@ -1,12 +1,14 @@
-"""Names and folders: the scope name (<regions>_<years>), the folder of an
-image (<scope>/<category>/<chunk>/<cid>.<ext>), and the chunk allocator that
-keeps every folder under --split images.
+"""Names and folders: the scope name (<regions>_<years>), the scope's folder
+under the base (by the base's layout), the folder of an image
+(<scope folder>/<category>[/<chunk>]/<cid>.<ext>), and the chunk allocator
+that keeps every folder under --split images.
 
 A scope folder holds a classify-style tree: one folder per category, and
-_unsure/<category>, each split into numbered chunks 001, 002, ... of at most
-`split` images (each with its .txt caption), so no folder grows past what
-Explorer handles well. A category stays one tree: trainers and the dataset
-tools read subfolders.
+_unsure/<category>. A category holds its images directly until it would pass
+`split` images; then they move into the numbered folder 001 and the next go
+into 002, 003, ... of at most `split` images each (each with its .txt caption),
+so no folder grows past what Explorer handles well. A category stays one tree:
+trainers and the dataset tools read subfolders.
 """
 
 from __future__ import annotations
@@ -36,10 +38,28 @@ def scope_name(labels: list[str], years: tuple[int, int], decade: int | None) ->
     return "+".join(labels) + "_" + years_label(years, decade)
 
 
+LAYOUTS = ("years/place", "place/years", "flat")
+DEFAULT_LAYOUT = "years/place"
+
+
+def scope_folder(layout: str, name: str, label: str, years: tuple[int, int], decade: int | None) -> str:
+    """The scope's folder relative to the base: years/place 1970s/russia,
+    place/years russia/1970s, flat russia_1970s (the scope's name)."""
+    if layout == "flat":
+        return name
+    y = years_label(years, decade)
+    return f"{y}/{label}" if layout == "years/place" else f"{label}/{y}"
+
+
 def check_scope_name(name: str) -> str:
     if not SCOPE_NAME.match(name) or len(name) > 80:
         raise SystemExit(f"scope name {name!r}: use at most 80 lower-case letters, digits, _, + and -")
     return name
+
+
+def scope_width(sc: dict) -> int:
+    """The digits of the scope's numbered folders (0: it has none)."""
+    return max(sc["width"], 3) if sc["split"] > 0 else 0
 
 
 def chunk_width(total: int, split: int) -> int:
@@ -65,22 +85,50 @@ def join_path(folder: str, chunk: int | None, width: int, name: str) -> str:
 
 
 class Chunker:
-    """Which chunk of a folder takes the next image: the lowest chunk with
-    room, so chunks left with holes by reclassify fill up again. Thread-safe."""
+    """Which folder of a category takes the next image. A category holds its
+    images directly until it would pass `split`; then it is chunked: the
+    images it holds are to move into chunk 1 (ready_moves, done by the
+    caller), and new images go into the lowest chunk with room, so chunks
+    left with holes by reclassify fill up again. A chunked category stays
+    chunked. Thread-safe.
+
+    place() hands out a path; done() says the image is committed there,
+    abandon() that it was not written, remove() that an image left a path."""
 
     def __init__(self, split: int, width: int, rels=()):
-        self.split, self.width = split, width
+        self.split, self.width = split, max(width, 3) if split > 0 else 0
         self.counts: dict[str, dict[int, int]] = defaultdict(lambda: defaultdict(int))
+        self.flat: dict[str, int] = defaultdict(int)          # images directly in the category
+        self.inflight: dict[str, int] = defaultdict(int)      # direct places not yet done or abandoned
+        self.chunked: set[str] = set()
+        self.reserved: set[str] = set()                       # chunk 1 held for the images that move
+        self.moves: set[str] = set()                          # chunked categories with images still to move
         self.lock = threading.Lock()
         for rel in rels:
-            folder, chunk, _ = split_path(rel, width)
+            folder, chunk, _ = split_path(rel, self.width)
             if chunk is not None:
                 self.counts[folder][chunk] += 1
+                self.chunked.add(folder)
+            else:
+                self.flat[folder] += 1
+        for folder, n in self.flat.items():
+            if n and (folder in self.chunked or (split > 0 and n > split)):
+                self.chunked.add(folder)
+                self.moves.add(folder)
 
     def place(self, folder: str, name: str) -> str:
         if self.split <= 0:
             return join_path(folder, None, 0, name)
         with self.lock:
+            if folder not in self.chunked:
+                if self.flat[folder] < self.split:
+                    self.flat[folder] += 1
+                    self.inflight[folder] += 1
+                    return join_path(folder, None, 0, name)
+                self.chunked.add(folder)
+                self.reserved.add(folder)
+                self.moves.add(folder)
+                self.counts[folder][1] = self.split
             counts = self.counts[folder]
             chunk = 1
             while counts.get(chunk, 0) >= self.split:
@@ -88,13 +136,45 @@ class Chunker:
             counts[chunk] += 1
         return join_path(folder, chunk, self.width, name)
 
-    def release(self, rel: str) -> None:
+    def done(self, rel: str) -> None:
         folder, chunk, _ = split_path(rel, self.width)
         if chunk is None:
-            return
+            with self.lock:
+                self.inflight[folder] = max(0, self.inflight[folder] - 1)
+
+    def abandon(self, rel: str) -> None:
+        folder, chunk, _ = split_path(rel, self.width)
         with self.lock:
-            if self.counts[folder].get(chunk, 0) > 0:
+            if chunk is None:
+                self.inflight[folder] = max(0, self.inflight[folder] - 1)
+                self.flat[folder] = max(0, self.flat[folder] - 1)
+            elif self.counts[folder].get(chunk, 0) > 0:
                 self.counts[folder][chunk] -= 1
+
+    def remove(self, rel: str) -> None:
+        folder, chunk, _ = split_path(rel, self.width)
+        with self.lock:
+            if chunk is None:
+                self.flat[folder] = max(0, self.flat[folder] - 1)
+            elif self.counts[folder].get(chunk, 0) > 0:
+                self.counts[folder][chunk] -= 1
+
+    def ready_moves(self) -> list[str]:
+        """Chunked categories whose direct images can move now (none is being written)."""
+        with self.lock:
+            ready = [f for f in self.moves if self.inflight[f] == 0]
+            self.moves.difference_update(ready)
+        return ready
+
+    def moved(self, folder: str, placed: dict[int, int]) -> None:
+        """The direct images of a category went into chunks: placed[chunk] of them."""
+        with self.lock:
+            if folder in self.reserved:
+                self.counts[folder][1] -= self.split
+                self.reserved.discard(folder)
+            for chunk, n in placed.items():
+                self.counts[folder][chunk] += n
+            self.flat[folder] = 0
 
 
 def category_of(rel: str, width: int) -> str:

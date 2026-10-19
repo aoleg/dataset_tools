@@ -25,9 +25,10 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
+import folders
 import layout
 import partition as pt
-from reclassify import move_pair, prune_empty, scan_scope
+from folders import move_pair, prune_empty, remove_folder
 from store import DONE, FAILED, SKIPPED, Store
 
 
@@ -129,17 +130,6 @@ def rule_plan(store: Store, aliases: dict, groups: dict, rule: pt.Rule, sources:
 
 # --- the plan ----------------------------------------------------------------------------
 
-def locate(base: Path, store: Store, owner: str, cid: int, path: str | None, scans: dict) -> str | None:
-    """Where the photo's image is, relative to the base: where the store says,
-    else wherever it was moved to inside its scope's folder."""
-    if path and (base / path).is_file():
-        return path
-    if owner not in scans:
-        scans[owner] = scan_scope(base / owner) if (base / owner).is_dir() else {}
-    rel = scans[owner].get(cid)
-    return f"{owner}/{rel}" if rel else None
-
-
 def plan(store: Store, base: Path, wanted: dict[int, str], members: list | None = None, defs: dict | None = None,
          pull_from: set | None = None) -> dict:
     """The moves that bring every photo of `wanted` into its scope. pull_from:
@@ -158,13 +148,14 @@ def plan(store: Store, base: Path, wanted: dict[int, str], members: list | None 
         if st["state"] != DONE:
             moves.append(Move(cid, owner, dst, "owner"))
             continue
-        actual = locate(base, store, owner, cid, st["path"], scans)
+        if owner not in scopes:
+            scopes[owner] = store.scope(owner) or {"width": 0, "split": 0, "folder": owner}
+        osc = scopes[owner]
+        actual = folders.locate(base, osc["folder"], cid, st["path"], scans)
         if actual is None:
             moves.append(Move(cid, owner, dst, "missing", st["path"]))
             continue
-        if owner not in scopes:
-            scopes[owner] = store.scope(owner) or {"width": 0}
-        cat = layout.category_of(actual[len(owner) + 1:], scopes[owner]["width"])
+        cat = layout.category_of(actual[len(osc["folder"]) + 1:], layout.scope_width(osc))
         moves.append(Move(cid, owner, dst, "file", actual, cat))
     dsts = set(wanted.values())
     covered = set(wanted)
@@ -231,19 +222,6 @@ def repath_record(store: Store, base: Path, cid: int, rel: str, note: dict | Non
     return text
 
 
-def remove_folder(base: Path, name: str) -> bool:
-    """Delete the scope's folder when nothing but empty folders is left in it."""
-    d = base / name
-    if not d.is_dir():
-        return True
-    prune_empty(d)
-    try:
-        d.rmdir()
-        return True
-    except OSError:
-        return False
-
-
 def apply(store: Store, base: Path, p: dict, rule: str, target: str, log=print) -> dict:
     run = store.start_regroup(rule, target)
     for n, d in p["create"].items():          # the numbered folder width is set below, from what it lists
@@ -255,10 +233,7 @@ def apply(store: Store, base: Path, p: dict, rule: str, target: str, log=print) 
         sc = store.scope(n)
         if sc and sc["split"] and not sc["width"]:
             store.set_scope_width(n, layout.chunk_width(max(store.scope_counts(n)["total"], 1), sc["split"]))
-    chunkers: dict[str, layout.Chunker] = {}
-    for n in dsts:
-        sc = store.scope(n)
-        chunkers[n] = layout.Chunker(sc["split"], sc["width"], [r[len(n) + 1:] for r in store.scope_paths(n)])
+    chunkers = {n: folders.ScopeChunks(store, base, store.scope(n), log, defer=True) for n in dsts}
     stats = Counter()
     lost_files = set()
     t0 = time.time()
@@ -266,11 +241,11 @@ def apply(store: Store, base: Path, p: dict, rule: str, target: str, log=print) 
         if m.kind == "file":
             fname = m.path.rsplit("/", 1)[-1]
             rel_scope = chunkers[m.dst].place(m.category, fname)
-            rel = f"{m.dst}/{rel_scope}"
+            rel = chunkers[m.dst].rel(rel_scope)
             try:
                 move_pair(base / m.path, base / rel)
             except OSError as e:
-                chunkers[m.dst].release(rel_scope)
+                chunkers[m.dst].abandon(rel_scope)
                 log(f"  {m.cid}: not moved ({e})")
                 stats["failed"] += 1
                 continue
@@ -278,6 +253,7 @@ def apply(store: Store, base: Path, p: dict, rule: str, target: str, log=print) 
             rec = repath_record(store, base, m.cid, rel, {"time": time.time(), "run": run, "from": m.src,
                                                           "to": m.dst})
             store.set_owner(m.cid, m.dst, rel, m.category, rec)
+            chunkers[m.dst].done(rel_scope)
             lost_files.add(m.src)
             stats["file"] += 1
         elif m.kind == "owner":
@@ -292,19 +268,22 @@ def apply(store: Store, base: Path, p: dict, rule: str, target: str, log=print) 
         seq += 1
         if i % 1000 == 0:
             log(f"  {i:,} of {len(p['moves']):,} moved ({time.time() - t0:.0f} s)")
+    for c in chunkers.values():
+        c.settle()
     removed = []
     for n in p["remove"]:
         sc = store.scope(n)
         if not sc or store.owned_rows(n):
             continue
-        removed.append({**{k: sc[k] for k in ("name", "regions", "years", "decade", "split", "width", "label")},
-                        "members": store.members(n)})
+        removed.append({**{k: sc[k] for k in ("name", "regions", "years", "decade", "split", "width", "label",
+                                              "folder")}, "members": store.members(n)})
         store.remove_scope(n)
-        if not remove_folder(base, n):
-            log(f"  {base / n} still holds files that are not photos of this tool; the folder stays")
+        if not remove_folder(base, sc["folder"]):
+            log(f"  {base / sc['folder']} still holds files that are not photos of this tool; the folder stays")
     for n in lost_files:
-        if store.scope(n):
-            prune_empty(base / n)
+        sc = store.scope(n)
+        if sc:
+            prune_empty(base / sc["folder"])
         store.close_reclass_runs(n)
     touched = ({m.src for m in p["moves"]} | dsts | {s for _, s, _ in p["members"]}) - {r["name"] for r in removed}
     for n in touched:
@@ -337,9 +316,9 @@ def drop_scope(store: Store, base: Path, sc: dict, log=print) -> dict:
     store.forget_photos([r[0] for r in rows])
     store.close_reclass_runs(name)
     store.remove_scope(name)
-    gone = remove_folder(base, name)
+    gone = remove_folder(base, sc["folder"])
     if not gone:
-        log(f"  {base / name} still holds files that are not photos of this tool; the folder stays")
+        log(f"  {base / sc['folder']} still holds files that are not photos of this tool; the folder stays")
     return {"photos": len(rows), "files": deleted, "folder_removed": gone}
 
 
@@ -351,11 +330,11 @@ def undo(store: Store, base: Path, log=print) -> dict:
     for r in last["removed"]:
         if not store.scope(r["name"]):
             store.add_scope(r["name"], r["regions"], tuple(r["years"]), r["decade"], r["split"], r.get("label"),
-                            r["width"])
+                            r["width"], r.get("folder"))
         store.add_members(r["name"], r["members"])
     stats = Counter()
     touched = set()
-    widths: dict[str, int] = {}
+    chunkers: dict[str, folders.ScopeChunks] = {}
     for seq, cid, src, src_path, dst, dst_path, kind, new_member in store.regroup_moves(run):
         touched |= {src, dst}
         if kind == "member":
@@ -369,22 +348,28 @@ def undo(store: Store, base: Path, log=print) -> dict:
                 log(f"  {cid}: no longer in {dst}; left where it is")
                 stats["skipped"] += 1
                 continue
-            here = locate(base, store, dst, cid, st["path"], {})
-            if here is None:
+            dsc, ssc = store.scope(dst), store.scope(src)
+            here = folders.locate(base, dsc["folder"] if dsc else dst, cid, st["path"], {})
+            if here is None or ssc is None:
                 log(f"  {cid}: the file is gone; left as it is")
                 stats["skipped"] += 1
                 continue
+            if src not in chunkers:
+                chunkers[src] = folders.ScopeChunks(store, base, ssc, log, defer=True)
+            ch = chunkers[src]
+            old_rel = src_path[len(ssc["folder"]) + 1:] if src_path.startswith(ssc["folder"] + "/") else src_path
+            cat = layout.category_of(old_rel, layout.scope_width(ssc))
+            back_rel = ch.place(cat, here.rsplit("/", 1)[-1])
             try:
-                move_pair(base / here, base / src_path)
+                move_pair(base / here, base / ch.rel(back_rel))
             except OSError as e:
+                ch.abandon(back_rel)
                 log(f"  {cid}: not moved back ({e})")
                 stats["skipped"] += 1
                 continue
-            if src not in widths:
-                widths[src] = (store.scope(src) or {"width": 0})["width"]
-            cat = layout.category_of(src_path[len(src) + 1:], widths[src])
-            rec = repath_record(store, base, cid, src_path, None, undo_run=run)
-            store.set_owner(cid, src, src_path, cat, rec)
+            rec = repath_record(store, base, cid, ch.rel(back_rel), None, undo_run=run)
+            store.set_owner(cid, src, ch.rel(back_rel), cat, rec)
+            ch.done(back_rel)
             stats["file"] += 1
         elif kind == "owner":
             st = store.status(cid)
@@ -393,16 +378,19 @@ def undo(store: Store, base: Path, log=print) -> dict:
                 stats["owner"] += 1
         else:
             stats["missing"] += 1
+    for c in chunkers.values():
+        c.settle()
     for n in last["created"]:
-        if store.scope(n) and not store.members(n) and not store.owned_rows(n):
+        sc = store.scope(n)
+        if sc and not store.members(n) and not store.owned_rows(n):
             store.remove_scope(n)
-            remove_folder(base, n)
+            remove_folder(base, sc["folder"])
             touched.discard(n)
             stats["removed"] += 1
     for n in touched:
-        if store.scope(n):
-            if (base / n).is_dir():
-                prune_empty(base / n)
+        sc = store.scope(n)
+        if sc:
+            prune_empty(base / sc["folder"])
             store.recount(n)
     store.undo_regroup(run)
     return {"run": run, "rule": last["rule"], "target": last["target"], **{k: stats[k] for k in KEYS}}
