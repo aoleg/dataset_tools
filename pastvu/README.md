@@ -4,6 +4,48 @@ Downloads historic photographs from [PastVu](https://pastvu.com) by region and y
 
 The tool uses PastVu's public API (no account, no key). Read [The photographs are not PastVu's](#the-photographs-are-not-pastvus) before you publish images you downloaded with it.
 
+## What it is
+
+The tool turns PastVu, the big archive of historic photos of the former Soviet Union, into a ready training dataset. You name a place and a time span; it downloads the photos, cleans them, sorts them into your categories and gives each one a caption.
+
+### What one run does
+
+You give a place and years, for example “Belarus, 1917 to 1991” or “Ukraine in the 1970s”. Places have short names in a settings file: all 15 former Soviet republics, groups such as “baltics”, every oblast and region, and the main cities. The tool asks PastVu for the list of matching photos, then handles them one at a time:
+
+1. **Download:** it fetches the full-size original. It skips photos smaller than 512 pixels on either side, and paintings.
+2. **Clean:**
+   - It cuts off PastVu’s grey “pastvu.com, uploaded by…” strip at the bottom.
+   - It trims scanned frames and white borders.
+   - It paints out printed captions, photographer credits and watermarks. It paints only marks it is confident about, so real shop signs and buildings are left alone.
+   - Cropping never lowers JPEG quality; only painting re-saves an image.
+3. **Sort:** it puts the photo into your categories, such as transport, people or monuments, learned from example images you put in a samples folder. When two categories fit about equally, the one with the lower folder number wins. Doubtful photos go into an “unsure” folder.
+4. **Caption:** it writes a short facts line from PastVu’s record: title, years, place and description.
+5. **Describe with a model (optional):** a vision model on your own machine, currently Gemma 4 in KoboldCpp, writes a full English description. It starts from the facts line and adds what is visible in the photo.
+
+Each category is split into numbered folders of at most 5,000 images, so Explorer stays fast.
+
+### Safety and convenience
+
+- **Stop and resume:** stop at any time; the same command continues where it left off. I killed runs on purpose several times, and nothing was lost or half-written.
+- **No double downloads:** a photo is downloaded only once, even if two runs cover the same area.
+- **Re-sorting:** after you improve your samples, `reclassify` re-sorts everything already downloaded in seconds. It never undoes your manual moves, and it can be undone.
+- **Captioning later:** `autocaption` captions photos you already have, a whole set or one folder, with a progress bar, statistics and resume. Old captions are backed up and can be restored.
+- **Live display:** a status line shows what is happening and how much GPU memory is in use, above a progress bar. Regular summaries report counts, skips, paints and speed.
+- **Export:** every photo’s full PastVu record is kept, and `export` writes all records as one file for publishing.
+
+### Speed
+
+- **Download and clean:** about 5 photos per second; PastVu’s server is the limit.
+- **With model descriptions:** about 1,300 photos per hour, roughly 3 seconds each.
+
+### Already done
+
+- **Belarus:** 18,218 photos, cleaned and sorted.
+- **Estonia:** a county from 1917 to 1991, and the whole country for the 1970s.
+- **Captions:** one test folder is fully described by the model.
+
+The README covers setup, the samples folder, the history behind the three Ukraine options, and the copyright status of Soviet-era photos.
+
 ## Install
 
 Run `install.bat` in the repository root first: it installs remove_borders, watermark and classify, whose code and models this tool uses, and then this tool. Or run `install.bat` in this folder after the root one. It installs `httpx`, `rich`, PyTurboJPEG, `zstandard` and `nvidia-ml-py` into the shared `..\venv`, puts `turbojpeg.dll` into `bin\` (PyTurboJPEG does not include the library, and libjpeg-turbo publishes its Windows builds only as installers, so the installer takes the DLL out of conda-forge's `libjpeg-turbo` package, pinned by version and sha256), and makes `pastvu.conf` from `pastvu.conf.example` when there is none.
