@@ -169,7 +169,7 @@ run.bat run --scope belarus_1917-1991
 run.bat scopes
 ```
 
-A run downloads a **scope**: regions and years. Its name is the aliases (or region names) joined by `+`, an underscore, and the years: `belarus_1917-1991`, `ukraine_1970s`, `minsk+brest_oblast_1945-1960`. More than three regions need `--name` or an alias of their own. Running the same command again continues it, as does `run --scope <name>`. The scope's folder follows `layout` in the conf (see [Output](#output)): `<base>\1970s\ukraine\` by default.
+A run downloads a **scope**: regions and years. Its name is the aliases (or region names) joined by `+`, an underscore, and the years: `belarus_1917-1991`, `ukraine_1970s`, `minsk+brest_oblast_1945-1960`. More than three regions need `--name` or an alias of their own. Running the same command again continues it, as does `run --scope <name>`. The scope's folder follows `layout` in the conf (see [Folder layouts](#folder-layouts)): `<base>\1970s\ukraine\` by default.
 
 `--years` takes the photos whose dating overlaps the years, as PastVu's own filter does: a photo dated 1910-1925 is in 1917-1991. `--decade 1970` takes the photos whose dating starts in 1970-1979, so a photo dated 1965-1975 belongs to the 1960s only, and decade runs never download a photo twice. Only photographs are taken, not paintings.
 
@@ -189,7 +189,7 @@ run.bat regroup --undo
 run.bat drop estonia_1950s --yes
 ```
 
-**`run --by RULE`** downloads the regions and years of the run into one scope per value of the rule, made as the photos turn up (in a years/place or place/years base the decade is always part of the rule, see [Output](#output)). `run --region estonia --by decade` indexes Estonia once for the years of the conf and fills `estonia_1910s` up to `estonia_1990s`, each with its own folder, categories and numbered folders, in one download with one progress bar; the final report adds a line per scope. The rules:
+**`run --by RULE`** downloads the regions and years of the run into one scope per value of the rule, made as the photos turn up (in a years/place or place/years base the decade is always part of the rule, see [Folder layouts](#folder-layouts)). `run --region estonia --by decade` indexes Estonia once for the years of the conf and fills `estonia_1910s` up to `estonia_1990s`, each with its own folder, categories and numbered folders, in one download with one progress bar; the final report adds a line per scope. The rules:
 
 - **decade:** the decade of the photo's start year, so every photo belongs to exactly one decade. A decade outside the years of the run is made like any other: a 1917-1991 run lists photos dated 1905-1920 (PastVu's filter takes every photo whose dating overlaps the years), and they go into the 1900s scope. Resuming such a scope later with `run --scope` downloads all of its decade.
 - **country:** the country alias of the conf that names the most specific region of the photo; on a tie the alias higher in the conf wins. Aliases that name several countries (`ussr`, `baltics`, ...) are never used. So Crimea and Sevastopol go to `ukraine`, which names them, and not to `russia`.
@@ -245,22 +245,114 @@ A JPEG crop keeps every coefficient of the kept blocks; the decoded pixels can s
       90_environment_outdoors\002\...           the next 5,000 images of the category
       _unsure\50_transport\165002.jpg           below the confidence gate, under its best guess
     ukraine\                                    the scope ukraine_1970s
-  1917-1991\
-    estonia\                                    the scope estonia_1917-1991
+  1980s\
+    ...
   _records\016\163150.json                      with json_files = yes only
   _reports\                                     reclassify --dry-run plans
   belarus_1970s_records.jsonl                   written by export
 ```
 
-**The folder tree.** `layout` in `[defaults]` of the conf chooses where a scope's folder goes:
+This is the default layout. [Folder layouts](#folder-layouts) shows the other two.
 
-| layout | the folder of `russia_1970s` | the folder of `estonia_1917-1991` |
+### Folder layouts
+
+`layout` in `[defaults]` of `pastvu.conf` decides how the scope folders of a base folder are arranged. There are three:
+
+| layout | the tree | `ukraine_1970s` goes into |
 |---|---|---|
-| `years/place` (default) | `<base>\1970s\russia\` | `<base>\1917-1991\estonia\` |
-| `place/years` | `<base>\russia\1970s\` | `<base>\estonia\1917-1991\` |
-| `flat` | `<base>\russia_1970s\` | `<base>\estonia_1917-1991\` |
+| `years/place` (default) | decade, then place | `<base>\1970s\ukraine\` |
+| `place/years` | place, then decade | `<base>\ukraine\1970s\` |
+| `flat` | one folder per scope | `<base>\ukraine_1970s\` |
 
-**In a years/place or place/years base every scope is one decade.** `run --region estonia` splits its years by decade as if `--by decade` were given, and fills `1910s\estonia\`, `1920s\estonia\` and so on; `--by country` or `--by region` adds the decade (`country,decade`), and so does `regroup`. Only `--decade` makes a single scope, of that decade. A flat base keeps one scope per run unless `--by` says otherwise. With `years/place` and `run --region ussr --by country`, each decade is one folder with a folder per country in it, so a trainer can be given one folder per decade and a number of repeats for each. A base folder keeps the tree it was made with: the store records it with the first scope, and a base made before this setting existed is `flat`. When the conf has no `layout` line, the tool writes one into `[defaults]`: the tree of the base when it already has scopes, else `years/place`. A `layout` in the conf that differs from the tree of an existing base is reported and applies to new base folders only.
+How they work:
+
+- **A scope has a place and years.** The place is the label of the run: the alias you give (`--region estonia` gives `estonia`, `--region baltics` gives `baltics`), the aliases joined by `+`, `--name`, or the country or region that `--by` finds for each photo. The years are a decade (`1970s`) or a span (`1917-1991`).
+- **`years/place` and `place/years`: every scope is one decade.** A run over a span of years puts each photo into the decade it starts in, as if `--by decade` were given. Decades outside the span are made too: a 1917-1991 run also lists photos dated 1905-1920, and they go into `1900s`. `--decade 1970` makes the one scope of that decade.
+- **`flat`: one folder per scope, named like the scope.** A run makes one scope for all its years (`estonia_1917-1991`) unless `--by` splits it.
+- **Countries need `--by country`.** A group alias is one place: `--region baltics` makes `1970s\baltics\`. `--by country` splits it into `1970s\estonia\`, `1970s\latvia\` and `1970s\lithuania\` (in the tree layouts the decade is added to the rule by itself). `--by region` makes one folder per oblast, county or region (`1970s\harju_county\`), without a country level.
+- **A base folder keeps its layout.** The store records the layout when the first scope is made, and a base made before this setting existed is `flat`. When the conf has no `layout` line, the tool writes one into `[defaults]`: the layout of the base when it already has scopes, else `years/place`. A `layout` in the conf that differs from the layout of an existing base is reported, and the base keeps its own. To use another layout, set it in the conf and start a new base folder: change `[paths] base`, or give `--base` before the command. An existing base cannot be changed to another layout.
+
+#### Decade, then country (default)
+
+```
+[defaults]
+layout = years/place
+```
+
+```
+run.bat run --region estonia                       1910s\estonia\, 1920s\estonia\, ... 1990s\estonia\
+run.bat run --region baltics --by country          1970s\estonia\, 1970s\latvia\, 1970s\lithuania\, ... per decade
+run.bat run --region ussr --by country             every former Soviet republic, a folder per decade
+run.bat run --region ukraine --decade 1970         1970s\ukraine\ only
+```
+
+```
+<base>\
+  1960s\
+    estonia\
+    latvia\
+  1970s\
+    estonia\
+      50_transport\
+      90_environment_outdoors\
+    latvia\
+```
+
+Each decade is one folder with a folder per country in it, so a trainer can be given one folder per decade with its own number of repeats.
+
+#### Country, then decade
+
+```
+[defaults]
+layout = place/years
+```
+
+The commands are the same as above:
+
+```
+run.bat run --region estonia                       estonia\1910s\, estonia\1920s\, ... estonia\1990s\
+run.bat run --region baltics --by country          estonia\1970s\, latvia\1970s\, lithuania\1970s\, ...
+```
+
+```
+<base>\
+  estonia\
+    1960s\
+    1970s\
+      50_transport\
+      90_environment_outdoors\
+  latvia\
+    1960s\
+    1970s\
+```
+
+#### Flat
+
+```
+[defaults]
+layout = flat
+```
+
+```
+run.bat run --region estonia                       estonia_1917-1991\ (all the years in one folder)
+run.bat run --region estonia --decade 1970         estonia_1970s\
+run.bat run --region estonia --by decade           estonia_1910s\, estonia_1920s\, ... estonia_1990s\
+run.bat run --region baltics --by country,decade   estonia_1970s\, latvia_1970s\, lithuania_1980s\, ...
+```
+
+```
+<base>\
+  estonia_1917-1991\
+    50_transport\
+    90_environment_outdoors\
+  latvia_1970s\
+```
+
+A conf serves every base folder, and each base keeps the layout it was made with. To keep a flat base next to a default one, set `layout = flat` before the first run of the flat base:
+
+```
+run.bat --base D:\pastvu_flat run --region estonia
+```
 
 **Numbered folders.** A category holds its images directly until it would pass `split` images (5,000 by default, so 10,000 files with the captions; Explorer slows down in folders much larger than that). Then its images move into the numbered folder `001`, and the next ones go into `002`, `003`, and so on, each of at most `split` images. The move takes a few seconds and happens during the download, as soon as no image of the category is being written; the store follows each file, and a move cut short by a crash is finished the next time the scope is written to. A category stays chunked when reclassify or regroup later takes images out of it, and the lowest numbered folder with room takes the next image. A category stays one tree: AI Toolkit and the dataset tools read subfolders, so point them at the category folder. `--split` sets another size for a new scope; with `--no-classify` the images and their numbered folders are directly in the scope folder.
 
