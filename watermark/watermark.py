@@ -60,7 +60,9 @@ MODELS_DIR = HERE / "models"                      # a checkpoint put here is use
 # predicts at that size unless told otherwise: dino3 at 1024, yolo11 and
 # yolo11x at 1280.
 DETECTORS = {
-    "dino3": ("corzent/yolov12x-dino3-watermark-detection", "model", "yolov12x-dino3-watermark-detection.pt",
+    # the Hub file was renamed from yolov12x-dino3-watermark-detection.pt to best.pt
+    # (same checkpoint, same SHA-256); the name in models/ stays
+    "dino3": ("corzent/yolov12x-dino3-watermark-detection", "model", "best.pt",
               "yolov12x-dino3-watermark-detection.pt", None),
     "yolo11": ("fancyfeast/joycaption-watermark-detection", "space", "yolo11x-train28-best.pt",
                "yolo11x-train28-best.pt", None),
