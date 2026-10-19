@@ -1,21 +1,24 @@
 @echo off
 setlocal
 chcp 65001 >nul
-title Dataset tools - install the pipeline tools
+title Dataset tools - install all tools
 
 rem ============================================================
-rem  install.bat - runs the install.bat of every tool the pipeline
-rem  uses, one after the other: remove_borders, reframe, jpeg_cleanup,
-rem  face_masks and watermark. Each one creates the shared venv when
-rem  it is missing and installs only its own dependencies into it, so
-rem  running this file again installs what is missing and changes
-rem  nothing that is there. The tools' install.bat pause at their end;
-rem  they get an empty input here, so they run through without a key press.
+rem  install.bat - runs the install.bat of every tool that needs one, one
+rem  after the other. First the five tools the pipeline uses:
+rem  remove_borders, reframe, jpeg_cleanup, face_masks and watermark; the
+rem  GPU ones install torch from the PyTorch CUDA index. Then deduplicate,
+rem  k2prep, ddg_images, classify and duck. Each one creates the shared
+rem  venv when it is missing and installs only its own dependencies into
+rem  it, so running this file again installs what is missing and changes
+rem  nothing that is there. duck needs git on PATH, and classify downloads
+rem  its encoder. The tools' install.bat pause at their end; they get an
+rem  empty input here, so they run through without a key press.
 rem ============================================================
 
 cd /d "%~dp0"
 
-for %%T in (remove_borders reframe jpeg_cleanup face_masks watermark) do (
+for %%T in (remove_borders reframe jpeg_cleanup face_masks watermark deduplicate k2prep ddg_images classify duck) do (
     echo.
     echo ============================================================
     echo  %%T
@@ -31,7 +34,7 @@ for %%T in (remove_borders reframe jpeg_cleanup face_masks watermark) do (
 
 echo.
 echo ============================================================
-echo  All pipeline tools are installed. Run the pipeline with
+echo  All tools are installed. Run the pipeline with
 echo  pipeline\run.bat --job job.json
 echo ============================================================
 pause
