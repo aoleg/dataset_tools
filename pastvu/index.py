@@ -131,11 +131,14 @@ def plan_shards(client: Client, store: Store, scope: str, region: dict, years: t
 
 
 def run_index(client: Client, store: Store, scope: dict, full_parent: bool = False, refresh: bool = False,
-              shard_max: int = SHARD_MAX, log=print, progress=None) -> dict:
+              shard_max: int = SHARD_MAX, log=print, progress=None, assign=None) -> dict:
     """Page every shard of the scope into the store; a finished shard is not
-    paged again unless refresh. progress(done_pages, total_pages, text)."""
+    paged again unless refresh. progress(done_pages, total_pages, text).
+
+    assign: for `run --by`, scope is a family (its name keys the shards) and
+    assign(photo) names the scope each photo joins, or None for no scope."""
     years, decade = tuple(scope["years"]), scope["decade"]
-    member = member_test(years, decade)
+    member = assign or member_test(years, decade)
     shards = []
     for cid in scope["regions"]:
         shards.extend(plan_shards(client, store, scope["name"], store.region(cid), years, full_parent, shard_max, log))

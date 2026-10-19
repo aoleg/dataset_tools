@@ -207,6 +207,7 @@ class Target:
     path: Path                 # the image
     image: object = None       # the upright pixels, when the stream has them in memory
     tags: str | None = None    # the existing caption, when the caller knows it
+    scope: str = ""            # the scope it belongs to (the stream's caption run per scope)
 
 
 def caption_photo(store, client: VLMClient, run: int, t: Target) -> dict:
@@ -380,9 +381,10 @@ class StreamCaptioner:
     is small, so the writers wait when the VLM is behind: the downloads slow
     to the VLM's pace instead of running ahead."""
 
-    def __init__(self, store, client: VLMClient, run_id: int, stats, display_ref, stop_event: threading.Event,
-                 depth: int = 4):
-        self.store, self.client, self.run_id = store, client, run_id
+    def __init__(self, store, client: VLMClient, stats, display_ref, stop_event: threading.Event, depth: int = 4):
+        self.store, self.client = store, client
+        self.runs: dict[str, int] = {}             # one caption run per scope, so undo works per scope
+        self.per_run: dict[int, list[int]] = {}
         self.stats, self.display_ref, self.stop_event = stats, display_ref, stop_event
         self.q: queue.Queue = queue.Queue(maxsize=max(1, depth))
         self.fails_in_row = 0
@@ -393,10 +395,18 @@ class StreamCaptioner:
     def put(self, target: Target) -> None:
         self.q.put(target)
 
+    def run_for(self, scope: str) -> int:
+        if scope not in self.runs:
+            rid = self.store.start_caption_run(scope, scope + "/", self.client.model, self.client.prompt_sha)
+            self.runs[scope] = rid
+            self.per_run[rid] = [0, 0]
+        return self.runs[scope]
+
     def close(self) -> None:
         self.q.put(None)
         self.thread.join()
-        self.store.end_caption_run(self.run_id, self.captioned, self.failed)
+        for rid, (ok, bad) in self.per_run.items():
+            self.store.end_caption_run(rid, ok, bad)
 
     def _work(self) -> None:
         while True:
@@ -406,17 +416,20 @@ class StreamCaptioner:
             d = self.display_ref()
             if self.stop_event.is_set() and self.fails_in_row >= MAX_CONSECUTIVE_FAILS:
                 continue                       # the endpoint is down: leave the rest for a later autocaption
+            rid = self.run_for(t.scope)
             try:
                 if d:
                     d.set(f"{t.cid}: captioning")
-                facts = caption_photo(self.store, self.client, self.run_id, t)
+                facts = caption_photo(self.store, self.client, rid, t)
                 self.stats.time("caption", facts["seconds"])
                 self.stats.add(captioned=1)
                 self.captioned += 1
+                self.per_run[rid][0] += 1
                 self.fails_in_row = 0
             except (CaptionFailed, EndpointDown) as e:
                 self.store.caption_failed(t.cid, str(e))
                 self.failed += 1
+                self.per_run[rid][1] += 1
                 self.fails_in_row += 1
                 if d:
                     d.print(f"[caption failed] {t.cid}: {e}")
@@ -428,3 +441,4 @@ class StreamCaptioner:
             except Exception as e:  # noqa: BLE001 - one photo never stops the stream
                 self.store.caption_failed(t.cid, f"{type(e).__name__}: {e}")
                 self.failed += 1
+                self.per_run[rid][1] += 1

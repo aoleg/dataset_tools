@@ -40,7 +40,8 @@ TOOL_VERSION = "0.2"
 @dataclass
 class Options:
     base: Path
-    scope: dict
+    scope: dict                       # the primary scope (its name titles the run)
+    scopes: dict | None = None        # every scope the run writes into (run --by), name -> scope
     min_side: int = 512
     png: bool = False
     wm_conf: float = 0.1
@@ -70,6 +71,7 @@ class Options:
 @dataclass
 class Job:
     cid: int
+    scope: str = ""
     result: dict = None
     photo: dict = None
     data: bytes = b""
@@ -98,20 +100,21 @@ def cleanup_interrupted(store: Store, base: Path, scope: str) -> int:
 
 class Stream:
     def __init__(self, client: Client, store: Store, opts: Options, classifier=None, detector=None, lama=None,
-                 caption_client=None, caption_run: int | None = None, vram=None):
+                 caption_client=None, vram=None):
         self.client, self.store, self.opts = client, store, opts
         self.classifier = classifier
         self.det_name, self.det = detector or (None, None)
         self.lama = lama
         self.scope = opts.scope["name"]
-        self.chunker = layout.Chunker(opts.scope["split"], opts.scope["width"],
-                                      [self.scope_rel(p) for p in store.scope_paths(self.scope)])
+        self.scopes = opts.scopes or {self.scope: opts.scope}
+        self.chunkers = {n: layout.Chunker(sc["split"], sc["width"], [self.scope_rel(p, n) for p in store.scope_paths(n)])
+                         for n, sc in self.scopes.items()}
         self.stats = Stats()
         self.stop = threading.Event()
         self.in_flight = 0
         self.lock = threading.Lock()
         self.display: Display | None = None
-        self.caption_client, self.caption_run, self.vram = caption_client, caption_run, vram
+        self.caption_client, self.vram = caption_client, vram
         self.captioner = None
         enc_model = getattr(getattr(classifier, "encoder", None), "model_id", None)
         self.emb_key = (enc_model, getattr(classifier, "patches", None))
@@ -120,17 +123,17 @@ class Stream:
                      "priority_margin": getattr(classifier, "priority_margin", None),
                      "patches": getattr(classifier, "patches", None)}
 
-    def scope_rel(self, base_rel: str) -> str:
+    def scope_rel(self, base_rel: str, scope: str) -> str:
         """A path relative to the base -> relative to the scope folder."""
-        prefix = self.scope + "/"
+        prefix = scope + "/"
         return base_rel[len(prefix):] if base_rel.startswith(prefix) else base_rel
 
     # --- fetch threads -------------------------------------------------------------
 
-    def fetch(self, cid: int) -> Job:
+    def fetch(self, cid: int, scope: str) -> Job:
         o = self.opts
         t0 = time.perf_counter()
-        job = Job(cid)
+        job = Job(cid, scope)
         try:
             job.result = self.client.give_for_page(cid)
         except PastvuError as e:
@@ -172,13 +175,14 @@ class Stream:
     def fetch_worker(self, cids, cid_lock, out_q: queue.Queue) -> None:
         while not self.stop.is_set():
             with cid_lock:
-                cid = next(cids, None)
-            if cid is None:
+                pair = next(cids, None)
+            if pair is None:
                 break
+            cid, scope = pair
             with self.lock:
                 self.in_flight += 1
             try:
-                item = self.fetch(cid)
+                item = self.fetch(cid, scope)
             except pr.Rejected as r:
                 item = r
             except TransportError as e:
@@ -189,16 +193,16 @@ class Stream:
                 with self.lock:
                     self.in_flight -= 1
             if isinstance(item, pr.Rejected):
-                item.cid = cid
+                item.cid, item.scope = cid, scope
             out_q.put(item)
         out_q.put(None)
 
     # --- outcomes ------------------------------------------------------------------
 
-    def reject(self, cid: int, r: pr.Rejected) -> None:
+    def reject(self, cid: int, r: pr.Rejected, scope: str) -> None:
         key = r.reason.split(":")[0].split(" (")[0]
         state = FAILED if r.failed else SKIPPED
-        self.store.reject(cid, self.scope, state, r.reason, {f"c.{state}.{key}": 1})
+        self.store.reject(cid, scope, state, r.reason, {f"c.{state}.{key}": 1})
         self.stats.add(**{f"{state}.{key}": 1})
         self.display.advance(saved=False)
         self.display.line({"cid": cid, "state": state, "reason": r.reason})
@@ -248,12 +252,14 @@ class Stream:
         if self.classifier is not None:
             verdict = self.classifier.example_override(data, verdict)
         folder = verdict.folder if verdict else ""
-        rel_scope = self.chunker.place(folder, f"{job.cid}{ext}")
-        rel = f"{self.scope}/{rel_scope}"
+        scope = job.scope
+        chunker = self.chunkers[scope]
+        rel_scope = chunker.place(folder, f"{job.cid}{ext}")
+        rel = f"{scope}/{rel_scope}"
         path = o.base / rel
         d.set(f"{job.cid}: saving {rel_scope}")
         t = time.perf_counter()
-        self.store.claim(job.cid, self.scope, rel)
+        self.store.claim(job.cid, scope, rel)
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(data)
@@ -269,11 +275,11 @@ class Stream:
                 path.with_suffix(".json").write_text(doc, encoding="utf-8")
             emb = (self.emb_key[0], self.emb_key[1], vec) if vec is not None else None
             counters = self.counters(job, plan, mode, folder, boxes)
-            self.store.finish(job.cid, self.scope, {"category": folder, "path": rel, "sha256": sha, "bytes": len(data),
+            self.store.finish(job.cid, scope, {"category": folder, "path": rel, "sha256": sha, "bytes": len(data),
                                                     "width": fw, "height": fh, "changed": plan["changed"]},
                               doc, emb, counters)
         except BaseException:
-            self.chunker.release(rel_scope)
+            chunker.release(rel_scope)
             for f in (path, path.with_suffix(".txt"), path.with_suffix(".json")):
                 f.unlink(missing_ok=True)
             self.store.unclaim(job.cid)
@@ -282,7 +288,7 @@ class Stream:
         if self.captioner is not None:
             # after the photo is committed: a wait here (the VLM is behind) slows the stream, nothing else
             import autocaption as ac
-            self.captioner.put(ac.Target(job.cid, path, image=final, tags=facts))
+            self.captioner.put(ac.Target(job.cid, path, image=final, tags=facts, scope=scope))
         s.add(done=1)
         d.advance(saved=True)
         d.line({"cid": job.cid, "state": DONE, "path": rel, "write": mode, "changed": plan["changed"],
@@ -309,7 +315,7 @@ class Stream:
         if job.comments is not None:
             result["comments"] = job.comments
         return sidecars.record_json(job.cid, page_url(job.cid), result, download, processing, classification,
-                                    {**self.tool, "scope": self.scope})
+                                    {**self.tool, "scope": job.scope})
 
     def counters(self, job: Job, plan: dict, mode: str, folder: str, boxes: list) -> dict:
         kw = {"c.done": 1, f"c.write.{mode}": 1}
@@ -343,7 +349,7 @@ class Stream:
             try:
                 self.write(*item)
             except Exception as e:  # noqa: BLE001
-                self.reject(job.cid, pr.Rejected(f"write: {type(e).__name__}: {e}", failed=True))
+                self.reject(job.cid, pr.Rejected(f"write: {type(e).__name__}: {e}", failed=True), job.scope)
                 self.display.print(f"[write error] {job.cid}: {''.join(traceback.format_exception_only(e)).strip()}")
 
     # --- the run -------------------------------------------------------------------
@@ -353,34 +359,52 @@ class Stream:
         import autocaption as ac
         return self.captioner is not None and self.captioner.fails_in_row >= ac.MAX_CONSECUTIVE_FAILS
 
+    def totals(self) -> tuple[dict, dict]:
+        """The counters and the state counts of every scope of the run, summed."""
+        from collections import Counter
+        counters, counts = Counter(), Counter()
+        for n in self.scopes:
+            counters.update(self.store.counters(n))
+            counts.update(self.store.scope_counts(n))
+        return dict(counters), dict(counts)
+
     def report(self, t_start: float, final: bool = False) -> str:
-        counts = self.store.scope_counts(self.scope)
-        text = report_block(self.store.counters(self.scope), self.stats, counts, time.time() - t_start, final)
+        counters, counts = self.totals()
+        text = report_block(counters, self.stats, counts, time.time() - t_start, final)
         if self.caption_client is not None:
             text += f"\n  captioned by the VLM in this run: {int(self.stats.c['captioned']):,}"
         if self.vram is not None and self.vram.ok:
             text += "\n  " + self.vram.report()
+        if final and len(self.scopes) > 1:
+            for n in sorted(self.scopes):
+                c = self.store.scope_counts(n)
+                text += (f"\n    {n:32} {c['done']:>7,} saved  {c['skipped']:>6,} skipped  {c['failed']:>4,} failed  "
+                         f"{c['elsewhere']:>6,} in other scopes  {c['pending']:>7,} left")
         return text
 
-    def run(self, cids: list[int], scope_total: int, completed: int) -> dict:
+    def run(self, pairs: list[tuple[int, str]], scope_total: int, completed: int) -> dict:
+        """pairs: (cid, scope) to do."""
         o = self.opts
-        if o.limit:
-            cids = cids[:o.limit]
-        it = iter(cids)
+        if o.limit is not None:
+            pairs = pairs[:max(0, o.limit)]
+        cids = pairs
+        it = iter(pairs)
         cid_lock = threading.Lock()
         out_q: queue.Queue = queue.Queue(maxsize=max(1, o.depth))
         wq: queue.Queue = queue.Queue(maxsize=max(2, o.writers * 2))
-        run_id = self.store.start_run(self.scope, {"cids": len(cids), **{k: str(v) for k, v in vars(o).items()
-                                                                          if k != "scope"}})
+        run_id = self.store.start_run(self.scope, {"cids": len(cids), "scopes": sorted(self.scopes),
+                                                   **{k: str(v) for k, v in vars(o).items()
+                                                      if k not in ("scope", "scopes")}})
         t_start = time.time()
         processed = 0
         with Display(scope_total, completed, o.display, vram=self.vram) as d:
             self.display = d
             if self.caption_client is not None:
                 import autocaption as ac
-                self.captioner = ac.StreamCaptioner(self.store, self.caption_client, self.caption_run, self.stats,
+                self.captioner = ac.StreamCaptioner(self.store, self.caption_client, self.stats,
                                                     lambda: self.display, self.stop)
-            d.print(f"{self.scope}: {len(cids):,} photos to do in this run; {completed:,} of {scope_total:,} done, "
+            where = self.scope if len(self.scopes) == 1 else f"{self.scope} ({len(self.scopes)} scopes)"
+            d.print(f"{where}: {len(cids):,} photos to do in this run; {completed:,} of {scope_total:,} done, "
                     f"skipped or saved under another scope before.")
             fetchers = [threading.Thread(target=self.fetch_worker, args=(it, cid_lock, out_q), daemon=True,
                                          name=f"fetch-{i}") for i in range(o.fetchers)]
@@ -404,7 +428,7 @@ class Stream:
                             ended += 1
                             continue
                         if isinstance(item, pr.Rejected):
-                            self.reject(item.cid, item)
+                            self.reject(item.cid, item, item.scope)
                         else:
                             self.stats.time("fetch", item.t_fetch)
                             try:
@@ -412,9 +436,10 @@ class Stream:
                                 item.array = None
                                 wq.put((item,) + res)
                             except pr.Rejected as r:
-                                self.reject(item.cid, r)
+                                self.reject(item.cid, r, item.scope)
                             except Exception as e:  # noqa: BLE001
-                                self.reject(item.cid, pr.Rejected(f"processing: {type(e).__name__}: {e}", failed=True))
+                                self.reject(item.cid, pr.Rejected(f"processing: {type(e).__name__}: {e}", failed=True),
+                                            item.scope)
                                 d.print(f"[error] {item.cid}: {type(e).__name__}: {e}")
                                 if "out of memory" in str(e).lower():
                                     import torch

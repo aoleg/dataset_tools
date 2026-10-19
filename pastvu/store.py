@@ -70,6 +70,12 @@ CREATE TABLE IF NOT EXISTS captions (
 CREATE TABLE IF NOT EXISTS caption_log (
     run INTEGER, cid INTEGER, before TEXT, after TEXT, PRIMARY KEY (run, cid)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS caption_fails (cid INTEGER PRIMARY KEY, attempts INTEGER, error TEXT, time REAL);
+CREATE TABLE IF NOT EXISTS regroup_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, rule TEXT, target TEXT, started REAL, moved INTEGER DEFAULT 0,
+    removed TEXT, created TEXT, undone REAL);
+CREATE TABLE IF NOT EXISTS regroup_moves (
+    run INTEGER, seq INTEGER, cid INTEGER, src_scope TEXT, src_path TEXT, dst_scope TEXT, dst_path TEXT, kind TEXT,
+    new_member INTEGER, PRIMARY KEY (run, seq)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS caption_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT, scope TEXT, target TEXT, model TEXT, prompt_sha TEXT, started REAL,
     ended REAL, captioned INTEGER DEFAULT 0, failed INTEGER DEFAULT 0, undone REAL);
@@ -97,6 +103,9 @@ class Store:
                 raise SystemExit(f"{self.path} is a store of the first version of this tool (one store per output "
                                  f"folder); it cannot be opened as a base folder store.")
         self.db.executescript(SCHEMA)
+        cols = {r[1] for r in self.db.execute("PRAGMA table_info(scopes)")}
+        if "label" not in cols:
+            self.db.execute("ALTER TABLE scopes ADD COLUMN label TEXT")
         self.set_meta("schema", SCHEMA_VERSION)
 
     def close(self) -> None:
@@ -169,19 +178,87 @@ class Store:
 
     def scope(self, name: str) -> dict | None:
         with self.lock:
-            row = self.db.execute("SELECT name, regions, years, decade, split, width, created, indexed FROM scopes "
-                                  "WHERE name=?", (name,)).fetchone()
+            row = self.db.execute("SELECT name, regions, years, decade, split, width, created, indexed, label FROM "
+                                  "scopes WHERE name=?", (name,)).fetchone()
         if not row:
             return None
         return {"name": row[0], "regions": json.loads(row[1]), "years": tuple(json.loads(row[2])), "decade": row[3],
-                "split": row[4], "width": row[5], "created": row[6], "indexed": row[7]}
+                "split": row[4], "width": row[5], "created": row[6], "indexed": row[7],
+                "label": row[8] or row[0].rsplit("_", 1)[0]}
 
-    def add_scope(self, name: str, regions: list[int], years: tuple[int, int], decade: int | None, split: int) -> dict:
+    def add_scope(self, name: str, regions: list[int], years: tuple[int, int], decade: int | None, split: int,
+                  label: str | None = None, width: int = 0) -> dict:
         with self.lock:
-            self.db.execute("INSERT INTO scopes (name, regions, years, decade, split, width, created) VALUES "
-                            "(?,?,?,?,?,0,?)", (name, json.dumps(sorted(regions)), json.dumps(list(years)), decade, split,
-                                                time.time()))
+            self.db.execute("INSERT INTO scopes (name, regions, years, decade, split, width, created, label) VALUES "
+                            "(?,?,?,?,?,?,?,?)", (name, json.dumps(sorted(regions)), json.dumps(list(years)), decade,
+                                                  split, width, time.time(), label))
         return self.scope(name)
+
+    def ensure_scope(self, name: str, regions, years: tuple[int, int], decade: int | None, split: int, label: str,
+                     width: int) -> dict:
+        """The scope of that name, made when missing; an existing one must have
+        the same regions, years and decade."""
+        sc = self.scope(name)
+        if sc is None:
+            return self.add_scope(name, list(regions), years, decade, split, label, width)
+        if sorted(sc["regions"]) != sorted(regions) or tuple(sc["years"]) != tuple(years) or sc["decade"] != decade:
+            raise SystemExit(f"scope {name} exists with regions {sc['regions']}, years {list(sc['years'])}, decade "
+                             f"{sc['decade']}; the rule wants regions {sorted(regions)}, years {list(years)}, decade "
+                             f"{decade}. Rename or drop the existing scope.")
+        return sc
+
+    def remove_scope(self, name: str) -> None:
+        """Forget a scope: its definition, members, shards and counters (not its
+        photos' status). The shards of a `run --by` family that made it are
+        forgotten too, so the next run of the family pages again and makes it again."""
+        def work(db):
+            for t, col in (("members", "scope"), ("shards", "scope"), ("counters", "scope"), ("scopes", "name")):
+                db.execute(f"DELETE FROM {t} WHERE {col}=?", (name,))
+            for key, value in db.execute("SELECT key, value FROM meta WHERE key LIKE 'family:%'").fetchall():
+                names = json.loads(value)
+                if name in names:
+                    db.execute("DELETE FROM shards WHERE scope=?", (key[len("family:"):],))
+                    db.execute("UPDATE meta SET value=? WHERE key=?", (json.dumps([n for n in names if n != name]), key))
+        self.tx(work)
+
+    def add_family(self, family: str, names) -> None:
+        """Remember the scopes a `run --by` family made (its shards are keyed by the family)."""
+        cur = set(self.get_meta(f"family:{family}", []))
+        self.set_meta(f"family:{family}", sorted(cur | set(names)))
+
+    def family(self, family: str) -> list[str]:
+        return self.get_meta(f"family:{family}", [])
+
+    def members(self, scope: str) -> list[int]:
+        with self.lock:
+            return [r[0] for r in self.db.execute("SELECT cid FROM members WHERE scope=? ORDER BY cid", (scope,))]
+
+    def add_member(self, scope: str, cid: int) -> bool:
+        with self.lock:
+            return self.db.execute("INSERT OR IGNORE INTO members (scope, cid) VALUES (?, ?)", (scope, cid)).rowcount > 0
+
+    def remove_member(self, scope: str, cid: int) -> None:
+        with self.lock:
+            self.db.execute("DELETE FROM members WHERE scope=? AND cid=?", (scope, cid))
+
+    def move_members(self, run: int, seq0: int, rows: list[tuple[int, str, str]]) -> int:
+        """Membership moves of a regroup in one transaction: (cid, src, dst);
+        logged from seq0 on, with whether dst gained the member. -> next seq."""
+        def work(db):
+            seq = seq0
+            for cid, src, dst in rows:
+                new = db.execute("INSERT OR IGNORE INTO members (scope, cid) VALUES (?, ?)", (dst, cid)).rowcount > 0
+                db.execute("DELETE FROM members WHERE scope=? AND cid=?", (src, cid))
+                db.execute("INSERT INTO regroup_moves VALUES (?,?,?,?,?,?,?,?,?)",
+                           (run, seq, cid, src, None, dst, None, "member", int(new)))
+                seq += 1
+            return seq
+        return self.tx(work)
+
+    def add_members(self, scope: str, cids) -> None:
+        def work(db):
+            db.executemany("INSERT OR IGNORE INTO members (scope, cid) VALUES (?, ?)", [(scope, c) for c in cids])
+        self.tx(work)
 
     def set_scope_width(self, name: str, width: int) -> None:
         with self.lock:
@@ -211,7 +288,8 @@ class Store:
 
     def add_page(self, key: str, scope: str, page: int, photos: list[dict], member) -> int:
         """Store one gallery page; member(photo) says whether the photo belongs
-        to the scope (decades keep start years only). -> new members."""
+        to the scope (True), to another scope (its name, as `run --by` splits a
+        download), or to none (False or None). -> new members."""
         now = time.time()
 
         def work(db):
@@ -224,8 +302,10 @@ class Store:
                            "last_seen=excluded.last_seen",
                            (cid, p.get("file", ""), p.get("title", ""), p.get("year"), p.get("year2"), p.get("dir"),
                             json.dumps(p.get("rs") or []), now, now))
-                if member(p):
-                    cur = db.execute("INSERT OR IGNORE INTO members (scope, cid) VALUES (?, ?)", (scope, cid))
+                target = member(p)
+                if target:
+                    cur = db.execute("INSERT OR IGNORE INTO members (scope, cid) VALUES (?, ?)",
+                                     (scope if target is True else target, cid))
                     new += cur.rowcount
                     db.execute("INSERT OR IGNORE INTO status (cid, state, updated) VALUES (?, ?, ?)", (cid, PENDING, now))
             db.execute("UPDATE shards SET pages_done=?, rows=rows+?, updated=? WHERE key=?",
@@ -269,6 +349,68 @@ class Store:
                 "SELECT m.cid FROM members m JOIN status s ON s.cid=m.cid WHERE m.scope=? AND "
                 "(s.state=? OR (s.state=? AND s.attempts<?)) ORDER BY m.cid", (scope, PENDING, FAILED, retries)).fetchall()
         return [r[0] for r in rows]
+
+    def pending_pairs(self, scopes: list[str], retries: int) -> list[tuple[int, str]]:
+        """(cid, scope) to do in any of the scopes, each photo once, in cid order."""
+        if not scopes:
+            return []
+        q = ",".join("?" * len(scopes))
+        with self.lock:
+            rows = self.db.execute(
+                f"SELECT m.cid, MIN(m.scope) FROM members m JOIN status s ON s.cid=m.cid WHERE m.scope IN ({q}) AND "
+                f"(s.state=? OR (s.state=? AND s.attempts<?)) GROUP BY m.cid ORDER BY m.cid",
+                (*scopes, PENDING, FAILED, retries)).fetchall()
+        return [(r[0], r[1]) for r in rows]
+
+    def owned_rows(self, scope: str) -> list[tuple]:
+        """(cid, state, path, category) of every photo the scope owns (done, skipped, failed)."""
+        with self.lock:
+            return self.db.execute("SELECT cid, state, path, category FROM status WHERE scope=? ORDER BY cid",
+                                   (scope,)).fetchall()
+
+    def set_owner(self, cid: int, scope: str | None, path: str | None, category: str | None,
+                  record: str | None = None, state: str | None = None) -> None:
+        def work(db):
+            if state:
+                db.execute("UPDATE status SET state=?, scope=?, path=?, category=?, updated=? WHERE cid=?",
+                           (state, scope, path, category, time.time(), cid))
+            else:
+                db.execute("UPDATE status SET scope=?, path=?, category=?, updated=? WHERE cid=?",
+                           (scope, path, category, time.time(), cid))
+            if record is not None:
+                db.execute("UPDATE records SET json=? WHERE cid=?", (record, cid))
+        self.tx(work)
+
+    def forget_photos(self, cids: list[int]) -> None:
+        """Back to not downloaded: status pending, no record, embedding or VLM caption."""
+        def work(db):
+            for cid in cids:
+                db.execute("UPDATE status SET state=?, reason='', attempts=0, scope=NULL, category=NULL, path=NULL, "
+                           "sha256=NULL, bytes=NULL, width=NULL, height=NULL, changed=NULL, updated=? WHERE cid=?",
+                           (PENDING, time.time(), cid))
+                for t in ("records", "embeddings", "captions", "caption_fails", "caption_log"):
+                    db.execute(f"DELETE FROM {t} WHERE cid=?", (cid,))
+        self.tx(work)
+
+    def recount(self, scope: str) -> dict:
+        """The scope's counters again, from the status and records of the photos it owns."""
+        from collections import Counter
+        total = Counter()
+        with self.lock:
+            rows = self.db.execute("SELECT s.cid, s.state, s.reason, s.category, r.json FROM status s LEFT JOIN records r "
+                                   "ON r.cid=s.cid WHERE s.scope=?", (scope,)).fetchall()
+        for cid, state, reason, category, rec in rows:
+            if state == DONE:
+                total.update(record_counters(json.loads(rec) if rec else {}, category or ""))
+            elif state in (SKIPPED, FAILED):
+                key = (reason or "").split(":")[0].split(" (")[0]
+                total[f"c.{state}.{key}"] += 1
+
+        def work(db):
+            db.execute("DELETE FROM counters WHERE scope=?", (scope,))
+            self._add_counters(db, scope, dict(total))
+        self.tx(work)
+        return dict(total)
 
     def writing_rows(self, scope: str) -> list[tuple[int, str]]:
         with self.lock:
@@ -489,3 +631,121 @@ class Store:
     def undo_caption_run(self, run: int) -> None:
         with self.lock:
             self.db.execute("UPDATE caption_runs SET undone=? WHERE id=?", (time.time(), run))
+
+    # --- regroup --------------------------------------------------------------------------
+
+    def start_regroup(self, rule: str, target: str) -> int:
+        with self.lock:
+            return self.db.execute("INSERT INTO regroup_runs (rule, target, started) VALUES (?,?,?)",
+                                   (rule, target, time.time())).lastrowid
+
+    def add_regroup_move(self, run: int, seq: int, cid: int, src_scope, src_path, dst_scope, dst_path, kind: str,
+                         new_member: bool) -> None:
+        with self.lock:
+            self.db.execute("INSERT INTO regroup_moves VALUES (?,?,?,?,?,?,?,?,?)",
+                            (run, seq, cid, src_scope, src_path, dst_scope, dst_path, kind, int(new_member)))
+
+    def end_regroup(self, run: int, moved: int, removed: list[dict], created: list[str]) -> None:
+        with self.lock:
+            self.db.execute("UPDATE regroup_runs SET moved=?, removed=?, created=? WHERE id=?",
+                            (moved, json.dumps(removed, ensure_ascii=False), json.dumps(created), run))
+
+    def last_regroup(self) -> dict | None:
+        with self.lock:
+            row = self.db.execute("SELECT id, rule, target, moved, removed, created FROM regroup_runs WHERE undone IS "
+                                  "NULL ORDER BY id DESC LIMIT 1").fetchone()
+        if not row:
+            return None
+        return {"id": row[0], "rule": row[1], "target": row[2], "moved": row[3],
+                "removed": json.loads(row[4] or "[]"), "created": json.loads(row[5] or "[]")}
+
+    def regroup_moves(self, run: int) -> list[tuple]:
+        with self.lock:
+            return self.db.execute("SELECT seq, cid, src_scope, src_path, dst_scope, dst_path, kind, new_member FROM "
+                                   "regroup_moves WHERE run=? ORDER BY seq DESC", (run,)).fetchall()
+
+    def undo_regroup(self, run: int) -> None:
+        with self.lock:
+            self.db.execute("UPDATE regroup_runs SET undone=? WHERE id=?", (time.time(), run))
+
+    def close_reclass_runs(self, scope: str) -> int:
+        """Reclassify runs of a scope whose photos moved can no longer be undone: close them."""
+        with self.lock:
+            return self.db.execute("UPDATE reclass_runs SET undone=? WHERE scope=? AND undone IS NULL",
+                                   (time.time(), scope)).rowcount
+
+    # --- the run lock -----------------------------------------------------------------------
+
+    # who may work beside whom: a download beside a caption job, never two downloads,
+    # and nothing beside a command that moves or deletes files
+    LOCK_CONFLICTS = {"exclusive": {"exclusive", "run", "shared"}, "run": {"exclusive", "run"},
+                      "shared": {"exclusive"}}
+
+    def acquire_lock(self, command: str, mode: str = "exclusive") -> None:
+        """Take this process's place in the base folder's lock, or stop when a
+        running command conflicts with this one. Entries of processes that no
+        longer run are dropped."""
+        import os
+        import runlock
+        me = {"pid": os.getpid(), "start": runlock.process_start(os.getpid()), "command": command, "mode": mode,
+              "time": time.time()}
+        with self.lock:
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                row = self.db.execute("SELECT value FROM meta WHERE key='lock'").fetchone()
+                held = json.loads(row[0]) if row else []
+                held = [held] if isinstance(held, dict) else held
+                live = [h for h in held if h.get("pid") != me["pid"] and runlock.is_running(h.get("pid"), h.get("start"))]
+                for h in live:
+                    if h.get("mode", "exclusive") in self.LOCK_CONFLICTS[mode]:
+                        raise SystemExit(f"Another pastvu command works on this base folder: {h.get('command')} "
+                                         f"(process {h.get('pid')}). Wait for it to finish.")
+                self.db.execute("INSERT OR REPLACE INTO meta VALUES ('lock', ?)", (json.dumps(live + [me]),))
+            except BaseException:
+                self.db.execute("ROLLBACK")
+                raise
+            self.db.execute("COMMIT")
+
+    def release_lock(self) -> None:
+        import os
+        with self.lock:
+            row = self.db.execute("SELECT value FROM meta WHERE key='lock'").fetchone()
+            if not row:
+                return
+            held = json.loads(row[0])
+            held = [held] if isinstance(held, dict) else held
+            rest = [h for h in held if h.get("pid") != os.getpid()]
+            if rest:
+                self.db.execute("UPDATE meta SET value=? WHERE key='lock'", (json.dumps(rest),))
+            else:
+                self.db.execute("DELETE FROM meta WHERE key='lock'")
+
+
+def record_counters(rec: dict, folder: str) -> dict:
+    """The counters one saved photo adds to its scope, from its record."""
+    p = rec.get("processing") or {}
+    wm = p.get("watermarks") or {}
+    kw = {"c.done": 1, f"c.write.{p.get('write', 'lossless')}": 1}
+    changed = p.get("changed") or []
+    band = p.get("band") or {}
+    if "band" in changed:
+        kw["c.band"] = 1
+    if band.get("rows") and not band.get("ok"):
+        kw["c.band_unverified"] = 1
+    borders = p.get("borders") or {}
+    if "borders" in changed:
+        kw["c.borders"] = 1
+        for kind in {c["kind"] for c in borders.get("cuts") or []}:
+            kw[f"c.cut.{kind}"] = 1
+    if borders.get("action") == "review":
+        kw["c.borders_review"] = 1
+    if wm.get("painted"):
+        kw["c.wm_images"] = 1
+        kw["c.wm_boxes"] = len(wm["painted"])
+    if wm.get("trim"):
+        kw["c.wm_trim"] = 1
+    if wm.get("detected") and not wm.get("painted") and not wm.get("trim"):
+        kw["c.wm_below"] = 1
+    if folder:
+        kw[f"cat.{folder}"] = 1
+    return kw

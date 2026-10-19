@@ -8,11 +8,16 @@ samples folder, the defaults and the region aliases come from pastvu.conf.
     run.bat run --region ukraine --decade 1970        ukraine_1970s
     run.bat run --region baltics --years 1945 1960    baltics_1945-1960
     run.bat run --scope belarus_1917-1991             resume
+    run.bat run --region estonia --by decade          estonia_1910s ... estonia_1990s in one download
+    run.bat run --region estonia --regroup            pull saved Estonia photos from other scopes, then download
+    run.bat regroup --by decade estonia_1917-1991     split a scope into decades, no downloads (--undo)
+    run.bat drop estonia_1950s --yes                  delete a scope's files and forget it
     run.bat reclassify belarus_1917-1991 --dry-run    sort again with the current samples
+    run.bat reclassify                                every scope of the base (asks first)
     run.bat captions belarus_1917-1991                rewrite the captions from the records
     run.bat autocaption belarus_1917-1991             caption with the VLM of [caption] in the conf
     run.bat autocaption <base>/belarus_1917-1991/5_transport --limit 100
-    run.bat export belarus_1917-1991 --format parquet
+    run.bat export "estonia_*" --format parquet       scope names take * and ? patterns
     run.bat scopes | aliases | regions --find Minsk | count --region belarus
 
 See README.md.
@@ -21,10 +26,12 @@ See README.md.
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import os
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -87,6 +94,47 @@ def scope_arg(base: Path, store: Store, value: str) -> dict:
         known = ", ".join(s["name"] for s in store.scopes()) or "none yet"
         raise SystemExit(f"no scope {name!r} in {base}. Scopes: {known}")
     return sc
+
+
+def is_pattern(value: str) -> bool:
+    return any(c in value for c in "*?[")
+
+
+def scopes_arg(base: Path, store: Store, values: list[str]) -> list[dict]:
+    """Scopes by name, folder or name pattern (estonia_*), each once, in the order given."""
+    out, seen = [], set()
+    for v in values:
+        if is_pattern(v):
+            hits = [sc for sc in store.scopes() if fnmatch.fnmatchcase(sc["name"], v)]
+            if not hits:
+                raise SystemExit(f"no scope of {base} matches {v!r}")
+        else:
+            hits = [scope_arg(base, store, v)]
+        for sc in hits:
+            if sc["name"] not in seen:
+                seen.add(sc["name"])
+                out.append(sc)
+    return out
+
+
+def confirm(question: str, yes: bool) -> bool:
+    if yes:
+        return True
+    try:
+        answer = input(question)
+    except EOFError:
+        print("\nno answer; add --yes to go ahead without asking")
+        return False
+    return answer.strip().lower() in ("y", "yes")
+
+
+@contextmanager
+def locked(store: Store, command: str, mode: str = "exclusive"):
+    store.acquire_lock(command, mode)
+    try:
+        yield
+    finally:
+        store.release_lock()
 
 
 def target_arg(base: Path, store: Store, value: str) -> tuple[dict, str]:
@@ -164,6 +212,81 @@ def do_index(args, client: Client, store: Store, sc: dict) -> dict:
     print(f"  {stats['pages']:,} pages read, {stats['new']:,} new photos; the scope lists {counts['total']:,} photos "
           f"({time.time() - t0:.0f} s)")
     return store.scope(sc["name"])
+
+
+def family_from_args(args, conf: cf.Conf, client: Client, store: Store, rule) -> tuple[dict, dict]:
+    """run --by: index the regions and years of the arguments once and put each
+    photo into the scope its rule names, made on first sight.
+    -> (the family as a pseudo scope, {name: scope} of every scope it fills)."""
+    import partition as pt
+    ix.ensure_regions(client, store)
+    years, decade = years_of(args, conf)
+    regions, labels = ix.resolve(store, conf.aliases, args.region)
+    if args.name:
+        label = layout.check_scope_name(args.name)
+    elif len(labels) > 3:
+        raise SystemExit("more than three regions: give the family a --name, or define an alias for them in the conf")
+    else:
+        label = "+".join(labels)
+    cids = sorted(r["cid"] for r in regions)
+    split = args.split if getattr(args, "split", None) is not None else conf.split
+    part = pt.Partitioner(store, conf.aliases, conf.groups, rule, label, cids)
+    inside = ix.member_test(years, decade)
+    family = f"{label}@{rule.text}"
+    made: dict[str, dict] = {}
+    cache: dict[tuple, str] = {}
+
+    def place(t):
+        lab, regs = (f"{label}_unplaced", cids) if t.label == "unplaced" else (t.label, list(t.regions))
+        if t.decade is not None:
+            y, d = (t.decade, t.decade + 9), t.decade
+        else:
+            y, d = years, decade
+        return layout.check_scope_name(layout.scope_name([lab], y, d)), regs, y, d, lab
+
+    def assign(photo):
+        if not inside(photo):
+            return None
+        t = part.target(photo)
+        key = (t.label, t.regions, t.decade)
+        name = cache.get(key)
+        if name is None:
+            name, regs, y, d, lab = place(t)
+            if name not in made:
+                is_new = store.scope(name) is None
+                made[name] = store.ensure_scope(name, regs, y, d, split, lab, 0)
+                if is_new:
+                    print(f"  new scope {name}", flush=True)
+            cache[key] = name
+        return name
+
+    fam = {"name": family, "regions": cids, "years": years, "decade": decade, "split": split, "width": 0}
+    where = ", ".join(ix.region_path(store, r) for r in regions)
+    print(f"Indexing {where}, {layout.years_label(years, decade)}, into scopes by {rule.text} ...", flush=True)
+    t0 = time.time()
+    last = [0.0]
+
+    def progress(done, total, text):
+        if time.time() - last[0] > 3 or done == total:
+            last[0] = time.time()
+            print(f"  index: page {done:,} of {total:,}  {text}", flush=True)
+
+    stats = ix.run_index(client, store, fam, getattr(args, "full_parent", False), getattr(args, "reindex", False),
+                         getattr(args, "shard_max", None) or ix.SHARD_MAX, progress=progress, assign=assign)
+    store.add_family(family, made)
+    scopes = {}
+    for name in store.family(family):
+        sc = store.scope(name)
+        if not sc:
+            continue
+        if sc["split"] and not sc["width"]:
+            store.set_scope_width(name, layout.chunk_width(store.scope_counts(name)["total"], sc["split"]))
+            sc = store.scope(name)
+        scopes[name] = sc
+    total = sum(store.scope_counts(n)["total"] for n in scopes)
+    print(f"  {stats['pages']:,} pages read, {stats['new']:,} new photos; {len(scopes)} scopes list {total:,} photos "
+          f"({time.time() - t0:.0f} s)")
+    return fam, scopes
 
 
 # --- subcommands -------------------------------------------------------------------------
@@ -246,7 +369,18 @@ def cmd_index(args, conf, client) -> int:
 def cmd_run(args, conf, client) -> int:
     import stream as sm
     base, store = open_base(args, conf)
-    if args.scope:
+    with locked(store, "run", "run"):
+        return run_locked(args, conf, client, base, store, sm)
+
+
+def run_locked(args, conf, client, base: Path, store: Store, sm) -> int:
+    scopes = None
+    if args.by:
+        import partition as pt
+        if args.scope or not args.region:
+            raise SystemExit("--by takes --region (the regions and years to split), not --scope")
+        sc, scopes = family_from_args(args, conf, client, store, pt.parse_rule(args.by))
+    elif args.scope:
         sc = scope_arg(base, store, args.scope)
         if args.reindex:
             ix.ensure_regions(client, store)
@@ -257,11 +391,25 @@ def cmd_run(args, conf, client) -> int:
         sc = do_index(args, client, store, sc)
     else:
         raise SystemExit("give --region (an alias, a region number or a title) or --scope NAME")
+    names = sorted(scopes) if scopes else [sc["name"]]
     fields = parse_fields(args.txt_fields)
-    n = sm.cleanup_interrupted(store, base, sc["name"])
+    n = sum(sm.cleanup_interrupted(store, base, name) for name in names)
     if n:
         print(f"  {n} photos were being written when the last run stopped; they are done again")
-    opts = sm.Options(base=base, scope=sc, min_side=args.min_side, png=args.png, wm_conf=args.wm_conf,
+    if args.regroup:
+        import regroup as rg
+        print("Pulling the saved photos these scopes list from other scopes ...", flush=True)
+        p = rg.plan(store, base, rg.pull_plan(store, names))
+        print("\n".join(rg.summary(p)))
+        if p["moves"] or p["remove"]:
+            res = rg.apply(store, base, p, "pull", " ".join(names))
+            print(f"  regroup run {res['run']}: {res['file']:,} photos moved, {res['missing']:,} files gone (downloaded "
+                  f"again in this run), {res['removed']} emptied scopes removed; regroup --undo puts it back")
+        if scopes:
+            scopes = {name: store.scope(name) for name in names}
+        else:
+            sc = store.scope(sc["name"])
+    opts = sm.Options(base=base, scope=sc, scopes=scopes, min_side=args.min_side, png=args.png, wm_conf=args.wm_conf,
                       wm_paint_conf=args.wm_paint_conf, wm_mode=args.wm_mode, borders=not args.no_borders,
                       dark_borders=not args.no_dark, fetchers=args.fetchers or conf.fetchers, depth=args.depth,
                       writers=args.writers, report_every=args.report_every, limit=args.limit, retries=args.retries,
@@ -269,11 +417,9 @@ def cmd_run(args, conf, client) -> int:
                       comments=args.comments,
                       display="json" if args.json_progress else "quiet" if args.quiet else "live")
 
-    caption_client = caption_run = None
+    caption_client = None
     if args.autocaption:
         caption_client = vlm_client(conf)
-        caption_run = store.start_caption_run(sc["name"], sc["name"] + "/", caption_client.model,
-                                              caption_client.prompt_sha)
     import vram as vr
     vram = vr.VramMonitor().start()
     print("Loading the models ...", flush=True)
@@ -300,93 +446,128 @@ def cmd_run(args, conf, client) -> int:
     import encode
     encode.turbo()
 
-    counts = store.scope_counts(sc["name"])
-    cids = store.pending_cids(sc["name"], args.retries)
-    completed = counts["total"] - len(cids)
+    total = sum(store.scope_counts(name)["total"] for name in names)
+    pairs = store.pending_pairs(names, args.retries)
+    completed = total - len(pairs)
     if vram.ok:
         print(f"  {vram.text()}", flush=True)
-    s = sm.Stream(client, store, opts, classifier, detector, lama, caption_client, caption_run, vram)
-    res = s.run(cids, counts["total"], completed)
-    left = len(store.pending_cids(sc["name"], args.retries))
+    s = sm.Stream(client, store, opts, classifier, detector, lama, caption_client, vram)
+    res = s.run(pairs, total, completed)
+    left = len(store.pending_pairs(names, args.retries))
+    where = sc["name"] if len(names) == 1 else f"its {len(names)} scopes"
     print(f"This run: {res['done']:,} saved, {res['skipped']:,} skipped, {res['failed']:,} failed in "
-          f"{res['seconds'] / 60:.1f} min. Left to do in {sc['name']}: {left:,}.")
+          f"{res['seconds'] / 60:.1f} min. Left to do in {where}: {left:,}.")
     if caption_client is not None and not s.stop_requested_by_captioner():
         # photos saved earlier or left behind: caption them now
         import autocaption as ac
-        targets, _ = ac.select(store, base, sc["name"], sc["name"] + "/", False, args.retries)
-        if targets:
-            print(f"Captioning {len(targets):,} saved photos of {sc['name']} that have no VLM caption yet ...")
-            from progress import Display
-            run_id = store.start_caption_run(sc["name"], sc["name"] + "/", caption_client.model,
-                                             caption_client.prompt_sha)
+        from progress import Display
+        for name in names:
+            targets, _ = ac.select(store, base, name, name + "/", False, args.retries)
+            if not targets:
+                continue
+            print(f"Captioning {len(targets):,} saved photos of {name} that have no VLM caption yet ...")
+            run_id = store.start_caption_run(name, name + "/", caption_client.model, caption_client.prompt_sha)
             mode = "json" if args.json_progress else "quiet" if args.quiet else "live"
             with Display(len(targets), 0, mode, vram=vram) as d:
-                ac.run(store, base, sc["name"], targets, caption_client, d, run_id, args.report_every, vram)
+                cres = ac.run(store, base, name, targets, caption_client, d, run_id, args.report_every, vram)
+            if cres.get("stopped"):
+                break
     vram.stop()
     return 0
 
 
 def cmd_captions(args, conf, client) -> int:
     base, store = open_base(args, conf)
-    sc = scope_arg(base, store, args.scope)
+    scopes = scopes_arg(base, store, args.scope)
     fields = parse_fields(args.txt_fields)
-    n = changed = missing = vlm = 0
-    autocaptioned = store.captioned_cids(sc["name"])
-    for cid, path, category, sha in store.done_rows(sc["name"]):
-        if cid in autocaptioned:
-            vlm += 1
-            continue
-        rec = store.record(cid)
-        img = base / path
-        if rec is None or not img.is_file():
-            missing += 1
-            continue
-        text = sidecars.caption(rec.get("record") or {}, fields)
-        txt = img.with_suffix(".txt")
-        old = txt.read_text(encoding="utf-8") if txt.is_file() else None
-        if old != text:
-            if not args.dry_run:
-                txt.write_text(text, encoding="utf-8")
-            changed += 1
-            if changed <= args.show:
-                print(f"{cid}:\n  - {old}\n  + {text}")
-        n += 1
-    verb = "would change" if args.dry_run else "changed"
-    print(f"{n:,} captions checked, {changed:,} {verb}, {missing:,} photos without a record or image")
-    if vlm:
-        print(f"{vlm:,} photos have a VLM caption and were left alone (autocaption --undo brings their facts "
-              f"line back)")
+    with locked(store, "captions", "shared"):
+        for sc in scopes:
+            n = changed = missing = vlm = 0
+            autocaptioned = store.captioned_cids(sc["name"])
+            for cid, path, category, sha in store.done_rows(sc["name"]):
+                if cid in autocaptioned:
+                    vlm += 1
+                    continue
+                rec = store.record(cid)
+                img = base / path
+                if rec is None or not img.is_file():
+                    missing += 1
+                    continue
+                text = sidecars.caption(rec.get("record") or {}, fields)
+                txt = img.with_suffix(".txt")
+                old = txt.read_text(encoding="utf-8") if txt.is_file() else None
+                if old != text:
+                    if not args.dry_run:
+                        txt.write_text(text, encoding="utf-8")
+                    changed += 1
+                    if changed <= args.show:
+                        print(f"{cid}:\n  - {old}\n  + {text}")
+                n += 1
+            verb = "would change" if args.dry_run else "changed"
+            print(f"{sc['name']}: {n:,} captions checked, {changed:,} {verb}, {missing:,} photos without a record or "
+                  f"image")
+            if vlm:
+                print(f"  {vlm:,} photos have a VLM caption and were left alone (autocaption --undo brings their facts "
+                      f"line back)")
     return 0
 
 
 def cmd_reclassify(args, conf, client) -> int:
-    import classifier as clf
     import reclassify as rc
     base, store = open_base(args, conf)
-    sc = scope_arg(base, store, args.scope)
-    if args.undo:
-        res = rc.undo(store, base, sc)
-        print(f"Undid reclassify run {res['run']}: {res['back']:,} photos moved back, {res['skipped']:,} left where "
-              f"they are, {res['pruned']} empty folders removed")
-        return 0
-    samples = Path(args.samples).resolve() if args.samples else conf.samples
-    classifier = clf.Classifier(samples, args.patches, args.min_confidence, priority_margin=margin_of(args, conf))
-    print(f"Sorting {sc['name']} again with {len(classifier.class_names)} classes from {samples} ...", flush=True)
-    p = rc.plan(store, base, sc, classifier, args.override_manual)
-    print(rc.summary(p))
-    if args.dry_run:
-        report = base / "_reports" / f"{sc['name']}-reclassify-{time.strftime('%Y%m%d-%H%M%S')}.jsonl"
-        report.parent.mkdir(parents=True, exist_ok=True)
-        with open(report, "w", encoding="utf-8") as f:
-            for m in p["moves"]:
-                f.write(json.dumps(m, ensure_ascii=False) + "\n")
-        print(f"Dry run: nothing moved. The planned moves are in {report}")
-        return 0
-    res = rc.apply(store, base, sc, p, str(samples))
-    print(f"Reclassify run {res['run']}: {res['moved']:,} photos moved, {res['failed']:,} not moved, "
-          f"{res['manual']:,} hand-sorted photos recorded where they are, {res['pruned']} empty folders removed. "
-          f"--undo puts the moves back.")
+    if args.scope:
+        scopes = scopes_arg(base, store, args.scope)
+    else:
+        scopes = [sc for sc in store.scopes() if not args.undo or store.last_reclass(sc["name"])]
+        if not scopes:
+            print(f"no scopes {'with a reclassify to undo ' if args.undo else ''}in {base}")
+            return 0
+        if not args.dry_run:
+            photos = sum(len(store.done_rows(sc["name"])) for sc in scopes)
+            what = "undo the last reclassify of" if args.undo else "reclassify"
+            if not confirm(f"This will {what} {len(scopes)} scope folders of {base} ({photos:,} saved photos): "
+                           f"{', '.join(sc['name'] for sc in scopes)}. Continue? [y/N] ", args.yes):
+                print("Nothing done.")
+                return 1
+    with locked(store, "reclassify", "shared" if args.dry_run else "exclusive"):
+        if args.undo:
+            for sc in scopes:
+                res = rc.undo(store, base, sc)
+                print(f"{sc['name']}: undid reclassify run {res['run']}: {res['back']:,} photos moved back, "
+                      f"{res['skipped']:,} left where they are, {res['pruned']} empty folders removed")
+            return 0
+        import classifier as clf
+        samples = Path(args.samples).resolve() if args.samples else conf.samples
+        classifier = clf.Classifier(samples, args.patches, args.min_confidence, priority_margin=margin_of(args, conf))
+        for sc in scopes:
+            print(f"Sorting {sc['name']} again with {len(classifier.class_names)} classes from {samples} ...", flush=True)
+            p = rc.plan(store, base, sc, classifier, args.override_manual)
+            print(rc.summary(p))
+            if args.dry_run:
+                report = base / "_reports" / f"{sc['name']}-reclassify-{time.strftime('%Y%m%d-%H%M%S')}.jsonl"
+                report.parent.mkdir(parents=True, exist_ok=True)
+                with open(report, "w", encoding="utf-8") as f:
+                    for m in p["moves"]:
+                        f.write(json.dumps(m, ensure_ascii=False) + "\n")
+                print(f"Dry run: nothing moved. The planned moves are in {report}")
+                continue
+            res = rc.apply(store, base, sc, p, str(samples))
+            print(f"Reclassify run {res['run']}: {res['moved']:,} photos moved, {res['failed']:,} not moved, "
+                  f"{res['manual']:,} hand-sorted photos recorded where they are, {res['pruned']} empty folders "
+                  f"removed. --undo puts the moves back.")
     return 0
+
+
+def caption_targets(base: Path, store: Store, values: list[str]) -> list[tuple[dict, str]]:
+    out, seen = [], set()
+    for v in values:
+        hits = [(sc, sc["name"] + "/") for sc in scopes_arg(base, store, [v])] if is_pattern(v) \
+            else [target_arg(base, store, v)]
+        for sc, prefix in hits:
+            if prefix not in seen:
+                seen.add(prefix)
+                out.append((sc, prefix))
+    return out
 
 
 def cmd_autocaption(args, conf, client) -> int:
@@ -394,39 +575,121 @@ def cmd_autocaption(args, conf, client) -> int:
     import vram as vr
     from progress import Display
     base, store = open_base(args, conf)
-    sc, prefix = target_arg(base, store, args.target)
-    if args.undo:
-        res = ac.undo(store, base, sc["name"])
-        print(f"Undid autocaption run {res['run']} ({res['target']}): {res['restored']:,} captions put back, "
-              f"{res['kept']:,} edited since and kept, {res['missing']:,} photos not found")
-        return 0
-    targets, counts = ac.select(store, base, sc["name"], prefix, args.recaption, args.retries)
-    if args.limit is not None:
-        targets = targets[:max(0, args.limit)]
-    print(f"{prefix.rstrip('/')}: {counts['listed']:,} saved photos, {counts['captioned before']:,} captioned before, "
-          f"{counts['gave up']:,} failed {args.retries} times; {len(targets):,} to caption")
-    if not targets:
-        return 0
-    capt = vlm_client(conf)
-    vram = vr.VramMonitor().start()
-    if vram.ok:
-        print(f"  {vram.text()}")
-    run_id = store.start_caption_run(sc["name"], prefix, capt.model, capt.prompt_sha)
-    mode = "json" if args.json_progress else "quiet" if args.quiet else "live"
-    with Display(len(targets), 0, mode, vram=vram) as d:
-        res = ac.run(store, base, sc["name"], targets, capt, d, run_id, args.report_every, vram)
-    vram.stop()
-    return 1 if res.get("stopped") and "Ctrl+C" not in res["stopped"] else 0
+    targets_of = caption_targets(base, store, args.target)
+    with locked(store, "autocaption", "shared"):
+        if args.undo:
+            for name in dict.fromkeys(sc["name"] for sc, _ in targets_of):
+                res = ac.undo(store, base, name)
+                print(f"Undid autocaption run {res['run']} ({res['target']}): {res['restored']:,} captions put back, "
+                      f"{res['kept']:,} edited since and kept, {res['missing']:,} photos not found")
+            return 0
+        jobs = []
+        left = args.limit
+        for sc, prefix in targets_of:
+            targets, counts = ac.select(store, base, sc["name"], prefix, args.recaption, args.retries)
+            if left is not None:
+                targets = targets[:max(0, left)]
+                left -= len(targets)
+            print(f"{prefix.rstrip('/')}: {counts['listed']:,} saved photos, {counts['captioned before']:,} captioned "
+                  f"before, {counts['gave up']:,} failed {args.retries} times; {len(targets):,} to caption")
+            if targets:
+                jobs.append((sc, prefix, targets))
+        if not jobs:
+            return 0
+        capt = vlm_client(conf)
+        vram = vr.VramMonitor().start()
+        if vram.ok:
+            print(f"  {vram.text()}")
+        mode = "json" if args.json_progress else "quiet" if args.quiet else "live"
+        code = 0
+        for sc, prefix, targets in jobs:
+            run_id = store.start_caption_run(sc["name"], prefix, capt.model, capt.prompt_sha)
+            with Display(len(targets), 0, mode, vram=vram) as d:
+                res = ac.run(store, base, sc["name"], targets, capt, d, run_id, args.report_every, vram)
+            if res.get("stopped"):
+                code = 0 if "Ctrl+C" in res["stopped"] else 1
+                break
+        vram.stop()
+    return code
 
 
 def cmd_export(args, conf, client) -> int:
     import export as ex
     base, store = open_base(args, conf)
-    sc = scope_arg(base, store, args.scope)
+    scopes = scopes_arg(base, store, args.scope)
+    if args.to and len(scopes) > 1:
+        raise SystemExit("--to takes one scope; without it each scope goes to <base>/<scope>_records.<format>")
     ext = ".jsonl" if args.format == "jsonl" else ".parquet"
-    dst = Path(args.to).resolve() if args.to else base / f"{sc['name']}_records{ext}"
-    n = ex.export(store, sc["name"], dst, args.format)
-    print(f"{n:,} records written to {dst}")
+    for sc in scopes:
+        dst = Path(args.to).resolve() if args.to else base / f"{sc['name']}_records{ext}"
+        n = ex.export(store, sc["name"], dst, args.format)
+        print(f"{n:,} records written to {dst}")
+    return 0
+
+
+def cmd_regroup(args, conf, client) -> int:
+    import partition as pt
+    import regroup as rg
+    base, store = open_base(args, conf)
+    with locked(store, "regroup", "shared" if args.dry_run else "exclusive"):
+        if args.undo:
+            res = rg.undo(store, base)
+            print(f"Undid regroup run {res['run']} ({res['rule']}, {res['target']}): {res['file']:,} photos moved back, "
+                  f"{res['owner']:,} skipped or failed photos returned, {res['members']:,} listings put back, "
+                  f"{res['skipped']:,} left where they are, {res['removed']} scopes it made removed")
+            if res["missing"]:
+                print(f"  {res['missing']:,} photos whose files were gone stay marked not downloaded")
+            return 0
+        if not args.by:
+            raise SystemExit("regroup needs --by RULE (decade, country, region, country,decade, region,decade) or --undo")
+        rule = pt.parse_rule(args.by)
+        whole = not args.target
+        sources = scopes_arg(base, store, args.target) if args.target else store.scopes()
+        if not sources:
+            raise SystemExit(f"no scopes in {base}")
+        if not store.regions_count():
+            ix.ensure_regions(client, store)
+        what = "every scope of the base" if whole else ", ".join(sc["name"] for sc in sources)
+        print(f"Regrouping {what} by {rule.text} ...", flush=True)
+        rp = rg.rule_plan(store, conf.aliases, conf.groups, rule, sources, whole)
+        p = rg.plan(store, base, rp["wanted"], rp["members"], rp["defs"], pull_from={sc["name"] for sc in sources})
+        print("\n".join(rg.summary(p)))
+        if args.dry_run:
+            print("Dry run: nothing moved.")
+            return 0
+        if not p["moves"] and not p["members"]:
+            return 0
+        res = rg.apply(store, base, p, rule.text, "*" if whole else " ".join(args.target))
+        print(f"Regroup run {res['run']}: {res['file']:,} photos moved, {res['owner']:,} skipped or failed photos "
+              f"reassigned, {res['missing']:,} files gone (marked not downloaded), {res['members']:,} listings moved, "
+              f"{res['created']} scopes made, {res['removed']} removed, {res['failed']} not moved. --undo puts it back.")
+        into = {}
+        for m in p["moves"]:
+            if m.kind == "file":
+                into.setdefault(m.dst, set()).add(m.src)
+        if any(len(v) > 1 for v in into.values()):
+            print("  Scopes sorted with different samples may now mix category names; reclassify them if so.")
+    return 0
+
+
+def cmd_drop(args, conf, client) -> int:
+    import regroup as rg
+    from store import DONE
+    base, store = open_base(args, conf)
+    scopes = scopes_arg(base, store, args.scope)
+    with locked(store, "drop"):
+        for sc in scopes:
+            rows = store.owned_rows(sc["name"])
+            saved = sum(1 for r in rows if r[1] == DONE)
+            print(f"{sc['name']}: {saved:,} saved photos (image and caption files), {len(rows) - saved:,} skipped or "
+                  f"failed, {len(store.members(sc['name'])):,} listed; folder {base / sc['name']}")
+        if not args.yes:
+            print("Nothing deleted. Add --yes to delete these files and forget the scopes; this cannot be undone.")
+            return 1
+        for sc in scopes:
+            res = rg.drop_scope(store, base, sc)
+            print(f"Dropped {sc['name']}: {res['files']:,} images deleted, {res['photos']:,} photos marked not "
+                  f"downloaded")
     return 0
 
 
@@ -661,6 +924,11 @@ def parse_args(argv=None):
     p = sub.add_parser("run", help="index (with --region) and download, process, sort and write a scope")
     scope_opts(p, False)
     p.add_argument("--scope", metavar="NAME", help="resume a scope by its name or folder")
+    p.add_argument("--by", metavar="RULE",
+                   help="split the download into scopes by decade, country or region, or country,decade / "
+                        "region,decade (with --region; a scope per value, made as photos turn up)")
+    p.add_argument("--regroup", action="store_true",
+                   help="first move the saved photos the run's scopes list into them, from whatever scope holds them")
     p.add_argument("--samples", metavar="DIR", help="classify samples folder (default: [paths] samples of the conf)")
     p.add_argument("--no-classify", action="store_true", help="no categories: images go into numbered folders of the scope")
     p.add_argument("--min-confidence", type=float, default=0.7, metavar="X", help="below this an image goes to _unsure")
@@ -696,13 +964,15 @@ def parse_args(argv=None):
                    help="caption each saved photo with the VLM of [caption] in the conf (downloads slow to its pace)")
 
     p = sub.add_parser("captions", help="rewrite the captions of a scope from the records, no downloads")
-    p.add_argument("scope", metavar="SCOPE", help="the scope's name or folder")
+    p.add_argument("scope", nargs="+", metavar="SCOPE", help="a scope's name, folder or name pattern (estonia_*)")
     p.add_argument("--txt-fields", metavar="LIST", help="caption parts in order (see run --help)")
     p.add_argument("--dry-run", action="store_true", help="count and show the changes, write nothing")
     p.add_argument("--show", type=int, default=5, metavar="N", help="print the first N changes (default 5)")
 
     p = sub.add_parser("reclassify", help="sort the saved photos of a scope again with the current samples folder")
-    p.add_argument("scope", metavar="SCOPE", help="the scope's name or folder")
+    p.add_argument("scope", nargs="*", metavar="SCOPE",
+                   help="a scope's name, folder or name pattern (estonia_*); none: every scope of the base (asks first)")
+    p.add_argument("--yes", action="store_true", help="do not ask before working on every scope of the base")
     p.add_argument("--samples", metavar="DIR", help="classify samples folder (default: [paths] samples of the conf)")
     p.add_argument("--min-confidence", type=float, default=0.7, metavar="X", help="below this an image goes to _unsure")
     p.add_argument("--priority-margin", type=float, metavar="X",
@@ -714,7 +984,8 @@ def parse_args(argv=None):
     p.add_argument("--undo", action="store_true", help="put back the moves of the last reclassify of the scope")
 
     p = sub.add_parser("autocaption", help="caption saved photos with a VLM, from each image and its caption")
-    p.add_argument("target", metavar="SCOPE|FOLDER", help="a scope's name, or its folder or any folder inside it")
+    p.add_argument("target", nargs="+", metavar="SCOPE|FOLDER",
+                   help="a scope's name or name pattern (estonia_*), or its folder or any folder inside it")
     p.add_argument("--recaption", action="store_true",
                    help="caption again the photos that have a VLM caption (from their original caption)")
     p.add_argument("--undo", action="store_true", help="put back the caption files of the last autocaption of the scope")
@@ -725,9 +996,20 @@ def parse_args(argv=None):
     p.add_argument("--json-progress", action="store_true", help="one JSON line per photo on stdout")
 
     p = sub.add_parser("export", help="write the records of a scope as JSON Lines or Parquet")
-    p.add_argument("scope", metavar="SCOPE", help="the scope's name or folder")
+    p.add_argument("scope", nargs="+", metavar="SCOPE", help="a scope's name, folder or name pattern (estonia_*)")
     p.add_argument("--format", choices=["jsonl", "parquet"], default="jsonl")
-    p.add_argument("--to", metavar="FILE", help="the output file (default <base>/<scope>_records.<format>)")
+    p.add_argument("--to", metavar="FILE", help="the output file, for one scope (default <base>/<scope>_records.<format>)")
+
+    p = sub.add_parser("regroup", help="move saved photos into scopes by decade, country or region, no downloads")
+    p.add_argument("target", nargs="*", metavar="SCOPE",
+                   help="scopes to split (names, folders or patterns); none: group every scope of the base")
+    p.add_argument("--by", metavar="RULE", help="decade, country, region, country,decade or region,decade")
+    p.add_argument("--dry-run", action="store_true", help="show what would move, move nothing")
+    p.add_argument("--undo", action="store_true", help="put back the last regroup (or run --regroup) of the base")
+
+    p = sub.add_parser("drop", help="delete the files of a scope and forget it; its photos count as not downloaded")
+    p.add_argument("scope", nargs="+", metavar="SCOPE", help="a scope's name, folder or name pattern")
+    p.add_argument("--yes", action="store_true", help="delete; without it, only show what would be deleted")
     return ap.parse_args(argv)
 
 
@@ -744,7 +1026,7 @@ def main(argv=None) -> int:
     try:
         cmds = {"regions": cmd_regions, "aliases": cmd_aliases, "count": cmd_count, "scopes": cmd_scopes,
                 "index": cmd_index, "run": cmd_run, "captions": cmd_captions, "reclassify": cmd_reclassify,
-                "export": cmd_export, "autocaption": cmd_autocaption}
+                "export": cmd_export, "autocaption": cmd_autocaption, "regroup": cmd_regroup, "drop": cmd_drop}
         return cmds[args.cmd](args, conf, client)
     finally:
         client.close()

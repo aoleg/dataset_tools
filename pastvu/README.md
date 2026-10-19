@@ -29,6 +29,7 @@ Each category is split into numbered folders of at most 5,000 images, so Explore
 - **Stop and resume:** stop at any time; the same command continues where it left off. I killed runs on purpose several times, and nothing was lost or half-written.
 - **No double downloads:** a photo is downloaded only once, even if two runs cover the same area.
 - **Re-sorting:** after you improve your samples, `reclassify` re-sorts everything already downloaded in seconds. It never undoes your manual moves, and it can be undone.
+- **Splitting and regrouping:** a country can be downloaded straight into one folder per decade, region or country. Photos you already have can be moved between such folders later without downloading them again, and every regroup can be undone ([Splitting and regrouping](#splitting-and-regrouping)).
 - **Captioning later:** `autocaption` captions photos you already have, a whole set or one folder, with a progress bar, statistics and resume. Old captions are backed up and can be restored.
 - **Live display:** a status line shows what is happening and how much GPU memory is in use, above a progress bar. Regular summaries report counts, skips, paints and speed.
 - **Export:** every photo’s full PastVu record is kept, and `export` writes all records as one file for publishing.
@@ -143,13 +144,18 @@ Number in steps of 10, so a category can go in between later without renaming th
 
 ```
 run.bat run --region <alias> [--region ...] [--years FROM TO | --decade YEAR] [options]
+run.bat run --region <alias> --by decade|country|region|country,decade|region,decade [--regroup]
 run.bat run --scope <name>
-run.bat reclassify <scope> [--dry-run] [--undo]
-run.bat captions <scope> [--txt-fields LIST] [--dry-run]
-run.bat autocaption <scope or folder> [--limit N] [--recaption] [--undo]
-run.bat export <scope> [--format jsonl|parquet]
+run.bat regroup --by RULE [<scope> ...] [--dry-run] [--undo]
+run.bat drop <scope> [...] [--yes]
+run.bat reclassify [<scope> ...] [--dry-run] [--undo] [--yes]
+run.bat captions <scope> [...] [--txt-fields LIST] [--dry-run]
+run.bat autocaption <scope or folder> [...] [--limit N] [--recaption] [--undo]
+run.bat export <scope> [...] [--format jsonl|parquet]
 run.bat scopes | aliases | count --region <alias> | regions [--find TEXT]
 ```
+
+Where a command takes scopes, a scope can be given by its name, by its folder, or by a name pattern with `*` and `?`: `estonia_*` is every scope whose name starts with `estonia_`. In Git Bash or PowerShell, put a pattern in quotes.
 
 Examples:
 
@@ -167,6 +173,44 @@ A run downloads a **scope**: regions and years. Its name is the aliases (or regi
 `--years` takes the photos whose dating overlaps the years, as PastVu's own filter does: a photo dated 1910-1925 is in 1917-1991. `--decade 1970` takes the photos whose dating starts in 1970-1979, so a photo dated 1965-1975 belongs to the 1960s only, and decade runs never download a photo twice. Only photographs are taken, not paintings.
 
 **A photo is downloaded once per base folder.** The store at `<base>\pastvu.db` is shared by every scope, so a photo already saved under one scope (Minsk) is not downloaded again for another (Belarus); the report counts it as already saved under another scope, and `scopes` shows how many there are.
+
+**One command at a time changes a base folder.** The store holds a lock. A second download into the same base folder stops at the start with the name of the command that holds the lock, and so does a `regroup`, `drop` or `reclassify` while anything else runs. `autocaption` and `captions` can run beside a download. A lock left by a process that no longer runs is taken over.
+
+## Splitting and regrouping
+
+```
+run.bat run --region estonia --by decade
+run.bat run --region baltics --by country,decade
+run.bat run --region estonia --regroup
+run.bat regroup --by decade estonia_1917-1991 --dry-run
+run.bat regroup --by country
+run.bat regroup --undo
+run.bat drop estonia_1950s --yes
+```
+
+**`run --by RULE`** downloads the regions and years of the run into one scope per value of the rule, made as the photos turn up. `run --region estonia --by decade` indexes Estonia once for the years of the conf and fills `estonia_1910s` up to `estonia_1990s`, each with its own folder, categories and numbered folders, in one download with one progress bar; the final report adds a line per scope. The rules:
+
+- **decade:** the decade of the photo's start year, so every photo belongs to exactly one decade. A decade outside the years of the run is made like any other: a 1917-1991 run lists photos dated 1905-1920 (PastVu's filter takes every photo whose dating overlaps the years), and they go into the 1900s scope. Resuming such a scope later with `run --scope` downloads all of its decade.
+- **country:** the country alias of the conf that names the most specific region of the photo; on a tie the alias higher in the conf wins. Aliases that name several countries (`ussr`, `baltics`, ...) are never used. So Crimea and Sevastopol go to `ukraine`, which names them, and not to `russia`.
+- **region:** the first level under the country in PastVu's tree (an oblast, a county, a federal city, Crimea), named by its alias in the conf or else by its English title. A photo placed at country level only goes to its country.
+- **country,decade** and **region,decade** combine the two: `estonia_1970s`, `harju_county_1980s`.
+
+A scope made by a rule is the same as one made by hand: `estonia_1970s` from `--by decade` is the scope that `--region estonia --decade 1970` makes, so the two meet instead of clashing. A scope of that name with other regions or years stops the run. The same command continues every scope of the split; `run --scope estonia_1970s` continues one of them.
+
+**`run --regroup`** first moves every saved photo that the run's scopes list into them, from whatever scope holds it now, and then downloads the rest. `run --region estonia --decade 1960 --regroup` pulls the 1960s photos out of `estonia_1917-1991`; `run --region estonia --regroup` pulls everything back from the decade scopes into `estonia_1917-1991`; `run --region estonia --by decade --regroup` moves an all-years download into its decades. The last regroup wins.
+
+**`regroup --by RULE [SCOPE ...]`** moves photos by a rule and downloads nothing. With scopes it splits them and keeps their label: `regroup --by decade estonia_1917-1991` makes `estonia_1920s` and so on. Without scopes it groups every scope of the base folder: by country, photos of `tartu_county_1970s` join `estonia_1970s`; by decade alone, the regions of all scopes are combined into `all_1970s` (scopes that all have the same regions keep their label). The years of a scope made by the country or region rule are those of the scopes its photos come from: the decade when they share one, else the span of their years. With two keys, photos of different countries or different decades never meet; photos of the same country and decade from different scopes do. The photos' listings move with them, so a later run of a new scope continues it. `--dry-run` prints the moves per pair of scopes, and the scopes made and removed.
+
+Both kinds of regroup move files the same way:
+
+- The image and its caption are renamed into the new scope (same drive, so at once), into the lowest numbered folder with room, under the category folder the file is in now: photos you sorted by hand keep their category. Records, embeddings and VLM captions are kept by the photo's number and follow.
+- A saved photo whose file is gone (deleted by hand) is marked not downloaded, and the next run downloads it again.
+- A scope left with no photos, whose listed photos all belong to the new scopes, is removed with its empty folders. Files in it that are not this tool's stay, and so does the folder.
+- The counters of every scope involved are counted again from the records.
+- The moves are logged in the store: `regroup --undo` puts the last regroup (or `run --regroup`) back and makes again the scopes it removed. A reclassify of a moved photo can no longer be undone.
+- Scopes sorted with different samples can mix category names when they are combined; `reclassify` sorts them again.
+
+**`drop SCOPE`** deletes the scope's images and captions and forgets the scope. Its photos count as not downloaded, with no record, embedding or VLM caption, so a later run downloads and processes them from the start; photos it lists that are saved under another scope stay there. A drop cannot be undone: without `--yes` it only shows what it would delete.
 
 ## What happens to one photo
 
@@ -227,11 +271,11 @@ run.bat run --region belarus --autocaption
 
 A vision-language model on your own machine writes each photo's caption from the image and its facts line, and the caption file then holds the model's caption alone: it is built from the facts line, so the date, place and names are in it. The model runs in a separate server with an OpenAI-compatible chat endpoint, such as [KoboldCpp](https://github.com/LostRuins/koboldcpp) with a vision model loaded; `[caption]` in the conf names its address and the two prompt files. The prompts are always files: `tagging\sysprompt.txt`, a short system prompt, and `tagging\main_prompt.txt`, which explains what the facts line is and how a caption is to be written; `{tags}` in it is replaced by the photo's existing caption. The API part is TagGUI's: one request per photo with the image inline (its longest side cut to `image_side`, 1024 px), reasoning switched off, thinking blocks removed from the answer, a retry at half the size when the endpoint rejects a request, and a stop when three photos in a row fail.
 
-`autocaption <target>` captions saved photos, one after another, with the same live display as a download (the photo being captioned, the VRAM in use, a progress bar with the rate and the time left) and report blocks every `--report-every` photos (100): photos captioned, photos per hour, seconds per photo, tokens per second, failures, and the VRAM now and at its peak. The target is a scope's name, its folder, or any folder inside it, such as one category. A photo with a VLM caption is not captioned again, so a stopped run continues where it was when you start it again; `--limit N` takes at most N photos in this run, and `--recaption` captions photos again from their original facts line (with a changed prompt, for example). A photo that fails is tried again on later runs, up to `--retries` (3) times. Ctrl+C finishes the photo being captioned and stops.
+`autocaption <target>` captions saved photos, one after another, with the same live display as a download (the photo being captioned, the VRAM in use, a progress bar with the rate and the time left) and report blocks every `--report-every` photos (100): photos captioned, photos per hour, seconds per photo, tokens per second, failures, and the VRAM now and at its peak. The target is a scope's name, its folder, or any folder inside it, such as one category. Several targets and name patterns are captioned one after another (`autocaption "estonia_*"`), and `--limit` counts across them. A photo with a VLM caption is not captioned again, so a stopped run continues where it was when you start it again; `--limit N` takes at most N photos in this run, and `--recaption` captions photos again from their original facts line (with a changed prompt, for example). A photo that fails is tried again on later runs, up to `--retries` (3) times. Ctrl+C finishes the photo being captioned and stops.
 
 **Backups and undo.** Before a caption file is written, its old text goes into the store, and the caption a photo had before its first VLM caption is kept as its original. `autocaption <target> --undo` puts back the caption files of the last autocaption run of the scope, one run at a time; a file you edited since that run keeps your edit. `captions <scope>` leaves photos with a VLM caption alone, and `export` writes the VLM caption next to the facts line.
 
-`run --autocaption` captions each photo as soon as it is saved, from the pixels still in memory, and then the saved photos of the scope that have no VLM caption yet. The downloads slow down to the model's pace: a queue of four photos sits between them, so the downloads never run far ahead. If the endpoint stops answering, the run stops; start `autocaption` later for the photos left.
+`run --autocaption` captions each photo as soon as it is saved, from the pixels still in memory, and then the saved photos of the scope that have no VLM caption yet. A run with `--by` keeps one caption run per scope, so `--undo` works per scope. The downloads slow down to the model's pace: a queue of four photos sits between them, so the downloads never run far ahead. If the endpoint stops answering, the run stops; start `autocaption` later for the photos left.
 
 **Speed and memory.** With Gemma 4 26B-A4B (NVFP4) in KoboldCpp 1.122 on an RTX 5090, a caption takes 2.4 to 3.3 s, about 1,300 photos per hour, against 5 to 9 photos per second for a download alone. The model holds about 23 GB of GPU memory; this tool's models add 2.1 GB, and up to 5.9 GB while LaMa paints a large window, so a download with `--autocaption` peaked at 27 GB of the card's 32. The VRAM shown is the whole card's, read through NVML as nvidia-smi reads it: on Windows a program does not see the memory other programs hold, and the driver does not fail when the card is full but moves memory to system RAM, which slows everything down. The status line warns when less than 1 GB is free.
 
@@ -241,11 +285,15 @@ A vision-language model on your own machine writes each photo's caption from the
 run.bat reclassify belarus_1917-1991 --dry-run
 run.bat reclassify belarus_1917-1991
 run.bat reclassify belarus_1917-1991 --undo
+run.bat reclassify "estonia_*"
+run.bat reclassify
 ```
 
 Sorts the saved photos of a scope again with the samples folder as it is now (or `--samples`) and the priority margin of the conf (or `--priority-margin`), and moves each image and its caption into its new category folder, in place. The file keeps its name, so the caption and the record stay joined. The embeddings are in the store, so the GPU is needed only for images without one, and the probe trains in seconds.
 
 A photo you moved to another category by hand keeps its place: reclassify sees that its file is not where the store says, records where it is now, and leaves it there (`--override-manual` sorts it like the rest). A photo whose file is gone is reported and left alone. `--dry-run` prints the moves per category pair and writes them to `<base>\_reports\`. `--undo` puts the moves of the last reclassify back.
+
+Several scopes and name patterns are sorted one after another with one load of the classifier. Without a scope, reclassify works on every scope of the base folder; it first asks `This will reclassify N scope folders ... Continue? [y/N]` with the number of saved photos, and `--yes` skips the question. `reclassify --undo` without a scope undoes the last reclassify of every scope that has one, after the same question.
 
 ## Progress and resume
 
@@ -273,6 +321,8 @@ Each saved photo costs one API call and one image download; a photo skipped as t
 | `--decade YEAR` | | photos whose dating starts in this decade |
 | `--name NAME` | `<aliases>_<years>` | the scope's name |
 | `--scope NAME` | | resume a scope by its name or folder |
+| `--by RULE` | | split the download into scopes by `decade`, `country`, `region`, `country,decade` or `region,decade` |
+| `--regroup` | off | first move the saved photos the run's scopes list into them |
 | `--split N` | conf (5000) | at most N images per folder, for a new scope; 0: no split |
 | `--samples DIR` | conf | the classify samples folder |
 | `--no-classify` | off | no categories |
@@ -323,6 +373,9 @@ Each record carries what attribution and a takedown need: the PastVu page, the u
 | `client.py` | the API client: retries, back-off, optional cap |
 | `store.py` | the SQLite store of a base folder |
 | `index.py` | the index of a scope, and how `--region` is resolved |
+| `partition.py` | the rules of `--by`: which scope a photo belongs to |
+| `regroup.py` | moving photos between scopes, drop, and undo |
+| `runlock.py` | whether the process that holds the lock still runs |
 | `layout.py` | scope names, folders and the numbered-folder allocator |
 | `process.py` | header, decode, band, borders, crop composition |
 | `encode.py` | the save rules, in memory |
