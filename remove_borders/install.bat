@@ -20,10 +20,10 @@ set "VPY=%VENV%\Scripts\python.exe"
 set "PYTHON="
 where python >nul 2>nul && set "PYTHON=python"
 if not defined PYTHON (
-    where py >nul 2>nul && set "PYTHON=py -3.12"
+    where py >nul 2>nul && set "PYTHON=py -3.13"
 )
 if not defined PYTHON (
-    echo [ERROR] Python was not found. Install Python 3.12 from https://www.python.org/downloads/
+    echo [ERROR] Python was not found. Install Python 3.13 from https://www.python.org/downloads/
     echo         and tick "Add Python to PATH".
     pause
     exit /b 1

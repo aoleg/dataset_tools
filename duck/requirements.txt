@@ -16,3 +16,7 @@ huggingface_hub>=1.0
 # Requires git on PATH. To pin instead of tracking the branch, replace @main with
 # @95523bc7579745a1749b8132d408b9fea89a338e
 img2dataset @ git+https://github.com/rom1504/img2dataset.git@main
+
+# img2dataset imports imghdr, which Python 3.13 removed from the standard library
+# (PEP 594). This is the unchanged module from 3.12, published as a package.
+standard-imghdr; python_version >= "3.13"

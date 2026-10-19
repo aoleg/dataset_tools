@@ -23,7 +23,7 @@ With `--preview <dir>` it also writes a copy of each image with the masked area 
 
 ## Install
 
-Run `install.bat`. It needs Python 3.10 or newer on PATH (`python`, or `py -3.12` from the launcher).
+Run `install.bat`. It needs Python 3.10 or newer on PATH (`python`, or `py -3.13` from the launcher).
 
 It creates the shared `..\venv` folder when it is missing and installs `torch==2.13.0` and `torchvision` from the PyTorch CUDA 13.2 index (`https://download.pytorch.org/whl/cu132`). It does not install torch from PyPI, because the PyPI torch for Windows is CPU only. Next it installs `requirements.txt` from PyPI. While it does this, it pins the installed torch and torchvision builds as a pip constraint, so the torch dependency of `ultralytics` cannot replace them. Then it prints the torch and CUDA versions and fails if torch is not a CUDA build.
 

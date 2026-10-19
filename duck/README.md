@@ -54,7 +54,7 @@ Requirements: Windows, Python 3.10 or newer on PATH, and git on PATH. git is nee
 install.bat
 ```
 
-This installs duck's dependencies into the shared `venv` of the repository, one level up, creating it when it is missing, and copies `duck.conf.example` to `duck.conf`. See the repository README for how the shared environment works.
+This installs duck's dependencies into the shared `venv` of the repository, one level up, creating it when it is missing, and copies `duck.conf.example` to `duck.conf`. See the repository README for how the shared environment works. On Python 3.13 or newer it also installs `standard-imghdr`, the `imghdr` module that 3.13 removed from the standard library and that img2dataset still imports.
 
 ## Configuring paths
 

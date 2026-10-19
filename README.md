@@ -166,7 +166,7 @@ Until 2026-10-11 these folders were inside the dataset: `_duplicates`, `_prep`, 
 
 ## Install
 
-All tools share one virtual environment: the `venv` folder in the repository root, next to the tool folders. It needs Python 3.10 or newer on Windows. To install a tool, run the `install.bat` in its folder. It creates the shared `venv` when it is missing and installs only that tool's dependencies into it, so a tool that needs no GPU never pulls torch in. Install the tools you need, in any order; running an `install.bat` again installs what is missing. Every `run.bat` uses the shared `venv`.
+All tools share one virtual environment: the `venv` folder in the repository root, next to the tool folders. It needs Python 3.10 or newer on Windows; it was last built and tested with Python 3.13. To install a tool, run the `install.bat` in its folder. It creates the shared `venv` when it is missing and installs only that tool's dependencies into it, so a tool that needs no GPU never pulls torch in. Install the tools you need, in any order; running an `install.bat` again installs what is missing. Every `run.bat` uses the shared `venv`.
 
 | tool | needs |
 |---|---|

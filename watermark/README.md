@@ -18,7 +18,7 @@ The detections are cached in `<folder>_backup/_watermark/cache.json`, in the bac
 
 | model | source | used for |
 |---|---|---|
-| `yolov12x-dino3-watermark-detection.pt` | [corzent/yolov12x-dino3-watermark-detection](https://huggingface.co/corzent/yolov12x-dino3-watermark-detection) | detection (default) |
+| `yolov12x-dino3-watermark-detection.pt` | [corzent/yolov12x-dino3-watermark-detection](https://huggingface.co/corzent/yolov12x-dino3-watermark-detection) (`best.pt`, renamed on the Hub from the file name kept here) | detection (default) |
 | `yolo11x-train28-best.pt` | [fancyfeast/joycaption-watermark-detection](https://huggingface.co/spaces/fancyfeast/joycaption-watermark-detection) | detection, when the first cannot be loaded |
 | `yolo11x-watermark-detection.pt` | [corzent/yolo11x_watermark_detection](https://huggingface.co/corzent/yolo11x_watermark_detection) (`best.pt`) | the second detector of the [deduplicate](../deduplicate/README.md) tool, `--detector yolo11x` here: stock ultralytics at 640 px, sees emblem badges the DINOv3 model does not, with more false positives on objects |
 | `big-lama.pt` | [simple-lama-inpainting](https://github.com/enesmsahin/simple-lama-inpainting) release v0.1.0 (the TorchScript export of [LaMa](https://github.com/advimman/lama)) | painting |
