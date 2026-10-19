@@ -38,23 +38,57 @@ class LazyEncoder:
         return self._enc.embed_arrays(arrays)
 
 
+DEFAULT_PRIORITY_MARGIN = 0.15
+
+
+def choose(p: np.ndarray, share: np.ndarray, margin: float, min_confidence: float,
+           vote_min_share: float) -> tuple[int, int, float, float, str]:
+    """The class of one image under the priority rule. p: the probe's class
+    probabilities, share: the share of the nearest examples per class, both
+    in the order of the samples folder (lowest number first).
+
+    The near classes are those within `margin` of the top probability; the
+    image goes to the lowest-numbered of them. The gates judge the near group
+    together: its summed probability against min_confidence, its summed share
+    of the nearest examples against vote_min_share. With margin 0 the near
+    group is the top class alone, which is classify's own rule.
+    -> (chosen class, top class, group probability, group share, reason)"""
+    top = int(p.argmax())
+    near = np.flatnonzero(p >= p[top] - margin) if margin > 0 else np.array([top])
+    chosen = int(near.min())
+    conf = float(p[near].sum())
+    group_share = float(share[near].sum())
+    reason = ""
+    if group_share < vote_min_share:
+        reason = cl.REASON_DISAGREE
+    elif conf < min_confidence:
+        reason = cl.REASON_CONFIDENCE
+    return chosen, top, conf, group_share, reason
+
+
 @dataclass
 class Verdict:
     folder: str          # the output folder relative to the scope: class, or _unsure/<class>
     cls: str
     sub: str
-    confidence: float
+    confidence: float    # the probability of the chosen class
     share: float
     vote: str
     reason: str
+    top: str = ""        # the class the probe scored highest, when the priority rule chose another
+    group: float = 0.0   # the summed probability of the near classes, which the gate judged
 
     def as_dict(self) -> dict:
-        return {"folder": self.folder, "class": self.cls, "subclass": self.sub, "confidence": round(self.confidence, 4),
-                "share": round(self.share, 2), "vote": self.vote, "reason": self.reason}
+        d = {"folder": self.folder, "class": self.cls, "subclass": self.sub, "confidence": round(self.confidence, 4),
+             "share": round(self.share, 2), "vote": self.vote, "reason": self.reason}
+        if self.top:
+            d.update(priority_over=self.top, group_confidence=round(self.group, 4))
+        return d
 
 
 class Classifier:
-    def __init__(self, samples: Path, patches: int, min_confidence: float, encoder=None):
+    def __init__(self, samples: Path, patches: int, min_confidence: float, encoder=None,
+                 priority_margin: float = DEFAULT_PRIORITY_MARGIN):
         from threadpoolctl import threadpool_limits
         threadpool_limits(limits=getattr(cl, "BLAS_THREADS", 8))
         if not samples or not Path(samples).is_dir():
@@ -62,6 +96,7 @@ class Classifier:
         self.samples = Path(samples)
         self.patches = patches
         self.min_confidence = min_confidence
+        self.priority_margin = max(0.0, float(priority_margin))
         self.encoder = encoder or LazyEncoder(patches)
         classes = cl.discover_samples(self.samples, cl.sidecar_set(cl.DEFAULT_SIDECARS))
         cl.check_samples(classes)
@@ -93,20 +128,17 @@ class Classifier:
         p_cls = cl.class_proba(p_sub, self.ts.sub_to_class, self.n_classes)
         shares = cl.knn_shares(self.ts.X, self.ts.y_class, X, self.n_classes)
         out = []
+        sub_to_class = np.asarray(self.ts.sub_to_class)
         for i in range(X.shape[0]):
-            ci = int(p_cls[i].argmax())
-            si = int(p_sub[i].argmax())
-            conf = float(p_cls[i, ci])
-            share = float(shares[i, ci])
+            ci, top, group, group_share, reason = choose(p_cls[i], shares[i], self.priority_margin,
+                                                         self.min_confidence, cl.VOTE_MIN_SHARE)
+            subs = np.flatnonzero(sub_to_class == ci)
+            si = int(subs[p_sub[i, subs].argmax()])
             name = self.ts.class_names[ci]
-            reason = ""
-            if share < cl.VOTE_MIN_SHARE:
-                reason = cl.REASON_DISAGREE
-            elif conf < self.min_confidence:
-                reason = cl.REASON_CONFIDENCE
             folder = f"{cl.UNSURE_DIRNAME}/{name}" if reason else name
-            out.append(Verdict(folder, name, self.ts.sub_names[si], conf, share,
-                               self.ts.class_names[int(shares[i].argmax())], reason))
+            out.append(Verdict(folder, name, self.ts.sub_names[si], float(p_cls[i, ci]), group_share,
+                               self.ts.class_names[int(shares[i].argmax())], reason,
+                               top=self.ts.class_names[top] if top != ci else "", group=group))
         return out
 
     def decide(self, vec: np.ndarray) -> Verdict:

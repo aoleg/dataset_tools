@@ -22,6 +22,7 @@ years = 1917 1991                     years of a run without --years or --decade
 split = 5000                          at most this many images per folder; 0: no split
 fetchers = 4                          download threads
 json_files = no                       also write each record as a JSON file
+priority_margin = 0.15                within this of the top score, the lower-numbered category wins
 ```
 
 The rest of the file is the **aliases**: names for PastVu region numbers, used with `--region`, in three groups. `[aliases.countries]` has the 15 countries of the former Soviet Union and the groups `ussr`, `baltics`, `caucasus` and `central_asia`. `[aliases.regions]` has the first level under each country (oblasts, krais, provinces, counties, republics within Russia). `[aliases.cities]` has the capitals and federal cities, then the places of the second level with at least 1,000 photos (city districts, towns, urban okrugs), with the parent's name added where two places share a name (`leninsky_district_minsk`). Each line has a comment with the PastVu title and the photo count when the file was made:
@@ -36,6 +37,36 @@ minsk                            = 636                  ; Minsk / Минск, 6,
 An alias may name several regions. The aliases follow PastVu's region tree, which files some territories under another country than you may want and marks them as a territorial dispute: Crimea (556) and Sevastopol (669) are under Russia, Abkhazia and South Ossetia under Georgia, Transnistria under Moldova. `ukraine = 20` does not contain Crimea or Sevastopol; change the aliases to fit your dataset. `run.bat aliases` lists them with the titles PastVu gives the numbers today, and `run.bat aliases --generate FILE` writes a fresh example from today's region tree.
 
 `--region` takes an alias first, then a PastVu region number, then a region title (English or local, matched exactly). `run.bat regions --find TEXT` finds numbers and titles.
+
+## The samples folder
+
+The classifier learns the categories from examples that you sort by hand: one subfolder per category in the samples folder that `[paths] samples` names. It is the samples folder of [classify](../classify/README.md#the-samples-folder), and the same folder serves both tools.
+
+1. **One numbered folder per category; the number is a priority.** The name after the number is only a label: it becomes the name of the category folder in the output, and the classifier looks only at the images inside. When an image fits two categories about equally, the one with the lower number takes it: if `60_people` scores within `priority_margin` (0.15) of `100_monuments`, a photo of people in front of a monument goes to `60_people`. The margin is set in the conf or with `--priority-margin`; 0 turns the priority off, and then the higher score always wins. Images of a kind you want in a particular folder, put into that folder, steer the classifier too.
+2. **About 40 images per category.** More helps, within reason: from 20 to about 150 per category has worked best. Below 20 the tool warns, below 5 it stops. Choose typical images, not only the clearest ones, and include the ones on the border with a neighbouring category: the classifier learns each border from what you give it.
+3. **The last folder for outliers.** Everything you want out of the main categories goes into a last folder named `outliers` after its number, in subfolders by kind: `postcards`, `blurry`, `screenshots`, or a theme you want to keep apart. Each subfolder is learned as its own kind, so unrelated rejects do not blur each other, and all of them are sorted into the one outliers folder in the output. Any category can have subfolders in the same way. As the last folder, outliers has the lowest priority: an image that is about as much a reject as a real category stays in the real category. Give outliers a low number if you want such images out instead.
+
+A structure to start from:
+
+```
+samples\
+  10_posters\
+  20_postcards_and_art\
+  30_futurism\
+  40_military\
+  50_transport\
+  60_people\
+  70_objects\
+  80_environment_indoors\
+  90_environment_outdoors\
+  100_monuments\
+  110_group_photo\
+  200_outliers\
+    blurry\
+    screenshots\
+```
+
+Number in steps of 10, so a category can go in between later without renaming the others. The folders sort by the value of the number, so `100_monuments` comes after `90_environment_outdoors`; a folder without a number comes after all numbered ones. The priority is this tool's: [classify](../classify/README.md) itself sorts by the higher score alone. Folders whose names start with `_` are ignored; the samples' embeddings are cached in `_embeddings` inside the samples folder. After you change the samples, `reclassify` sorts what you already downloaded again, in seconds.
 
 ## Usage
 
@@ -71,7 +102,7 @@ A run downloads a **scope**: regions and years. Its name is the aliases (or regi
 2. **Band and borders** (download threads): the band rows are known from the record and come off exactly. [remove_borders](../remove_borders/README.md) analyses the picture without the band for scanned frames, mounts, thin lines and text banners.
 3. **Watermarks** (GPU): the [watermark](../watermark/README.md) detector runs on the picture without the band, so the band's own text is never taken for a watermark. Detections from `--wm-conf` (0.1) go into the record; only those from `--wm-paint-conf` (0.4) are painted out with LaMa. Below 0.4 the detector often finds scene text and objects (a shop sign, a building facade); from 0.4 up it found printed captions and credits in every case checked.
 4. **Crop**: the band, the border cuts and a watermark trim (`--wm-mode trim`) make one crop, put on the JPEG block grid: the top and left edges move inward to the next block where a cut set them, so the cut part goes completely, and the far edges are exact.
-5. **Classify** (GPU): the final pixels are embedded with SigLIP 2 and sorted by classify's probe, trained once at start on the samples folder, with classify's rules: the confidence gate (`--min-confidence`, 0.7), the share of the 10 nearest examples, and a byte-identical copy of a sample taking the sample's category.
+5. **Classify** (GPU): the final pixels are embedded with SigLIP 2 and scored by classify's probe, trained once at start on the samples folder. Among the categories within `priority_margin` of the top score, the lowest-numbered takes the image ([The samples folder](#the-samples-folder)). Then classify's gates: the summed score of those near categories against the confidence threshold (`--min-confidence`, 0.7) and their summed share of the 10 nearest examples against 0.3; an image that fails goes to `_unsure` under the chosen category. A byte-identical copy of a sample takes the sample's category. The record keeps the score of the chosen category and, when the priority chose it over a higher score, which category that was.
 6. **Write** (writer threads): the image and its caption go into the next folder of the category with room; then the photo's status, its record, its embedding and the scope's counters are committed to the store in one transaction.
 
 Pixels stay in memory from the download to the write; no temporary file is made. How an image is written:
@@ -121,7 +152,7 @@ run.bat reclassify belarus_1917-1991
 run.bat reclassify belarus_1917-1991 --undo
 ```
 
-Sorts the saved photos of a scope again with the samples folder as it is now (or `--samples`), and moves each image and its caption into its new category folder, in place. The file keeps its name, so the caption and the record stay joined. The embeddings are in the store, so the GPU is needed only for images without one, and the probe trains in seconds.
+Sorts the saved photos of a scope again with the samples folder as it is now (or `--samples`) and the priority margin of the conf (or `--priority-margin`), and moves each image and its caption into its new category folder, in place. The file keeps its name, so the caption and the record stay joined. The embeddings are in the store, so the GPU is needed only for images without one, and the probe trains in seconds.
 
 A photo you moved to another category by hand keeps its place: reclassify sees that its file is not where the store says, records where it is now, and leaves it there (`--override-manual` sorts it like the rest). A photo whose file is gone is reported and left alone. `--dry-run` prints the moves per category pair and writes them to `<base>\_reports\`. `--undo` puts the moves of the last reclassify back.
 
@@ -155,6 +186,7 @@ Each saved photo costs one API call and one image download; a photo skipped as t
 | `--samples DIR` | conf | the classify samples folder |
 | `--no-classify` | off | no categories |
 | `--min-confidence X` | 0.7 | below this an image goes to `_unsure` |
+| `--priority-margin X` | conf (0.15) | within this of the top score, the lower-numbered category wins; 0: off |
 | `--min-side PX` | 512 | skip pictures smaller than this on either side, before and after the crop |
 | `--png` | off | write painted images as PNG |
 | `--no-watermark` | off | no watermark detection or painting |

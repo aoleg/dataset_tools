@@ -22,6 +22,10 @@ fetchers = 4
 ; Also write each record as a JSON file in <base>\_records\<number>\. The store
 ; holds every record anyway, and `export` writes them as JSON Lines or Parquet.
 json_files = no
+; The numbers of the samples folders are a priority: when categories score
+; within this margin of the top one, the lowest-numbered of them wins. 0 turns
+; it off (the top score always wins).
+priority_margin = 0.15
 
 ; Aliases: a name for one or more PastVu region numbers, used with --region.
 ; Three groups: countries (and groups of countries), regions (the first level
@@ -37,8 +41,8 @@ json_files = no
 ; Crimea or Sevastopol. Change the aliases to fit your dataset.
 
 [aliases.countries]
-russia                           = 1                    ; Russia / Россия, 1,425,215 photos
-ukraine                          = 20                   ; Ukraine / Украина, 136,270 photos
+russia                           = 1                    ; Russia / Россия, 1,425,218 photos
+ukraine                          = 20                   ; Ukraine / Украина, 136,271 photos
 belarus                          = 22                   ; Belarus / Беларусь, 23,422 photos
 moldova                          = 189                  ; Moldova / Молдавия, 5,812 photos
 estonia                          = 267                  ; Estonia / Эстония, 11,480 photos
@@ -67,7 +71,7 @@ omsk_oblast                      = 283                  ; Omsk Oblast / Омск
 primorsky_krai                   = 308                  ; Primorsky Krai / Приморский край, 31,905 photos
 rostov_oblast                    = 285                  ; Rostov Oblast / Ростовская область, 31,592 photos
 nizhny_novgorod_oblast           = 26                   ; Nizhny Novgorod Oblast / Нижегородская область, 27,850 photos
-kaliningrad_oblast               = 302                  ; Kaliningrad Oblast / Калининградская область, 26,463 photos
+kaliningrad_oblast               = 302                  ; Kaliningrad Oblast / Калининградская область, 26,466 photos
 yaroslavl_oblast                 = 287                  ; Yaroslavl Oblast / Ярославская область, 24,747 photos
 sverdlovsk_oblast                = 334                  ; Sverdlovsk Oblast / Свердловская область, 23,187 photos
 tver_oblast                      = 350                  ; Tver Oblast / Тверская область, 22,797 photos
@@ -329,9 +333,9 @@ tsentralny_district_spb          = 702                  ; Tsentralny District SP
 western_ao                       = 394                  ; Western AO / ЗАО, 27,286 photos, in Moscow
 north_eastern_ao                 = 389                  ; North-Eastern AO / СВАО, 24,678 photos, in Moscow
 sochi_urban_okrug                = 922                  ; Sochi Urban Okrug / Городской округ Сочи, 24,633 photos, in Krasnodar Krai
-admiralteysky_district           = 701                  ; Admiralteysky District / Адмиралтейский район, 24,360 photos, in Saint Petersburg
+admiralteysky_district           = 701                  ; Admiralteysky District / Адмиралтейский район, 24,361 photos, in Saint Petersburg
 yalta_city_municipality          = 1622                 ; Yalta city municipality / Ялтинский горсовет, 23,626 photos, in Crimea (territorial dispute)
-petrogradsky_district            = 658                  ; Petrogradsky District / Петроградский район, 23,259 photos, in Saint Petersburg
+petrogradsky_district            = 658                  ; Petrogradsky District / Петроградский район, 23,260 photos, in Saint Petersburg
 omsk                             = 284                  ; Omsk / Омск, 22,810 photos, in Omsk Oblast
 northern_ao                      = 388                  ; Northern AO / САО, 22,645 photos, in Moscow
 southern_ao                      = 392                  ; Southern AO / ЮАО, 21,782 photos, in Moscow
@@ -493,7 +497,7 @@ medvezhyegorsky_district         = 1519                 ; Medvezhyegorsky Distri
 orekhovo_zuyevsky_urban_area     = 1128                 ; Orekhovo-Zuyevsky Urban Area / Орехово-Зуевский городской округ, 1,373 photos, in Moscow Oblast
 naberezhnye_chelny               = 621                  ; Naberezhnye Chelny / Набережные Челны, 1,371 photos, in Tatarstan
 gagarinsky_district_sevastopol   = 1614                 ; Gagarinsky District / Гагаринский район, 1,351 photos, in Sevastopol (territorial dispute)
-sovetsk                          = 838                  ; Sovetsk / Советск, 1,343 photos, in Kaliningrad Oblast
+sovetsk                          = 838                  ; Sovetsk / Советск, 1,346 photos, in Kaliningrad Oblast
 leninsky_urban_area              = 1151                 ; Leninsky Urban Area / Ленинский городской округ, 1,288 photos, in Moscow Oblast
 lomonosovsky_district            = 523                  ; Lomonosovsky District / Ломоносовский район, 1,280 photos, in Leningrad Oblast
 teykovo                          = 878                  ; Teykovo / Тейково, 1,273 photos, in Ivanovo Oblast
@@ -527,9 +531,9 @@ ufa                              = 867                  ; Ufa / Уфа, 1,037 ph
 gorodetsky_district              = 2553                 ; Gorodetsky District / Городецкий район, 1,015 photos, in Nizhny Novgorod Oblast
 ulan_ude                         = 869                  ; Ulan-Ude / Улан-Удэ, 1,014 photos, in Buryat Republic
 ; Ukraine
-kiev                             = 353                  ; Kiev / Киев, 61,574 photos
+kiev                             = 353                  ; Kiev / Киев, 61,575 photos
 shevchenkivskyi_district         = 3452                 ; Shevchenkivskyi district (Kiev) / Шевченковский район (Киев), 22,649 photos, in Kiev
-pecherskyi_district              = 3448                 ; Pecherskyi district / Печерский район, 17,400 photos, in Kiev
+pecherskyi_district              = 3448                 ; Pecherskyi district / Печерский район, 17,402 photos, in Kiev
 dnipro_district                  = 7726                 ; Dnipro District (Dnipropetrovsk Oblast) / Днепровский район (Днепр. обл.), 12,515 photos, in Dnipropetrovsk Oblast
 odessa                           = 1628                 ; Odessa / Одесса, 9,205 photos, in Odessa Oblast
 podilskyi_district               = 3449                 ; Podilskyi district / Подольский район, 6,311 photos, in Kiev

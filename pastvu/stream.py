@@ -114,6 +114,7 @@ class Stream:
         self.emb_key = (enc_model, getattr(classifier, "patches", None))
         self.tool = {"name": "dataset_tools/pastvu", "version": TOOL_VERSION, "detector": self.det_name,
                      "detector_conf": opts.wm_conf, "paint_conf": opts.wm_paint_conf, "encoder": enc_model,
+                     "priority_margin": getattr(classifier, "priority_margin", None),
                      "patches": getattr(classifier, "patches", None)}
 
     def scope_rel(self, base_rel: str) -> str:
@@ -295,11 +296,7 @@ class Stream:
                       "output": {"path": rel, "bytes": len(data), "sha256": sha, "size": [fw, fh],
                                  "stored_size": list(enc.size_of(data)),
                                  "orientation": job.head["orientation"] if mode != "array" else 1}}
-        classification = None
-        if verdict:
-            classification = {"folder": verdict.folder, "class": verdict.cls, "subclass": verdict.sub,
-                              "confidence": round(verdict.confidence, 4), "share": round(verdict.share, 2),
-                              "vote": verdict.vote, "reason": verdict.reason}
+        classification = verdict.as_dict() if verdict else None
         result = dict(job.result)
         if job.comments is not None:
             result["comments"] = job.comments

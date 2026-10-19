@@ -11,6 +11,7 @@ the defaults of a run, and the region aliases, in three groups: countries
     split = 5000
     fetchers = 4
     json_files = no
+    priority_margin = 0.15
 
     [aliases.countries]
     belarus = 22
@@ -43,6 +44,7 @@ class Conf:
     split: int = 5000
     fetchers: int = 4
     json_files: bool = False
+    priority_margin: float = 0.15
     aliases: dict[str, list[int]] = field(default_factory=dict)
     groups: dict[str, str] = field(default_factory=dict)      # alias -> its group
 
@@ -101,6 +103,7 @@ def load(path: Path | None = None) -> Conf:
             conf.split = d.getint("split", fallback=conf.split)
             conf.fetchers = d.getint("fetchers", fallback=conf.fetchers)
             conf.json_files = d.getboolean("json_files", fallback=conf.json_files)
+            conf.priority_margin = d.getfloat("priority_margin", fallback=conf.priority_margin)
         except ValueError as e:
             raise SystemExit(f"{path}: [defaults] {e}")
     for group in ALIAS_GROUPS:

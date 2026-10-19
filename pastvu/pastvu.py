@@ -243,7 +243,8 @@ def cmd_run(args, conf, client) -> int:
     if not args.no_classify:
         import classifier as clf
         samples = Path(args.samples).resolve() if args.samples else conf.samples
-        classifier = clf.Classifier(samples, args.patches, args.min_confidence)
+        classifier = clf.Classifier(samples, args.patches, args.min_confidence,
+                                    priority_margin=margin_of(args, conf))
         classifier.embed(np.zeros((64, 64, 3), np.uint8))         # load the encoder now
         print(f"  classifier: {len(classifier.class_names)} classes from {samples}", flush=True)
     if torch.cuda.is_available():
@@ -300,7 +301,7 @@ def cmd_reclassify(args, conf, client) -> int:
               f"they are, {res['pruned']} empty folders removed")
         return 0
     samples = Path(args.samples).resolve() if args.samples else conf.samples
-    classifier = clf.Classifier(samples, args.patches, args.min_confidence)
+    classifier = clf.Classifier(samples, args.patches, args.min_confidence, priority_margin=margin_of(args, conf))
     print(f"Sorting {sc['name']} again with {len(classifier.class_names)} classes from {samples} ...", flush=True)
     p = rc.plan(store, base, sc, classifier, args.override_manual)
     print(rc.summary(p))
@@ -328,6 +329,13 @@ def cmd_export(args, conf, client) -> int:
     n = ex.export(store, sc["name"], dst, args.format)
     print(f"{n:,} records written to {dst}")
     return 0
+
+
+def margin_of(args, conf: cf.Conf) -> float:
+    m = args.priority_margin if getattr(args, "priority_margin", None) is not None else conf.priority_margin
+    if not 0 <= m < 1:
+        raise SystemExit(f"priority margin {m}: give a value from 0 (off) to below 1")
+    return m
 
 
 def parse_fields(spec: str | None) -> list[str]:
@@ -419,6 +427,10 @@ fetchers = 4
 ; Also write each record as a JSON file in <base>\\_records\\<number>\\. The store
 ; holds every record anyway, and `export` writes them as JSON Lines or Parquet.
 json_files = no
+; The numbers of the samples folders are a priority: when categories score
+; within this margin of the top one, the lowest-numbered of them wins. 0 turns
+; it off (the top score always wins).
+priority_margin = 0.15
 
 ; Aliases: a name for one or more PastVu region numbers, used with --region.
 ; Three groups: countries (and groups of countries), regions (the first level
@@ -487,6 +499,8 @@ def parse_args(argv=None):
     p.add_argument("--samples", metavar="DIR", help="classify samples folder (default: [paths] samples of the conf)")
     p.add_argument("--no-classify", action="store_true", help="no categories: images go into numbered folders of the scope")
     p.add_argument("--min-confidence", type=float, default=0.7, metavar="X", help="below this an image goes to _unsure")
+    p.add_argument("--priority-margin", type=float, metavar="X",
+                   help="a category within X of the top score wins when its number is lower (default: [defaults] priority_margin of the conf, 0.15; 0: the top score always wins)")
     p.add_argument("--patches", type=int, default=576, metavar="N", help="encoder patch budget (default 576)")
     p.add_argument("--min-side", type=int, default=512, metavar="PX",
                    help="skip images whose picture is smaller than this on either side (default 512)")
@@ -524,6 +538,8 @@ def parse_args(argv=None):
     p.add_argument("scope", metavar="SCOPE", help="the scope's name or folder")
     p.add_argument("--samples", metavar="DIR", help="classify samples folder (default: [paths] samples of the conf)")
     p.add_argument("--min-confidence", type=float, default=0.7, metavar="X", help="below this an image goes to _unsure")
+    p.add_argument("--priority-margin", type=float, metavar="X",
+                   help="a category within X of the top score wins when its number is lower (default: [defaults] priority_margin of the conf, 0.15; 0: the top score always wins)")
     p.add_argument("--patches", type=int, default=576, metavar="N", help="encoder patch budget (default 576)")
     p.add_argument("--dry-run", action="store_true", help="report the moves and write them to <base>/_reports, move nothing")
     p.add_argument("--override-manual", action="store_true",
