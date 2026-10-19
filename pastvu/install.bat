@@ -8,8 +8,9 @@ rem  install.bat - installs the dependencies of this tool into the shared
 rem  venv (..\venv) and fetches turbojpeg.dll into bin\. The models and
 rem  their dependencies come from the installers of remove_borders,
 rem  watermark and classify, which the root install.bat runs before this
-rem  one; run that first on a new machine. Running install.bat again
-rem  installs what is missing.
+rem  one; run that first on a new machine. It also makes pastvu.conf from
+rem  pastvu.conf.example when there is none. Running install.bat again
+rem  installs what is missing and leaves pastvu.conf alone.
 rem ============================================================
 
 cd /d "%~dp0"
@@ -54,9 +55,16 @@ if errorlevel 1 (
     exit /b 1
 )
 
+if not exist "pastvu.conf" (
+    copy pastvu.conf.example pastvu.conf >nul
+    echo.
+    echo Created pastvu.conf from pastvu.conf.example. Edit it: set the base folder of the
+    echo downloads and the classify samples folder under [paths].
+)
+
 echo.
 echo Installation finished. Count the photos of a region with
-echo   run.bat count --region Belarus
+echo   run.bat count --region belarus
 pause
 exit /b 0
 

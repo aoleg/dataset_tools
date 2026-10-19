@@ -1,35 +1,46 @@
-"""classify's sorter, one image at a time: the samples folder is embedded
-(classify's cache), the probe is trained once at start, and each processed
-image gets classify's decision: the probe's class, the share of its 10 nearest
-examples, the confidence gate, and the byte-identical example rule.
-
-The output folder mirrors a classify output: <out>/<class>/,
-<out>/_unsure/<predicted class>/, <out>/_classify/plan.csv and the embedding
-cache <out>/_embeddings, so classify's own --extract and re-sorting work on it.
+"""classify's sorter, one image at a time or in batches: the samples folder
+is embedded (classify's cache in the samples folder), the probe is trained
+once, and each image gets classify's decision: the probe's class, the share
+of its 10 nearest examples, the confidence gate, and the byte-identical
+example rule. The embeddings of the saved images go into the store, keyed by
+PastVu number, so reclassify needs the GPU only for images without one.
 """
 
 from __future__ import annotations
 
-import csv
 import hashlib
-import os
-import threading
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 
-import process  # noqa: F401 - puts the tool folders on sys.path
+import process as pr  # puts the tool folders on sys.path
 import classify as cl
 
-PLAN_HEADER = ["source", "destination", "class", "subclass", "confidence", "share", "vote", "isolation", "reason",
-               "pass", "sidecars"]
+
+class LazyEncoder:
+    """classify's Encoder, loaded on the first image it embeds: reclassify
+    with every embedding in the store never loads it."""
+
+    def __init__(self, patches: int):
+        self.patches = patches
+        self.model_id = cl.MODEL_REPO
+        self._enc = None
+
+    @property
+    def loaded(self) -> bool:
+        return self._enc is not None
+
+    def embed_arrays(self, arrays):
+        if self._enc is None:
+            self._enc = cl.Encoder(patches=self.patches)
+        return self._enc.embed_arrays(arrays)
 
 
 @dataclass
 class Verdict:
-    folder: str          # the output folder relative to <out>: class, or _unsure/<class>
+    folder: str          # the output folder relative to the scope: class, or _unsure/<class>
     cls: str
     sub: str
     confidence: float
@@ -37,97 +48,77 @@ class Verdict:
     vote: str
     reason: str
 
+    def as_dict(self) -> dict:
+        return {"folder": self.folder, "class": self.cls, "subclass": self.sub, "confidence": round(self.confidence, 4),
+                "share": round(self.share, 2), "vote": self.vote, "reason": self.reason}
+
 
 class Classifier:
-    def __init__(self, samples: Path, patches: int, min_confidence: float, encoder=None, log=print):
+    def __init__(self, samples: Path, patches: int, min_confidence: float, encoder=None):
         from threadpoolctl import threadpool_limits
-        threadpool_limits(limits=cl.BLAS_THREADS if hasattr(cl, "BLAS_THREADS") else 8)
+        threadpool_limits(limits=getattr(cl, "BLAS_THREADS", 8))
+        if not samples or not Path(samples).is_dir():
+            raise SystemExit(f"samples folder {samples} does not exist; set [paths] samples in the conf or give --samples")
+        self.samples = Path(samples)
         self.patches = patches
         self.min_confidence = min_confidence
-        self.encoder = encoder or cl.Encoder(patches=patches)
-        classes = cl.discover_samples(samples, cl.sidecar_set(cl.DEFAULT_SIDECARS))
+        self.encoder = encoder or LazyEncoder(patches)
+        classes = cl.discover_samples(self.samples, cl.sidecar_set(cl.DEFAULT_SIDECARS))
         cl.check_samples(classes)
         args = SimpleNamespace(patches=patches, threads=8, batch=64, reembed=False)
-        res = cl.embed_samples(samples, classes, self.encoder, args)
+        res = cl.embed_samples(self.samples, classes, self.encoder, args)
         rep = cl.Report()
         self.ts, self.cv, self.probe, self.example_hashes = cl.fit_probe(classes, res, rep)
-        self.report_lines = rep.lines
         self.n_classes = len(self.ts.class_names)
+
+    @property
+    def model_id(self) -> str:
+        return cl.MODEL_REPO
 
     @property
     def class_names(self) -> list[str]:
         return list(self.ts.class_names)
 
     def embed(self, array: np.ndarray) -> np.ndarray:
-        import process as pr
         return self.encoder.embed_arrays([pr.naflex_resize(array, self.patches)])[0]
 
-    def decide(self, vec: np.ndarray) -> Verdict:
-        X = vec[None].astype(np.float32)
+    def embed_file(self, path: Path) -> np.ndarray:
+        data = Path(path).read_bytes()
+        head = pr.head_of(data)
+        return self.embed(pr.decode(data, head))
+
+    def decide_many(self, X: np.ndarray) -> list[Verdict]:
+        X = np.asarray(X, np.float32)
         p_sub = self.probe.proba_sub(X)
         p_cls = cl.class_proba(p_sub, self.ts.sub_to_class, self.n_classes)
-        ci = int(p_cls[0].argmax())
-        si = int(p_sub[0].argmax())
-        conf = float(p_cls[0, ci])
         shares = cl.knn_shares(self.ts.X, self.ts.y_class, X, self.n_classes)
-        vote = self.ts.class_names[int(shares[0].argmax())]
-        share = float(shares[0, ci])
-        name = self.ts.class_names[ci]
-        reason = ""
-        if share < cl.VOTE_MIN_SHARE:
-            reason = cl.REASON_DISAGREE
-        elif conf < self.min_confidence:
-            reason = cl.REASON_CONFIDENCE
-        folder = f"{cl.UNSURE_DIRNAME}/{name}" if reason else name
-        return Verdict(folder, name, self.ts.sub_names[si], conf, share, vote, reason)
+        out = []
+        for i in range(X.shape[0]):
+            ci = int(p_cls[i].argmax())
+            si = int(p_sub[i].argmax())
+            conf = float(p_cls[i, ci])
+            share = float(shares[i, ci])
+            name = self.ts.class_names[ci]
+            reason = ""
+            if share < cl.VOTE_MIN_SHARE:
+                reason = cl.REASON_DISAGREE
+            elif conf < self.min_confidence:
+                reason = cl.REASON_CONFIDENCE
+            folder = f"{cl.UNSURE_DIRNAME}/{name}" if reason else name
+            out.append(Verdict(folder, name, self.ts.sub_names[si], conf, share,
+                               self.ts.class_names[int(shares[i].argmax())], reason))
+        return out
+
+    def decide(self, vec: np.ndarray) -> Verdict:
+        return self.decide_many(vec[None])[0]
+
+    def example_class(self, sha256: str | None) -> str | None:
+        """The class of a sample that is a byte-identical copy (by sha256), or None."""
+        ci = self.example_hashes.get(sha256) if sha256 else None
+        return self.ts.class_names[ci] if ci is not None else None
 
     def example_override(self, data: bytes, verdict: Verdict) -> Verdict:
-        """A byte-identical copy of a sample takes the sample's class, as in classify."""
-        h = hashlib.sha256(data).hexdigest()
-        ci = self.example_hashes.get(h)
-        if ci is None:
+        name = self.example_class(hashlib.sha256(data).hexdigest())
+        if name is None:
             return verdict
-        name = self.ts.class_names[ci]
         return Verdict(name, name, name, 1.0, verdict.share, verdict.vote, cl.REASON_EXAMPLE)
-
-
-class OutputIndex:
-    """The embedding cache and plan.csv of the output folder, written as the
-    stream goes. Thread-safe."""
-
-    FLUSH_EVERY = 200
-
-    def __init__(self, out: Path, model_id: str, patches: int):
-        self.out = out
-        self.cache = cl.EmbeddingCache(out, model_id, patches)
-        self.plan = out / cl.RUN_DIRNAME / "plan.csv"
-        self.lock = threading.Lock()
-        self.pending = 0
-
-    def add(self, rel: str, path: Path, vec: np.ndarray, source: str, verdict: Verdict | None) -> None:
-        st = path.stat()
-        item = SimpleNamespace(rel=rel, size=st.st_size, mtime_ns=st.st_mtime_ns)
-        with self.lock:
-            self.cache.put([item], vec[None].astype(np.float16))
-            self.plan.parent.mkdir(parents=True, exist_ok=True)
-            new = not self.plan.is_file()
-            with open(self.plan, "a", encoding="utf-8", newline="") as f:
-                w = csv.writer(f)
-                if new:
-                    w.writerow(PLAN_HEADER)
-                if verdict:
-                    w.writerow([source, str(path), verdict.cls, verdict.sub, f"{verdict.confidence:.4f}",
-                                f"{verdict.share:.2f}", verdict.vote, "0.0000", verdict.reason, 1,
-                                os.path.splitext(rel)[0] + ".txt"])
-                else:
-                    w.writerow([source, str(path), "", "", "", "", "", "", "", 1, os.path.splitext(rel)[0] + ".txt"])
-            self.pending += 1
-            if self.pending >= self.FLUSH_EVERY:
-                self.cache.save()
-                self.pending = 0
-
-    def flush(self) -> None:
-        with self.lock:
-            if self.pending:
-                self.cache.save()
-                self.pending = 0

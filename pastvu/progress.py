@@ -33,16 +33,14 @@ def hms(seconds: float) -> str:
 
 
 class Stats:
-    """Counters of a run, thread-safe. `session` counts this process; the
-    store keeps the totals across resumed runs."""
+    """Pace and counts of this process; the store keeps the totals of the
+    scope across runs, written with each photo."""
 
     def __init__(self):
         self.lock = threading.Lock()
         self.c = Counter()
         self.seconds = Counter()
         self.calls = Counter()
-        self.categories = Counter()
-        self.flushed = Counter()
 
     def add(self, **kw) -> None:
         with self.lock:
@@ -54,31 +52,19 @@ class Stats:
             self.seconds[stage] += seconds
             self.calls[stage] += 1
 
-    def category(self, folder: str) -> None:
-        with self.lock:
-            self.categories[folder] += 1
 
-    def delta(self) -> dict:
-        """The counters added since the last call, flattened for the store."""
-        with self.lock:
-            now = Counter()
-            now.update({f"c.{k}": v for k, v in self.c.items()})
-            now.update({f"cat.{k}": v for k, v in self.categories.items()})
-            d = {k: v - self.flushed.get(k, 0) for k, v in now.items() if v != self.flushed.get(k, 0)}
-            self.flushed = now
-            return d
-
-
-def report_block(totals: dict, session: Stats, scope: int, elapsed: float, final: bool = False) -> str:
-    """The report printed every N images: totals from the store, pace from this session."""
+def report_block(totals: dict, session: Stats, counts: dict, elapsed: float, final: bool = False) -> str:
+    """The report printed every N images: totals of the scope from the store,
+    rate and pace from this process."""
     c = {k[2:]: v for k, v in totals.items() if k.startswith("c.")}
-    cats = {k[4:]: int(v) for k, v in totals.items() if k.startswith("cat.")}
-    done = int(c.get("done", 0))
+    cats = {k[4:]: int(v) for k, v in totals.items() if k.startswith("cat.") and v}
     skipped = {k[8:]: int(v) for k, v in c.items() if k.startswith("skipped.") and v}
     failed = {k[7:]: int(v) for k, v in c.items() if k.startswith("failed.") and v}
     rate = session.c["done"] / elapsed if elapsed > 0 else 0.0
-    lines = [f"{'Finished: ' if final else ''}{done:,} images saved out of {scope:,} in {hms(elapsed)} this run "
-             f"({rate:.2f}/s)"]
+    lines = [f"{'Finished: ' if final else ''}{counts['done']:,} images saved out of {counts['total']:,} "
+             f"({session.c['done']:,} in {hms(elapsed)} this run, {rate:.2f}/s)"]
+    if counts.get("elsewhere"):
+        lines.append(f"  already saved under another scope: {counts['elsewhere']:,} (not downloaded again)")
     if skipped:
         lines.append("  skipped: " + ", ".join(f"{v:,} {k}" for k, v in sorted(skipped.items(), key=lambda x: -x[1])))
     if failed:

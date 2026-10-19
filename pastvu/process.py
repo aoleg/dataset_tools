@@ -14,6 +14,7 @@ watermark.
 from __future__ import annotations
 
 import io
+import warnings
 import sys
 from pathlib import Path
 
@@ -28,6 +29,10 @@ for _tool in ("remove_borders", "watermark", "classify"):
 import remove_borders as rb  # noqa: E402
 
 Image.MAX_IMAGE_PIXELS = None
+# Some PastVu files carry a broken EXIF block; Pillow warns on every read and the
+# warnings flood the live display. The block is dropped where it cannot be read.
+warnings.filterwarnings("ignore", message="Corrupt EXIF data", category=UserWarning)
+warnings.filterwarnings("ignore", message="Possibly corrupt EXIF", category=UserWarning)
 
 BAND_GREY_SPREAD = 14          # the band is a neutral grey: channels within this of each other
 BAND_MIN_SHARE = 0.50          # share of band pixels on the band colour (the rest is the white text)

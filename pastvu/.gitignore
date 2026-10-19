@@ -8,3 +8,5 @@ database/
 # planning and research notes stay local
 PLAN.md
 ANALYSIS.md
+# the local configuration (install.bat makes it from pastvu.conf.example)
+pastvu.conf

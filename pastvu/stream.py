@@ -1,9 +1,13 @@
-"""The stream: every photo of the index that is not done yet goes through
+"""The stream: every photo of a scope that is not done yet goes through
 fetch, band and borders (fetch threads), watermark detection, painting and
 classification (the main thread, models resident on the GPU), and encoding
-and writing (writer threads). Images, plans and output bytes stay in memory;
-the only file operations per photo are the final writes of the image, its
-caption, its record, and the status row in the store.
+and writing (writer threads). Images, plans and output bytes stay in memory.
+
+Writing one photo: its path is claimed in the store (state writing), the
+image and its caption are written, then the status, the record, the
+embedding and the counters are committed in one transaction. A photo found
+in state writing at the start of a run was interrupted: its files are
+deleted and it is done again.
 
 Ctrl+C finishes the images already fetched and stops; a second Ctrl+C stops
 at once. Either way the store says what is done, and the next run of the same
@@ -23,19 +27,20 @@ from pathlib import Path
 import numpy as np
 
 import encode as enc
+import layout
 import process as pr
 import sidecars
-from client import Client, PastvuError, TransportError, page_url
+from client import IMG, Client, PastvuError, TransportError, page_url
 from progress import Display, Stats, report_block
 from store import DONE, FAILED, SKIPPED, Store
 
-TOOL_VERSION = "0.1"
+TOOL_VERSION = "0.2"
 
 
 @dataclass
 class Options:
-    out: Path
-    meta: Path
+    base: Path
+    scope: dict
     min_side: int = 512
     png: bool = False
     wm_conf: float = 0.1
@@ -52,9 +57,14 @@ class Options:
     limit: int | None = None
     retries: int = 3
     txt_fields: list = field(default_factory=lambda: list(sidecars.TXT_FIELDS))
+    json_files: bool = False
     json_sidecar: bool = False
     comments: bool = False
     display: str = "live"
+
+    @property
+    def scope_dir(self) -> Path:
+        return self.base / self.scope["name"]
 
 
 @dataclass
@@ -74,22 +84,42 @@ class Job:
     t_fetch: float = 0.0
 
 
+def cleanup_interrupted(store: Store, base: Path, scope: str) -> int:
+    """Photos left in state writing by a killed run: delete their files, make them pending."""
+    rows = store.writing_rows(scope)
+    for cid, path in rows:
+        if path:
+            img = base / path
+            for f in (img, img.with_suffix(".txt"), img.with_suffix(".json")):
+                f.unlink(missing_ok=True)
+        store.unclaim(cid)
+    return len(rows)
+
+
 class Stream:
-    def __init__(self, client: Client, store: Store, opts: Options, classifier=None, out_index=None,
-                 detector=None, lama=None):
+    def __init__(self, client: Client, store: Store, opts: Options, classifier=None, detector=None, lama=None):
         self.client, self.store, self.opts = client, store, opts
-        self.classifier, self.out_index = classifier, out_index
+        self.classifier = classifier
         self.det_name, self.det = detector or (None, None)
         self.lama = lama
+        self.scope = opts.scope["name"]
+        self.chunker = layout.Chunker(opts.scope["split"], opts.scope["width"],
+                                      [self.scope_rel(p) for p in store.scope_paths(self.scope)])
         self.stats = Stats()
         self.stop = threading.Event()
         self.in_flight = 0
         self.lock = threading.Lock()
         self.display: Display | None = None
+        enc_model = getattr(getattr(classifier, "encoder", None), "model_id", None)
+        self.emb_key = (enc_model, getattr(classifier, "patches", None))
         self.tool = {"name": "dataset_tools/pastvu", "version": TOOL_VERSION, "detector": self.det_name,
-                     "detector_conf": opts.wm_conf, "paint_conf": opts.wm_paint_conf,
-                     "encoder": getattr(getattr(classifier, "encoder", None), "model_id", None),
+                     "detector_conf": opts.wm_conf, "paint_conf": opts.wm_paint_conf, "encoder": enc_model,
                      "patches": getattr(classifier, "patches", None)}
+
+    def scope_rel(self, base_rel: str) -> str:
+        """A path relative to the base -> relative to the scope folder."""
+        prefix = self.scope + "/"
+        return base_rel[len(prefix):] if base_rel.startswith(prefix) else base_rel
 
     # --- fetch threads -------------------------------------------------------------
 
@@ -147,16 +177,15 @@ class Stream:
                 item = self.fetch(cid)
             except pr.Rejected as r:
                 item = r
-                item.cid = cid
             except TransportError as e:
                 item = pr.Rejected(f"download: {e}", failed=True)
-                item.cid = cid
             except Exception as e:  # noqa: BLE001 - one bad photo never stops the stream
                 item = pr.Rejected(f"fetch: {type(e).__name__}: {e}", failed=True)
-                item.cid = cid
             finally:
                 with self.lock:
                     self.in_flight -= 1
+            if isinstance(item, pr.Rejected):
+                item.cid = cid
             out_q.put(item)
         out_q.put(None)
 
@@ -164,14 +193,11 @@ class Stream:
 
     def reject(self, cid: int, r: pr.Rejected) -> None:
         key = r.reason.split(":")[0].split(" (")[0]
-        if r.failed:
-            self.store.set_status(cid, FAILED, r.reason)
-            self.stats.add(**{f"failed.{key}": 1})
-        else:
-            self.store.set_status(cid, SKIPPED, r.reason)
-            self.stats.add(**{f"skipped.{key}": 1})
+        state = FAILED if r.failed else SKIPPED
+        self.store.reject(cid, self.scope, state, r.reason, {f"c.{state}.{key}": 1})
+        self.stats.add(**{f"{state}.{key}": 1})
         self.display.advance(saved=False)
-        self.display.line({"cid": cid, "state": FAILED if r.failed else SKIPPED, "reason": r.reason})
+        self.display.line({"cid": cid, "state": state, "reason": r.reason})
 
     # --- the GPU stage -------------------------------------------------------------
 
@@ -218,16 +244,45 @@ class Stream:
         if self.classifier is not None:
             verdict = self.classifier.example_override(data, verdict)
         folder = verdict.folder if verdict else ""
-        rel = f"{folder}/{job.cid}{ext}" if folder else f"{job.cid}{ext}"
-        path = o.out / rel
-        d.set(f"{job.cid}: saving {rel}")
+        rel_scope = self.chunker.place(folder, f"{job.cid}{ext}")
+        rel = f"{self.scope}/{rel_scope}"
+        path = o.base / rel
+        d.set(f"{job.cid}: saving {rel_scope}")
         t = time.perf_counter()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(data)
-        path.with_suffix(".txt").write_text(sidecars.caption(job.photo, o.txt_fields), encoding="utf-8")
-        sha = hashlib.sha256(data).hexdigest()
+        self.store.claim(job.cid, self.scope, rel)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+            path.with_suffix(".txt").write_text(sidecars.caption(job.photo, o.txt_fields), encoding="utf-8")
+            sha = hashlib.sha256(data).hexdigest()
+            doc = self.record_json(job, plan, boxes, mode, rel, data, sha, fw, fh, verdict)
+            if o.json_files:
+                rf = layout.record_file(o.base, job.cid)
+                rf.parent.mkdir(parents=True, exist_ok=True)
+                rf.write_text(doc, encoding="utf-8")
+            if o.json_sidecar:
+                path.with_suffix(".json").write_text(doc, encoding="utf-8")
+            emb = (self.emb_key[0], self.emb_key[1], vec) if vec is not None else None
+            counters = self.counters(job, plan, mode, folder, boxes)
+            self.store.finish(job.cid, self.scope, {"category": folder, "path": rel, "sha256": sha, "bytes": len(data),
+                                                    "width": fw, "height": fh, "changed": plan["changed"]},
+                              doc, emb, counters)
+        except BaseException:
+            self.chunker.release(rel_scope)
+            for f in (path, path.with_suffix(".txt"), path.with_suffix(".json")):
+                f.unlink(missing_ok=True)
+            self.store.unclaim(job.cid)
+            raise
+        s.time("write", time.perf_counter() - t)
+        s.add(done=1)
+        d.advance(saved=True)
+        d.line({"cid": job.cid, "state": DONE, "path": rel, "write": mode, "changed": plan["changed"],
+                "class": verdict.cls if verdict else None})
+
+    def record_json(self, job: Job, plan, boxes, mode, rel, data, sha, fw, fh, verdict) -> str:
+        o = self.opts
         p = job.photo
-        download = {"url": f"{enc_url(p['file'])}", "bytes": len(job.data), "sha256": hashlib.sha256(job.data).hexdigest(),
+        download = {"url": f"{IMG}/a/{p['file']}", "bytes": len(job.data), "sha256": hashlib.sha256(job.data).hexdigest(),
                     "content_type": job.ctype, "format": job.head["format"], "stored_size": job.head["stored"],
                     "orientation": job.head["orientation"], "mcu": job.head["mcu"]}
         processing = {"band": {"rows": job.rows, **(job.band or {})},
@@ -236,9 +291,10 @@ class Stream:
                                      "mode": o.wm_mode, "conf": o.wm_conf, "paint_conf": o.wm_paint_conf,
                                      "dilate": o.wm_dilate},
                       "box": plan["box"], "stored_box": plan["stored_box"], "changed": plan["changed"],
-                      "write": mode, "output": {"path": rel, "bytes": len(data), "sha256": sha, "size": [fw, fh],
-                                             "stored_size": list(enc.size_of(data)),
-                                             "orientation": job.head["orientation"] if mode != "array" else 1}}
+                      "write": mode,
+                      "output": {"path": rel, "bytes": len(data), "sha256": sha, "size": [fw, fh],
+                                 "stored_size": list(enc.size_of(data)),
+                                 "orientation": job.head["orientation"] if mode != "array" else 1}}
         classification = None
         if verdict:
             classification = {"folder": verdict.folder, "class": verdict.cls, "subclass": verdict.sub,
@@ -247,45 +303,31 @@ class Stream:
         result = dict(job.result)
         if job.comments is not None:
             result["comments"] = job.comments
-        doc = sidecars.record_json(job.cid, page_url(job.cid), result, download, processing, classification, self.tool)
-        (o.meta / f"{job.cid}.json").write_text(doc, encoding="utf-8")
-        if o.json_sidecar:
-            path.with_suffix(".json").write_text(doc, encoding="utf-8")
-        if self.out_index is not None and vec is not None:
-            self.out_index.add(rel, path, vec, page_url(job.cid), verdict)
-        self.store.set_status(job.cid, DONE, "", category=folder, path=rel, sha256=sha, bytes=len(data), width=fw,
-                              height=fh, changed=plan["changed"])
-        s.time("write", time.perf_counter() - t)
-        self.count_done(job, plan, mode, folder, boxes)
-        d.advance(saved=True)
-        d.line({"cid": job.cid, "state": DONE, "path": rel, "write": mode, "changed": plan["changed"],
-                "class": verdict.cls if verdict else None})
+        return sidecars.record_json(job.cid, page_url(job.cid), result, download, processing, classification,
+                                    {**self.tool, "scope": self.scope})
 
-    def count_done(self, job: Job, plan: dict, mode: str, folder: str, boxes: list) -> None:
-        s = self.stats
-        kw = {"done": 1, f"write.{mode}": 1}
+    def counters(self, job: Job, plan: dict, mode: str, folder: str, boxes: list) -> dict:
+        kw = {"c.done": 1, f"c.write.{mode}": 1}
         if "band" in plan["changed"]:
-            kw["band"] = 1
-        elif job.rows:
-            kw["band_missing"] = 1
+            kw["c.band"] = 1
         if job.rows and not (job.band or {}).get("ok"):
-            kw["band_unverified"] = 1
+            kw["c.band_unverified"] = 1
         if "borders" in plan["changed"]:
-            kw["borders"] = 1
+            kw["c.borders"] = 1
             for kind in {c["kind"] for c in ((job.borders or {}).get("result") or {}).get("cuts") or []}:
-                kw[f"cut.{kind}"] = 1
+                kw[f"c.cut.{kind}"] = 1
         if (job.borders or {}).get("action") == "review":
-            kw["borders_review"] = 1
+            kw["c.borders_review"] = 1
         if plan["wm_inside"]:
-            kw["wm_images"] = 1
-            kw["wm_boxes"] = len(plan["wm_inside"])
+            kw["c.wm_images"] = 1
+            kw["c.wm_boxes"] = len(plan["wm_inside"])
         if plan["trim"]:
-            kw["wm_trim"] = 1
+            kw["c.wm_trim"] = 1
         if boxes and not plan["wm_inside"] and not plan["trim"]:
-            kw["wm_below"] = 1
-        s.add(**kw)
+            kw["c.wm_below"] = 1
         if folder:
-            s.category(folder)
+            kw[f"cat.{folder}"] = 1
+        return kw
 
     def writer_worker(self, wq: queue.Queue) -> None:
         while True:
@@ -301,9 +343,9 @@ class Stream:
 
     # --- the run -------------------------------------------------------------------
 
-    def flush_counters(self) -> dict:
-        self.store.add_counters(self.stats.delta())
-        return self.store.counters()
+    def report(self, t_start: float, final: bool = False) -> str:
+        counts = self.store.scope_counts(self.scope)
+        return report_block(self.store.counters(self.scope), self.stats, counts, time.time() - t_start, final)
 
     def run(self, cids: list[int], scope_total: int, completed: int) -> dict:
         o = self.opts
@@ -313,12 +355,14 @@ class Stream:
         cid_lock = threading.Lock()
         out_q: queue.Queue = queue.Queue(maxsize=max(1, o.depth))
         wq: queue.Queue = queue.Queue(maxsize=max(2, o.writers * 2))
-        run_id = self.store.start_run({"cids": len(cids), **{k: str(v) for k, v in vars(o).items()}})
+        run_id = self.store.start_run(self.scope, {"cids": len(cids), **{k: str(v) for k, v in vars(o).items()
+                                                                          if k != "scope"}})
         t_start = time.time()
         processed = 0
         with Display(scope_total, completed, o.display) as d:
             self.display = d
-            d.print(f"{len(cids):,} photos to do in this run; {completed:,} of {scope_total:,} done or skipped before.")
+            d.print(f"{self.scope}: {len(cids):,} photos to do in this run; {completed:,} of {scope_total:,} done, "
+                    f"skipped or saved under another scope before.")
             fetchers = [threading.Thread(target=self.fetch_worker, args=(it, cid_lock, out_q), daemon=True,
                                          name=f"fetch-{i}") for i in range(o.fetchers)]
             writers = [threading.Thread(target=self.writer_worker, args=(wq,), daemon=True, name=f"write-{i}")
@@ -358,7 +402,7 @@ class Stream:
                                     torch.cuda.empty_cache()
                         processed += 1
                         if o.report_every and processed % o.report_every == 0:
-                            d.print(report_block(self.flush_counters(), self.stats, scope_total, time.time() - t_start))
+                            d.print(self.report(t_start))
                     except KeyboardInterrupt:
                         interrupts += 1
                         if interrupts == 1:
@@ -376,19 +420,11 @@ class Stream:
                     wq.put(None)
                 for t in writers:
                     t.join()
-                if self.out_index is not None:
-                    self.out_index.flush()
-                totals = self.flush_counters()
                 d.set("done")
-                d.print(report_block(totals, self.stats, scope_total, time.time() - t_start, final=True))
+                d.print(self.report(t_start, final=True))
         c = self.stats.c
         failed = sum(v for k, v in c.items() if k.startswith("failed."))
         skipped = sum(v for k, v in c.items() if k.startswith("skipped."))
         self.store.end_run(run_id, int(c["done"]), int(skipped), int(failed))
         return {"done": int(c["done"]), "skipped": int(skipped), "failed": int(failed),
                 "seconds": time.time() - t_start}
-
-
-def enc_url(file: str) -> str:
-    from client import IMG
-    return f"{IMG}/a/{file}"

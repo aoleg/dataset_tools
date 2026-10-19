@@ -1,46 +1,78 @@
 # PastVu
 
-Downloads historic photographs from [PastVu](https://pastvu.com) by region and years, and prepares each one for a training dataset while it downloads: it cuts the grey PastVu band and any scanned border, paints out watermarks and printed captions, sorts the image into the categories of a [classify](../classify/README.md) samples folder, and writes it with a one-line caption for the captioner and its full PastVu record. One image after another, with every model kept on the GPU, and with a store that lets a stopped run continue where it was.
+Downloads historic photographs from [PastVu](https://pastvu.com) by region and years, and prepares each one for a training dataset while it downloads: it cuts the grey PastVu band and any scanned border, paints out watermarks and printed captions, sorts the image into the categories of a [classify](../classify/README.md) samples folder, and writes it with a one-line caption for the captioner. One image after another, with every model kept on the GPU, and with a store that lets a stopped run continue where it was.
 
 The tool uses PastVu's public API (no account, no key). Read [The photographs are not PastVu's](#the-photographs-are-not-pastvus) before you publish images you downloaded with it.
 
 ## Install
 
-Run `install.bat` in the repository root first: it installs remove_borders, watermark and classify, whose code and models this tool uses. Then run `install.bat` in this folder. It installs `httpx`, `rich`, PyTurboJPEG and `zstandard` into the shared `..\venv`, and puts `turbojpeg.dll` into `bin\`: PyTurboJPEG does not include the library, and libjpeg-turbo publishes its Windows builds only as installers, so the installer takes the DLL out of conda-forge's `libjpeg-turbo` package (pinned by version and sha256).
+Run `install.bat` in the repository root first: it installs remove_borders, watermark and classify, whose code and models this tool uses, and then this tool. Or run `install.bat` in this folder after the root one. It installs `httpx`, `rich`, PyTurboJPEG and `zstandard` into the shared `..\venv`, puts `turbojpeg.dll` into `bin\` (PyTurboJPEG does not include the library, and libjpeg-turbo publishes its Windows builds only as installers, so the installer takes the DLL out of conda-forge's `libjpeg-turbo` package, pinned by version and sha256), and makes `pastvu.conf` from `pastvu.conf.example` when there is none.
+
+## The conf file
+
+`pastvu.conf`, next to `pastvu.py`, holds what stays the same from run to run. Edit `[paths]` before the first run:
+
+```
+[paths]
+base = D:\pastvu                      the base folder of the downloads
+samples = D:\samples                  the classify samples folder
+
+[defaults]
+years = 1917 1991                     years of a run without --years or --decade
+split = 5000                          at most this many images per folder; 0: no split
+fetchers = 4                          download threads
+json_files = no                       also write each record as a JSON file
+```
+
+The rest of the file is the **aliases**: names for PastVu region numbers, used with `--region`, in three groups. `[aliases.countries]` has the 15 countries of the former Soviet Union and the groups `ussr`, `baltics`, `caucasus` and `central_asia`. `[aliases.regions]` has the first level under each country (oblasts, krais, provinces, counties, republics within Russia). `[aliases.cities]` has the capitals and federal cities, then the places of the second level with at least 1,000 photos (city districts, towns, urban okrugs), with the parent's name added where two places share a name (`leninsky_district_minsk`). Each line has a comment with the PastVu title and the photo count when the file was made:
+
+```
+belarus                          = 22                   ; Belarus / Беларусь, 23,422 photos
+baltics                          = 149, 154, 267        ; Latvia, Lithuania, Estonia
+moscow_oblast                    = 4                    ; Moscow Oblast / Московская область, 97,530 photos
+minsk                            = 636                  ; Minsk / Минск, 6,910 photos
+```
+
+An alias may name several regions. The aliases follow PastVu's region tree, which files some territories under another country than you may want and marks them as a territorial dispute: Crimea (556) and Sevastopol (669) are under Russia, Abkhazia and South Ossetia under Georgia, Transnistria under Moldova. `ukraine = 20` does not contain Crimea or Sevastopol; change the aliases to fit your dataset. `run.bat aliases` lists them with the titles PastVu gives the numbers today, and `run.bat aliases --generate FILE` writes a fresh example from today's region tree.
+
+`--region` takes an alias first, then a PastVu region number, then a region title (English or local, matched exactly). `run.bat regions --find TEXT` finds numbers and titles.
 
 ## Usage
 
 ```
-run.bat regions [--find TEXT] [--children CID]
-run.bat count --region <cid or name> [--region ...] [--years FROM TO]
-run.bat run --out <folder> --region <cid or name> [--years FROM TO] --samples <folder> [options]
-run.bat run --out <folder>
-run.bat captions --out <folder> [--txt-fields LIST] [--dry-run]
+run.bat run --region <alias> [--region ...] [--years FROM TO | --decade YEAR] [options]
+run.bat run --scope <name>
+run.bat reclassify <scope> [--dry-run] [--undo]
+run.bat captions <scope> [--txt-fields LIST] [--dry-run]
+run.bat export <scope> [--format jsonl|parquet]
+run.bat scopes | aliases | count --region <alias> | regions [--find TEXT]
 ```
 
 Examples:
 
 ```
-run.bat regions --find Georgia
-run.bat count --region Belarus --region 3
-run.bat run --out D:\pastvu\belarus --region Belarus --samples D:\samples
-run.bat run --out D:\pastvu\belarus
+run.bat count --region baltics --decade 1960
+run.bat run --region belarus
+run.bat run --region ukraine --decade 1970
+run.bat run --region minsk --region brest_oblast --years 1945 1960
+run.bat run --scope belarus_1917-1991
+run.bat scopes
 ```
 
-`captions` rewrites the caption of every saved photo from its record, with the current caption rules and `--txt-fields`, and downloads nothing; `--dry-run` shows the first changes and counts them.
+A run downloads a **scope**: regions and years. Its name is the aliases (or region names) joined by `+`, an underscore, and the years: `belarus_1917-1991`, `ukraine_1970s`, `minsk+brest_oblast_1945-1960`. More than three regions need `--name` or an alias of their own. The scope's folder is `<base>\<name>`, and running the same command again continues it, as does `run --scope <name>`.
 
-The first example lists the regions whose name contains the text, with their cids and photo counts (Georgia the country is 92, the US state is 726). The second prints how many photos PastVu lists for Belarus and for Moscow (cid 3) in the default years, 1917 to 1991. The third indexes Belarus and starts the stream into `D:\pastvu\belarus`. The fourth continues that run: the scope is kept in the store.
+`--years` takes the photos whose dating overlaps the years, as PastVu's own filter does: a photo dated 1910-1925 is in 1917-1991. `--decade 1970` takes the photos whose dating starts in 1970-1979, so a photo dated 1965-1975 belongs to the 1960s only, and decade runs never download a photo twice. Only photographs are taken, not paintings.
 
-`--years` selects the photos whose dating overlaps the years, as PastVu's own filter does: a photo dated 1910-1925 is in 1917-1991. Only photographs are taken, not paintings.
+**A photo is downloaded once per base folder.** The store at `<base>\pastvu.db` is shared by every scope, so a photo already saved under one scope (Minsk) is not downloaded again for another (Belarus); the report counts it as already saved under another scope, and `scopes` shows how many there are.
 
 ## What happens to one photo
 
 1. **Fetch** (download threads): the PastVu record; the photo is skipped when it is smaller than `--min-side` (512) on either side, a painting, or not public. Then the original file, which is the picture with PastVu's grey band appended at the bottom (`pastvu.com/<cid> uploaded by ...`). The file must have the size the record gives, picture plus band, or the photo counts as failed.
 2. **Band and borders** (download threads): the band rows are known from the record and come off exactly. [remove_borders](../remove_borders/README.md) analyses the picture without the band for scanned frames, mounts, thin lines and text banners.
-3. **Watermarks** (GPU): the [watermark](../watermark/README.md) detector runs on the picture without the band, so the band's own text is never taken for a watermark. Detections from `--wm-conf` (0.1) go into the record; only those from `--wm-paint-conf` (0.4) are painted out with LaMa.
+3. **Watermarks** (GPU): the [watermark](../watermark/README.md) detector runs on the picture without the band, so the band's own text is never taken for a watermark. Detections from `--wm-conf` (0.1) go into the record; only those from `--wm-paint-conf` (0.4) are painted out with LaMa. Below 0.4 the detector often finds scene text and objects (a shop sign, a building facade); from 0.4 up it found printed captions and credits in every case checked.
 4. **Crop**: the band, the border cuts and a watermark trim (`--wm-mode trim`) make one crop, put on the JPEG block grid: the top and left edges move inward to the next block where a cut set them, so the cut part goes completely, and the far edges are exact.
 5. **Classify** (GPU): the final pixels are embedded with SigLIP 2 and sorted by classify's probe, trained once at start on the samples folder, with classify's rules: the confidence gate (`--min-confidence`, 0.7), the share of the 10 nearest examples, and a byte-identical copy of a sample taking the sample's category.
-6. **Write** (writer threads): the image, its caption and its record, then its status in the store.
+6. **Write** (writer threads): the image and its caption go into the next folder of the category with room; then the photo's status, its record, its embedding and the scope's counters are committed to the store in one transaction.
 
 Pixels stay in memory from the download to the write; no temporary file is made. How an image is written:
 
@@ -50,27 +82,26 @@ Pixels stay in memory from the download to the write; no temporary file is made.
 | only cuts (band, borders, trim) | JPEG: cropped in the DCT domain with libjpeg-turbo, every coefficient kept, EXIF kept with the new size. PNG: the exact pixels in the same format and mode. |
 | a watermark painted | JPEG at quality 97 without chroma subsampling, or PNG with `--png` |
 
-A JPEG crop keeps every coefficient of the kept blocks; the decoded pixels can still differ in the last row or column at a cut, where the decoder's chroma upsampling no longer sees the cut-off neighbours.
-
-An image that is smaller than `--min-side` after its crop is skipped.
+A JPEG crop keeps every coefficient of the kept blocks; the decoded pixels can still differ in the last row or column at a cut, where the decoder's chroma upsampling no longer sees the cut-off neighbours. An image that is smaller than `--min-side` after its crop is skipped.
 
 ## Output
 
 ```
-<out>\
-  10_environment_outdoors\163150.jpg      the image, named by its PastVu number
-  10_environment_outdoors\163150.txt      its caption
-  _unsure\5_transport\165001.jpg          below the confidence gate, under its best guess
-  _unsure\5_transport\165001.txt
-  _classify\plan.csv                      classify's plan layout, one row per image
-  _embeddings\                            classify's embedding cache of the output
-<out>_meta\
-  163150.json                             the full record and what was done
-  pastvu.db                               the index, the status of every photo, the counters
-  _dataset_tools.json                     marks the folder, so the other tools skip it
+<base>\
+  pastvu.db                                     the store of every scope
+  belarus_1917-1991\
+    10_environment_outdoors\001\163150.jpg      the image, named by its PastVu number
+    10_environment_outdoors\001\163150.txt      its caption
+    10_environment_outdoors\002\...             the next 5,000 images of the category
+    _unsure\5_transport\001\165001.jpg          below the confidence gate, under its best guess
+  ukraine_1970s\
+    ...
+  _records\016\163150.json                      with json_files = yes only
+  _reports\                                     reclassify --dry-run plans
+  belarus_1917-1991_records.jsonl               written by export
 ```
 
-The output is a classify output: `classify --extract` works on it, and the embeddings are already cached. With `--no-classify` every image goes into `<out>` itself.
+Each category is split into numbered folders `001`, `002`, ... of at most `split` images (5,000 by default, so 10,000 files with the captions; Explorer slows down in folders much larger than that). A category stays one tree: AI Toolkit and the dataset tools read subfolders, so point them at the category folder. `--split` sets another size for a new scope; with `--no-classify` the numbered folders are directly in the scope folder.
 
 **The caption** is one line of facts for the captioner, in the record's language with the English region names added: title, years, regions, address and description, in that order, empty parts left out (`--txt-fields` chooses the parts and their order; `direction` adds the camera direction). Example:
 
@@ -78,15 +109,27 @@ The output is a classify output: `classify --extract` works on it, and the embed
 Холмские ворота. Брестская крепость. 1900-1930. Беларусь, Брестская область, Брест, Брестская крепость (Belarus, Brest Oblast, Brest, Brest Fortress).
 ```
 
-PastVu's placeholder titles ("Где это?") are left out, and so are the parts of a description that held a link, a publication permission, a note on where the map point stands, or a pointer to another upload. No URLs and no user names go into the caption. The [taggui_captioning](../taggui_captioning/README.md) prompt reads it as the existing caption; change its sentence that says English words in the caption describe image quality, because here they are region names.
+PastVu's placeholder titles ("Где это?", alone or in front of a guess) are left out, and so are the parts of a description that held a link, a publication permission, a note on where the map point stands, a pointer to another upload, or a separator line. No URLs and no user names go into the caption. The [taggui_captioning](../taggui_captioning/README.md) prompt reads it as the existing caption; change its sentence that says English words in the caption describe image quality, because here they are region names. `captions <scope>` rewrites every caption of a scope from the records with the current rules and `--txt-fields`, without downloading anything.
 
-**The record** `<cid>.json` is in `<out>_meta`, outside the dataset, because deduplicate, k2prep and the pipeline move only `.txt` files with an image; the PastVu number in the file name joins it to the image in any later folder. It holds the PastVu record as the API gives it (title, description, address, author, source, years, coordinates, direction, regions, uploader), the download (URL, size, sha256), what was done (band, border cuts, every watermark detection with its confidence, the painted boxes, the crop, how the file was written) and the classification. `--json-sidecar` also writes it next to the image; `--comments` adds the PastVu comment thread.
+**The record** of each photo is in the store: the PastVu record as the API gives it (title, description, address, author, source, years, coordinates, direction, regions, uploader), the download (URL, size, sha256), what was done (band, border cuts, every watermark detection with its confidence, the painted boxes, the crop, how the file was written) and the classification. `export <scope>` writes the records of a scope as JSON Lines (one full record per line) or, with `--format parquet`, as Parquet with the main fields as columns and the full record as a JSON string. `json_files = yes` in the conf also writes each record to `<base>\_records\<number>\<cid>.json`, where the number is the PastVu number divided by 10,000, so no folder holds more than 10,000 files; `--json-sidecar` writes it next to the image instead.
+
+## Reclassify
+
+```
+run.bat reclassify belarus_1917-1991 --dry-run
+run.bat reclassify belarus_1917-1991
+run.bat reclassify belarus_1917-1991 --undo
+```
+
+Sorts the saved photos of a scope again with the samples folder as it is now (or `--samples`), and moves each image and its caption into its new category folder, in place. The file keeps its name, so the caption and the record stay joined. The embeddings are in the store, so the GPU is needed only for images without one, and the probe trains in seconds.
+
+A photo you moved to another category by hand keeps its place: reclassify sees that its file is not where the store says, records where it is now, and leaves it there (`--override-manual` sorts it like the rest). A photo whose file is gone is reported and left alone. `--dry-run` prints the moves per category pair and writes them to `<base>\_reports\`. `--undo` puts the moves of the last reclassify back.
 
 ## Progress and resume
 
-The live display shows the current activity on a status line ("163150: detecting watermarks", "waiting for downloads (6 in flight)") above a progress bar with the rate and the time left. Every `--report-every` photos (500) a report block is printed above them and stays: photos saved and skipped by reason, band and border cuts, watermarks painted and detected below the threshold, how the files were written, the categories, and the time per stage. `--quiet` prints the report blocks only; `--json-progress` prints one JSON line per photo.
+The live display shows the current activity on a status line ("163150: detecting watermarks", "163150: saving 5_transport/001/163150.jpg", "waiting for downloads (4 in flight)") above a progress bar with the rate and the time left. Every `--report-every` photos (500) a report block is printed above them and stays: photos saved, skipped by reason and already saved under another scope, band and border cuts, watermarks painted and detected below the threshold, how the files were written, the categories, and the time per stage. `--quiet` prints the report blocks only; `--json-progress` prints one JSON line per photo.
 
-Ctrl+C finishes the photos already downloaded and stops; a second Ctrl+C stops at once. Run the same command again, or `run.bat run --out <folder>`, and it continues with every photo that is not done. A photo's status becomes done only after its image, caption and record are written, so a photo that was being written when the process died is done again. A photo that failed is tried again on the next run, up to `--retries` (3) times.
+Ctrl+C finishes the photos already downloaded and stops; a second Ctrl+C stops at once. Run the same command again and it continues with every photo that is not done. Before a photo is written its path is claimed in the store; a photo found claimed but not done at the start of a run was interrupted while writing, so its files are deleted and it is done again. A photo that failed is tried again on the next run, up to `--retries` (3) times.
 
 ## Speed
 
@@ -103,10 +146,13 @@ Each saved photo costs one API call and one image download; a photo skipped as t
 
 | option | default | meaning |
 |---|---|---|
-| `--out DIR` | required | the dataset folder; the store goes to `DIR_meta` next to it |
-| `--region CID\|NAME` | | a PastVu region; repeat for several; needed on the first run only |
-| `--years FROM TO` | 1917 1991 | photos whose dating overlaps these years |
-| `--samples DIR` | | classify samples folder, one subfolder of examples per category |
+| `--region ALIAS\|CID\|TITLE` | | a region; repeat for several; needed for a new scope |
+| `--years FROM TO` | conf | photos whose dating overlaps these years |
+| `--decade YEAR` | | photos whose dating starts in this decade |
+| `--name NAME` | `<aliases>_<years>` | the scope's name |
+| `--scope NAME` | | resume a scope by its name or folder |
+| `--split N` | conf (5000) | at most N images per folder, for a new scope; 0: no split |
+| `--samples DIR` | conf | the classify samples folder |
 | `--no-classify` | off | no categories |
 | `--min-confidence X` | 0.7 | below this an image goes to `_unsure` |
 | `--min-side PX` | 512 | skip pictures smaller than this on either side, before and after the crop |
@@ -120,7 +166,7 @@ Each saved photo costs one API call and one image download; a photo skipped as t
 | `--txt-fields LIST` | title,years,regions,address,desc | the caption parts in order; `direction` is the extra one |
 | `--json-sidecar` | off | also write the record next to the image |
 | `--comments` | off | add the comment thread to the record |
-| `--fetchers N` | 4 | download threads; 8 is about 30 to 70 % faster and doubles the load on PastVu |
+| `--fetchers N` | conf (4) | download threads; 8 is about 30 to 70 % faster and doubles the load on PastVu |
 | `--depth N` | 16 | photos downloaded ahead of the GPU |
 | `--writers N` | 2 | encoder and writer threads |
 | `--limit N` | | do at most N photos in this run |
@@ -129,7 +175,8 @@ Each saved photo costs one API call and one image download; a photo skipped as t
 | `--quiet`, `--json-progress` | | report blocks only, or one JSON line per photo |
 | `--full-parent` | off | page a large region itself instead of through its children |
 | `--reindex` | off | page the scope again, to find photos published since |
-| `--max-per-second N` | | before the subcommand: cap the requests to PastVu |
+
+Before the subcommand: `--conf FILE` another conf, `--base DIR` another base folder, `--max-per-second N` a cap on the requests to PastVu.
 
 ## How the index works
 
@@ -147,15 +194,20 @@ Each record carries what attribution and a takedown need: the PastVu page, the u
 
 | file | purpose |
 |---|---|
-| `pastvu.py` | the command line |
+| `pastvu.py` | the command line, and the example conf generator |
+| `conf.py` | reads `pastvu.conf` |
 | `client.py` | the API client: retries, back-off, optional cap |
-| `store.py` | the SQLite store |
-| `index.py` | the index of a scope |
+| `store.py` | the SQLite store of a base folder |
+| `index.py` | the index of a scope, and how `--region` is resolved |
+| `layout.py` | scope names, folders and the numbered-folder allocator |
 | `process.py` | header, decode, band, borders, crop composition |
 | `encode.py` | the save rules, in memory |
-| `classifier.py` | classify's sorter, one image at a time |
+| `classifier.py` | classify's sorter, one image at a time or in batches |
+| `reclassify.py` | sorting a scope again, and undo |
+| `export.py` | records as JSON Lines or Parquet |
 | `sidecars.py` | the caption and the record |
 | `progress.py` | the live display and the report blocks |
 | `stream.py` | the threads and the run |
 | `fetch_turbojpeg.py` | fetches `turbojpeg.dll` into `bin\` |
+| `pastvu.conf.example` | the example conf with the aliases |
 | `install.bat`, `run.bat`, `requirements.txt` | install into the shared venv, run with it |
