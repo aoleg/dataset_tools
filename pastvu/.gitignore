@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+# fetched by install.bat (fetch_turbojpeg.py)
+bin/
+# the PastVu development database dump, unpacked locally
+database/
+# planning and research notes stay local
+PLAN.md
+ANALYSIS.md
