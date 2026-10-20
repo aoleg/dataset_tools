@@ -444,14 +444,16 @@ class EmbedResult:
 
 def embed_root(root: Path, items: list[ImageItem], encoder: Encoder, cache: EmbeddingCache,
                threads: int, batch: int, reembed: bool, label: str) -> EmbedResult:
-    t0 = time.time()
-    todo = [it for it in items if reembed or not cache.has(it)]
+    todo: list[ImageItem] = []
     vectors: dict[str, np.ndarray] = {}
     failed: dict[str, str] = {}
     for it in items:
-        if it not in todo:
+        if not reembed and cache.has(it):
             vectors[it.rel] = cache.get(it).astype(np.float32)
+        else:
+            todo.append(it)
     print(f"{label}: {len(items)} images, {len(items) - len(todo)} cached, {len(todo)} to embed")
+    t0 = time.time()  # the rate covers embedding only, not the cache lookup above
     if todo:
         done = 0
         since_flush = 0
