@@ -1,8 +1,9 @@
-"""Delete .txt caption sidecars that have no matching image, recursively.
+"""Delete .txt and .small caption sidecars that have no matching image,
+recursively.
 
-A sidecar "name.txt" is kept when the same folder holds "name.png",
-"name.jpg", "name.jpeg" or "name.gif" (case-insensitive). Every other
-.txt file is deleted.
+A sidecar "name.txt" or "name.small" (the shorter alternative caption) is
+kept when the same folder holds "name.png", "name.jpg", "name.jpeg" or
+"name.gif" (case-insensitive). Every other .txt and .small file is deleted.
 
 Usage:
     python clean_orphaned_txt.py [folder] [--dry-run] [--quiet]
@@ -14,6 +15,7 @@ import sys
 import time
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif"}
+SIDECAR_EXTS = {".txt", ".small"}
 
 
 def scan(root, dry_run, quiet):
@@ -42,7 +44,7 @@ def scan(root, dry_run, quiet):
                     ext = ext.lower()
                     if ext in IMAGE_EXTS:
                         images.add(stem.lower())
-                    elif ext == ".txt":
+                    elif ext in SIDECAR_EXTS:
                         texts.append(entry)
         except OSError as e:
             print(f"  Cannot read folder: {e}", file=sys.stderr)
@@ -72,7 +74,7 @@ def scan(root, dry_run, quiet):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Recursively delete .txt sidecars with no matching "
+        description="Recursively delete .txt and .small sidecars with no matching "
                     "png/jpg/jpeg/gif in the same folder.")
     ap.add_argument("folder", nargs="?", default=".",
                     help="root folder (default: current folder)")
@@ -87,7 +89,7 @@ def main():
         sys.exit(f"Not a folder: {root}")
 
     mode = " (dry run, nothing is deleted)" if args.dry_run else ""
-    print(f"===== Checking sidecar TXT files in {root} and all subfolders{mode} =====")
+    print(f"===== Checking sidecar TXT and SMALL files in {root} and all subfolders{mode} =====")
     t0 = time.perf_counter()
     folders, kept, deleted, failed = scan(root, args.dry_run, args.quiet)
     dt = time.perf_counter() - t0
