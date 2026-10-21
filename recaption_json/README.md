@@ -76,13 +76,13 @@ Long captions in another sidecar extension:
 run.bat D:\photos --ext .caption
 ```
 
-A run prints one line per batch and a summary:
+A run prints one line per request and a summary:
 
 ```
 236 items in D:\photos, 0 with a .short already, 236 to do (A 93, B 84, C 59), batch 10
 model koboldcpp/gemma-4-31B-it, log D:\photos_recaption_log.csv
-[ 10/236] 9 ok, 1 retried, 0 compacted, 0 fallback, 1.1 s/item
-[ 20/236] 8 ok, 1 retried, 1 compacted, 0 fallback, 1.0 s/item
+[ 10/236] 10 sent (0 retries): 9 ok, 0 retried, 0 compacted, 0 fallback, 1 to retry, 0.6 s/item
+[ 20/236] 10 sent (1 retries): 9 ok, 1 retried, 0 compacted, 0 fallback, 0 to retry, 0.6 s/item
 ...
 236 items in 262 s (1.1 s/item): 205 ok on the first try, 29 after a retry, 2 compacted, 0 from the first sentence, 0 skipped
 ```
@@ -135,7 +135,7 @@ Every short prompt the model returns is checked before it is written:
 - no template opening ("A color photograph from ...") and none of: this image, this photograph, appears to, seems, likely, possibly, probably;
 - no request or instruction: no generate, create, render, give me, gimme, show me, make me, do a, I need, I want, please, can you anywhere, and no imperative verb such as make, draw or show as the first word.
 
-An item that fails a check, or that a batch answer leaves out, is asked for again on its own with the reason added to the request, at most twice. An item whose answers all fail still gets a `.short`: the LLM is asked, with `prompt/compact.txt`, to compact the long caption into one line the way a user writes a prompt, and that line passes if it is English, not a request and at most 40 words (`compacted` in the log). If two such requests give nothing usable, the long caption's first sentence, cut to 30 words, is written (`fallback`). So a finished run leaves no image without a `.short`. That matters: AI Toolkit gives an image without one an empty caption in the `short` dataset entry, with no warning (or the text of a `default.short` or `default.txt` in its folder). After a stopped run the summary says how many images still have no `.short`; run the tool again to finish them. A request with one item may be answered with the bare short prompt instead of JSON; it is taken and checked like any other.
+An item that fails a check, or that a batch answer leaves out, goes back with the reason and rides in the next request, ahead of the new items that fill the rest of the batch: with `--batch 10`, 8 items that passed and 2 that did not make the next request 2 retries and 8 new items. Each item is tried at most three times; at the end of a run the remaining retries go out together. An item whose answers all fail still gets a `.short`: the LLM is asked, with `prompt/compact.txt`, to compact the long caption into one line the way a user writes a prompt, and that line passes if it is English, not a request and at most 40 words (`compacted` in the log). If two such requests give nothing usable, the long caption's first sentence, cut to 30 words, is written (`fallback`). So a finished run leaves no image without a `.short`. That matters: AI Toolkit gives an image without one an empty caption in the `short` dataset entry, with no warning (or the text of a `default.short` or `default.txt` in its folder). After a stopped run the summary says how many images still have no `.short`; run the tool again to finish them. A request with one item may be answered with the bare short prompt instead of JSON; it is taken and checked like any other.
 
 ## The log
 

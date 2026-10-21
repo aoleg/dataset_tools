@@ -15,7 +15,8 @@ prompt/recaption.txt; the user message holds --batch numbered items, and the
 model answers a JSON array [{"id": n, "short": "..."}]. Every short is checked
 (length, English, era, color mode, color words, concept names, requests,
 banned phrases); an item that fails, or that the
-reply leaves out, is asked for again on its own with the reason, at most twice.
+reply leaves out, is asked for again with the reason, at most twice: it rides in
+the next request, ahead of the new items that fill the rest of the batch.
 An item whose styled answers all fail is not left without a short: the LLM
 compacts its long caption the way a user writes a prompt (prompt/compact.txt;
 any English line of at most 40 words that is not a request passes), and when
@@ -187,6 +188,8 @@ class Item:
     mode: str = ""
     seconds: float = 0.0
     concepts: list = field(default_factory=list)
+    first: str = ""            # why the first answer was rejected, and the answer (for the log)
+    retry_reason: str = ""     # why the last answer was rejected, sent with the next request
 
     @property
     def short_path(self) -> Path:
@@ -501,41 +504,66 @@ def rejection(reasons: list[str], short: str) -> str:
     return "; ".join(reasons) + (f"{ANSWER}{short!r}" if short else "")
 
 
+def run_queue(client, system: str, items: list[Item], batch: int, retries: int = MAX_RETRIES, write: bool = True,
+              compact_system: str | None = None, on_request=None) -> list[Item]:
+    """Every item to a final status, batch items per request. A rejected item (or one the reply leaves out)
+    goes back with its reason and rides in the next request ahead of the new items, which fill the rest of
+    it; after 1 + retries tries it is compacted (compact()) with compact_system, or is "failed" without one.
+    on_request(chunk, done, waiting) is called after each request with the items it finished and the number
+    of items waiting for a retry. -> the items in the order they finished."""
+    new, waiting, finished = list(reversed(items)), [], []
+    while new or waiting:
+        chunk = waiting[:batch]
+        waiting = waiting[batch:]
+        while len(chunk) < batch and new:
+            chunk.append(new.pop())
+        t0 = time.time()
+        reasons_in = {n: it.retry_reason for n, it in enumerate(chunk, 1) if it.retry_reason}
+        shorts, missing = ask(client, system, chunk, reasons_in or None)
+        share = (time.time() - t0) / len(chunk)
+        done = []
+        for n, it in enumerate(chunk, 1):
+            it.attempts += 1
+            it.seconds += share
+            if it.attempts == 1:
+                it.mode = "batch" if len(chunk) > 1 else "single"
+            it.short = shorts.get(n, "")
+            reasons = validate(it.short, it.style, it.long) if it.short else [missing]
+            if reasons and it.attempts == 1:
+                it.first = rejection(reasons, it.short)
+            if reasons and it.attempts <= retries:
+                it.retry_reason = "; ".join(reasons) if it.short else ""
+                waiting.append(it)
+                continue
+            finish(client, compact_system, it, reasons, write)
+            done.append(it)
+        finished += done
+        if on_request:
+            on_request(chunk, done, len(waiting))
+    return finished
+
+
+def finish(client, compact_system: str | None, it: Item, reasons: list[str], write: bool) -> None:
+    """The final status, log reason and concepts of an item whose last try gave reasons (or none), and its .short."""
+    if reasons:
+        last = rejection(reasons, it.short)
+        if compact_system is None:
+            it.status, it.reason, it.concepts = "failed", last, []
+            return
+        it.short, it.status = compact(client, compact_system, it)
+        it.reason = REJECTED + last                                     # why the last styled answer was rejected
+    else:
+        it.status = "ok" if it.attempts == 1 else "retried"
+        it.reason = "" if it.attempts == 1 else FIRST_TRY + it.first   # why the first answer was rejected
+    it.concepts = verified_concepts(it.short, it.long)
+    if write:
+        write_short(it)
+
+
 def process_chunk(client, system: str, chunk: list[Item], retries: int = MAX_RETRIES, write: bool = True,
                   compact_system: str | None = None) -> None:
-    """First try for the chunk (batch or single), then single-mode retries for every item that failed; with
-    compact_system, an item that fails them all is compacted instead (compact()), so it never fails."""
-    mode = "batch" if len(chunk) > 1 else "single"
-    t0 = time.time()
-    shorts, missing = ask(client, system, chunk)
-    share = (time.time() - t0) / len(chunk)
-    for n, it in enumerate(chunk, 1):
-        it.mode, it.attempts, it.seconds = mode, 1, share
-        it.short = shorts.get(n, "")
-        reasons = validate(it.short, it.style, it.long) if it.short else [missing]
-        first = rejection(reasons, it.short)
-        while reasons and it.attempts <= retries:
-            reason = "; ".join(reasons)
-            t1 = time.time()
-            again, missing1 = ask(client, system, [it], {1: reason} if it.short else None)
-            it.seconds += time.time() - t1
-            it.attempts += 1
-            it.short = again.get(1, "")
-            reasons = validate(it.short, it.style, it.long) if it.short else [missing1]
-        if reasons:
-            last = rejection(reasons, it.short)
-            if compact_system is None:
-                it.status, it.reason = "failed", last
-                it.concepts = []
-                continue
-            it.short, it.status = compact(client, compact_system, it)
-            it.reason = REJECTED + last                                 # why the last styled answer was rejected
-        else:
-            it.status = "ok" if it.attempts == 1 else "retried"
-            it.reason = "" if it.attempts == 1 else FIRST_TRY + first  # why the first answer was rejected
-        it.concepts = verified_concepts(it.short, it.long)
-        if write:
-            write_short(it)
+    """One batch and its retries, which go out together: run_queue() on the chunk alone."""
+    run_queue(client, system, chunk, len(chunk), retries, write, compact_system)
 
 
 def usable(line: str) -> bool:
@@ -658,17 +686,20 @@ def main(argv=None) -> int:
 
     t_start = time.time()
     finished: list[Item] = []
+    clock = [time.time()]
+
+    def on_request(chunk, done, waiting):
+        log_rows(a.log, done, root)
+        finished.extend(done)
+        st = {s: sum(1 for it in done if it.status == s) for s in STATUSES}
+        print(f"[{len(finished):>{len(str(len(pending)))}}/{len(pending)}] {len(chunk)} sent "
+              f"({sum(1 for it in chunk if it.attempts > 1)} retries): {st['ok']} ok, {st['retried']} retried, "
+              f"{st['compacted']} compacted, {st['fallback']} fallback, {waiting} to retry, "
+              f"{(time.time() - clock[0]) / len(chunk):.1f} s/item", flush=True)
+        clock[0] = time.time()
+
     try:
-        for start in range(0, len(pending), a.batch):
-            chunk = pending[start:start + a.batch]
-            t0 = time.time()
-            process_chunk(client, system, chunk, compact_system=compact_system)
-            log_rows(a.log, chunk, root)
-            finished += chunk
-            st = {s: sum(1 for it in chunk if it.status == s) for s in STATUSES}
-            print(f"[{len(finished):>{len(str(len(pending)))}}/{len(pending)}] {st['ok']} ok, {st['retried']} retried, "
-                  f"{st['compacted']} compacted, {st['fallback']} fallback, "
-                  f"{(time.time() - t0) / len(chunk):.1f} s/item", flush=True)
+        run_queue(client, system, pending, a.batch, compact_system=compact_system, on_request=on_request)
     except EndpointDown as e:
         print(f"\nstopped: {e}\nrun again to continue", file=sys.stderr)
     except KeyboardInterrupt:
