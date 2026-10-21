@@ -29,6 +29,7 @@ Install:  httpx (install.bat)
 from __future__ import annotations
 
 import argparse
+import codecs
 import csv
 import hashlib
 import json
@@ -210,12 +211,16 @@ def style_for(stem: str, styles: list[tuple[str, float]]) -> str:
 
 
 def read_text(path: Path) -> str:
-    """UTF-8 (a BOM is dropped), else cp1251, which some hand-written files are in."""
+    """UTF-16 with a BOM (what Notepad calls "Unicode"), UTF-8 (a BOM is dropped), else cp1251, which some
+    hand-written files are in."""
     data = path.read_bytes()
-    try:
-        text = data.decode("utf-8-sig")
-    except UnicodeDecodeError:
-        text = data.decode("cp1251")
+    if data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        text = data.decode("utf-16")
+    else:
+        try:
+            text = data.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            text = data.decode("cp1251")
     return text.replace("\r\n", "\n")
 
 
@@ -521,7 +526,10 @@ def log_rows(path: Path, items: list[Item], root: Path) -> None:
 def load_system_prompt() -> str:
     if not PROMPT_FILE.is_file():
         raise SystemExit(f"the system prompt {PROMPT_FILE} does not exist")
-    return read_text(PROMPT_FILE).strip()
+    text = read_text(PROMPT_FILE).strip()
+    if "\x00" in text:                     # UTF-16 without a BOM, or another encoding read as cp1251
+        raise SystemExit(f"cannot read the encoding of {PROMPT_FILE}; save it as UTF-8")
+    return text
 
 
 def main(argv=None) -> int:

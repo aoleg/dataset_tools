@@ -108,7 +108,7 @@ The exit code is 0 when every item was processed (some may have failed; see the 
 
 The dataset folder is searched recursively. An item is every `<stem>.txt` (or `--ext`) with an image of the same stem next to it (`.jpg`, `.jpeg`, `.png`, `.webp`); a caption without an image is left alone, and `_controls` mask folders are not searched. An item with a non-empty `<stem>.short` is skipped unless `--overwrite` is given.
 
-`<stem>.short` holds the short prompt only: one line of UTF-8 text with no BOM and no line break at the end. The `.txt` file is never changed. The long captions may be UTF-8 or Windows-1251.
+`<stem>.short` holds the short prompt only: one line of UTF-8 text with no BOM and no line break at the end. The `.txt` file is never changed. The long captions may be UTF-8, UTF-16 with a BOM, or Windows-1251.
 
 ## Styles
 
@@ -184,4 +184,4 @@ datasets:
 
 ## The prompts
 
-`prompt/recaption.txt` is the system prompt of this tool: the facts rules, the styles, and the concept names with their conditions. The concept table in `recaption.py` (`CONCEPTS`) mirrors that list; change both together. `prompt/prompt.txt` is a captioning prompt for a later tool and is not used here. Both files are read as UTF-8, or as Windows-1251 when they are not UTF-8.
+`prompt/recaption.txt` is the system prompt of this tool: the facts rules, the styles, and the concept names with their conditions. The concept table in `recaption.py` (`CONCEPTS`) mirrors that list; change both together. `prompt/prompt.txt` is a captioning prompt for a later tool and is not used here. Both files may be UTF-8 (with or without a BOM), UTF-16 with a BOM (what Notepad calls "Unicode"), or Windows-1251; a prompt in any other encoding stops the run with an error rather than reaching the model garbled. UTF-8 is the best choice for the repository, as git shows UTF-16 files as binary.
