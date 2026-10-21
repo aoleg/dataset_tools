@@ -433,7 +433,7 @@ def validate(short: str, style: str, long: str) -> list[str]:
 
     for name, rx, cond in CONCEPTS:
         if rx.search(s) and not cond(long):
-            why.append(f'"{name}" only when the long caption meets its condition; use a plain noun')
+            why.append(f'"{name}" only when the long caption meets its condition (use a plain noun)')
 
     if any(t in low for t in TEMPLATE_OPENINGS):
         why.append("the long caption's template opening (write the user form)")
