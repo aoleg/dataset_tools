@@ -262,6 +262,19 @@ def do_index(args, client: Client, store: Store, sc: dict) -> dict:
     return store.scope(sc["name"])
 
 
+def skip_pairs(store: Store, names: list[str], pairs: list[tuple[int, str]], skip: int) -> list[tuple[int, str]]:
+    """run --skip N: leave out the first N photos the scopes list, in PastVu
+    number order (the order of a run), whether done or not. They are not
+    downloaded and stay to do for a run without --skip."""
+    if not skip:
+        return pairs
+    cids = store.member_cids(names)
+    if skip >= len(cids):
+        return []
+    first = cids[skip]
+    return [p for p in pairs if p[0] >= first]
+
+
 def run_rule(args, store: Store):
     """The rule a --region run splits by, or None for one scope. In a
     years/place or place/years base every scope is one decade, so a run over a
@@ -438,6 +451,8 @@ def cmd_run(args, conf, client) -> int:
 
 
 def run_locked(args, conf, client, base: Path, store: Store, sm) -> int:
+    if args.skip < 0:
+        raise SystemExit("--skip takes a number of photos, 0 or more")
     scopes = None
     if args.by and (args.scope or not args.region):
         raise SystemExit("--by takes --region (the regions and years to split), not --scope")
@@ -513,6 +528,11 @@ def run_locked(args, conf, client, base: Path, store: Store, sm) -> int:
     total = sum(store.scope_counts(name)["total"] for name in names)
     pairs = store.pending_pairs(names, args.retries)
     completed = total - len(pairs)
+    if args.skip:
+        n = len(pairs)
+        pairs = skip_pairs(store, names, pairs, args.skip)
+        print(f"  --skip {args.skip:,}: starting at photo {args.skip + 1:,} of {total:,}; {n - len(pairs):,} photos "
+              f"before it that are not done are left for later", flush=True)
     if vram.ok:
         print(f"  {vram.text()}", flush=True)
     s = sm.Stream(client, store, opts, classifier, detector, lama, caption_client, vram)
@@ -1031,6 +1051,9 @@ def parse_args(argv=None):
     p.add_argument("--depth", type=int, default=16, metavar="N", help="images fetched ahead of the GPU (default 16)")
     p.add_argument("--writers", type=int, default=2, metavar="N", help="encoder and writer threads (default 2)")
     p.add_argument("--limit", type=int, metavar="N", help="do at most N photos in this run")
+    p.add_argument("--skip", type=int, default=0, metavar="N",
+                   help="start at photo N+1 in PastVu number order: the first N are left out, not downloaded, and "
+                        "stay to do for a run without --skip")
     p.add_argument("--retries", type=int, default=3, metavar="N", help="attempts for a photo that failed (default 3)")
     p.add_argument("--report-every", type=int, default=500, metavar="N", help="a report block every N photos")
     p.add_argument("--quiet", action="store_true", help="report blocks only, no live display")

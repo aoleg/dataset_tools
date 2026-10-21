@@ -185,7 +185,15 @@ The first run indexes all of Ukraine for the years of the conf (one gallery page
 run.bat run --region ukraine --limit 1000
 ```
 
-The same command continues with the photos that are not done yet, in the same order, so it takes the next 1,000; the index is not paged again. A photo that failed in an earlier run is tried again first when its number is lower. There is no option to skip photos without downloading them: a run always continues where the last one stopped.
+The same command continues with the photos that are not done yet, in the same order, so it takes the next 1,000; the index is not paged again. A photo that failed in an earlier run is tried again first when its number is lower.
+
+**Download 1,000 photos starting from photo 5,001, without the first 5,000:**
+
+```
+run.bat run --region ukraine --skip 5000 --limit 1000
+```
+
+`--skip N` starts at photo N+1 of everything the scope (or the scopes of a decade split) lists, in the same PastVu number order. It counts positions in the whole list, done or not: after a first run of 5,000, `--skip 5000 --limit 1000` takes the same 1,000 as the example above. The photos before that position that are not done are not downloaded and stay to do; a later run without `--skip` downloads them. This lets two base folders, or two machines, share out one region: one runs `--limit 5000`, the other `--skip 5000`.
 
 **Resume a download:**
 
@@ -476,6 +484,7 @@ Each saved photo costs one API call and one image download; a photo skipped as t
 | `--depth N` | 16 | photos downloaded ahead of the GPU |
 | `--writers N` | 2 | encoder and writer threads |
 | `--limit N` | | do at most N photos in this run |
+| `--skip N` | 0 | start at photo N+1 in PastVu number order; the first N are not downloaded and stay to do |
 | `--retries N` | 3 | attempts for a photo that failed |
 | `--report-every N` | 500 | a report block every N photos |
 | `--quiet`, `--json-progress` | | report blocks only, or one JSON line per photo |

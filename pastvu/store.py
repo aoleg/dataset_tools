@@ -373,6 +373,15 @@ class Store:
                 "(s.state=? OR (s.state=? AND s.attempts<?)) ORDER BY m.cid", (scope, PENDING, FAILED, retries)).fetchall()
         return [r[0] for r in rows]
 
+    def member_cids(self, scopes: list[str]) -> list[int]:
+        """Every photo the scopes list, each once, in PastVu number order."""
+        if not scopes:
+            return []
+        q = ",".join("?" * len(scopes))
+        with self.lock:
+            return [r[0] for r in self.db.execute(f"SELECT DISTINCT cid FROM members WHERE scope IN ({q}) ORDER BY cid",
+                                                  scopes)]
+
     def pending_pairs(self, scopes: list[str], retries: int) -> list[tuple[int, str]]:
         """(cid, scope) to do in any of the scopes, each photo once, in cid order."""
         if not scopes:
