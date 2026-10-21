@@ -51,6 +51,7 @@ TOKENS_PER_ITEM = 160                   # max_tokens = this per item + TOKENS_BA
 TOKENS_BASE = 96
 TIMEOUT = 600.0                         # seconds for one reply
 LOG_FIELDS = ["path", "style", "status", "attempts", "reason", "words", "concepts", "mode", "seconds"]
+FIRST_TRY = "first try: "               # a retried item's log reason: why its first answer was rejected
 
 # End-of-turn tokens to stop on (pastvu/autocaption.py); the API allows at most four.
 STOP_SEQUENCES = ["<|return|>", "<|im_end|>", "<end_of_turn>", "<|eot_id|>"]
@@ -501,6 +502,7 @@ def process_chunk(client, system: str, chunk: list[Item], retries: int = MAX_RET
         it.mode, it.attempts, it.seconds = mode, 1, share
         it.short = shorts.get(n, "")
         reasons = validate(it.short, it.style, it.long) if it.short else [missing]
+        first = "; ".join(reasons)
         while reasons and it.attempts <= retries:
             reason = "; ".join(reasons)
             t1 = time.time()
@@ -514,7 +516,7 @@ def process_chunk(client, system: str, chunk: list[Item], retries: int = MAX_RET
             it.concepts = []
             continue
         it.status = "ok" if it.attempts == 1 else "retried"
-        it.reason = ""
+        it.reason = "" if it.attempts == 1 else FIRST_TRY + first     # why the first answer was rejected
         it.concepts = verified_concepts(it.short, it.long)
         if write:
             write_short(it)
@@ -630,15 +632,24 @@ def main(argv=None) -> int:
         if group:
             good = sum(1 for it in group if it.status != "failed")
             print(f"  style {k}: {good}/{len(group)} written")
-    reasons: dict[str, int] = {}
-    for it in finished:
-        if it.status == "failed":
-            for r in it.reason.split("; "):
-                key = r.split(" (")[0].split(":")[0]
-                reasons[key] = reasons.get(key, 0) + 1
-    for r, c in sorted(reasons.items(), key=lambda kv: -kv[1])[:10]:
-        print(f"  {c:4} x {r}")
+    for status, title in (("failed", "failed"), ("retried", "rejected on the first try, then passed")):
+        counts = reason_counts(it.reason for it in finished if it.status == status)
+        if counts:
+            print(f"  {title}:")
+            for r, c in counts[:10]:
+                print(f"  {c:6} x {r}")
     return 0 if len(finished) == len(pending) else 1
+
+
+def reason_counts(texts) -> list[tuple[str, int]]:
+    """[(reason, count)], most frequent first, for log reasons: the details after "(" or ":" and the
+    actual count (", not 21") dropped."""
+    counts: dict[str, int] = {}
+    for text in texts:
+        for r in text.removeprefix(FIRST_TRY).split("; "):
+            key = re.sub(r", not \d+$", "", r.split(" (")[0].split(":")[0])
+            counts[key] = counts.get(key, 0) + 1
+    return sorted(counts.items(), key=lambda kv: -kv[1])
 
 
 if __name__ == "__main__":

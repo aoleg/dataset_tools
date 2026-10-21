@@ -147,13 +147,13 @@ One CSV row per item, appended on every run (UTF-8 with a BOM, so Excel shows Cy
 | `style` | the style letter |
 | `status` | `ok` on the first try, `retried` (passed after a retry), `failed` (no `.short` written), `skipped` (a `.short` exists) |
 | `attempts` | requests for this item, 1 to 3 |
-| `reason` | why it failed |
+| `reason` | for `failed`, why its last answer was rejected; for `retried`, `first try: ` and why its first answer was rejected; empty otherwise |
 | `words` | words in the short prompt |
 | `concepts` | the verified concept names in the short prompt |
 | `mode` | `batch` or `single`, of the first try |
 | `seconds` | time spent on the item; a batch's time is shared out between its items |
 
-To see what failed, filter the log on `status` = `failed`.
+To see what failed, filter the log on `status` = `failed`; to see which rule the model breaks most, filter on `retried` and sort by `reason`. The summary at the end of a run counts both, by reason.
 
 ## Batch or single
 
