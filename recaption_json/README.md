@@ -130,12 +130,12 @@ Every short prompt the model returns is checked before it is written:
 - English only: no Cyrillic outside quotes (a quoted sign's text may keep its alphabet);
 - an era: a decade (`1960s`, `60s`, `mid-1960s`), a year, `20th century`, or `Soviet era`;
 - a color mode that matches the opening of the long caption: a black-and-white form for "A black-and-white ...", a sepia or black-and-white form for a sepia photograph, a color form for a color photograph, `film still` or `movie still` for a film still. A painting, an illustration or a drawing names its medium instead (`painting`, `illustration`, `drawing`) and never says photo;
-- no color words when the long caption begins "A black-and-white" (light and dark are allowed, and place names such as Red Square are not colors);
+- no hues when the long caption begins "A black-and-white": no red, blue, golden, blond and so on; the tones such a photo shows (black, white, grey, light, dark) are allowed, and place names such as Red Square are not colors;
 - a concept name from the prompt's list only when the long caption meets its condition;
 - no template opening ("A color photograph from ...") and none of: this image, this photograph, appears to, seems, likely, possibly, probably;
 - no request or instruction: no generate, create, render, give me, gimme, show me, make me, do a, I need, I want, please, can you anywhere, and no imperative verb such as make, draw or show as the first word.
 
-An item that fails a check, or that a batch answer leaves out, is asked for again on its own with the reason added to the request, at most twice. An item that still fails gets no `.short`; its reason is in the log, and the next run tries it again. A request with one item may be answered with the bare short prompt instead of JSON; it is taken and checked like any other.
+An item that fails a check, or that a batch answer leaves out, is asked for again on its own with the reason added to the request, at most twice. An item that still fails gets no `.short`; its reason is in the log, and the next run tries it again. Run the tool until no item fails before you train: AI Toolkit gives an image without a `.short` an empty caption in the `short` dataset entry, with no warning (or the text of a `default.short` or `default.txt` in its folder). The summary at the end of a run says how many images have no `.short`. A request with one item may be answered with the bare short prompt instead of JSON; it is taken and checked like any other.
 
 ## The log
 
@@ -147,7 +147,7 @@ One CSV row per item, appended on every run (UTF-8 with a BOM, so Excel shows Cy
 | `style` | the style letter |
 | `status` | `ok` on the first try, `retried` (passed after a retry), `failed` (no `.short` written), `skipped` (a `.short` exists) |
 | `attempts` | requests for this item, 1 to 3 |
-| `reason` | for `failed`, why its last answer was rejected; for `retried`, `first try: ` and why its first answer was rejected; empty otherwise |
+| `reason` | for `failed`, why its last answer was rejected; for `retried`, `first try: ` and why its first answer was rejected; then ` \| answer: ` and the rejected answer itself; empty otherwise |
 | `words` | words in the short prompt |
 | `concepts` | the verified concept names in the short prompt |
 | `mode` | `batch` or `single`, of the first try |

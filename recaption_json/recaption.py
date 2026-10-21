@@ -55,6 +55,7 @@ TOKENS_BASE = 96
 TIMEOUT = 600.0                         # seconds for one reply
 LOG_FIELDS = ["path", "style", "status", "attempts", "reason", "words", "concepts", "mode", "seconds"]
 FIRST_TRY = "first try: "               # a retried item's log reason: why its first answer was rejected
+ANSWER = " | answer: "                  # then the rejected answer itself
 
 # End-of-turn tokens to stop on (pastvu/autocaption.py); the API allows at most four.
 STOP_SEQUENCES = ["<|return|>", "<|im_end|>", "<end_of_turn>", "<|eot_id|>"]
@@ -86,11 +87,11 @@ MODE_TOKENS["sepia"] = ("sepia photo", "sepia-tone photo", "sepia-toned photo")
 MEDIUM_TOKENS = {"painting": ("painting",), "illustration": ("illustration",), "drawing": ("drawing",)}
 PHOTO_WORD = re.compile(r"\bphoto|\bsnapshot|\b(?:film|movie) still", re.I)
 
-# No color words in a short whose long caption begins "A black-and-white"; light and dark are allowed.
+# No hues in a short whose long caption begins "A black-and-white"; the tones it shows are allowed:
+# black, white, grey, light and dark.
 COLOR_WORDS = ("red", "orange", "yellow", "green", "blue", "navy", "purple", "violet", "pink", "magenta",
-               "brown", "beige", "khaki", "white", "black", "grey", "gray", "silver", "silvery", "gold",
-               "golden", "blond", "blonde", "crimson", "scarlet", "maroon", "burgundy", "teal", "turquoise",
-               "cyan", "azure", "ivory")
+               "brown", "beige", "khaki", "silver", "silvery", "gold", "golden", "blond", "blonde", "crimson",
+               "scarlet", "maroon", "burgundy", "teal", "turquoise", "cyan", "azure", "ivory")
 COLOR_RE = re.compile(r"\b(?:%s)(?:ish)?\b" % "|".join(COLOR_WORDS), re.I)
 # Proper names with a color word in them, which are places, not colors.
 COLOR_NAMES = re.compile(r"\b(?:red square|red army|black sea|white sea)\b", re.I)
@@ -458,7 +459,8 @@ def validate(short: str, style: str, long: str) -> list[str]:
         bare = COLOR_NAMES.sub(" ", bare)
         colors = COLOR_RE.findall(bare)
         if colors:
-            why.append(f"a black-and-white photo takes no color words (found {colors[0]!r})")
+            why.append(f"a black-and-white photo takes no hues, only black, white, grey, light and dark "
+                       f"(found {colors[0]!r})")
 
     for name, rx, cond in CONCEPTS:
         if rx.search(s) and not cond(long):
@@ -481,6 +483,11 @@ def write_short(item: Item) -> None:
     item.short_path.write_bytes(item.short.encode("utf-8"))
 
 
+def rejection(reasons: list[str], short: str) -> str:
+    """A log reason: why an answer was rejected, then the answer itself when there was one."""
+    return "; ".join(reasons) + (f"{ANSWER}{short!r}" if short else "")
+
+
 def process_chunk(client, system: str, chunk: list[Item], retries: int = MAX_RETRIES, write: bool = True) -> None:
     """First try for the chunk (batch or single), then single-mode retries for every item that failed."""
     mode = "batch" if len(chunk) > 1 else "single"
@@ -491,7 +498,7 @@ def process_chunk(client, system: str, chunk: list[Item], retries: int = MAX_RET
         it.mode, it.attempts, it.seconds = mode, 1, share
         it.short = shorts.get(n, "")
         reasons = validate(it.short, it.style, it.long) if it.short else [missing]
-        first = "; ".join(reasons)
+        first = rejection(reasons, it.short)
         while reasons and it.attempts <= retries:
             reason = "; ".join(reasons)
             t1 = time.time()
@@ -501,7 +508,7 @@ def process_chunk(client, system: str, chunk: list[Item], retries: int = MAX_RET
             it.short = again.get(1, "")
             reasons = validate(it.short, it.style, it.long) if it.short else [missing1]
         if reasons:
-            it.status, it.reason = "failed", "; ".join(reasons)
+            it.status, it.reason = "failed", rejection(reasons, it.short)
             it.concepts = []
             continue
         it.status = "ok" if it.attempts == 1 else "retried"
@@ -630,6 +637,11 @@ def main(argv=None) -> int:
             print(f"  {title}:")
             for r, c in counts[:10]:
                 print(f"  {c:6} x {r}")
+    missing = sum(1 for it in items if not has_short(it))
+    if missing:
+        print(f"\n{missing} of {len(items)} images have no {SHORT_EXT}. AI Toolkit trains them with an empty caption "
+              f"in the {SHORT_EXT} dataset entry (or a default{SHORT_EXT} / default.txt in their folder); run again "
+              f"to retry them.")
     return 0 if len(finished) == len(pending) else 1
 
 
@@ -638,7 +650,7 @@ def reason_counts(texts) -> list[tuple[str, int]]:
     actual count (", not 21") dropped."""
     counts: dict[str, int] = {}
     for text in texts:
-        for r in text.removeprefix(FIRST_TRY).split("; "):
+        for r in text.removeprefix(FIRST_TRY).split(ANSWER)[0].split("; "):
             key = re.sub(r", not \d+$", "", r.split(" (")[0].split(":")[0])
             counts[key] = counts.get(key, 0) + 1
     return sorted(counts.items(), key=lambda kv: -kv[1])
