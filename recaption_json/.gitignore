@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+# run logs and the batch comparison (it quotes the dataset's captions) stay local
+*.csv
+compare_batch.md
+compare_batch.json
