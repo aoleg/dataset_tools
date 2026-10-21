@@ -126,7 +126,7 @@ There is no style D: a request style ("Generate a 1960s photo of ...") was dropp
 
 Every short prompt the model returns is checked before it is written:
 
-- length: A and C 8 to 20 words; B 6 to 12 comma-separated tags of at most 5 words each;
+- length: A and C 8 to 20 words; B 3 to 14 comma-separated parts and 6 to 30 words in all. The prompt asks B for 6 to 12 short tags, but the check takes any tag-style prompt a user could type, a long tag or a sentence among the tags included;
 - English only: no Cyrillic outside quotes (a quoted sign's text may keep its alphabet);
 - an era: a decade (`1960s`, `60s`, `mid-1960s`), a year, `20th century`, or `Soviet era`;
 - a color mode that matches the opening of the long caption: a black-and-white form for "A black-and-white ...", a sepia or black-and-white form for a sepia photograph, a color form for a color photograph, `film still` or `movie still` for a film still. A painting, an illustration or a drawing names its medium instead (`painting`, `illustration`, `drawing`) and never says photo;

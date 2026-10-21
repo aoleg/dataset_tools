@@ -64,8 +64,10 @@ THINKING_BLOCK = re.compile(r"<(think|thinking|reasoning)>.*?</\1>", re.S | re.I
 # --- validation tables ----------------------------------------------------------------------
 
 WORD_LIMITS = {"A": (8, 20), "C": (8, 20)}
-TAG_LIMITS = (6, 12)
-TAG_MAX_WORDS = 5
+# Style B asks for 6 to 12 short tags, but any comma-separated prompt a user could type passes: a long tag
+# ("children holding hands crossing a zebra crosswalk") or a sentence among the tags is fine.
+TAG_LIMITS = (3, 14)
+B_WORD_LIMITS = (6, 30)
 # Shorts are English: Cyrillic only inside quotes, where it is a sign's text as the long caption gives it.
 CYRILLIC = re.compile(r"[а-яё]+", re.I)
 QUOTED = re.compile(r"\"[^\"]*\"|«[^»]*»|“[^”]*”|„[^“”]*[“”]")
@@ -420,9 +422,9 @@ def validate(short: str, style: str, long: str) -> list[str]:
         lo, hi = TAG_LIMITS
         if not lo <= len(tags) <= hi:
             why.append(f"style B needs {lo} to {hi} comma-separated tags, not {len(tags)}")
-        long_tags = [t for t in tags if word_count(t) > TAG_MAX_WORDS]
-        if long_tags:
-            why.append(f"tags have at most {TAG_MAX_WORDS} words: {long_tags[0]!r}")
+        lo, hi = B_WORD_LIMITS
+        if not lo <= n <= hi:
+            why.append(f"style B needs {lo} to {hi} words, not {n}")
     else:
         lo, hi = WORD_LIMITS[style]
         if not lo <= n <= hi:
