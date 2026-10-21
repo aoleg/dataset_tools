@@ -22,7 +22,7 @@ The dataset folder is searched recursively. An item is every `<stem>.txt` with a
 | `--endpoint` | `http://localhost:5001/v1/` | the OpenAI-compatible API |
 | `--model` | `auto` | the model name; `auto` takes the first model the endpoint lists |
 | `--batch` | `10` | items per request; `1` asks for each item on its own |
-| `--styles` | `A=30,B=25,C=20,D=15,E=10` | the share of each style; `E=0` turns the Russian style off |
+| `--styles` | `A=35,B=30,C=25,E=10` | the share of each style; `E=0` turns the Russian style off |
 | `--limit` | all | at most this many items without a `.short` |
 | `--overwrite` | off | write a new `.short` where one exists |
 | `--dry-run` | off | count the items per style and print the first request; no requests, no files |
@@ -35,18 +35,21 @@ The dataset folder is searched recursively. An item is every `<stem>.txt` with a
 
 ## Styles
 
-Every item gets one style letter from a hash of its file name, so a rerun gives the same letter and the shares follow `--styles`. The styles are defined in `prompt/recaption.txt`: A is a subject phrase with trailing tags, B a comma-separated tag list, C a casual sentence, D a request ("Generate a ... photo of ..."), E style A or C in Russian.
+Every item gets one style letter from a hash of its file name, so a rerun gives the same letter and the shares follow `--styles`. The styles are defined in `prompt/recaption.txt`: A is a subject phrase with trailing tags, B a comma-separated tag list, C a plain descriptive phrase, E style A or C in Russian. There is no D: a request style ("Generate a ... photo of ...", "I need a ...") was dropped, because a short prompt only describes what the picture shows, the way a brief but competent user writes it.
 
 ## Checks
 
 Every short prompt the model returns is checked before it is written:
 
-- length: A, C and D 8 to 20 words; B 6 to 12 comma-separated tags of at most 5 words each; E 6 to 20 words, at least 80 % of the letters Cyrillic;
+- length: A and C 8 to 20 words; B 6 to 12 comma-separated tags of at most 5 words each; E 6 to 20 words, at least 80 % of the letters Cyrillic;
 - an era: a decade (`1960s`, `60s`, `mid-1960s`), a year, `20th century`, or `Soviet era`; for E also the Russian forms (`1960-е`, `1960-х`);
-- a color mode that matches the opening of the long caption: a black-and-white form for "A black-and-white ..." (and sepia), a color form for a color photograph, `film still` or `movie still` for a film still; Russian forms for E. A painting, an illustration or a drawing names its medium instead (`painting`, `illustration`, `drawing`; for E `картина`, `иллюстрация`, `рисунок`) and never says photo;
+- a color mode that matches the opening of the long caption: a black-and-white form for "A black-and-white ...", a sepia or black-and-white form for a sepia photograph, a color form for a color photograph, `film still` or `movie still` for a film still; Russian forms for E. A painting, an illustration or a drawing names its medium instead (`painting`, `illustration`, `drawing`; for E `картина`, `иллюстрация`, `рисунок`) and never says photo;
 - no color words when the long caption begins "A black-and-white" (light and dark are allowed, and place names such as Red Square are not colors);
 - a concept name from the prompt's list only when the long caption meets its condition;
-- no template opening ("A color photograph from ...") and none of: this image, this photograph, appears to, seems, likely, possibly, probably.
+- no template opening ("A color photograph from ...") and none of: this image, this photograph, appears to, seems, likely, possibly, probably;
+- no request or instruction: no generate, create, render, give me, gimme, show me, make me, do a, I need, I want, please, can you (and the Russian equivalents) anywhere, and no imperative verb such as make, draw or show as the first word.
+
+A request with one item may be answered with the bare short prompt instead of JSON; it is taken and checked like any other.
 
 An item that fails a check, or that a batch answer leaves out, is asked for again on its own with the reason added to the request, at most twice. An item that still fails gets no `.short`; its reason is in the log.
 

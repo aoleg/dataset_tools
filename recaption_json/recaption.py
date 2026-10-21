@@ -7,12 +7,13 @@ local LLM, written as a second sidecar (<stem>.short) next to the image.
     python recaption.py D:\\photos --batch 1 --limit 50 --log D:\\photos_recaption_log.csv
 
 An item is every <stem>.txt (or --ext) that has an image next to it. Each item
-gets one style letter (A trailing tags, B tag list, C casual sentence, D
-request, E Russian), chosen from a hash of the stem, so a rerun gives the same
-letter. The system prompt is prompt/recaption.txt; the user message holds
---batch numbered items, and the model answers a JSON array
+gets one style letter (A trailing tags, B tag list, C plain phrase, E Russian;
+there is no D: the request style, "Generate a ...", was dropped, as a prompt
+only describes the picture), chosen from a hash of the stem, so a rerun gives
+the same letter. The system prompt is prompt/recaption.txt; the user message
+holds --batch numbered items, and the model answers a JSON array
 [{"id": n, "short": "..."}]. Every short is checked (length, era, color mode,
-color words, concept names, banned phrases); an item that fails, or that the
+color words, concept names, requests, banned phrases); an item that fails, or that the
 reply leaves out, is asked for again on its own with the reason, at most twice.
 A short that never passes is not written, and the log says why.
 
@@ -20,7 +21,7 @@ The .txt is never changed. An item with a non-empty .short is skipped (unless
 --overwrite), so a stopped run continues where it stopped.
 
 Usage:    python recaption.py DATASET [--ext .txt] [--endpoint URL] [--model auto]
-          [--batch 10] [--styles A=30,B=25,C=20,D=15,E=10] [--limit N]
+          [--batch 10] [--styles A=35,B=30,C=25,E=10] [--limit N]
           [--overwrite] [--dry-run] [--log recaption_log.csv] [--temperature 0.3]
 Install:  httpx (install.bat)
 """
@@ -42,9 +43,9 @@ IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp")
 SHORT_EXT = ".short"
 EXCLUDES = {"_controls"}                # face_masks folders: masks, never items
 DEFAULT_ENDPOINT = "http://localhost:5001/v1/"
-DEFAULT_STYLES = "A=30,B=25,C=20,D=15,E=10"
+DEFAULT_STYLES = "A=35,B=30,C=25,E=10"
 DEFAULT_BATCH = 10
-STYLE_LETTERS = "ABCDE"
+STYLE_LETTERS = "ABCE"                  # no D: the request style was dropped
 MAX_RETRIES = 2                         # single-mode retries after the first try
 TOKENS_PER_ITEM = 160                   # max_tokens = this per item + TOKENS_BASE
 TOKENS_BASE = 96
@@ -57,7 +58,7 @@ THINKING_BLOCK = re.compile(r"<(think|thinking|reasoning)>.*?</\1>", re.S | re.I
 
 # --- validation tables ----------------------------------------------------------------------
 
-WORD_LIMITS = {"A": (8, 20), "C": (8, 20), "D": (8, 20), "E": (6, 20)}
+WORD_LIMITS = {"A": (8, 20), "C": (8, 20), "E": (6, 20)}
 TAG_LIMITS = (6, 12)
 TAG_MAX_WORDS = 5
 CYRILLIC_SHARE = 0.8
@@ -71,17 +72,20 @@ ERA_EN = re.compile(r"(?<![\w-])(?:mid-)?(?:(?:19|20)\d0s|'?\d0s|(?:19|20)\d\d)(
 ERA_RU = re.compile(r"(?<!\d)(?:19|20)\d0-[ех](?![а-яё])|(?<!\d)(?:19|20)\d\d(?!\d)|советск\w*\s+(?:эпох|врем)\w*"
                     r"|(?:xx|20)(?:-?го)?\s+век\w*", re.I)
 
-# Color-mode tokens per mode: "bw" black-and-white, "color", "film" film still.
+# Color-mode tokens per mode: "bw" black-and-white, "sepia" (its own words or black-and-white), "color",
+# "film" film still.
 MODE_TOKENS = {
     "bw": ("black-and-white photo", "black and white photo", "b&w photo", "monochrome photo"),
     "color": ("color photo", "colour photo", "vintage color photo", "old color photo"),
     "film": ("film still", "movie still"),
 }
+MODE_TOKENS["sepia"] = ("sepia photo", "sepia-tone photo", "sepia-toned photo")
 MODE_TOKENS_RU = {
     "bw": ("чёрно-белое фото", "черно-белое фото"),
     "color": ("цветное фото",),
     "film": ("кадр из фильма",),
 }
+MODE_TOKENS_RU["sepia"] = ("сепи",)
 # A painting, an illustration or a drawing names its medium instead of a color mode, and is never a photo.
 MEDIUM_TOKENS = {"painting": ("painting",), "illustration": ("illustration",), "drawing": ("drawing",)}
 MEDIUM_TOKENS_RU = {"painting": ("картин", "живопис"), "illustration": ("иллюстрац",), "drawing": ("рисун",)}
@@ -104,6 +108,14 @@ COLOR_NAMES = re.compile(r"\b(?:red square|red army|black sea|white sea)\b"
 
 TEMPLATE_OPENINGS = ("a black-and-white photograph from", "a color photograph from", "a color film still")
 BANNED = re.compile(r"\b(?:this image|this photograph|appears to|seems|likely|possibly|probably)\b", re.I)
+# A short prompt only describes the picture: no request or instruction anywhere, no imperative verb first.
+REQUEST = re.compile(
+    r"\b(?:generate|create|render|gimme|give me|show me|make me|draw me|do an?|i need|i want|i'd like|i would like"
+    r"|please|can you|could you|would you|let's|let me)\b"
+    r"|(?<![а-яё])(?:сгенерируй\w*|создай\w*|нарисуй\w*|сделай\w*|покажи\w*|дай(?:те)?|мне\s+нужн\w*|хочу"
+    r"|пожалуйста|можешь|можете)(?![а-яё])", re.I)
+IMPERATIVE_FIRST = re.compile(r"^\W*(?:make|draw|show|paint|produce|design|depict|imagine|visualize|give|get|take"
+                              r"|изобрази\w*|покажи\w*)\b", re.I)
 
 # Concept names (mirroring prompt/recaption.txt): name, how it shows in a short (English or Russian),
 # and the condition the long caption must meet. "pioneer tie" and "Soviet school uniform" are not
@@ -140,7 +152,7 @@ CONCEPTS = [
      _uniform_only),
     ("Soviet school uniform", r"school\s+uniforms?|школьн\w*\s+форм\w*", _has(UNIFORM)),
     ("pedal cars", r"\bpedal[- ]cars?\b|педальн\w*\s+(?:машин|автомобил)\w*",
-     _has(r"pedal[- ]car|toy\s+car\b[^.]{0,80}steering\s+wheel")),
+     _has(r"pedal[- ](?:powered\s+|driven\s+)?cars?\b|toy\s+car\b[^.]{0,80}steering\s+wheel")),
     ("GAZ-21 Volga", r"\bgaz-?\s?21\b|(?<![а-яё])газ-?\s?21\b", _has(r"\bgaz-?\s?21\b")),
     ("GAZ-24 Volga", r"\bgaz-?\s?24\b|(?<![а-яё])газ-?\s?24\b", _has(r"\bgaz-?\s?24\b")),
     ("GAZ-M20 Pobeda", r"\bgaz-?\s?m-?20\b|\bpobeda\b|газ-?\s?м-?20\b|(?<![а-яё])победа(?![а-яё])",
@@ -187,9 +199,12 @@ def parse_styles(spec: str) -> list[tuple[str, float]]:
         part = part.strip()
         if not part:
             continue
-        m = re.fullmatch(r"([A-Ea-e])\s*=\s*(\d+(?:\.\d+)?)", part)
+        m = re.fullmatch(r"([A-Za-z])\s*=\s*(\d+(?:\.\d+)?)", part)
         if not m:
             raise ValueError(f"bad style share {part!r}; expected e.g. A=30")
+        if m.group(1).upper() not in STYLE_LETTERS:
+            dropped = " (D, the request style, was dropped)" if m.group(1).upper() == "D" else ""
+            raise ValueError(f"no style {m.group(1).upper()}{dropped}; the styles are {', '.join(STYLE_LETTERS)}")
         out[m.group(1).upper()] = float(m.group(2))
     total = sum(out.values())
     if total <= 0:
@@ -351,6 +366,9 @@ def ask(client, system: str, items: list[Item], reasons: dict[int, str] | None =
     except Rejected as e:
         return {}, f"the endpoint rejected the request ({e})"
     reply = extract_json_array(text)
+    line = " ".join(text.split()).strip("\"'` ")
+    if reply is None and len(items) == 1 and line and "\n" not in text.strip() and not re.search(r"[\[\]{}]", line):
+        return {1: line}, ""                              # one item answered with the bare short: take it
     if reply is None:
         return {}, f"the reply has no JSON array: {' '.join(text.split())[:100]!r}"
     return map_reply(reply, len(items)), "the reply has no short for this id"
@@ -368,7 +386,9 @@ def color_mode(long: str) -> str | None:
     if "film still" in opening or "movie still" in opening:
         return "film"
     if re.search(r"photo|snapshot", opening):
-        if re.search(r"black-and-white|black and white|monochrome|sepia", opening):
+        if "sepia" in opening:
+            return "sepia"
+        if re.search(r"black-and-white|black and white|monochrome", opening):
             return "bw"
         if re.search(r"colou?r", opening):
             return "color"
@@ -433,10 +453,12 @@ def validate(short: str, style: str, long: str) -> list[str]:
         if m:
             why.append(f'a {mode} is not a photo (found {m.group(0)!r})')
     elif mode is not None:
-        if mode not in found:
-            why.append(f'no color mode, or not the long caption\'s (use one of: {", ".join(tokens[mode])})')
-        elif found - {mode}:
-            why.append("two color modes (keep only " + ", ".join(tokens[mode]) + ")")
+        allowed = {"bw", "sepia"} if mode == "sepia" else {mode}       # a sepia photo may be called b&w
+        words = ", ".join(t for m in allowed for t in tokens[m])
+        if not found & allowed:
+            why.append(f"no color mode, or not the long caption's (use one of: {words})")
+        elif found - allowed:
+            why.append(f"two color modes (keep only {words})")
 
     if " ".join(long.split()).lower().startswith("a black-and-white"):
         bare = low
@@ -457,6 +479,9 @@ def validate(short: str, style: str, long: str) -> list[str]:
     m = BANNED.search(s)
     if m:
         why.append(f'"{m.group(0)}" is not allowed')
+    m = REQUEST.search(s) or IMPERATIVE_FIRST.search(s)
+    if m:
+        why.append(f'a request or instruction ("{m.group(0).strip()}"); only describe what the picture shows')
     return why
 
 
