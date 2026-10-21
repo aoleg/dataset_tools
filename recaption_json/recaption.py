@@ -62,11 +62,13 @@ TAG_LIMITS = (6, 12)
 TAG_MAX_WORDS = 5
 CYRILLIC_SHARE = 0.8
 
-# "mid-20th century" too: some long captions date the photo that way and nothing finer.
-ERA_EN = re.compile(r"(?<![\w-])(?:mid-)?(?:19\d0s|'?\d0s|19\d\d)(?![\w])|\bsoviet era\b|\b20th[- ]century\b", re.I)
+# "mid-20th century" too: some long captions date the photo that way and nothing finer; and 20xx for the
+# later photos of Soviet things a dataset may hold ("A color photograph from 2009 of a Soviet-era trolleybus").
+ERA_EN = re.compile(r"(?<![\w-])(?:mid-)?(?:(?:19|20)\d0s|'?\d0s|(?:19|20)\d\d)(?![\w])|\bsoviet era\b"
+                    r"|\b20th[- ]century\b", re.I)
 # E also takes the Russian forms: 1960-е, 1960-х ("фото 1960-х"), a year, "Soviet era" in Russian
 # (the prompt asks for "Soviet era" when the long caption has no date), and the 20th century.
-ERA_RU = re.compile(r"(?<!\d)19\d0-[ех](?![а-яё])|(?<!\d)19\d\d(?!\d)|советск\w*\s+(?:эпох|врем)\w*"
+ERA_RU = re.compile(r"(?<!\d)(?:19|20)\d0-[ех](?![а-яё])|(?<!\d)(?:19|20)\d\d(?!\d)|советск\w*\s+(?:эпох|врем)\w*"
                     r"|(?:xx|20)(?:-?го)?\s+век\w*", re.I)
 
 # Color-mode tokens per mode: "bw" black-and-white, "color", "film" film still.
@@ -346,7 +348,7 @@ def ask(client, system: str, items: list[Item], reasons: dict[int, str] | None =
         return {}, f"the endpoint rejected the request ({e})"
     reply = extract_json_array(text)
     if reply is None:
-        return {}, "the reply has no JSON array"
+        return {}, f"the reply has no JSON array: {' '.join(text.split())[:100]!r}"
     return map_reply(reply, len(items)), "the reply has no short for this id"
 
 
