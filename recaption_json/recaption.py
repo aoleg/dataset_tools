@@ -7,13 +7,14 @@ local LLM, written as a second sidecar (<stem>.short) next to the image.
     python recaption.py D:\\photos --batch 1 --limit 50 --log D:\\photos_recaption_log.csv
 
 An item is every <stem>.txt (or --ext) that has an image next to it. Each item
-gets one style letter (A trailing tags, B tag list, C plain phrase, E Russian;
-there is no D: the request style, "Generate a ...", was dropped, as a prompt
-only describes the picture), chosen from a hash of the stem, so a rerun gives
-the same letter. The system prompt is prompt/recaption.txt; the user message
-holds --batch numbered items, and the model answers a JSON array
-[{"id": n, "short": "..."}]. Every short is checked (length, era, color mode,
-color words, concept names, requests, banned phrases); an item that fails, or that the
+gets one style letter (A trailing tags, B tag list, C plain phrase), chosen
+from a hash of the stem, so a rerun gives the same letter. There is no D (a
+request, "Generate a ...": a prompt only describes the picture) and no E
+(Russian: every short is in English). The system prompt is
+prompt/recaption.txt; the user message holds --batch numbered items, and the
+model answers a JSON array [{"id": n, "short": "..."}]. Every short is checked
+(length, English, era, color mode, color words, concept names, requests,
+banned phrases); an item that fails, or that the
 reply leaves out, is asked for again on its own with the reason, at most twice.
 A short that never passes is not written, and the log says why.
 
@@ -21,7 +22,7 @@ The .txt is never changed. An item with a non-empty .short is skipped (unless
 --overwrite), so a stopped run continues where it stopped.
 
 Usage:    python recaption.py DATASET [--ext .txt] [--endpoint URL] [--model auto]
-          [--batch 10] [--styles A=35,B=30,C=25,E=10] [--limit N]
+          [--batch 10] [--styles A=40,B=35,C=25] [--limit N]
           [--overwrite] [--dry-run] [--log recaption_log.csv] [--temperature 0.3]
 Install:  httpx (install.bat)
 """
@@ -43,9 +44,10 @@ IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp")
 SHORT_EXT = ".short"
 EXCLUDES = {"_controls"}                # face_masks folders: masks, never items
 DEFAULT_ENDPOINT = "http://localhost:5001/v1/"
-DEFAULT_STYLES = "A=35,B=30,C=25,E=10"
+DEFAULT_STYLES = "A=40,B=35,C=25"
 DEFAULT_BATCH = 10
-STYLE_LETTERS = "ABCE"                  # no D: the request style was dropped
+STYLE_LETTERS = "ABC"
+DROPPED_STYLES = {"D": "D, the request style, was dropped", "E": "E, the Russian style, was dropped: shorts are English"}
 MAX_RETRIES = 2                         # single-mode retries after the first try
 TOKENS_PER_ITEM = 160                   # max_tokens = this per item + TOKENS_BASE
 TOKENS_BASE = 96
@@ -59,19 +61,17 @@ THINKING_BLOCK = re.compile(r"<(think|thinking|reasoning)>.*?</\1>", re.S | re.I
 
 # --- validation tables ----------------------------------------------------------------------
 
-WORD_LIMITS = {"A": (8, 20), "C": (8, 20), "E": (6, 20)}
+WORD_LIMITS = {"A": (8, 20), "C": (8, 20)}
 TAG_LIMITS = (6, 12)
 TAG_MAX_WORDS = 5
-CYRILLIC_SHARE = 0.8
+# Shorts are English: Cyrillic only inside quotes, where it is a sign's text as the long caption gives it.
+CYRILLIC = re.compile(r"[а-яё]+", re.I)
+QUOTED = re.compile(r"\"[^\"]*\"|«[^»]*»|“[^”]*”|„[^“”]*[“”]")
 
 # "mid-20th century" too: some long captions date the photo that way and nothing finer; and 20xx for the
 # later photos of Soviet things a dataset may hold ("A color photograph from 2009 of a Soviet-era trolleybus").
 ERA_EN = re.compile(r"(?<![\w-])(?:mid-)?(?:(?:19|20)\d0s|'?\d0s|(?:19|20)\d\d)(?![\w])|\bsoviet era\b"
                     r"|\b20th[- ]century\b", re.I)
-# E also takes the Russian forms: 1960-е, 1960-х ("фото 1960-х"), a year, "Soviet era" in Russian
-# (the prompt asks for "Soviet era" when the long caption has no date), and the 20th century.
-ERA_RU = re.compile(r"(?<!\d)(?:19|20)\d0-[ех](?![а-яё])|(?<!\d)(?:19|20)\d\d(?!\d)|советск\w*\s+(?:эпох|врем)\w*"
-                    r"|(?:xx|20)(?:-?го)?\s+век\w*", re.I)
 
 # Color-mode tokens per mode: "bw" black-and-white, "sepia" (its own words or black-and-white), "color",
 # "film" film still.
@@ -81,16 +81,9 @@ MODE_TOKENS = {
     "film": ("film still", "movie still"),
 }
 MODE_TOKENS["sepia"] = ("sepia photo", "sepia-tone photo", "sepia-toned photo")
-MODE_TOKENS_RU = {
-    "bw": ("чёрно-белое фото", "черно-белое фото"),
-    "color": ("цветное фото",),
-    "film": ("кадр из фильма",),
-}
-MODE_TOKENS_RU["sepia"] = ("сепи",)
 # A painting, an illustration or a drawing names its medium instead of a color mode, and is never a photo.
 MEDIUM_TOKENS = {"painting": ("painting",), "illustration": ("illustration",), "drawing": ("drawing",)}
-MEDIUM_TOKENS_RU = {"painting": ("картин", "живопис"), "illustration": ("иллюстрац",), "drawing": ("рисун",)}
-PHOTO_WORD = re.compile(r"\bphoto|\bsnapshot|\b(?:film|movie) still|фото|снимок|кадр из фильма", re.I)
+PHOTO_WORD = re.compile(r"\bphoto|\bsnapshot|\b(?:film|movie) still", re.I)
 
 # No color words in a short whose long caption begins "A black-and-white"; light and dark are allowed.
 COLOR_WORDS = ("red", "orange", "yellow", "green", "blue", "navy", "purple", "violet", "pink", "magenta",
@@ -98,28 +91,20 @@ COLOR_WORDS = ("red", "orange", "yellow", "green", "blue", "navy", "purple", "vi
                "golden", "blond", "blonde", "crimson", "scarlet", "maroon", "burgundy", "teal", "turquoise",
                "cyan", "azure", "ivory")
 COLOR_RE = re.compile(r"\b(?:%s)(?:ish)?\b" % "|".join(COLOR_WORDS), re.I)
-COLOR_RE_RU = re.compile(
-    r"(?<![а-яё])(?:красн|оранжев|ж[её]лт|з[её]л[её]н|голуб|фиолетов|розов|коричнев|бежев|ч[её]рн|серебрист"
-    r"|золот|блондин|светловолос|рыж|бордов|бирюзов)[а-яё]*"
-    r"|(?<![а-яё])(?:син|бел|сер)(?:ый|ий|ая|яя|ое|ее|ые|ие|ого|его|ой|ей|ых|их|ым|им|ыми|ими|ую|юю)(?![а-яё])",
-    re.I)
 # Proper names with a color word in them, which are places, not colors.
-COLOR_NAMES = re.compile(r"\b(?:red square|red army|black sea|white sea)\b"
-                         r"|красн\w* площад\w*|красн\w* арми\w*|ч[её]рн\w* мор\w*|бел\w* мор\w*", re.I)
+COLOR_NAMES = re.compile(r"\b(?:red square|red army|black sea|white sea)\b", re.I)
 
 TEMPLATE_OPENINGS = ("a black-and-white photograph from", "a color photograph from", "a color film still")
 BANNED = re.compile(r"\b(?:this image|this photograph|appears to|seems|likely|possibly|probably)\b", re.I)
 # A short prompt only describes the picture: no request or instruction anywhere, no imperative verb first.
 REQUEST = re.compile(
     r"\b(?:generate|create|render|gimme|give me|show me|make me|draw me|do an?|i need|i want|i'd like|i would like"
-    r"|please|can you|could you|would you|let's|let me)\b"
-    r"|(?<![а-яё])(?:сгенерируй\w*|создай\w*|нарисуй\w*|сделай\w*|покажи\w*|дай(?:те)?|мне\s+нужн\w*|хочу"
-    r"|пожалуйста|можешь|можете)(?![а-яё])", re.I)
-IMPERATIVE_FIRST = re.compile(r"^\W*(?:make|draw|show|paint|produce|design|depict|imagine|visualize|give|get|take"
-                              r"|изобрази\w*|покажи\w*)\b", re.I)
+    r"|please|can you|could you|would you|let's|let me)\b", re.I)
+IMPERATIVE_FIRST = re.compile(r"^\W*(?:make|draw|show|paint|produce|design|depict|imagine|visualize|give|get|take)\b",
+                              re.I)
 
-# Concept names (mirroring prompt/recaption.txt): name, how it shows in a short (English or Russian),
-# and the condition the long caption must meet. "pioneer tie" and "Soviet school uniform" are not
+# Concept names (mirroring prompt/recaption.txt): name, how it shows in a short (the Russian forms catch
+# a quoted sign, the only Cyrillic a short may hold), and the condition the long caption must meet. "pioneer tie" and "Soviet school uniform" are not
 # concept names but are bound to the long caption's words by the prompt's school rules.
 TIE = r"pioneer\s+(?:tie|neckerchief|scarf)"
 OCTOBRIST = r"octobrist\w*['’]?s?\s+(?:star|badge|pin)"
@@ -204,7 +189,7 @@ def parse_styles(spec: str) -> list[tuple[str, float]]:
         if not m:
             raise ValueError(f"bad style share {part!r}; expected e.g. A=30")
         if m.group(1).upper() not in STYLE_LETTERS:
-            dropped = " (D, the request style, was dropped)" if m.group(1).upper() == "D" else ""
+            dropped = f" ({DROPPED_STYLES[m.group(1).upper()]})" if m.group(1).upper() in DROPPED_STYLES else ""
             raise ValueError(f"no style {m.group(1).upper()}{dropped}; the styles are {', '.join(STYLE_LETTERS)}")
         out[m.group(1).upper()] = float(m.group(2))
     total = sum(out.values())
@@ -412,11 +397,10 @@ def word_count(short: str) -> int:
     return len(short.split())
 
 
-def cyrillic_share(text: str) -> float:
-    letters = [c for c in text if c.isalpha()]
-    if not letters:
-        return 0.0
-    return sum(1 for c in letters if 0x400 <= ord(c) <= 0x4FF) / len(letters)
+def unquoted_cyrillic(text: str) -> str:
+    """The first Cyrillic word outside quotes, or ''."""
+    m = CYRILLIC.search(QUOTED.sub(" ", text))
+    return m.group(0) if m else ""
 
 
 def validate(short: str, style: str, long: str) -> list[str]:
@@ -437,18 +421,18 @@ def validate(short: str, style: str, long: str) -> list[str]:
         lo, hi = WORD_LIMITS[style]
         if not lo <= n <= hi:
             why.append(f"style {style} needs {lo} to {hi} words, not {n}")
-    if style == "E" and cyrillic_share(s) < CYRILLIC_SHARE:
-        why.append("style E must be written in Russian")
+    russian = unquoted_cyrillic(s)
+    if russian:
+        why.append(f"write in English only; Cyrillic only in a quoted sign (found {russian!r})")
 
-    if not (ERA_EN.search(s) or (style == "E" and ERA_RU.search(s))):
+    if not ERA_EN.search(s):
         why.append('no era (a decade such as "1960s", a year, or "Soviet era" when the long caption has no date)')
 
     mode = color_mode(long)
-    tokens = MODE_TOKENS_RU if style == "E" else MODE_TOKENS
+    tokens = MODE_TOKENS
     found = {m for m, toks in tokens.items() if any(t in low for t in toks)}
     if mode in MEDIUM_TOKENS:
-        media = MEDIUM_TOKENS_RU if style == "E" else MEDIUM_TOKENS
-        if not any(t in low for t in media[mode]):
+        if not any(t in low for t in MEDIUM_TOKENS[mode]):
             why.append(f"no medium (the long caption is a {mode}, not a photo)")
         m = PHOTO_WORD.search(s)
         if m:
@@ -463,11 +447,11 @@ def validate(short: str, style: str, long: str) -> list[str]:
 
     if " ".join(long.split()).lower().startswith("a black-and-white"):
         bare = low
-        for toks in list(MODE_TOKENS.values()) + list(MODE_TOKENS_RU.values()):
+        for toks in MODE_TOKENS.values():
             for t in toks:
                 bare = bare.replace(t, " ")
         bare = COLOR_NAMES.sub(" ", bare)
-        colors = COLOR_RE.findall(bare) + COLOR_RE_RU.findall(bare)
+        colors = COLOR_RE.findall(bare)
         if colors:
             why.append(f"a black-and-white photo takes no color words (found {colors[0]!r})")
 

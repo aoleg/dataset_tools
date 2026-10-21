@@ -58,10 +58,10 @@ Keep the log next to the dataset instead of in the current folder:
 run.bat D:\photos --log D:\photos_recaption_log.csv
 ```
 
-No Russian prompts, and more tag lists:
+More tag lists, fewer plain phrases:
 
 ```
-run.bat D:\photos --styles A=35,B=40,C=25,E=0
+run.bat D:\photos --styles A=35,B=50,C=15
 ```
 
 Another server or model, one caption per request (for a small model that loses track in a batch):
@@ -79,7 +79,7 @@ run.bat D:\photos --ext .caption
 A run prints one line per batch and a summary:
 
 ```
-236 items in D:\photos, 0 with a .short already, 236 to do (A 80, B 82, C 59, E 15), batch 10
+236 items in D:\photos, 0 with a .short already, 236 to do (A 93, B 84, C 59), batch 10
 model koboldcpp/gemma-4-31B-it, log D:\photos_recaption_log.csv
 [ 10/236] 9 ok, 1 retried, 0 failed, 1.1 s/item
 [ 20/236] 10 ok, 0 retried, 0 failed, 0.9 s/item
@@ -97,7 +97,7 @@ The exit code is 0 when every item was processed (some may have failed; see the 
 | `--endpoint` | `http://localhost:5001/v1/` | the OpenAI-compatible API |
 | `--model` | `auto` | the model name; `auto` takes the first model the endpoint lists |
 | `--batch` | `10` | items per request; `1` asks for each item on its own |
-| `--styles` | `A=35,B=30,C=25,E=10` | the share of each style; `E=0` turns the Russian style off |
+| `--styles` | `A=40,B=35,C=25` | the share of each style; `C=0` turns a style off |
 | `--limit` | all | at most this many items without a `.short` |
 | `--overwrite` | off | write a new `.short` where one exists |
 | `--dry-run` | off | count the items per style and print the first request; no requests, no files |
@@ -119,21 +119,21 @@ Every item gets one style letter from a hash of its file name, so a rerun gives 
 | A | subject phrase, then tags with era, place and color mode; 8 to 20 words | `A GAZ-21 Volga parked on a city street. 1960s, Soviet Union, black-and-white photo.` |
 | B | 6 to 12 lowercase comma-separated tags, era and color mode last | `gaz-21 volga, parked cars, ornate stone building, pedestrians, soviet street, 1960s, black and white photo` |
 | C | one plain descriptive phrase; 8 to 20 words | `old black and white photo of kids riding pedal cars in a park, Soviet Union 1950s` |
-| E | style A or C in Russian | `Волга ГАЗ-21 на городской улице. 1960-е, СССР, чёрно-белое фото.` |
 
-There is no style D: a request style ("Generate a 1960s photo of ...") was dropped, because a short prompt only describes the picture.
+There is no style D: a request style ("Generate a 1960s photo of ...") was dropped, because a short prompt only describes the picture. There is no style E: a Russian style was dropped, because every short prompt is in English; Cyrillic appears only in a sign's text quoted as the long caption gives it.
 
 ## Checks
 
 Every short prompt the model returns is checked before it is written:
 
-- length: A and C 8 to 20 words; B 6 to 12 comma-separated tags of at most 5 words each; E 6 to 20 words, at least 80 % of the letters Cyrillic;
-- an era: a decade (`1960s`, `60s`, `mid-1960s`), a year, `20th century`, or `Soviet era`; for E also the Russian forms (`1960-е`, `1960-х`);
-- a color mode that matches the opening of the long caption: a black-and-white form for "A black-and-white ...", a sepia or black-and-white form for a sepia photograph, a color form for a color photograph, `film still` or `movie still` for a film still; Russian forms for E. A painting, an illustration or a drawing names its medium instead (`painting`, `illustration`, `drawing`; for E `картина`, `иллюстрация`, `рисунок`) and never says photo;
+- length: A and C 8 to 20 words; B 6 to 12 comma-separated tags of at most 5 words each;
+- English only: no Cyrillic outside quotes (a quoted sign's text may keep its alphabet);
+- an era: a decade (`1960s`, `60s`, `mid-1960s`), a year, `20th century`, or `Soviet era`;
+- a color mode that matches the opening of the long caption: a black-and-white form for "A black-and-white ...", a sepia or black-and-white form for a sepia photograph, a color form for a color photograph, `film still` or `movie still` for a film still. A painting, an illustration or a drawing names its medium instead (`painting`, `illustration`, `drawing`) and never says photo;
 - no color words when the long caption begins "A black-and-white" (light and dark are allowed, and place names such as Red Square are not colors);
 - a concept name from the prompt's list only when the long caption meets its condition;
 - no template opening ("A color photograph from ...") and none of: this image, this photograph, appears to, seems, likely, possibly, probably;
-- no request or instruction: no generate, create, render, give me, gimme, show me, make me, do a, I need, I want, please, can you (and the Russian equivalents) anywhere, and no imperative verb such as make, draw or show as the first word.
+- no request or instruction: no generate, create, render, give me, gimme, show me, make me, do a, I need, I want, please, can you anywhere, and no imperative verb such as make, draw or show as the first word.
 
 An item that fails a check, or that a batch answer leaves out, is asked for again on its own with the reason added to the request, at most twice. An item that still fails gets no `.short`; its reason is in the log, and the next run tries it again. A request with one item may be answered with the bare short prompt instead of JSON; it is taken and checked like any other.
 
