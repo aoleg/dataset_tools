@@ -81,13 +81,13 @@ A run prints one line per batch and a summary:
 ```
 236 items in D:\photos, 0 with a .short already, 236 to do (A 93, B 84, C 59), batch 10
 model koboldcpp/gemma-4-31B-it, log D:\photos_recaption_log.csv
-[ 10/236] 9 ok, 1 retried, 0 failed, 1.1 s/item
-[ 20/236] 10 ok, 0 retried, 0 failed, 0.9 s/item
+[ 10/236] 9 ok, 1 retried, 0 compacted, 0 fallback, 1.1 s/item
+[ 20/236] 8 ok, 1 retried, 1 compacted, 0 fallback, 1.0 s/item
 ...
-236 items in 262 s (1.1 s/item): 205 ok on the first try, 31 after a retry, 0 failed, 0 skipped
+236 items in 262 s (1.1 s/item): 205 ok on the first try, 29 after a retry, 2 compacted, 0 from the first sentence, 0 skipped
 ```
 
-The exit code is 0 when every item was processed (some may have failed; see the log) and 1 when the run stopped early.
+The exit code is 0 when every item was processed and 1 when the run stopped early.
 
 ## Options
 
@@ -135,7 +135,7 @@ Every short prompt the model returns is checked before it is written:
 - no template opening ("A color photograph from ...") and none of: this image, this photograph, appears to, seems, likely, possibly, probably;
 - no request or instruction: no generate, create, render, give me, gimme, show me, make me, do a, I need, I want, please, can you anywhere, and no imperative verb such as make, draw or show as the first word.
 
-An item that fails a check, or that a batch answer leaves out, is asked for again on its own with the reason added to the request, at most twice. An item that still fails gets no `.short`; its reason is in the log, and the next run tries it again. Run the tool until no item fails before you train: AI Toolkit gives an image without a `.short` an empty caption in the `short` dataset entry, with no warning (or the text of a `default.short` or `default.txt` in its folder). The summary at the end of a run says how many images have no `.short`. A request with one item may be answered with the bare short prompt instead of JSON; it is taken and checked like any other.
+An item that fails a check, or that a batch answer leaves out, is asked for again on its own with the reason added to the request, at most twice. An item whose answers all fail still gets a `.short`: the LLM is asked, with `prompt/compact.txt`, to compact the long caption into one line the way a user writes a prompt, and that line passes if it is English, not a request and at most 40 words (`compacted` in the log). If two such requests give nothing usable, the long caption's first sentence, cut to 30 words, is written (`fallback`). So a finished run leaves no image without a `.short`. That matters: AI Toolkit gives an image without one an empty caption in the `short` dataset entry, with no warning (or the text of a `default.short` or `default.txt` in its folder). After a stopped run the summary says how many images still have no `.short`; run the tool again to finish them. A request with one item may be answered with the bare short prompt instead of JSON; it is taken and checked like any other.
 
 ## The log
 
@@ -145,15 +145,15 @@ One CSV row per item, appended on every run (UTF-8 with a BOM, so Excel shows Cy
 |---|---|
 | `path` | the long caption, relative to the dataset folder |
 | `style` | the style letter |
-| `status` | `ok` on the first try, `retried` (passed after a retry), `failed` (no `.short` written), `skipped` (a `.short` exists) |
-| `attempts` | requests for this item, 1 to 3 |
-| `reason` | for `failed`, why its last answer was rejected; for `retried`, `first try: ` and why its first answer was rejected; then ` \| answer: ` and the rejected answer itself; empty otherwise |
+| `status` | `ok` on the first try, `retried` (passed after a retry), `compacted` (every styled answer was rejected; the compacted caption was written), `fallback` (the compacting failed too; the first sentence was written), `skipped` (a `.short` exists) |
+| `attempts` | requests for this item, 1 to 5 |
+| `reason` | for `retried`, `first try: ` and why its first answer was rejected; for `compacted` and `fallback`, `rejected: ` and why its last styled answer was rejected; then ` \| answer: ` and the rejected answer itself; empty otherwise |
 | `words` | words in the short prompt |
 | `concepts` | the verified concept names in the short prompt |
 | `mode` | `batch` or `single`, of the first try |
 | `seconds` | time spent on the item; a batch's time is shared out between its items |
 
-To see what failed, filter the log on `status` = `failed`; to see which rule the model breaks most, filter on `retried` and sort by `reason`. The summary at the end of a run counts both, by reason.
+To check the items that lost their style, filter the log on `status` = `compacted` or `fallback`; to see which rule the model breaks most, filter on `retried` and sort by `reason`. The summary at the end of a run counts all three, by reason.
 
 ## Batch or single
 

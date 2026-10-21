@@ -16,7 +16,11 @@ model answers a JSON array [{"id": n, "short": "..."}]. Every short is checked
 (length, English, era, color mode, color words, concept names, requests,
 banned phrases); an item that fails, or that the
 reply leaves out, is asked for again on its own with the reason, at most twice.
-A short that never passes is not written, and the log says why.
+An item whose styled answers all fail is not left without a short: the LLM
+compacts its long caption the way a user writes a prompt (prompt/compact.txt;
+any English line of at most 40 words that is not a request passes), and when
+even that gives nothing usable, the long caption's first sentence is used. The
+log marks these "compacted" and "fallback".
 
 The .txt is never changed. An item with a non-empty .short is skipped (unless
 --overwrite), so a stopped run continues where it stopped.
@@ -55,7 +59,14 @@ TOKENS_BASE = 96
 TIMEOUT = 600.0                         # seconds for one reply
 LOG_FIELDS = ["path", "style", "status", "attempts", "reason", "words", "concepts", "mode", "seconds"]
 FIRST_TRY = "first try: "               # a retried item's log reason: why its first answer was rejected
+REJECTED = "rejected: "                 # a compacted item's: why its last styled answer was rejected
 ANSWER = " | answer: "                  # then the rejected answer itself
+COMPACT_FILE = TOOL_DIR / "prompt" / "compact.txt"
+COMPACT_TRIES = 2                       # compact requests before the first-sentence fallback
+COMPACT_TOKENS = 160
+COMPACT_MAX_WORDS = 40
+FALLBACK_WORDS = 30
+STATUSES = ("ok", "retried", "compacted", "fallback", "failed")
 
 # End-of-turn tokens to stop on (pastvu/autocaption.py); the API allows at most four.
 STOP_SEQUENCES = ["<|return|>", "<|im_end|>", "<end_of_turn>", "<|eot_id|>"]
@@ -490,8 +501,10 @@ def rejection(reasons: list[str], short: str) -> str:
     return "; ".join(reasons) + (f"{ANSWER}{short!r}" if short else "")
 
 
-def process_chunk(client, system: str, chunk: list[Item], retries: int = MAX_RETRIES, write: bool = True) -> None:
-    """First try for the chunk (batch or single), then single-mode retries for every item that failed."""
+def process_chunk(client, system: str, chunk: list[Item], retries: int = MAX_RETRIES, write: bool = True,
+                  compact_system: str | None = None) -> None:
+    """First try for the chunk (batch or single), then single-mode retries for every item that failed; with
+    compact_system, an item that fails them all is compacted instead (compact()), so it never fails."""
     mode = "batch" if len(chunk) > 1 else "single"
     t0 = time.time()
     shorts, missing = ask(client, system, chunk)
@@ -510,14 +523,49 @@ def process_chunk(client, system: str, chunk: list[Item], retries: int = MAX_RET
             it.short = again.get(1, "")
             reasons = validate(it.short, it.style, it.long) if it.short else [missing1]
         if reasons:
-            it.status, it.reason = "failed", rejection(reasons, it.short)
-            it.concepts = []
-            continue
-        it.status = "ok" if it.attempts == 1 else "retried"
-        it.reason = "" if it.attempts == 1 else FIRST_TRY + first     # why the first answer was rejected
+            last = rejection(reasons, it.short)
+            if compact_system is None:
+                it.status, it.reason = "failed", last
+                it.concepts = []
+                continue
+            it.short, it.status = compact(client, compact_system, it)
+            it.reason = REJECTED + last                                 # why the last styled answer was rejected
+        else:
+            it.status = "ok" if it.attempts == 1 else "retried"
+            it.reason = "" if it.attempts == 1 else FIRST_TRY + first  # why the first answer was rejected
         it.concepts = verified_concepts(it.short, it.long)
         if write:
             write_short(it)
+
+
+def usable(line: str) -> bool:
+    """A compacted line passes when it is a prompt at all: English, not a request, not too long."""
+    return (bool(line) and word_count(line) <= COMPACT_MAX_WORDS and not unquoted_cyrillic(line)
+            and not (REQUEST.search(line) or IMPERATIVE_FIRST.search(line)))
+
+
+def compact(client, system: str, it: Item) -> tuple[str, str]:
+    """After every styled answer failed: (short, status). The LLM compacts the long caption the way a user
+    writes a prompt ("compacted"); when that gives nothing usable either, the long caption's first sentence,
+    cut to FALLBACK_WORDS words ("fallback"). Never an empty short."""
+    for _ in range(COMPACT_TRIES):
+        t1 = time.time()
+        try:
+            text = client.complete(system, " ".join(it.long.split()), COMPACT_TOKENS)
+        except Rejected:
+            text = ""
+        it.seconds += time.time() - t1
+        it.attempts += 1
+        reply = extract_json_array(text)
+        line = map_reply(reply, 1).get(1, "") if reply else text.strip().splitlines()[0] if text.strip() else ""
+        line = " ".join(line.split()).strip("\"'` ")
+        if usable(line):
+            return line, "compacted"
+    return " ".join(first_sentence(it.long).split()[:FALLBACK_WORDS]), "fallback"
+
+
+def first_sentence(text: str) -> str:
+    return re.split(r"(?<=[.!?])\s+", " ".join(text.split()), maxsplit=1)[0]
 
 
 def log_rows(path: Path, items: list[Item], root: Path) -> None:
@@ -532,12 +580,13 @@ def log_rows(path: Path, items: list[Item], root: Path) -> None:
                         f"{it.seconds:.2f}"])
 
 
-def load_system_prompt() -> str:
-    if not PROMPT_FILE.is_file():
-        raise SystemExit(f"the system prompt {PROMPT_FILE} does not exist")
-    text = read_text(PROMPT_FILE).strip()
+def load_system_prompt(path: Path | None = None) -> str:
+    path = path or PROMPT_FILE
+    if not path.is_file():
+        raise SystemExit(f"the system prompt {path} does not exist")
+    text = read_text(path).strip()
     if "\x00" in text:                     # UTF-16 without a BOM, or another encoding read as cp1251
-        raise SystemExit(f"cannot read the encoding of {PROMPT_FILE}; save it as UTF-8")
+        raise SystemExit(f"cannot read the encoding of {path}; save it as UTF-8")
     return text
 
 
@@ -575,6 +624,7 @@ def main(argv=None) -> int:
     except ValueError as e:
         raise SystemExit(str(e))
     system = load_system_prompt()
+    compact_system = load_system_prompt(COMPACT_FILE)
 
     items = find_items(root, ext, styles)
     skipped = [] if a.overwrite else [it for it in items if has_short(it)]
@@ -612,28 +662,31 @@ def main(argv=None) -> int:
         for start in range(0, len(pending), a.batch):
             chunk = pending[start:start + a.batch]
             t0 = time.time()
-            process_chunk(client, system, chunk)
+            process_chunk(client, system, chunk, compact_system=compact_system)
             log_rows(a.log, chunk, root)
             finished += chunk
-            st = {s: sum(1 for it in chunk if it.status == s) for s in ("ok", "retried", "failed")}
+            st = {s: sum(1 for it in chunk if it.status == s) for s in STATUSES}
             print(f"[{len(finished):>{len(str(len(pending)))}}/{len(pending)}] {st['ok']} ok, {st['retried']} retried, "
-                  f"{st['failed']} failed, {(time.time() - t0) / len(chunk):.1f} s/item", flush=True)
+                  f"{st['compacted']} compacted, {st['fallback']} fallback, "
+                  f"{(time.time() - t0) / len(chunk):.1f} s/item", flush=True)
     except EndpointDown as e:
         print(f"\nstopped: {e}\nrun again to continue", file=sys.stderr)
     except KeyboardInterrupt:
         print("\nstopped; run again to continue", file=sys.stderr)
 
     elapsed = time.time() - t_start
-    st = {s: sum(1 for it in finished if it.status == s) for s in ("ok", "retried", "failed")}
+    st = {s: sum(1 for it in finished if it.status == s) for s in STATUSES}
     print(f"\n{len(finished)} items in {elapsed:.0f} s ({elapsed / max(1, len(finished)):.1f} s/item): "
-          f"{st['ok']} ok on the first try, {st['retried']} after a retry, {st['failed']} failed, "
-          f"{len(skipped)} skipped")
+          f"{st['ok']} ok on the first try, {st['retried']} after a retry, {st['compacted']} compacted, "
+          f"{st['fallback']} from the first sentence, {len(skipped)} skipped")
     for k, _ in styles:
         group = [it for it in finished if it.style == k]
         if group:
-            good = sum(1 for it in group if it.status != "failed")
-            print(f"  style {k}: {good}/{len(group)} written")
-    for status, title in (("failed", "failed"), ("retried", "rejected on the first try, then passed")):
+            styled = sum(1 for it in group if it.status in ("ok", "retried"))
+            print(f"  style {k}: {styled}/{len(group)} in the style")
+    for status, title in (("compacted", "compacted after every styled answer was rejected"),
+                          ("fallback", "first sentence after the compacting failed too"),
+                          ("retried", "rejected on the first try, then passed")):
         counts = reason_counts(it.reason for it in finished if it.status == status)
         if counts:
             print(f"  {title}:")
@@ -643,7 +696,7 @@ def main(argv=None) -> int:
     if missing:
         print(f"\n{missing} of {len(items)} images have no {SHORT_EXT}. AI Toolkit trains them with an empty caption "
               f"in the {SHORT_EXT} dataset entry (or a default{SHORT_EXT} / default.txt in their folder); run again "
-              f"to retry them.")
+              f"to finish them.")
     return 0 if len(finished) == len(pending) else 1
 
 
@@ -652,7 +705,7 @@ def reason_counts(texts) -> list[tuple[str, int]]:
     actual count (", not 21") dropped."""
     counts: dict[str, int] = {}
     for text in texts:
-        for r in text.removeprefix(FIRST_TRY).split(ANSWER)[0].split("; "):
+        for r in text.removeprefix(FIRST_TRY).removeprefix(REJECTED).split(ANSWER)[0].split("; "):
             key = re.sub(r", not \d+$", "", r.split(" (")[0].split(":")[0])
             counts[key] = counts.get(key, 0) + 1
     return sorted(counts.items(), key=lambda kv: -kv[1])
