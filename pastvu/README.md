@@ -165,9 +165,36 @@ run.bat count --region baltics --decade 1960
 run.bat run --region belarus
 run.bat run --region ukraine --decade 1970
 run.bat run --region minsk --region brest_oblast --years 1945 1960
-run.bat run --scope belarus_1917-1991
+run.bat run --scope ukraine_1970s
 run.bat scopes
 ```
+
+### Common tasks
+
+**Download 5,000 photos of a region (here Ukraine):**
+
+```
+run.bat run --region ukraine --limit 5000
+```
+
+The first run indexes all of Ukraine for the years of the conf (one gallery page per 100 photos, so a few minutes for a large country), then processes 5,000 photos and stops. `--limit` counts the photos processed in the run: those saved and those skipped as too small (about 7 % in Belarus), so expect about 4,650 images. Photos are taken in the order of their PastVu number, which is the order of upload, oldest first, from all decades at once: in the default layout they go into `1910s\ukraine\`, `1920s\ukraine\` and so on up to `1990s\ukraine\`.
+
+**Download the next 1,000 (photos 5,001 to 6,000):**
+
+```
+run.bat run --region ukraine --limit 1000
+```
+
+The same command continues with the photos that are not done yet, in the same order, so it takes the next 1,000; the index is not paged again. A photo that failed in an earlier run is tried again first when its number is lower. There is no option to skip photos without downloading them: a run always continues where the last one stopped.
+
+**Resume a download:**
+
+```
+run.bat run --region ukraine
+run.bat run --scope ukraine_1970s
+```
+
+Without `--limit`, the same command runs until every photo is done. Ctrl+C finishes the photos in progress and stops; a second Ctrl+C stops at once. `--scope` continues one scope only, here the 1970s. A photo that failed is tried again on the next run, up to `--retries` (3) times; a photo skipped as too small is not. `--reindex` pages the index again to find photos published since the first run.
 
 A run downloads a **scope**: regions and years. Its name is the aliases (or region names) joined by `+`, an underscore, and the years: `belarus_1917-1991`, `ukraine_1970s`, `minsk+brest_oblast_1945-1960`. More than three regions need `--name` or an alias of their own. Running the same command again continues it, as does `run --scope <name>`. The scope's folder follows `layout` in the conf (see [Folder layouts](#folder-layouts)): `<base>\1970s\ukraine\` by default.
 
