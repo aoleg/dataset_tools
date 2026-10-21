@@ -35,7 +35,6 @@ import recaption as rc
 TOOL_DIR = Path(__file__).resolve().parent
 OUT_MD = TOOL_DIR / "compare_batch.md"
 OUT_JSON = TOOL_DIR / "compare_batch.json"
-DEFAULT_DATASET = Path(".")
 SIDE_BY_SIDE = 20
 PASS_MARGIN = 3.0                       # points: batch within this of single, and no leakage -> batch
 
@@ -59,8 +58,7 @@ CITIES = {"Moscow": "москв", "Leningrad": "ленинград", "Kiev": "к
           "Novocherkassk": "новочеркасск", "Volgograd": "волгоград", "Stalingrad": "сталинград",
           "Sevastopol": "севастопол", "Yalta": "ялт", "Sochi": "сочи", "Lvov": "львов", "Murmansk": "мурманск",
           "Vladivostok": "владивосток", "Novosibirsk": "новосибирск", "Sverdlovsk": "свердловск",
-          "Gorky": "горьк", "Kazan": "казан", "Kuibyshev": "куйбышев", "Rostov": "ростов", "Kaliningrad": "калининград",
-          "Tokyo": "токио"}
+          "Gorky": "горьк", "Kazan": "казан", "Kuibyshev": "куйбышев", "Rostov": "ростов", "Kaliningrad": "калининград"}
 NOT_PLACES = {"Soviet", "Union", "USSR", "Russia", "Eastern", "Europe", "The", "Cyrillic", "Lenin", "Culture", "St"}
 
 
@@ -289,9 +287,9 @@ def report(data: dict) -> str:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Compare batch and single mode of recaption.py on the first items "
                                              "of a dataset.")
-    ap.add_argument("dataset", type=Path, nargs="?", default=DEFAULT_DATASET)
-    ap.add_argument("--items", type=int, default=100)
-    ap.add_argument("--batch", type=int, default=10)
+    ap.add_argument("dataset", type=Path, nargs="?", help="the dataset folder (not needed with --report-only)")
+    ap.add_argument("--items", type=int, default=100, help="the first N items (default 100)")
+    ap.add_argument("--batch", type=int, default=10, help="items per request in batch mode (default 10)")
     ap.add_argument("--ext", default=".txt")
     ap.add_argument("--endpoint", default=rc.DEFAULT_ENDPOINT)
     ap.add_argument("--model", default="auto")
@@ -299,6 +297,8 @@ def main(argv=None) -> int:
     ap.add_argument("--temperature", type=float, default=0.3)
     ap.add_argument("--report-only", action="store_true", help=f"rebuild {OUT_MD.name} from {OUT_JSON.name}")
     a = ap.parse_args(argv)
+    if a.dataset is None and not a.report_only:
+        ap.error("give the dataset folder, or --report-only")
     for stream in (sys.stdout, sys.stderr):
         stream.reconfigure(encoding="utf-8", errors="replace")
 
