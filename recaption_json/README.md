@@ -43,7 +43,7 @@ Every short prompt the model returns is checked before it is written:
 
 - length: A, C and D 8 to 20 words; B 6 to 12 comma-separated tags of at most 5 words each; E 6 to 20 words, at least 80 % of the letters Cyrillic;
 - an era: a decade (`1960s`, `60s`, `mid-1960s`), a year, `20th century`, or `Soviet era`; for E also the Russian forms (`1960-е`, `1960-х`);
-- a color mode that matches the opening of the long caption: a black-and-white form for "A black-and-white ..." (and sepia), a color form for a color photograph, `film still` or `movie still` for a film still; Russian forms for E. A painting, an illustration or a drawing has no color mode in the prompt, so nothing is required for it;
+- a color mode that matches the opening of the long caption: a black-and-white form for "A black-and-white ..." (and sepia), a color form for a color photograph, `film still` or `movie still` for a film still; Russian forms for E. A painting, an illustration or a drawing names its medium instead (`painting`, `illustration`, `drawing`; for E `картина`, `иллюстрация`, `рисунок`) and never says photo;
 - no color words when the long caption begins "A black-and-white" (light and dark are allowed, and place names such as Red Square are not colors);
 - a concept name from the prompt's list only when the long caption meets its condition;
 - no template opening ("A color photograph from ...") and none of: this image, this photograph, appears to, seems, likely, possibly, probably.

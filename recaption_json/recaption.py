@@ -82,6 +82,10 @@ MODE_TOKENS_RU = {
     "color": ("цветное фото",),
     "film": ("кадр из фильма",),
 }
+# A painting, an illustration or a drawing names its medium instead of a color mode, and is never a photo.
+MEDIUM_TOKENS = {"painting": ("painting",), "illustration": ("illustration",), "drawing": ("drawing",)}
+MEDIUM_TOKENS_RU = {"painting": ("картин", "живопис"), "illustration": ("иллюстрац",), "drawing": ("рисун",)}
+PHOTO_WORD = re.compile(r"\bphoto|\bsnapshot|\b(?:film|movie) still|фото|снимок|кадр из фильма", re.I)
 
 # No color words in a short whose long caption begins "A black-and-white"; light and dark are allowed.
 COLOR_WORDS = ("red", "orange", "yellow", "green", "blue", "navy", "purple", "violet", "pink", "magenta",
@@ -355,8 +359,8 @@ def ask(client, system: str, items: list[Item], reasons: dict[int, str] | None =
 # --- validation -----------------------------------------------------------------------------
 
 def color_mode(long: str) -> str | None:
-    """The color mode the long caption's opening states: bw, color, film, or None for a medium
-    the prompt names no color mode for (a painting, an illustration, a drawing)."""
+    """The color mode the long caption's opening states: bw, color, film; or the medium of a picture
+    that is not a photo: painting, illustration, drawing; None when the opening says neither."""
     head = " ".join(long.split()).lower()
     if head.startswith("a black-and-white"):
         return "bw"
@@ -368,6 +372,10 @@ def color_mode(long: str) -> str | None:
             return "bw"
         if re.search(r"colou?r", opening):
             return "color"
+        return None
+    for medium in MEDIUM_TOKENS:
+        if medium in opening:
+            return medium
     return None
 
 
@@ -417,7 +425,14 @@ def validate(short: str, style: str, long: str) -> list[str]:
     mode = color_mode(long)
     tokens = MODE_TOKENS_RU if style == "E" else MODE_TOKENS
     found = {m for m, toks in tokens.items() if any(t in low for t in toks)}
-    if mode is not None:
+    if mode in MEDIUM_TOKENS:
+        media = MEDIUM_TOKENS_RU if style == "E" else MEDIUM_TOKENS
+        if not any(t in low for t in media[mode]):
+            why.append(f"no medium (the long caption is a {mode}, not a photo)")
+        m = PHOTO_WORD.search(s)
+        if m:
+            why.append(f'a {mode} is not a photo (found {m.group(0)!r})')
+    elif mode is not None:
         if mode not in found:
             why.append(f'no color mode, or not the long caption\'s (use one of: {", ".join(tokens[mode])})')
         elif found - {mode}:
