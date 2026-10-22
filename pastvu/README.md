@@ -201,10 +201,11 @@ run.bat run --region ukraine --skip 5000 --limit 1000
 
 ```
 run.bat run --region ukraine
+run.bat run --region ukraine --resume
 run.bat run --scope ukraine_1970s
 ```
 
-Without `--limit`, the same command runs until every photo is done. Ctrl+C finishes the photos in progress and stops; a second Ctrl+C stops at once. `--scope` continues one scope only, here the 1970s. A photo that failed is tried again on the next run, up to `--retries` (3) times; a photo skipped as too small is not. `--reindex` pages the index again to find photos published since the first run.
+Without `--limit`, the same command runs until every photo is done. Running it again first goes over the index: finished shards are not paged again, but planning the shards asks PastVu for the photo count of every large region and its children, which takes a while for a big country. `--resume` skips the index altogether and downloads what the store lists already; it says how much of the index is done ("189 of 189 shards finished, 0 partly paged, 0 not started"), and when the index is not finished, a run without `--resume` lists the rest. Ctrl+C finishes the photos in progress and stops; a second Ctrl+C stops at once. `--scope` continues one scope only, here the 1970s. A photo that failed is tried again on the next run, up to `--retries` (3) times; a photo skipped as too small is not. `--reindex` pages the index again to find photos published since the first run.
 
 A run downloads a **scope**: regions and years. Its name is the aliases (or region names) joined by `+`, an underscore, and the years: `belarus_1917-1991`, `ukraine_1970s`, `minsk+brest_oblast_1945-1960`. More than three regions need `--name` or an alias of their own. Running the same command again continues it, as does `run --scope <name>`. The scope's folder follows `layout` in the conf (see [Folder layouts](#folder-layouts)): `<base>\1970s\ukraine\` by default.
 
@@ -514,6 +515,7 @@ Each saved photo costs one API call and one image download; a photo skipped as t
 | `--autocaption` | off | caption each saved photo with the VLM of `[caption]`; the downloads slow to its pace |
 | `--full-parent` | off | page a large region itself instead of through its children |
 | `--reindex` | off | page the scope again, to find photos published since |
+| `--resume` | off | skip the index (no requests to plan or page it) and download what is listed already |
 
 Before the subcommand: `--conf FILE` another conf, `--base DIR` another base folder, `--max-per-second N` a cap on the requests to PastVu.
 

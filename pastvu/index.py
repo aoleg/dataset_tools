@@ -130,6 +130,36 @@ def plan_shards(client: Client, store: Store, scope: str, region: dict, years: t
     return shards
 
 
+def progress_of(store: Store, name: str) -> dict:
+    """How far the index of a scope or family has got, from the store alone:
+    planned shards (None when no plan was recorded), finished, partly paged, rows."""
+    plan = store.get_meta(f"plan:{name}")
+    prefix = name + "|"
+    with store.lock:
+        rows = store.db.execute("SELECT key, done, rows FROM shards WHERE substr(key, 1, ?) = ?",
+                                (len(prefix), prefix)).fetchall()
+    state = {key: (done, n) for key, done, n in rows}
+    out = {"planned": None, "done": sum(1 for d, _ in state.values() if d),
+           "partial": sum(1 for d, _ in state.values() if not d), "rows": sum(n for _, n in state.values())}
+    if plan:
+        keys = [k for k, _ in plan["shards"]]
+        out.update(planned=len(keys), not_started=sum(1 for k in keys if k not in state),
+                   expected=sum(c for _, c in plan["shards"]))
+    return out
+
+
+def describe_progress(p: dict) -> str:
+    if p["planned"] is None:
+        text = f"{p['done']:,} shards finished, {p['partial']:,} partly paged; the full plan was not recorded"
+    else:
+        text = (f"{p['done']:,} of {p['planned']:,} shards finished, {p['partial']:,} partly paged, "
+                f"{p['not_started']:,} not started")
+    text += f" ({p['rows']:,} photos listed"
+    if p.get("expected"):
+        text += f" of about {p['expected']:,}"
+    return text + ")"
+
+
 def run_index(client: Client, store: Store, scope: dict, full_parent: bool = False, refresh: bool = False,
               shard_max: int = SHARD_MAX, log=print, progress=None, assign=None) -> dict:
     """Page every shard of the scope into the store; a finished shard is not
@@ -142,6 +172,9 @@ def run_index(client: Client, store: Store, scope: dict, full_parent: bool = Fal
     shards = []
     for cid in scope["regions"]:
         shards.extend(plan_shards(client, store, scope["name"], store.region(cid), years, full_parent, shard_max, log))
+    # the plan, so run --resume can tell how much of the index is done without asking PastVu again
+    store.set_meta(f"plan:{scope['name']}", {"years": list(years), "time": time.time(),
+                                             "shards": [[s["key"], s["count"]] for s in shards]})
     total_pages = sum(-(-s["count"] // PAGE_SIZE) for s in shards)
     stats = {"shards": len(shards), "pages": 0, "rows": 0, "new": 0, "count": sum(s["count"] for s in shards)}
     done_pages = 0

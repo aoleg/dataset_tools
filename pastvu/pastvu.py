@@ -230,7 +230,7 @@ def vlm_client(conf: cf.Conf):
     return client
 
 
-def scope_from_args(args, conf: cf.Conf, client: Client, store: Store) -> dict:
+def scope_from_args(args, conf: cf.Conf, client: Client, store: Store, create: bool = True) -> dict:
     ix.ensure_regions(client, store)
     years, decade = years_of(args, conf)
     regions, labels = ix.resolve(store, conf.aliases, args.region)
@@ -248,6 +248,8 @@ def scope_from_args(args, conf: cf.Conf, client: Client, store: Store) -> dict:
                              f"{', decade ' + str(sc['decade']) if sc['decade'] is not None else ''}; "
                              f"give another --name")
         return sc
+    if not create:
+        raise SystemExit(f"--resume: there is no scope {name} in this base yet; run the command once without --resume")
     split = args.split if getattr(args, "split", None) is not None else conf.split
     where = ", ".join(ix.region_path(store, r) for r in regions)
     rule = " (by start year)" if decade is not None else ""
@@ -301,9 +303,11 @@ def run_rule(args, store: Store):
     return rule
 
 
-def family_from_args(args, conf: cf.Conf, client: Client, store: Store, rule) -> tuple[dict, dict]:
+def family_from_args(args, conf: cf.Conf, client: Client, store: Store, rule,
+                     index: bool = True) -> tuple[dict, dict]:
     """run --by: index the regions and years of the arguments once and put each
-    photo into the scope its rule names, made on first sight.
+    photo into the scope its rule names, made on first sight. index False
+    (run --resume): no index, the scopes the family has listed so far.
     -> (the family as a pseudo scope, {name: scope} of every scope it fills)."""
     import partition as pt
     ix.ensure_regions(client, store)
@@ -362,6 +366,22 @@ def family_from_args(args, conf: cf.Conf, client: Client, store: Store, rule) ->
 
     fam = {"name": family, "regions": cids, "years": years, "decade": decade, "split": split, "width": 0}
     where = ", ".join(ix.region_path(store, r) for r in regions)
+    if not index:
+        scopes = {n: store.scope(n) for n in store.family(family)}
+        scopes = {n: sc for n, sc in scopes.items() if sc and of_this_run(sc)}
+        if not scopes:
+            raise SystemExit(f"--resume: nothing of {where}, {layout.years_label(years, decade)} by {rule.text} is "
+                             f"indexed in this base yet; run the command once without --resume")
+        p = ix.progress_of(store, family)
+        print(f"Resuming {where}, {layout.years_label(years, decade)} by {rule.text}: {len(scopes)} scopes, no "
+              f"indexing. Index: {ix.describe_progress(p)}.", flush=True)
+        if p["partial"] or p.get("not_started"):
+            print("  The index is not finished: this run downloads what is listed; run without --resume to list "
+                  "the rest.", flush=True)
+        elif p["planned"] is None:
+            print("  An older version made this index without recording its plan, so it may lack shards that were "
+                  "never started; a run without --resume finishes it.", flush=True)
+        return fam, scopes
     print(f"Indexing {where}, {layout.years_label(years, decade)}, into scopes by {rule.text} ...", flush=True)
     t0 = time.time()
     last = [0.0]
@@ -487,9 +507,11 @@ def run_locked(args, conf, client, base: Path, store: Store, sm) -> int:
     scopes = None
     if args.by and (args.scope or not args.region):
         raise SystemExit("--by takes --region (the regions and years to split), not --scope")
+    if args.resume and args.reindex:
+        raise SystemExit("--resume skips the index and --reindex pages it again: give one of them")
     rule = run_rule(args, store) if args.region and not args.scope else None
     if rule:
-        sc, scopes = family_from_args(args, conf, client, store, rule)
+        sc, scopes = family_from_args(args, conf, client, store, rule, index=not args.resume)
     elif args.scope:
         sc = scope_arg(base, store, args.scope)
         if args.reindex:
@@ -497,8 +519,12 @@ def run_locked(args, conf, client, base: Path, store: Store, sm) -> int:
             sc = do_index(args, client, store, sc)
         print(f"Resuming {sc['name']}")
     elif args.region:
-        sc = scope_from_args(args, conf, client, store)
-        sc = do_index(args, client, store, sc)
+        sc = scope_from_args(args, conf, client, store, create=not args.resume)
+        if args.resume:
+            p = ix.progress_of(store, sc["name"])
+            print(f"Resuming {sc['name']}, no indexing. Index: {ix.describe_progress(p)}.", flush=True)
+        else:
+            sc = do_index(args, client, store, sc)
     else:
         raise SystemExit("give --region (an alias, a region number or a title) or --scope NAME")
     names = sorted(scopes) if scopes else [sc["name"]]
@@ -1056,6 +1082,8 @@ def parse_args(argv=None):
     p = sub.add_parser("run", help="index (with --region) and download, process, sort and write a scope")
     scope_opts(p, False)
     p.add_argument("--scope", metavar="NAME", help="resume a scope by its name or folder")
+    p.add_argument("--resume", action="store_true",
+                   help="skip the index (no requests to plan or page it) and download what is listed already")
     p.add_argument("--regroup", action="store_true",
                    help="first move the saved photos the run's scopes list into them, from whatever scope holds them")
     p.add_argument("--samples", metavar="DIR", help="classify samples folder (default: [paths] samples of the conf)")
