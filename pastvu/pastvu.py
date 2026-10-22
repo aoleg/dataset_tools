@@ -31,6 +31,7 @@ import json
 import os
 import sys
 import time
+from collections import Counter
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -782,6 +783,53 @@ def cmd_export(args, conf, client) -> int:
     return 0
 
 
+def cmd_extract(args, conf, client) -> int:
+    import extract as xt
+    base, store = open_base(args, conf)
+    if args.out and len(args.category) > 1:
+        raise SystemExit("-o takes one category; without it each goes to <base parent>/<category and filters>")
+    scopes = xt.scope_filter(store.scopes(), args.scope)
+    years, decade = None, None
+    if args.decade is not None:
+        if args.decade % 10:
+            raise SystemExit(f"--decade {args.decade}: give the first year of a decade, e.g. 1970")
+        decade = args.decade
+    elif args.years:
+        years = tuple(args.years)
+    filters = {"years": years, "decade": decade, "scopes": args.scope or [],
+               "mode": "bw" if args.bw else "color" if args.color else None, "regions": [], "region_labels": []}
+    if args.region:
+        regions, labels = ix.resolve(store, conf.aliases, args.region)
+        filters["regions"] = sorted(r["cid"] for r in regions)
+        filters["region_labels"] = labels
+    with locked(store, "extract", "shared"):
+        picked = xt.select(store, base, scopes, args.category, filters)
+        for label, sel in picked.items():
+            out = Path(args.out).resolve() if args.out else base.parent / xt.folder_name(label, filters)
+            photos = sel["photos"]
+            modes = Counter(m or "none" for m, _ in photos.values())
+            also = f" (also written {', '.join(h for h in sel['hits'] if h != label)})" if len(sel["hits"]) > 1 else ""
+            no_mode = f" / no mode {modes['none']:,}" if modes.get("none") else ""
+            print(f"{label}{also}: {len(photos):,} photos, bw {modes.get('bw', 0):,} / colour "
+                  f"{modes.get('color', 0):,}{no_mode} -> {out}", flush=True)
+            criteria = {"category": label, "argument": sel["arg"], "folders": sel["hits"], "base": str(base),
+                        **{k: v for k, v in filters.items() if v}}
+            res = xt.extract(photos, out, criteria, args.split, args.link, args.prune, args.dry_run)
+            if args.dry_run:
+                print(f"  dry run: {res.get('new', 0):,} to copy, {res.get('there', 0):,} there already, "
+                      f"{res.get('stale', 0):,} no longer matching")
+                continue
+            done = res.get("linked", 0) + res.get("copied", 0)
+            how = f"{res.get('linked', 0):,} linked, {res.get('copied', 0):,} copied" if args.link \
+                else f"{done:,} copied"
+            print(f"  {how}, {res.get('there', 0):,} there already, {res.get('failed', 0) + res.get('gone', 0):,} "
+                  f"not copied; {res.get('stale', 0):,} files from earlier extracts no longer match"
+                  + (" and were deleted" if args.prune else (" (--prune deletes them)" if res.get("stale") else "")))
+    if not args.link:
+        print(xt.LINK_TIP)
+    return 0
+
+
 def cmd_regroup(args, conf, client) -> int:
     import partition as pt
     import regroup as rg
@@ -1176,6 +1224,27 @@ def parse_args(argv=None):
     p.add_argument("--format", choices=["jsonl", "parquet"], default="jsonl")
     p.add_argument("--to", metavar="FILE", help="the output file, for one scope (default <base>/<scope>_records.<format>)")
 
+    p = sub.add_parser("extract", help="copy the photos of a category into a flat folder for training (bw/ and "
+                                        "color/ kept)")
+    p.add_argument("category", nargs="+", metavar="CATEGORY",
+                   help="a category by number (050 or 50), name (transport) or full name (050-transport)")
+    p.add_argument("-o", "--out", metavar="DIR",
+                   help="the output folder, for one category (default: <base parent>/<category>[_<filters>])")
+    p.add_argument("--region", action="append", metavar="ALIAS|CID|TITLE",
+                   help="only photos placed in this region (the photo's own region chain); repeat for several")
+    when(p)
+    p.add_argument("--scope", action="append", metavar="NAME|PATTERN", help="only these scopes (estonia_*)")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--bw", action="store_true", help="only black-and-white photos")
+    g.add_argument("--color", action="store_true", help="only colour photos")
+    p.add_argument("--split", type=int, default=0, metavar="N",
+                   help="numbered folders of at most N images under bw/ and color/ (default 0: flat)")
+    p.add_argument("--link", action="store_true",
+                   help="hard-link the images instead of copying them (same drive; captions are still copied)")
+    p.add_argument("--prune", action="store_true",
+                   help="delete the files of earlier extracts into this folder that no longer match")
+    p.add_argument("--dry-run", action="store_true", help="count, copy nothing")
+
     p = sub.add_parser("regroup", help="move saved photos into scopes by decade, country or region, no downloads")
     p.add_argument("target", nargs="*", metavar="SCOPE",
                    help="scopes to split (names, folders or patterns); none: group every scope of the base")
@@ -1202,7 +1271,8 @@ def main(argv=None) -> int:
     try:
         cmds = {"regions": cmd_regions, "aliases": cmd_aliases, "count": cmd_count, "scopes": cmd_scopes,
                 "index": cmd_index, "run": cmd_run, "captions": cmd_captions, "reclassify": cmd_reclassify,
-                "export": cmd_export, "autocaption": cmd_autocaption, "regroup": cmd_regroup, "drop": cmd_drop}
+                "export": cmd_export, "autocaption": cmd_autocaption, "regroup": cmd_regroup, "drop": cmd_drop,
+                "extract": cmd_extract}
         return cmds[args.cmd](args, conf, client)
     finally:
         client.close()

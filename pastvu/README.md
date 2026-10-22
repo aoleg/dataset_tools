@@ -155,6 +155,7 @@ run.bat reclassify [<scope> ...] [--dry-run] [--undo] [--yes]
 run.bat captions <scope> [...] [--txt-fields LIST] [--dry-run]
 run.bat autocaption <scope or folder> [...] [--limit N] [--recaption] [--undo]
 run.bat export <scope> [...] [--format jsonl|parquet]
+run.bat extract <category> [...] [--region R] [--years A B | --decade D] [--bw | --color] [-o DIR]
 run.bat scopes | aliases | count --region <alias> | regions [--find TEXT]
 ```
 
@@ -461,6 +462,33 @@ Versions before 2026-10-23 put doubtful photos into `_unsure\<category>`. `recla
 
 Several scopes and name patterns are sorted one after another with one load of the classifier. Without a scope, reclassify works on every scope of the base folder; it first asks `This will reclassify N scope folders ... Continue? [y/N]` with the number of saved photos, and `--yes` skips the question. `reclassify --undo` without a scope undoes the last reclassify of every scope that has one, after the same question.
 
+## Extract
+
+```
+run.bat extract 050
+run.bat extract transport --decade 1970
+run.bat extract 100-environment_outdoors --region moscow --color
+run.bat extract 050 060 --years 1960 1979 --scope "russia_*"
+run.bat extract 050 -o D:\train\transport --link
+```
+
+Copies the photos of a category out of the base folder into a flat folder for training. Only the `bw\` and `color\` level stays; there are no decade, place or numbered folders:
+
+```
+<base parent>\050-transport_1970s\
+  bw\123456.jpg, 123456.txt, 123456.short
+  color\...
+  extract.json
+```
+
+- **The category** is named by its number (`050` or `50`), its name (`transport`) or its full name (`050-transport`). Folders written differently but meaning the same category (`50_transport` from older samples) are taken together. When a number or name matches two different categories, for example `140-aerial` and `140-monuments`, extract refuses and asks for the full name. Several categories at once each go into their own folder.
+- **The photos are found where they are on disk**, in the category folders of every scope, so a photo you moved by hand to another category, or between `bw\` and `color\`, is extracted from where it sits now. Only finished photos are taken, so extract can run beside a download.
+- **Filters narrow the selection and never add folders:** `--region` (one or more, matched against the photo's own region chain, so `--region crimea` finds Crimean photos in `russia_1970s`), `--years` (dating overlaps the years), `--decade` (dating starts in the decade), `--scope` (names or patterns), `--bw` or `--color`.
+- **The output folder** is `<base parent>\<category>` with the filters added to the name (`050-transport_1970s`, `050-transport_ukraine_1960-1979`), or `-o` for one category. `--split N` puts at most N images into each numbered folder under `bw\` and `color\` when a flat folder grows too large.
+- **Each image comes with its caption** (`.txt`, the VLM caption where there is one) and its `.short` caption if [recaption_json](../recaption_json/README.md) made one.
+- **Running it again tops the folder up:** new photos are copied, files already there are left as they are (captions you edited for training stay), and files from earlier extracts that no longer match (reclassified, moved, dropped) are reported; `--prune` deletes them. Files you put there yourself are never pruned. `extract.json` holds the criteria and the files extract copied.
+- **Copy or link.** Images are copied by default. `--link` hard-links them instead, so they take no extra disk space on the same drive; captions are always copied. A tool that edits images in place (remove_borders, jpeg_cleanup) would then change the base's files too, which is why it is not the default; every run without `--link` prints a reminder that it exists. `--dry-run` counts and copies nothing.
+
 ## Progress and resume
 
 The live display shows the current activity on a status line ("163150: detecting watermarks", "163150: saving 5_transport/001/163150.jpg", "waiting for downloads (4 in flight)") above a progress bar with the rate and the time left. Every `--report-every` photos (500) a report block is printed above them and stays: photos saved, skipped by reason and already saved under another scope, band and border cuts, watermarks painted and detected below the threshold, how the files were written, the categories, and the time per stage. `--quiet` prints the report blocks only; `--json-progress` prints one JSON line per photo.
@@ -555,6 +583,7 @@ Each record carries what attribution and a takedown need: the PastVu page, the u
 | `vram.py` | the GPU memory of the whole card, through NVML |
 | `tagging\` | the default prompts of autocaption |
 | `export.py` | records as JSON Lines or Parquet |
+| `extract.py` | a category copied into a flat folder for training |
 | `sidecars.py` | the caption and the record |
 | `progress.py` | the live display and the report blocks |
 | `stream.py` | the threads and the run |
