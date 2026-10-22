@@ -2,8 +2,9 @@
 photo belongs to, by its decade, its country, its region, or a pair of them.
 
 - decade: from the photo's start year (the gallery's `year`), so every photo
-  belongs to exactly one decade; a decade outside the years asked for is
-  created like any other.
+  belongs to exactly one decade. A run keeps the decades its years cover
+  (1917-1991: the 1910s to the 1990s); a photo PastVu lists for the years
+  that starts in another decade (dated 1890-1920) joins no scope.
 - country: the alias of the conf's countries section that matches the
   photo's region chain at the deepest level, the first in the file on a tie.
   Aliases that name two or more countries (ussr, baltics, ...) are never

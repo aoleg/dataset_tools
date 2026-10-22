@@ -319,6 +319,18 @@ def family_from_args(args, conf: cf.Conf, client: Client, store: Store, rule) ->
     split = args.split if getattr(args, "split", None) is not None else conf.split
     part = pt.Partitioner(store, conf.aliases, conf.groups, rule, label, cids)
     inside = ix.member_test(years, decade)
+    if rule.decade and decade is None:
+        # a decade split keeps the decades the years cover: 1917-1991 gives the 1910s to the 1990s; a photo
+        # dated 1890-1920 is listed by PastVu's overlap filter but starts in the 1890s, so it joins no scope
+        lo, hi = years[0] // 10 * 10, years[1] // 10 * 10 + 9
+        inside = lambda p: p.get("year") is not None and lo <= int(p["year"]) <= hi  # noqa: E731
+
+        def of_this_run(sc):
+            return sc["decade"] is not None and lo <= sc["decade"] <= hi
+    else:
+        def of_this_run(sc):
+            target = (decade, decade + 9) if rule.decade else years
+            return tuple(sc["years"]) == tuple(target) and sc["decade"] == decade
     family = f"{label}@{rule.text}"
     made: dict[str, dict] = {}
     cache: dict[tuple, str] = {}
@@ -342,6 +354,7 @@ def family_from_args(args, conf: cf.Conf, client: Client, store: Store, rule) ->
             if name not in made:
                 is_new = store.scope(name) is None
                 made[name] = store.ensure_scope(name, regs, y, d, split, lab, 0)
+                store.add_family(family, [name])           # at once: an index cut short keeps its scopes
                 if is_new:
                     print(f"  new scope {name}", flush=True)
             cache[key] = name
@@ -364,7 +377,7 @@ def family_from_args(args, conf: cf.Conf, client: Client, store: Store, rule) ->
     scopes = {}
     for name in store.family(family):
         sc = store.scope(name)
-        if not sc:
+        if not sc or not of_this_run(sc):          # the family also lists scopes of runs with other years
             continue
         if sc["split"] and not sc["width"]:
             store.set_scope_width(name, layout.chunk_width(store.scope_counts(name)["total"], sc["split"]))
