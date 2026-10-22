@@ -1,9 +1,9 @@
-"""Delete .txt and .small caption sidecars that have no matching image,
+"""Delete .txt and .short caption sidecars that have no matching image,
 recursively.
 
-A sidecar "name.txt" or "name.small" (the shorter alternative caption) is
+A sidecar "name.txt" or "name.short" (the shorter alternative caption) is
 kept when the same folder holds "name.png", "name.jpg", "name.jpeg" or
-"name.gif" (case-insensitive). Every other .txt and .small file is deleted.
+"name.gif" (case-insensitive). Every other .txt and .short file is deleted.
 
 Usage:
     python clean_orphaned_txt.py [folder] [--dry-run] [--quiet]
@@ -15,7 +15,7 @@ import sys
 import time
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif"}
-SIDECAR_EXTS = {".txt", ".small"}
+SIDECAR_EXTS = {".txt", ".short"}
 
 
 def scan(root, dry_run, quiet):
@@ -74,7 +74,7 @@ def scan(root, dry_run, quiet):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Recursively delete .txt and .small sidecars with no matching "
+        description="Recursively delete .txt and .short sidecars with no matching "
                     "png/jpg/jpeg/gif in the same folder.")
     ap.add_argument("folder", nargs="?", default=".",
                     help="root folder (default: current folder)")
