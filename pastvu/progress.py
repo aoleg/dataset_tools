@@ -18,7 +18,7 @@ from rich.progress import BarColumn, MofNCompleteColumn, Progress, TaskProgressC
     TimeRemainingColumn
 from rich.text import Text
 
-STAGES = ["fetch", "detect", "paint", "classify", "encode", "write", "caption"]
+STAGES = ["fetch", "detect", "paint", "colour", "classify", "encode", "write", "caption"]
 
 
 def hms(seconds: float) -> str:
@@ -79,6 +79,10 @@ def report_block(totals: dict, session: Stats, counts: dict, elapsed: float, fin
     lines.append(f"  saved as: {int(c.get('write.verbatim', 0)):,} untouched, {int(c.get('write.lossless', 0)):,} "
                  f"lossless JPEG crops, {int(c.get('write.exact', 0)) + int(c.get('write.png', 0)):,} exact crops, "
                  f"{int(c.get('write.array', 0)):,} re-encoded after painting")
+    bw, col = int(c.get("mode.bw", 0)), int(c.get("mode.color", 0))
+    if bw or col:
+        lines.append(f"  black-and-white {bw:,}, colour {col:,} ({col / max(1, bw + col):.1%} colour; "
+                     f"{int(c.get('mode.probe', 0)):,} borderline photos decided by the probe)")
     if cats:
         unsure = sum(v for k, v in cats.items() if k.startswith("_unsure"))
         top = Counter({k: v for k, v in cats.items() if not k.startswith("_unsure")})

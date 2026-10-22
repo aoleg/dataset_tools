@@ -102,6 +102,7 @@ class Classifier:
         cl.check_samples(classes)
         args = SimpleNamespace(patches=patches, threads=8, batch=64, reembed=False)
         res = cl.embed_samples(self.samples, classes, self.encoder, args)
+        self.sample_vectors = res.vectors          # rel -> embedding, for the colour probe
         rep = cl.Report()
         self.ts, self.cv, self.probe, self.example_hashes = cl.fit_probe(classes, res, rep)
         self.n_classes = len(self.ts.class_names)

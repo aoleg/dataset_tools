@@ -106,8 +106,8 @@ def chunk_category(store, base: Path, sc: dict, category: str, width: int, log=p
     """Move the images that lie directly in a category folder into its lowest
     numbered folders with room (001 first), and point the store at every
     image of the category's numbered folders. Safe to run again. -> placed[chunk]."""
-    name, folder, split = sc["name"], sc["folder"], sc["split"]
-    cat_dir = base / folder / category if category else base / folder
+    name, split = sc["name"], sc["split"]
+    cat_dir = base / layout.to_base(sc, category)
     _journal(store, name, category, True)
     counts: Counter = Counter()
     loose = []
@@ -167,7 +167,7 @@ def chunk_category(store, base: Path, sc: dict, category: str, width: int, log=p
     flush()
     _journal(store, name, category, False)
     if loose:
-        log(f"  {folder}/{category or '.'}: passed {split:,} images; {len(loose):,} moved into numbered folders")
+        log(f"  {layout.to_base(sc, category)}: passed {split:,} images; {len(loose):,} moved into numbered folders")
     return dict(placed)
 
 
@@ -183,15 +183,14 @@ class ScopeChunks:
         for scope, category in [tuple(x) for x in store.get_meta(JOURNAL, [])]:
             if scope == sc["name"] and self.width:          # a move cut short: finish it, the store follows
                 chunk_category(store, base, sc, category, self.width, log)
-        prefix = self.folder + "/"
-        rels = [p[len(prefix):] for p in store.scope_paths(sc["name"]) if p.startswith(prefix)]
+        rels = [r for r in (layout.to_scope(sc, p) for p in store.scope_paths(sc["name"])) if r is not None]
         self.chunker = layout.Chunker(sc["split"], sc["width"], rels)
         if not defer:
             self.settle()
 
     def rel(self, scope_rel: str) -> str:
-        """Relative to the scope folder -> relative to the base."""
-        return f"{self.folder}/{scope_rel}"
+        """Relative to the scope -> relative to the base."""
+        return layout.to_base(self.sc, scope_rel)
 
     def place(self, category: str, name: str) -> str:
         return self.chunker.place(category, name)
@@ -215,13 +214,32 @@ class ScopeChunks:
                                                         self.log))
 
 
-def locate(base: Path, folder: str, cid: int, path: str | None, scans: dict) -> str | None:
+def scan_rels(base: Path, sc: dict) -> dict[int, str]:
+    """PastVu number -> scope-relative path of its image, over every root of the scope."""
+    out = {}
+    for prefix, root in layout.scope_roots(sc):
+        if (base / root).is_dir():
+            for cid, rel in scan_scope(base / root).items():
+                out[cid] = prefix + rel
+    return out
+
+
+def locate(base: Path, sc: dict, cid: int, path: str | None, scans: dict) -> str | None:
     """Where the photo's image is, relative to the base: where the store says,
-    else wherever it was moved to inside its scope's folder (scans caches the
-    scan of each folder)."""
+    else wherever it was moved to inside its scope's roots (scans caches the
+    scan of each scope)."""
     if path and (base / path).is_file():
         return path
-    if folder not in scans:
-        scans[folder] = scan_scope(base / folder) if (base / folder).is_dir() else {}
-    rel = scans[folder].get(cid)
-    return f"{folder}/{rel}" if rel else None
+    if sc["name"] not in scans:
+        scans[sc["name"]] = scan_rels(base, sc)
+    rel = scans[sc["name"]].get(cid)
+    return layout.to_base(sc, rel) if rel else None
+
+
+def prune_scope(base: Path, sc: dict) -> int:
+    return sum(prune_empty(base / root) for _, root in layout.scope_roots(sc))
+
+
+def remove_scope_folders(base: Path, sc: dict) -> bool:
+    """remove_folder for every root of the scope; False when one keeps foreign files."""
+    return all([remove_folder(base, root) for _, root in layout.scope_roots(sc)])

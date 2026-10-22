@@ -57,6 +57,52 @@ def check_scope_name(name: str) -> str:
     return name
 
 
+MODES = ("bw", "color")
+
+
+def scope_roots(sc: dict) -> list[tuple[str, str]]:
+    """Where a scope's photos live: (the start of a scope-relative path, the
+    folder relative to the base) per root. A base split by black-and-white
+    and colour gives every scope two roots, bw/<folder> and color/<folder>,
+    and a scope-relative path starts with its mode: bw/50_transport/123.jpg."""
+    if sc.get("split_mode"):
+        return [(f"{m}/", f"{m}/{sc['folder']}") for m in MODES]
+    return [("", sc["folder"])]
+
+
+def to_base(sc: dict, rel: str) -> str:
+    """A scope-relative path (or category folder) -> relative to the base."""
+    if sc.get("split_mode"):
+        mode, _, rest = rel.partition("/")
+        return f"{mode}/{sc['folder']}" + (f"/{rest}" if rest else "")
+    return sc["folder"] + (f"/{rel}" if rel else "")
+
+
+def to_scope(sc: dict, base_rel: str) -> str | None:
+    """Relative to the base -> relative to the scope (None when outside it)."""
+    for prefix, root in scope_roots(sc):
+        if base_rel == root:
+            return prefix.rstrip("/")
+        if base_rel.startswith(root + "/"):
+            return prefix + base_rel[len(root) + 1:]
+    return None
+
+
+def mode_category(sc: dict, folder: str) -> tuple[str | None, str]:
+    """A category folder relative to the scope -> (its mode, the category)."""
+    if sc.get("split_mode"):
+        mode, _, rest = folder.partition("/")
+        return mode, rest
+    return None, folder
+
+
+def with_mode(sc: dict, mode: str | None, category: str) -> str:
+    """The category folder of a photo relative to the scope."""
+    if sc.get("split_mode") and mode:
+        return f"{mode}/{category}" if category else mode
+    return category
+
+
 def scope_width(sc: dict) -> int:
     """The digits of the scope's numbered folders (0: it has none)."""
     return max(sc["width"], 3) if sc["split"] > 0 else 0

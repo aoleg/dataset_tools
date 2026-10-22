@@ -84,7 +84,7 @@ CREATE TABLE IF NOT EXISTS caption_runs (
 PENDING, WRITING, DONE, SKIPPED, FAILED = "pending", "writing", "done", "skipped", "failed"
 REGION_COLS = "cid, parent, parents, title_en, title_local, phc, pac, child_len"
 STATUS_COLS = ("cid", "state", "reason", "attempts", "scope", "category", "path", "sha256", "bytes", "width", "height",
-               "changed")
+               "changed", "mode")
 
 
 class Store:
@@ -108,6 +108,8 @@ class Store:
             self.db.execute("ALTER TABLE scopes ADD COLUMN label TEXT")
         if "folder" not in cols:
             self.db.execute("ALTER TABLE scopes ADD COLUMN folder TEXT")
+        if "mode" not in {r[1] for r in self.db.execute("PRAGMA table_info(status)")}:
+            self.db.execute("ALTER TABLE status ADD COLUMN mode TEXT")
         self.set_meta("schema", SCHEMA_VERSION)
 
     def close(self) -> None:
@@ -186,7 +188,8 @@ class Store:
             return None
         return {"name": row[0], "regions": json.loads(row[1]), "years": tuple(json.loads(row[2])), "decade": row[3],
                 "split": row[4], "width": row[5], "created": row[6], "indexed": row[7],
-                "label": row[8] or row[0].rsplit("_", 1)[0], "folder": row[9] or row[0]}
+                "label": row[8] or row[0].rsplit("_", 1)[0], "folder": row[9] or row[0],
+                "split_mode": bool(self.get_meta("bw_color", False))}
 
     def layout(self) -> str:
         """The folder tree of the base: set when its first scope is made; bases
@@ -418,7 +421,8 @@ class Store:
         def work(db):
             for cid in cids:
                 db.execute("UPDATE status SET state=?, reason='', attempts=0, scope=NULL, category=NULL, path=NULL, "
-                           "sha256=NULL, bytes=NULL, width=NULL, height=NULL, changed=NULL, updated=? WHERE cid=?",
+                           "sha256=NULL, bytes=NULL, width=NULL, height=NULL, changed=NULL, mode=NULL, updated=? "
+                           "WHERE cid=?",
                            (PENDING, time.time(), cid))
                 for t in ("records", "embeddings", "captions", "caption_fails", "caption_log"):
                     db.execute(f"DELETE FROM {t} WHERE cid=?", (cid,))
@@ -464,9 +468,10 @@ class Store:
 
         def work(db):
             db.execute("UPDATE status SET state=?, reason='', scope=?, category=?, path=?, sha256=?, bytes=?, width=?, "
-                       "height=?, changed=?, updated=? WHERE cid=?",
+                       "height=?, changed=?, mode=?, updated=? WHERE cid=?",
                        (DONE, scope, facts.get("category", ""), facts["path"], facts.get("sha256"), facts.get("bytes"),
-                        facts.get("width"), facts.get("height"), json.dumps(facts.get("changed") or []), now, cid))
+                        facts.get("width"), facts.get("height"), json.dumps(facts.get("changed") or []),
+                        facts.get("mode"), now, cid))
             db.execute("INSERT OR REPLACE INTO records (cid, json) VALUES (?, ?)", (cid, record))
             if emb is not None:
                 model, patches, vec = emb
@@ -513,9 +518,11 @@ class Store:
                     db.execute("UPDATE records SET json=? WHERE cid=?", (record, cid))
         self.tx(work)
 
-    def move(self, cid: int, path: str, category: str, record: str | None = None) -> None:
+    def move(self, cid: int, path: str, category: str, record: str | None = None, mode: str | None = None) -> None:
         def work(db):
             db.execute("UPDATE status SET path=?, category=?, updated=? WHERE cid=?", (path, category, time.time(), cid))
+            if mode:
+                db.execute("UPDATE status SET mode=? WHERE cid=?", (mode, cid))
             if record is not None:
                 db.execute("UPDATE records SET json=? WHERE cid=?", (record, cid))
 
@@ -791,4 +798,9 @@ def record_counters(rec: dict, folder: str) -> dict:
         kw["c.wm_below"] = 1
     if folder:
         kw[f"cat.{folder}"] = 1
+    col = p.get("colour") or {}
+    if col.get("mode"):
+        kw[f"c.mode.{col['mode']}"] = 1
+        if col.get("by") == "probe":
+            kw["c.mode.probe"] = 1
     return kw

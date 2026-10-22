@@ -18,11 +18,12 @@ You give a place and years, for example “Belarus, 1917 to 1991” or “Ukrain
    - It trims scanned frames and white borders.
    - It paints out printed captions, photographer credits and watermarks. It paints only marks it is confident about, so real shop signs and buildings are left alone.
    - Cropping never lowers JPEG quality; only painting re-saves an image.
-3. **Sort:** it puts the photo into your categories, such as transport, people or monuments, learned from example images you put in a samples folder. When two categories fit about equally, the one with the lower folder number wins. Doubtful photos go into an “unsure” folder.
-4. **Caption:** it writes a short facts line from PastVu’s record: title, years, place and description.
-5. **Describe with a model (optional):** a vision model on your own machine, currently Gemma 4 in KoboldCpp, writes a full English description. It starts from the facts line and adds what is visible in the photo.
+3. **Black-and-white or colour:** a fast pixel test tells colour photos from black-and-white ones, and counts sepia, toned prints and yellowed paper as black-and-white.
+4. **Sort:** it puts the photo into your categories, such as transport, people or monuments, learned from example images you put in a samples folder. When two categories fit about equally, the one with the lower folder number wins. Doubtful photos go into an “unsure” folder.
+5. **Caption:** it writes a short facts line from PastVu’s record: title, years, place and description.
+6. **Describe with a model (optional):** a vision model on your own machine, currently Gemma 4 in KoboldCpp, writes a full English description. It starts from the facts line and adds what is visible in the photo.
 
-Downloads are filed by decade, then by place (`1970s\russia\transport`), or by place first, or in one folder per download, as the settings file says. A category that grows past 5,000 images is split into numbered folders, so Explorer stays fast.
+Downloads are split into black-and-white and colour first, then filed by decade and place (`bw\1970s\russia\transport`, `color\1970s\russia\transport`), or by place first, or in one folder per download, as the settings file says. A category that grows past 5,000 images is split into numbered folders, so Explorer stays fast.
 
 ### Safety and convenience
 
@@ -63,6 +64,7 @@ samples = D:\samples                  the classify samples folder
 [defaults]
 years = 1917 1991                     years of a run without --years or --decade
 layout = years/place                  the folder tree: years/place, place/years or flat
+bw_color = yes                        black-and-white and colour photos in two trees, bw\ and color\
 split = 5000                          at most this many images per folder; 0: no split
 fetchers = 4                          download threads
 json_files = no                       also write each record as a JSON file
@@ -156,7 +158,7 @@ run.bat export <scope> [...] [--format jsonl|parquet]
 run.bat scopes | aliases | count --region <alias> | regions [--find TEXT]
 ```
 
-Where a command takes scopes, a scope can be given by its name, by its folder, or by a name pattern with `*` and `?`: `estonia_*` is every scope whose name starts with `estonia_`. A folder that holds scope folders stands for all of them: `1970s` (or `<base>\1970s`) is every scope of the 1970s in a years/place base. In Git Bash or PowerShell, put a pattern in quotes.
+Where a command takes scopes, a scope can be given by its name, by its folder, or by a name pattern with `*` and `?`: `estonia_*` is every scope whose name starts with `estonia_`. A folder that holds scope folders stands for all of them: `color` (or `<base>\color`) is the colour tree of every scope, and `color\1970s` the colour photos of every scope of the 1970s. In Git Bash or PowerShell, put a pattern in quotes.
 
 Examples:
 
@@ -255,7 +257,8 @@ Both kinds of regroup move files the same way:
 3. **Watermarks** (GPU): the [watermark](../watermark/README.md) detector runs on the picture without the band, so the band's own text is never taken for a watermark. Detections from `--wm-conf` (0.1) go into the record; only those from `--wm-paint-conf` (0.4) are painted out with LaMa. Below 0.4 the detector often finds scene text and objects (a shop sign, a building facade); from 0.4 up it found printed captions and credits in every case checked.
 4. **Crop**: the band, the border cuts and a watermark trim (`--wm-mode trim`) make one crop, put on the JPEG block grid: the top and left edges move inward to the next block where a cut set them, so the cut part goes completely, and the far edges are exact.
 5. **Classify** (GPU): the final pixels are embedded with SigLIP 2 and scored by classify's probe, trained once at start on the samples folder. Among the categories within `priority_margin` of the top score, the lowest-numbered takes the image ([The samples folder](#the-samples-folder)). Then classify's gates: the summed score of those near categories against the confidence threshold (`--min-confidence`, 0.7) and their summed share of the 10 nearest examples against 0.3; an image that fails goes to `_unsure` under the chosen category. A byte-identical copy of a sample takes the sample's category. The record keeps the score of the chosen category and, when the priority chose it over a higher score, which category that was.
-6. **Write** (writer threads): the image and its caption go into the next folder of the category with room; then the photo's status, its record, its embedding and the scope's counters are committed to the store in one transaction.
+6. **Black-and-white or colour** (CPU, about 0.06 s): the pixel test on the final picture, with the painted watermark boxes left out; a borderline photo is decided by the probe on its SigLIP 2 embedding ([Black-and-white and colour](#black-and-white-and-colour)).
+7. **Write** (writer threads): the image and its caption go into the next folder of the category with room, under `bw\` or `color\`; then the photo's status, its record, its embedding and the scope's counters are committed to the store in one transaction.
 
 Pixels stay in memory from the download to the write; no temporary file is made. How an image is written:
 
@@ -272,16 +275,20 @@ A JPEG crop keeps every coefficient of the kept blocks; the decoded pixels can s
 ```
 <base>\
   pastvu.db                                     the store of every scope
-  1970s\
-    belarus\                                    the scope belarus_1970s
-      50_transport\163150.jpg                   the image, named by its PastVu number
-      50_transport\163150.txt                   its caption
-      90_environment_outdoors\001\165001.jpg    a category past 5,000 images: numbered folders
-      90_environment_outdoors\002\...           the next 5,000 images of the category
-      _unsure\50_transport\165002.jpg           below the confidence gate, under its best guess
-    ukraine\                                    the scope ukraine_1970s
-  1980s\
-    ...
+  bw\                                           black-and-white photos
+    1970s\
+      belarus\                                  the black-and-white photos of the scope belarus_1970s
+        50_transport\163150.jpg                 the image, named by its PastVu number
+        50_transport\163150.txt                 its caption
+        90_environment_outdoors\001\165001.jpg  a category past 5,000 images: numbered folders
+        90_environment_outdoors\002\...         the next 5,000 images of the category
+        _unsure\50_transport\165002.jpg         below the confidence gate, under its best guess
+      ukraine\
+    1980s\
+      ...
+  color\                                        colour photos, the same tree
+    1970s\
+      belarus\
   _records\016\163150.json                      with json_files = yes only
   _reports\                                     reclassify --dry-run plans
   belarus_1970s_records.jsonl                   written by export
@@ -291,7 +298,7 @@ This is the default layout. [Folder layouts](#folder-layouts) shows the other tw
 
 ### Folder layouts
 
-`layout` in `[defaults]` of `pastvu.conf` decides how the scope folders of a base folder are arranged. There are three:
+`layout` in `[defaults]` of `pastvu.conf` decides how the scope folders of a base folder are arranged. There are three. With `bw_color = yes` (the default) the whole tree is there twice, once under `bw\` and once under `color\` ([Black-and-white and colour](#black-and-white-and-colour)); the examples below leave that level out.
 
 | layout | the tree | `ukraine_1970s` goes into |
 |---|---|---|
@@ -389,7 +396,23 @@ A conf serves every base folder, and each base keeps the layout it was made with
 run.bat --base D:\pastvu_flat run --region estonia
 ```
 
-**Numbered folders.** A category holds its images directly until it would pass `split` images (5,000 by default, so 10,000 files with the captions; Explorer slows down in folders much larger than that). Then its images move into the numbered folder `001`, and the next ones go into `002`, `003`, and so on, each of at most `split` images. The move takes a few seconds and happens during the download, as soon as no image of the category is being written; the store follows each file, and a move cut short by a crash is finished the next time the scope is written to. A category stays chunked when reclassify or regroup later takes images out of it, and the lowest numbered folder with room takes the next image. A category stays one tree: AI Toolkit and the dataset tools read subfolders, so point them at the category folder. `--split` sets another size for a new scope; with `--no-classify` the images and their numbered folders are directly in the scope folder.
+### Black-and-white and colour
+
+`bw_color = yes` in `[defaults]` (the default for a new base) puts every photo into one of two trees, `<base>\bw\` and `<base>\color\`, each arranged by `layout`: `bw\1970s\russia\50_transport\` and `color\1970s\russia\50_transport\`. Training needs the two balanced, and the decades differ widely in how many colour photos they hold, so `scopes` and the report of every run give the black-and-white and colour counts of each scope.
+
+**The test.** A toned print (sepia, selenium, cyanotype, yellowed paper) has a colour that depends only on brightness; a colour photo also has colour in other hues. The tool fits the tone curve of the picture (the median colour per brightness band, in Lab), takes the colour that is left, and keeps the part that points away from the tone's own hue. A photo is colour when at least 1 % of the picture has more than 6 units of such off-hue colour, or 3 % has more than 12 units of leftover colour. The test runs on the final picture (after the band, border and watermark cuts) with the painted watermark boxes left out, on its central 90 % reduced to 128 pixels, in about 0.06 s on the CPU. Sepia, toned and split-toned prints, poor scans and yellowed paper count as black-and-white; aged and faded colour prints count as colour.
+
+**Borderline photos.** About 10 % of photos lie close to those lines. A run that sorts into categories (the default) already has each photo's SigLIP 2 embedding, and a small probe decides the borderline ones: a logistic regression trained at start on the samples folder images that the pixel test is sure about, so it needs no labels of its own. The pixel scores of the samples are cached in `<samples>\_embeddings\pastvu_colour.json`, so only the first run pays the few seconds. With `--no-classify` the pixel test decides alone; the encoder is never loaded for this test only.
+
+**How good it is.** Calibrated on 1,280 sample images, 264 of them checked by hand, most of those borderline: the pixel test alone missed 3 colour photos and called 10 black-and-white photos colour; with the probe it missed no colour photo and called 8 black-and-white photos colour, half of them one-ink posters, documents on cream paper or photos with a coloured stamp. That is about 1 % of all photos either way, and the misses are near-neutral colour photos (a grey river scene, a white TV set) and black-and-white prints with uneven toning or stains.
+
+**Correcting by hand.** Move a photo's image (with its caption) from `bw\` to `color\` or back. `reclassify` then treats it as a hand-sorted photo: it records the new mode in the store and the record, and leaves the photo where you put it. The record keeps the test's numbers in `processing.colour` (`mode`; `by`: `rule`, `probe` or `hand`; `off_hue`, `strong`, `tone`, and `probe` for a borderline photo), so another threshold can be applied later without downloading again.
+
+**Existing bases.** Like the layout, the setting is fixed per base when its first scope is made, and a base made before it existed is not split; its photos still get the test, the counts and the record. A conf without the line gets `bw_color` written into `[defaults]`.
+
+### Numbered folders
+
+A category holds its images directly until it would pass `split` images (5,000 by default, so 10,000 files with the captions; Explorer slows down in folders much larger than that). Then its images move into the numbered folder `001`, and the next ones go into `002`, `003`, and so on, each of at most `split` images. The move takes a few seconds and happens during the download, as soon as no image of the category is being written; the store follows each file, and a move cut short by a crash is finished the next time the scope is written to. A category stays chunked when reclassify or regroup later takes images out of it, and the lowest numbered folder with room takes the next image. A category stays one tree: AI Toolkit and the dataset tools read subfolders, so point them at the category folder. `--split` sets another size for a new scope; with `--no-classify` the images and their numbered folders are directly in the scope folder.
 
 **The caption** is one line of facts for the captioner, in the record's language with the English region names added: title, years, regions, address and description, in that order, empty parts left out (`--txt-fields` chooses the parts and their order; `direction` adds the camera direction). Example:
 
@@ -517,6 +540,7 @@ Each record carries what attribution and a takedown need: the PastVu page, the u
 | `index.py` | the index of a scope, and how `--region` is resolved |
 | `partition.py` | the rules of `--by`: which scope a photo belongs to |
 | `regroup.py` | moving photos between scopes, drop, and undo |
+| `colour.py` | the black-and-white or colour test, and the probe for borderline photos |
 | `folders.py` | finding and moving files, and the move of a category into numbered folders |
 | `runlock.py` | whether the process that holds the lock still runs |
 | `layout.py` | scope names, the folder tree, and the numbered-folder allocator |

@@ -66,6 +66,7 @@ class Conf:
     json_files: bool = False
     priority_margin: float = 0.15
     layout: str | None = None          # the folder tree of a new base; None: not in the file (written on first use)
+    bw_color: bool | None = None       # bw/ and color/ at the top of a new base; None: not in the file
     caption: CaptionConf = field(default_factory=CaptionConf)
     aliases: dict[str, list[int]] = field(default_factory=dict)
     groups: dict[str, str] = field(default_factory=dict)      # alias -> its group
@@ -105,22 +106,32 @@ LAYOUT_COMMENT = [
 ]
 
 
+BW_COLOR_COMMENT = [
+    "; Black-and-white and colour photos in two trees: <base>\\bw\\... and",
+    "; <base>\\color\\..., each with the layout above. A base keeps the choice it was made with.",
+]
+
+
 def save_layout(path: Path, value: str) -> None:
-    """Write layout = value into [defaults] of the conf file, keeping the rest
-    of the file as it is."""
+    save_default(path, "layout", value, LAYOUT_COMMENT)
+
+
+def save_default(path: Path, key: str, value: str, comment: list[str]) -> None:
+    """Write key = value into [defaults] of the conf file, keeping the rest of
+    the file as it is."""
     with open(path, encoding="utf-8", newline="") as f:
         text = f.read()
     nl = "\r\n" if "\r\n" in text else "\n"
     lines = text.splitlines()
-    entry = LAYOUT_COMMENT + [f"layout = {value}"]
+    entry = comment + [f"{key} = {value}"]
     head = next((i for i, l in enumerate(lines) if l.strip().lower() == "[defaults]"), None)
     if head is None:
         lines += ["", "[defaults]"] + entry
     else:
         end = next((i for i in range(head + 1, len(lines)) if lines[i].strip().startswith("[")), len(lines))
-        old = next((i for i in range(head + 1, end) if lines[i].split("=")[0].strip().lower() == "layout"), None)
+        old = next((i for i in range(head + 1, end) if lines[i].split("=")[0].strip().lower() == key), None)
         if old is not None:
-            lines[old] = f"layout = {value}"
+            lines[old] = f"{key} = {value}"
         else:
             while end > head + 1 and not lines[end - 1].strip():
                 end -= 1
@@ -158,6 +169,8 @@ def load(path: Path | None = None) -> Conf:
                 raise SystemExit(f"{path}: [defaults] layout must be one of {', '.join(LAYOUTS)}")
             conf.layout = lay
         try:
+            if d.get("bw_color", "").strip():
+                conf.bw_color = d.getboolean("bw_color")
             conf.split = d.getint("split", fallback=conf.split)
             conf.fetchers = d.getint("fetchers", fallback=conf.fetchers)
             conf.json_files = d.getboolean("json_files", fallback=conf.json_files)

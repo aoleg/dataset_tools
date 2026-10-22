@@ -24,7 +24,8 @@ from folders import move_pair, prune_empty, scan_scope  # noqa: F401
 from store import Store
 
 
-def update_record(store: Store, cid: int, rel: str, verdict_dict: dict | None, note: dict) -> str | None:
+def update_record(store: Store, cid: int, rel: str, verdict_dict: dict | None, note: dict,
+                  mode: str | None = None) -> str | None:
     rec = store.record(cid)
     if rec is None:
         return None
@@ -32,20 +33,27 @@ def update_record(store: Store, cid: int, rel: str, verdict_dict: dict | None, n
     if verdict_dict is not None:
         note["previous"] = rec.get("classification")
         rec["classification"] = verdict_dict
+    if mode:
+        col = rec["processing"].setdefault("colour", {})
+        if col.get("mode") != mode:
+            note["mode_from"] = col.get("mode")
+            col.update(mode=mode, by="hand")
     rec.setdefault("reclassified", []).append(note)
     return json.dumps(rec, ensure_ascii=False, indent=1, default=str)
 
 
 def plan(store: Store, base: Path, scope: dict, classifier, override_manual: bool, log=print) -> dict:
-    """What a reclassify would do. -> {"moves": [...], "manual": [...], "missing": [...], "kept": n, "embedded": n}"""
+    """What a reclassify would do. -> {"moves": [...], "manual": [...], "missing": [...], "kept": n, "embedded": n}
+
+    Paths and categories are relative to the scope; in a base split by black-and-white
+    and colour they start with the mode (bw/50_transport), so a photo moved by hand
+    from bw to color is a hand-sorted photo like one moved to another category."""
     name, width = scope["name"], layout.scope_width(scope)
-    scope_dir = base / scope["folder"]
-    on_disk = scan_scope(scope_dir)
+    on_disk = folders.scan_rels(base, scope)
     rows = store.done_rows(name)
-    prefix = scope["folder"] + "/"
     manual, missing, todo = [], [], []
     for cid, path, category, sha in rows:
-        stored = path[len(prefix):] if path.startswith(prefix) else path
+        stored = layout.to_scope(scope, path) or path
         actual = on_disk.get(cid)
         if actual is None:
             missing.append(cid)
@@ -62,7 +70,7 @@ def plan(store: Store, base: Path, scope: dict, classifier, override_manual: boo
     for i, (cid, actual, _, _) in enumerate(todo):
         v = store.embedding(cid, model, patches)
         if v is None:
-            v = classifier.embed_file(scope_dir / actual)
+            v = classifier.embed_file(base / layout.to_base(scope, actual))
             store.set_embedding(cid, model, patches, v)
             embedded += 1
             if embedded % 200 == 0:
@@ -74,43 +82,43 @@ def plan(store: Store, base: Path, scope: dict, classifier, override_manual: boo
         ex = classifier.example_class(sha)
         if ex is not None:
             v.folder, v.cls, v.sub, v.confidence, v.reason = ex, ex, ex, 1.0, "example"
-        if v.folder == cat_now:
+        mode, _ = layout.mode_category(scope, cat_now)
+        to = layout.with_mode(scope, mode, v.folder)
+        if to == cat_now:
             kept += 1
         else:
-            moves.append({"cid": cid, "src": actual, "from": cat_now, "to": v.folder, "verdict": v.as_dict()})
+            moves.append({"cid": cid, "src": actual, "from": cat_now, "to": to, "verdict": v.as_dict()})
     return {"moves": moves, "manual": manual, "missing": missing, "kept": kept, "embedded": embedded,
             "checked": len(rows)}
 
 
 def apply(store: Store, base: Path, scope: dict, p: dict, samples: str, log=print) -> dict:
     name, width = scope["name"], layout.scope_width(scope)
-    folder = scope["folder"]
-    scope_dir = base / folder
-    # hand-sorted photos: record where they are now
+    # hand-sorted photos: record where they are now (their category, and their mode in a split base)
     for cid, stored, actual in p["manual"]:
         cat = layout.category_of(actual, width)
         old = layout.category_of(stored, width)
-        rec = update_record(store, cid, f"{folder}/{actual}", None, {"time": time.time(), "manual": True, "from": old,
-                                                                      "to": cat})
-        store.move(cid, f"{folder}/{actual}", cat, rec)
-        store.move_counter(name, old, cat)
+        mode, plain = layout.mode_category(scope, cat)
+        rel = layout.to_base(scope, actual)
+        rec = update_record(store, cid, rel, None, {"time": time.time(), "manual": True, "from": old, "to": cat}, mode)
+        store.move(cid, rel, plain, rec, mode)
     chunks = folders.ScopeChunks(store, base, scope, log, defer=True)
     run = store.start_reclass(name, samples)
     moved = failed = 0
     scans: dict = {}
     for seq, m in enumerate(p["moves"]):
         src = m["src"]
-        if not (scope_dir / src).is_file():
-            here = folders.locate(base, folder, m["cid"], None, scans)
+        if not (base / layout.to_base(scope, src)).is_file():
+            here = folders.locate(base, scope, m["cid"], None, scans)
             if here is None:
                 log(f"  {m['cid']}: not found; not moved")
                 failed += 1
                 continue
-            src = here[len(folder) + 1:]
+            src = layout.to_scope(scope, here)
         fname = src.rsplit("/", 1)[-1]
         dst = chunks.place(m["to"], fname)
         try:
-            move_pair(scope_dir / src, scope_dir / dst)
+            move_pair(base / layout.to_base(scope, src), base / chunks.rel(dst))
         except OSError as e:
             chunks.abandon(dst)
             log(f"  {m['cid']}: not moved ({e})")
@@ -119,21 +127,20 @@ def apply(store: Store, base: Path, scope: dict, p: dict, samples: str, log=prin
         chunks.remove(src)
         note = {"time": time.time(), "run": run, "from": m["from"], "to": m["to"], "samples": samples}
         rec = update_record(store, m["cid"], chunks.rel(dst), m["verdict"], note)
-        store.move(m["cid"], chunks.rel(dst), m["to"], rec)
+        store.move(m["cid"], chunks.rel(dst), layout.mode_category(scope, m["to"])[1], rec)
         chunks.done(dst)
-        store.move_counter(name, m["from"], m["to"])
         store.add_reclass_move(run, seq, m["cid"], src, dst, m["from"], m["to"])
         moved += 1
     chunks.settle()
-    pruned = prune_empty(scope_dir)
+    pruned = folders.prune_scope(base, scope)
+    store.recount(name)
     return {"run": run, "moved": moved, "failed": failed, "pruned": pruned, "manual": len(p["manual"])}
 
 
 def undo(store: Store, base: Path, scope: dict, log=print) -> dict:
     """Put the photos of the last reclassify back into the categories they came
     from (into a numbered folder with room when the category was chunked since)."""
-    name, folder = scope["name"], scope["folder"]
-    scope_dir = base / folder
+    name = scope["name"]
     last = store.last_reclass(name)
     if not last:
         raise SystemExit(f"{name}: no reclassify to undo")
@@ -142,19 +149,20 @@ def undo(store: Store, base: Path, scope: dict, log=print) -> dict:
     scans: dict = {}
     for seq, cid, src, dst, cat_from, cat_to in store.reclass_moves(last["id"]):
         st = store.status(cid)
-        if not st or st["scope"] != name or st["category"] != cat_to:
+        mode_to, plain_to = layout.mode_category(scope, cat_to)
+        if not st or st["scope"] != name or st["category"] != plain_to or (mode_to and st.get("mode") != mode_to):
             log(f"  {cid}: moved again since; left where it is")
             skipped += 1
             continue
-        here = folders.locate(base, folder, cid, st["path"], scans)
+        here = folders.locate(base, scope, cid, st["path"], scans)
         if here is None:
             log(f"  {cid}: the file is gone; left as it is")
             skipped += 1
             continue
-        here = here[len(folder) + 1:]
+        here = layout.to_scope(scope, here)
         back_to = chunks.place(cat_from, here.rsplit("/", 1)[-1])
         try:
-            move_pair(scope_dir / here, scope_dir / back_to)
+            move_pair(base / layout.to_base(scope, here), base / chunks.rel(back_to))
         except OSError as e:
             chunks.abandon(back_to)
             log(f"  {cid}: not moved back ({e})")
@@ -169,13 +177,13 @@ def undo(store: Store, base: Path, scope: dict, log=print) -> dict:
                 rec["classification"] = note["previous"]
             rec.setdefault("reclassified", []).append({"time": time.time(), "undo": last["id"], "to": cat_from})
             rec = json.dumps(rec, ensure_ascii=False, indent=1, default=str)
-        store.move(cid, chunks.rel(back_to), cat_from, rec)
+        store.move(cid, chunks.rel(back_to), layout.mode_category(scope, cat_from)[1], rec)
         chunks.done(back_to)
-        store.move_counter(name, cat_to, cat_from)
         back += 1
     chunks.settle()
     store.undo_reclass(last["id"])
-    pruned = prune_empty(scope_dir)
+    pruned = folders.prune_scope(base, scope)
+    store.recount(name)
     return {"run": last["id"], "back": back, "skipped": skipped, "pruned": pruned}
 
 

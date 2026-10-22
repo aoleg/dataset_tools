@@ -88,6 +88,21 @@ def base_layout(conf: cf.Conf, store: Store, base: Path) -> str:
         conf.layout = used
     elif conf.layout != used:
         print(f"{base} keeps its folder tree {used}; layout = {conf.layout} in the conf applies to new base folders")
+    # black-and-white and colour at the top of the tree: the same rules
+    if store.scopes():
+        split = bool(store.get_meta("bw_color", False))
+        if store.get_meta("bw_color") is None:
+            store.set_meta("bw_color", split)
+    else:
+        split = True if conf.bw_color is None else conf.bw_color
+        store.set_meta("bw_color", split)
+    if conf.bw_color is None:
+        if conf.path:
+            cf.save_default(conf.path, "bw_color", "yes" if split else "no", cf.BW_COLOR_COMMENT)
+            print(f"{conf.path.name}: bw_color = {'yes' if split else 'no'} written into [defaults]")
+        conf.bw_color = split
+    elif conf.bw_color != split:
+        print(f"{base} keeps bw_color = {'yes' if split else 'no'}; the conf's setting applies to new base folders")
     return used
 
 
@@ -174,10 +189,9 @@ def target_arg(base: Path, store: Store, value: str) -> list[tuple[dict, str]]:
     """A scope name, or a folder: a scope's folder, one inside it, or one that
     holds scope folders (the 1970s folder of a years/place base). A relative
     folder is taken from the current folder, else from the base.
-    -> [(scope, path prefix relative to the base, ending in /)]."""
+    -> [(scope, path prefix relative to the base, ending in /, or "" for the whole scope)]."""
     if "/" not in value and "\\" not in value and store.scope(value):
-        sc = store.scope(value)
-        return [(sc, sc["folder"] + "/")]
+        return [(store.scope(value), "")]
     p = Path(value)
     if not p.is_absolute():
         p = Path.cwd() / p if (Path.cwd() / p).exists() or not (base / p).exists() else base / p
@@ -193,11 +207,12 @@ def target_arg(base: Path, store: Store, value: str) -> list[tuple[dict, str]]:
     prefix = rel.as_posix().rstrip("/") + "/"
     hits = []
     for sc in store.scopes():
-        f = sc["folder"] + "/"
-        if prefix.startswith(f):
-            return [(sc, prefix)]
-        if f.startswith(prefix):
-            hits.append((sc, f))
+        for _, root in layout.scope_roots(sc):
+            f = root + "/"
+            if prefix.startswith(f):
+                return [(sc, prefix)]
+            if f.startswith(prefix):
+                hits.append((sc, f))
     if not hits:
         raise SystemExit(f"{p} is not the folder of a scope, inside one, or holding any")
     return hits
@@ -426,9 +441,12 @@ def cmd_scopes(args, conf, client) -> int:
         print(f"no scopes in {base}")
     for sc in scopes:
         c = store.scope_counts(sc["name"])
+        k = store.counters(sc["name"])
         where = f"  {sc['folder']}" if sc["folder"] != sc["name"] else ""
+        modes = f"  bw {int(k.get('c.mode.bw', 0)):,} / colour {int(k.get('c.mode.color', 0)):,}" \
+            if k.get("c.mode.bw") or k.get("c.mode.color") else ""
         print(f"{sc['name']:36} {c['total']:>9,} listed  {c['done']:>9,} saved  {c['skipped']:>7,} skipped  "
-              f"{c['failed']:>5,} failed  {c['elsewhere']:>7,} in other scopes  {c['pending']:>9,} left{where}")
+              f"{c['failed']:>5,} failed  {c['elsewhere']:>7,} in other scopes  {c['pending']:>9,} left{modes}{where}")
     return 0
 
 
@@ -511,7 +529,7 @@ def run_locked(args, conf, client, base: Path, store: Store, sm) -> int:
         detector = wm.detector_lazy()
         lama = wm.lama_lazy()
         print(f"  watermark detector {detector[0]}, LaMa", flush=True)
-    classifier = None
+    classifier = mode_probe = None
     if not args.no_classify:
         import classifier as clf
         samples = Path(args.samples).resolve() if args.samples else conf.samples
@@ -519,6 +537,8 @@ def run_locked(args, conf, client, base: Path, store: Store, sm) -> int:
                                     priority_margin=margin_of(args, conf))
         classifier.embed(np.zeros((64, 64, 3), np.uint8))         # load the encoder now
         print(f"  classifier: {len(classifier.class_names)} classes from {samples}", flush=True)
+        import colour
+        mode_probe = colour.probe_from_samples(samples, classifier.sample_vectors)
     if torch.cuda.is_available():
         print(f"  loaded in {time.time() - t0:.0f} s; GPU memory in use {torch.cuda.memory_allocated() / 2**30:.1f} GB",
               flush=True)
@@ -535,7 +555,7 @@ def run_locked(args, conf, client, base: Path, store: Store, sm) -> int:
               f"before it that are not done are left for later", flush=True)
     if vram.ok:
         print(f"  {vram.text()}", flush=True)
-    s = sm.Stream(client, store, opts, classifier, detector, lama, caption_client, vram)
+    s = sm.Stream(client, store, opts, classifier, detector, lama, caption_client, vram, mode_probe)
     res = s.run(pairs, total, completed)
     left = len(store.pending_pairs(names, args.retries))
     where = sc["name"] if len(names) == 1 else f"its {len(names)} scopes"
@@ -546,12 +566,12 @@ def run_locked(args, conf, client, base: Path, store: Store, sm) -> int:
         import autocaption as ac
         from progress import Display
         for name in names:
-            prefix = store.scope(name)["folder"] + "/"
+            prefix = ""
             targets, _ = ac.select(store, base, name, prefix, False, args.retries)
             if not targets:
                 continue
             print(f"Captioning {len(targets):,} saved photos of {name} that have no VLM caption yet ...")
-            run_id = store.start_caption_run(name, prefix, caption_client.model, caption_client.prompt_sha)
+            run_id = store.start_caption_run(name, name, caption_client.model, caption_client.prompt_sha)
             mode = "json" if args.json_progress else "quiet" if args.quiet else "live"
             with Display(len(targets), 0, mode, vram=vram) as d:
                 cres = ac.run(store, base, name, targets, caption_client, d, run_id, args.report_every, vram)
@@ -646,11 +666,11 @@ def cmd_reclassify(args, conf, client) -> int:
 def caption_targets(base: Path, store: Store, values: list[str]) -> list[tuple[dict, str]]:
     out, seen = [], set()
     for v in values:
-        hits = [(sc, sc["folder"] + "/") for sc in scopes_arg(base, store, [v])] if is_pattern(v) \
+        hits = [(sc, "") for sc in scopes_arg(base, store, [v])] if is_pattern(v) \
             else target_arg(base, store, v)
         for sc, prefix in hits:
-            if prefix not in seen:
-                seen.add(prefix)
+            if (sc["name"], prefix) not in seen:
+                seen.add((sc["name"], prefix))
                 out.append((sc, prefix))
     return out
 
@@ -675,7 +695,7 @@ def cmd_autocaption(args, conf, client) -> int:
             if left is not None:
                 targets = targets[:max(0, left)]
                 left -= len(targets)
-            print(f"{prefix.rstrip('/')}: {counts['listed']:,} saved photos, {counts['captioned before']:,} captioned "
+            print(f"{prefix.rstrip('/') or sc['name']}: {counts['listed']:,} saved photos, {counts['captioned before']:,} captioned "
                   f"before, {counts['gave up']:,} failed {args.retries} times; {len(targets):,} to caption")
             if targets:
                 jobs.append((sc, prefix, targets))
@@ -688,7 +708,7 @@ def cmd_autocaption(args, conf, client) -> int:
         mode = "json" if args.json_progress else "quiet" if args.quiet else "live"
         code = 0
         for sc, prefix, targets in jobs:
-            run_id = store.start_caption_run(sc["name"], prefix, capt.model, capt.prompt_sha)
+            run_id = store.start_caption_run(sc["name"], prefix or sc["name"], capt.model, capt.prompt_sha)
             with Display(len(targets), 0, mode, vram=vram) as d:
                 res = ac.run(store, base, sc["name"], targets, capt, d, run_id, args.report_every, vram)
             if res.get("stopped"):
@@ -770,7 +790,8 @@ def cmd_drop(args, conf, client) -> int:
             rows = store.owned_rows(sc["name"])
             saved = sum(1 for r in rows if r[1] == DONE)
             print(f"{sc['name']}: {saved:,} saved photos (image and caption files), {len(rows) - saved:,} skipped or "
-                  f"failed, {len(store.members(sc['name'])):,} listed; folder {base / sc['folder']}")
+                  f"failed, {len(store.members(sc['name'])):,} listed; "
+                  f"{', '.join(str(base / root) for _, root in layout.scope_roots(sc))}")
         if not args.yes:
             print("Nothing deleted. Add --yes to delete these files and forget the scopes; this cannot be undone.")
             return 1

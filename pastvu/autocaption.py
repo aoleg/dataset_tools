@@ -410,9 +410,7 @@ class StreamCaptioner:
 
     def run_for(self, scope: str) -> int:
         if scope not in self.runs:
-            sc = self.store.scope(scope)
-            rid = self.store.start_caption_run(scope, (sc["folder"] if sc else scope) + "/", self.client.model,
-                                               self.client.prompt_sha)
+            rid = self.store.start_caption_run(scope, scope, self.client.model, self.client.prompt_sha)
             self.runs[scope] = rid
             self.per_run[rid] = [0, 0]
         return self.runs[scope]

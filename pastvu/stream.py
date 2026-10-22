@@ -26,6 +26,7 @@ from pathlib import Path
 
 import numpy as np
 
+import colour
 import encode as enc
 import folders
 import layout
@@ -101,7 +102,7 @@ def cleanup_interrupted(store: Store, base: Path, scope: str) -> int:
 
 class Stream:
     def __init__(self, client: Client, store: Store, opts: Options, classifier=None, detector=None, lama=None,
-                 caption_client=None, vram=None):
+                 caption_client=None, vram=None, mode_probe=None):
         self.client, self.store, self.opts = client, store, opts
         self.classifier = classifier
         self.det_name, self.det = detector or (None, None)
@@ -115,6 +116,7 @@ class Stream:
         self.lock = threading.Lock()
         self.display: Display | None = None
         self.caption_client, self.vram = caption_client, vram
+        self.mode_probe = mode_probe       # decides the borderline black-and-white or colour photos
         self.captioner = None
         enc_model = getattr(getattr(classifier, "encoder", None), "model_id", None)
         self.emb_key = (enc_model, getattr(classifier, "patches", None))
@@ -231,6 +233,9 @@ class Stream:
             painted = wm.inpaint(crop, plan["wm_inside"], o.wm_dilate, o.wm_max_size, self.lama)
             s.time("paint", time.perf_counter() - t)
         final = painted if painted is not None else crop
+        t = time.perf_counter()
+        tone = colour.scores(final, plan["wm_inside"], o.wm_dilate)    # painted boxes left out
+        s.time("colour", time.perf_counter() - t)
         vec = verdict = None
         if self.classifier is not None:
             d.set(f"{job.cid}: classifying")
@@ -238,11 +243,13 @@ class Stream:
             vec = self.classifier.embed(final)
             verdict = self.classifier.decide(vec)
             s.time("classify", time.perf_counter() - t)
-        return plan, boxes, painted, vec, verdict, final.shape[1], final.shape[0], final
+        tone = colour.decide(tone, self.mode_probe, vec)
+        return plan, boxes, painted, vec, verdict, final.shape[1], final.shape[0], final, tone
 
     # --- writer threads ------------------------------------------------------------
 
-    def write(self, job: Job, plan: dict, boxes: list, painted, vec, verdict, fw: int, fh: int, final=None) -> None:
+    def write(self, job: Job, plan: dict, boxes: list, painted, vec, verdict, fw: int, fh: int, final=None,
+              tone=None) -> None:
         o, s, d = self.opts, self.stats, self.display
         d.set(f"{job.cid}: encoding")
         t = time.perf_counter()
@@ -253,7 +260,8 @@ class Stream:
         folder = verdict.folder if verdict else ""
         scope = job.scope
         chunker = self.chunkers[scope]
-        rel_scope = chunker.place(folder, f"{job.cid}{ext}")
+        tone = tone or colour.decide({"off_hue": 0.0, "strong": 0.0, "tone": 0.0})
+        rel_scope = chunker.place(layout.with_mode(chunker.sc, tone["mode"], folder), f"{job.cid}{ext}")
         rel = chunker.rel(rel_scope)
         path = o.base / rel
         d.set(f"{job.cid}: saving {rel_scope}")
@@ -265,7 +273,7 @@ class Stream:
             facts = sidecars.caption(job.photo, o.txt_fields)
             path.with_suffix(".txt").write_text(facts, encoding="utf-8")
             sha = hashlib.sha256(data).hexdigest()
-            doc = self.record_json(job, plan, boxes, mode, rel, data, sha, fw, fh, verdict)
+            doc = self.record_json(job, plan, boxes, mode, rel, data, sha, fw, fh, verdict, tone)
             if o.json_files:
                 rf = layout.record_file(o.base, job.cid)
                 rf.parent.mkdir(parents=True, exist_ok=True)
@@ -273,9 +281,10 @@ class Stream:
             if o.json_sidecar:
                 path.with_suffix(".json").write_text(doc, encoding="utf-8")
             emb = (self.emb_key[0], self.emb_key[1], vec) if vec is not None else None
-            counters = self.counters(job, plan, mode, folder, boxes)
+            counters = self.counters(job, plan, mode, folder, boxes, tone)
             self.store.finish(job.cid, scope, {"category": folder, "path": rel, "sha256": sha, "bytes": len(data),
-                                                    "width": fw, "height": fh, "changed": plan["changed"]},
+                                                    "width": fw, "height": fh, "changed": plan["changed"],
+                                                    "mode": tone["mode"]},
                               doc, emb, counters)
         except BaseException:
             chunker.abandon(rel_scope)
@@ -292,9 +301,10 @@ class Stream:
         s.add(done=1)
         d.advance(saved=True)
         d.line({"cid": job.cid, "state": DONE, "path": rel, "write": mode, "changed": plan["changed"],
+                "colour": tone["mode"],
                 "class": verdict.cls if verdict else None})
 
-    def record_json(self, job: Job, plan, boxes, mode, rel, data, sha, fw, fh, verdict) -> str:
+    def record_json(self, job: Job, plan, boxes, mode, rel, data, sha, fw, fh, verdict, tone=None) -> str:
         o = self.opts
         p = job.photo
         download = {"url": f"{IMG}/a/{p['file']}", "bytes": len(job.data), "sha256": hashlib.sha256(job.data).hexdigest(),
@@ -307,6 +317,7 @@ class Stream:
                                      "dilate": o.wm_dilate},
                       "box": plan["box"], "stored_box": plan["stored_box"], "changed": plan["changed"],
                       "write": mode,
+                      "colour": tone,
                       "output": {"path": rel, "bytes": len(data), "sha256": sha, "size": [fw, fh],
                                  "stored_size": list(enc.size_of(data)),
                                  "orientation": job.head["orientation"] if mode != "array" else 1}}
@@ -317,7 +328,7 @@ class Stream:
         return sidecars.record_json(job.cid, page_url(job.cid), result, download, processing, classification,
                                     {**self.tool, "scope": job.scope})
 
-    def counters(self, job: Job, plan: dict, mode: str, folder: str, boxes: list) -> dict:
+    def counters(self, job: Job, plan: dict, mode: str, folder: str, boxes: list, tone: dict | None = None) -> dict:
         kw = {"c.done": 1, f"c.write.{mode}": 1}
         if "band" in plan["changed"]:
             kw["c.band"] = 1
@@ -338,6 +349,10 @@ class Stream:
             kw["c.wm_below"] = 1
         if folder:
             kw[f"cat.{folder}"] = 1
+        if tone:
+            kw[f"c.mode.{tone['mode']}"] = 1
+            if tone.get("by") == "probe":
+                kw["c.mode.probe"] = 1
         return kw
 
     def writer_worker(self, wq: queue.Queue) -> None:
@@ -378,8 +393,10 @@ class Stream:
         if final and len(self.scopes) > 1:
             for n in sorted(self.scopes):
                 c = self.store.scope_counts(n)
+                k = self.store.counters(n)
                 text += (f"\n    {n:32} {c['done']:>7,} saved  {c['skipped']:>6,} skipped  {c['failed']:>4,} failed  "
-                         f"{c['elsewhere']:>6,} in other scopes  {c['pending']:>7,} left")
+                         f"{c['elsewhere']:>6,} in other scopes  {c['pending']:>7,} left  "
+                         f"bw {int(k.get('c.mode.bw', 0)):,} / colour {int(k.get('c.mode.color', 0)):,}")
         return text
 
     def run(self, pairs: list[tuple[int, str]], scope_total: int, completed: int) -> dict:
