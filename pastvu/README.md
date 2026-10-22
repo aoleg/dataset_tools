@@ -19,7 +19,7 @@ You give a place and years, for example “Belarus, 1917 to 1991” or “Ukrain
    - It paints out printed captions, photographer credits and watermarks. It paints only marks it is confident about, so real shop signs and buildings are left alone.
    - Cropping never lowers JPEG quality; only painting re-saves an image.
 3. **Black-and-white or colour:** a fast pixel test tells colour photos from black-and-white ones, and counts sepia, toned prints and yellowed paper as black-and-white.
-4. **Sort:** it puts the photo into your categories, such as transport, people or monuments, learned from example images you put in a samples folder. When two categories fit about equally, the one with the lower folder number wins. Doubtful photos go into an “unsure” folder.
+4. **Sort:** it puts the photo into your categories, such as transport, people or monuments, learned from example images you put in a samples folder. When two categories fit about equally, the one with the lower folder number wins. Every photo goes into a category, a doubtful one into its best guess.
 5. **Caption:** it writes a short facts line from PastVu’s record: title, years, place and description.
 6. **Describe with a model (optional):** a vision model on your own machine, currently Gemma 4 in KoboldCpp, writes a full English description. It starts from the facts line and adds what is visible in the photo.
 
@@ -257,7 +257,7 @@ Both kinds of regroup move files the same way:
 2. **Band and borders** (download threads): the band rows are known from the record and come off exactly. [remove_borders](../remove_borders/README.md) analyses the picture without the band for scanned frames, mounts, thin lines and text banners.
 3. **Watermarks** (GPU): the [watermark](../watermark/README.md) detector runs on the picture without the band, so the band's own text is never taken for a watermark. Detections from `--wm-conf` (0.1) go into the record; only those from `--wm-paint-conf` (0.4) are painted out with LaMa. Below 0.4 the detector often finds scene text and objects (a shop sign, a building facade); from 0.4 up it found printed captions and credits in every case checked.
 4. **Crop**: the band, the border cuts and a watermark trim (`--wm-mode trim`) make one crop, put on the JPEG block grid: the top and left edges move inward to the next block where a cut set them, so the cut part goes completely, and the far edges are exact.
-5. **Classify** (GPU): the final pixels are embedded with SigLIP 2 and scored by classify's probe, trained once at start on the samples folder. Among the categories within `priority_margin` of the top score, the lowest-numbered takes the image ([The samples folder](#the-samples-folder)). Then classify's gates: the summed score of those near categories against the confidence threshold (`--min-confidence`, 0.7) and their summed share of the 10 nearest examples against 0.3; an image that fails goes to `_unsure` under the chosen category. A byte-identical copy of a sample takes the sample's category. The record keeps the score of the chosen category and, when the priority chose it over a higher score, which category that was.
+5. **Classify** (GPU): the final pixels are embedded with SigLIP 2 and scored by classify's probe, trained once at start on the samples folder. Among the categories within `priority_margin` of the top score, the lowest-numbered takes the image ([The samples folder](#the-samples-folder)). Then classify's gates: the summed score of those near categories against the confidence threshold (`--min-confidence`, 0.7) and their summed share of the 10 nearest examples against 0.3; an image that fails still goes into the chosen category, its best guess, and the record keeps the reason (`low confidence` or `disagree`), so doubtful photos can be found later. A byte-identical copy of a sample takes the sample's category. The record keeps the score of the chosen category and, when the priority chose it over a higher score, which category that was.
 6. **Black-and-white or colour** (CPU, about 0.06 s): the pixel test on the final picture, with the painted watermark boxes left out; a borderline photo is decided by the probe on its SigLIP 2 embedding ([Black-and-white and colour](#black-and-white-and-colour)).
 7. **Write** (writer threads): the image and its caption go into the next folder of the category with room, under `bw\` or `color\`; then the photo's status, its record, its embedding and the scope's counters are committed to the store in one transaction.
 
@@ -283,7 +283,6 @@ A JPEG crop keeps every coefficient of the kept blocks; the decoded pixels can s
         50_transport\163150.txt                 its caption
         90_environment_outdoors\001\165001.jpg  a category past 5,000 images: numbered folders
         90_environment_outdoors\002\...         the next 5,000 images of the category
-        _unsure\50_transport\165002.jpg         below the confidence gate, under its best guess
       ukraine\
     1980s\
       ...
@@ -458,6 +457,8 @@ Sorts the saved photos of a scope again with the samples folder as it is now (or
 
 A photo you moved to another category by hand keeps its place: reclassify sees that its file is not where the store says, records where it is now, and leaves it there (`--override-manual` sorts it like the rest). A photo whose file is gone is reported and left alone. `--dry-run` prints the moves per category pair and writes them to `<base>\_reports\`. `--undo` puts the photos of the last reclassify back into the categories they came from.
 
+Versions before 2026-10-23 put doubtful photos into `_unsure\<category>`. `reclassify --unsure` moves them into `<category>`, their best guess, without the classifier or the GPU: `run.bat reclassify --unsure` for the whole base (it asks first), or name scopes. `--dry-run` and `--undo` work as for a full reclassify.
+
 Several scopes and name patterns are sorted one after another with one load of the classifier. Without a scope, reclassify works on every scope of the base folder; it first asks `This will reclassify N scope folders ... Continue? [y/N]` with the number of saved photos, and `--yes` skips the question. `reclassify --undo` without a scope undoes the last reclassify of every scope that has one, after the same question.
 
 ## Progress and resume
@@ -491,7 +492,7 @@ Each saved photo costs one API call and one image download; a photo skipped as t
 | `--split N` | conf (5000) | at most N images per folder, for a new scope; 0: no split |
 | `--samples DIR` | conf | the classify samples folder |
 | `--no-classify` | off | no categories |
-| `--min-confidence X` | 0.7 | below this an image goes to `_unsure` |
+| `--min-confidence X` | 0.7 | below this the record marks the photo as doubtful; it still goes into its best-guess category |
 | `--priority-margin X` | conf (0.15) | within this of the top score, the lower-numbered category wins; 0: off |
 | `--min-side PX` | 512 | skip pictures smaller than this on either side, before and after the crop |
 | `--png` | off | write painted images as PNG |

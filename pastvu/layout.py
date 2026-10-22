@@ -3,8 +3,8 @@ under the base (by the base's layout), the folder of an image
 (<scope folder>/<category>[/<chunk>]/<cid>.<ext>), and the chunk allocator
 that keeps every folder under --split images.
 
-A scope folder holds a classify-style tree: one folder per category, and
-_unsure/<category>. A category holds its images directly until it would pass
+A scope folder holds one folder per category (older versions also had
+_unsure/<category>; reclassify --unsure empties it). A category holds its images directly until it would pass
 `split` images; then they move into the numbered folder 001 and the next go
 into 002, 003, ... of at most `split` images each (each with its .txt caption),
 so no folder grows past what Explorer handles well. A category stays one tree:

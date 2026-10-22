@@ -68,7 +68,7 @@ def choose(p: np.ndarray, share: np.ndarray, margin: float, min_confidence: floa
 
 @dataclass
 class Verdict:
-    folder: str          # the output folder relative to the scope: class, or _unsure/<class>
+    folder: str          # the output folder relative to the scope: the class (no _unsure folder)
     cls: str
     sub: str
     confidence: float    # the probability of the chosen class
@@ -136,7 +136,7 @@ class Classifier:
             subs = np.flatnonzero(sub_to_class == ci)
             si = int(subs[p_sub[i, subs].argmax()])
             name = self.ts.class_names[ci]
-            folder = f"{cl.UNSURE_DIRNAME}/{name}" if reason else name
+            folder = name          # always the best guess; a failed gate stays in the record as the reason
             out.append(Verdict(folder, name, self.ts.sub_names[si], float(p_cls[i, ci]), group_share,
                                self.ts.class_names[int(shares[i].argmax())], reason,
                                top=self.ts.class_names[top] if top != ci else "", group=group))

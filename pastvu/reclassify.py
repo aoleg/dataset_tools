@@ -92,6 +92,34 @@ def plan(store: Store, base: Path, scope: dict, classifier, override_manual: boo
             "checked": len(rows)}
 
 
+UNSURE = "_unsure"
+
+
+def plan_unsure(store: Store, base: Path, scope: dict) -> dict:
+    """The photos in _unsure/<category> (from versions that had the folder) into
+    <category>, their best guess; no classifier. Same shape as plan()."""
+    name, width = scope["name"], layout.scope_width(scope)
+    on_disk = folders.scan_rels(base, scope)
+    rows = store.done_rows(name)
+    moves, missing, kept = [], [], 0
+    for cid, path, category, sha in rows:
+        actual = on_disk.get(cid)
+        if actual is None:
+            missing.append(cid)
+            continue
+        cat = layout.category_of(actual, width)
+        mode, plain = layout.mode_category(scope, cat)
+        if plain != UNSURE and not plain.startswith(UNSURE + "/"):
+            kept += 1
+            continue
+        best = plain[len(UNSURE) + 1:]
+        verdict = dict((store.record(cid) or {}).get("classification") or {})
+        verdict["folder"] = best
+        moves.append({"cid": cid, "src": actual, "from": cat, "to": layout.with_mode(scope, mode, best),
+                      "verdict": verdict})
+    return {"moves": moves, "manual": [], "missing": missing, "kept": kept, "embedded": 0, "checked": len(rows)}
+
+
 def apply(store: Store, base: Path, scope: dict, p: dict, samples: str, log=print) -> dict:
     name, width = scope["name"], layout.scope_width(scope)
     # hand-sorted photos: record where they are now (their category, and their mode in a split base)

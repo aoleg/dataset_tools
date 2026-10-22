@@ -668,7 +668,8 @@ def cmd_reclassify(args, conf, client) -> int:
             return 0
         if not args.dry_run:
             photos = sum(len(store.done_rows(sc["name"])) for sc in scopes)
-            what = "undo the last reclassify of" if args.undo else "reclassify"
+            what = "undo the last reclassify of" if args.undo else \
+                "move the _unsure photos into their best-guess categories in" if args.unsure else "reclassify"
             if not confirm(f"This will {what} {len(scopes)} scope folders of {base} ({photos:,} saved photos): "
                            f"{', '.join(sc['name'] for sc in scopes)}. Continue? [y/N] ", args.yes):
                 print("Nothing done.")
@@ -680,12 +681,22 @@ def cmd_reclassify(args, conf, client) -> int:
                 print(f"{sc['name']}: undid reclassify run {res['run']}: {res['back']:,} photos moved back, "
                       f"{res['skipped']:,} left where they are, {res['pruned']} empty folders removed")
             return 0
-        import classifier as clf
-        samples = Path(args.samples).resolve() if args.samples else conf.samples
-        classifier = clf.Classifier(samples, args.patches, args.min_confidence, priority_margin=margin_of(args, conf))
+        if args.unsure:
+            classifier, samples = None, "unsure: best guess"
+        else:
+            import classifier as clf
+            samples = Path(args.samples).resolve() if args.samples else conf.samples
+            classifier = clf.Classifier(samples, args.patches, args.min_confidence,
+                                        priority_margin=margin_of(args, conf))
         for sc in scopes:
-            print(f"Sorting {sc['name']} again with {len(classifier.class_names)} classes from {samples} ...", flush=True)
-            p = rc.plan(store, base, sc, classifier, args.override_manual)
+            if classifier is None:
+                print(f"Moving the photos of {sc['name']} out of _unsure into their best-guess categories ...",
+                      flush=True)
+                p = rc.plan_unsure(store, base, sc)
+            else:
+                print(f"Sorting {sc['name']} again with {len(classifier.class_names)} classes from {samples} ...",
+                      flush=True)
+                p = rc.plan(store, base, sc, classifier, args.override_manual)
             print(rc.summary(p))
             if args.dry_run:
                 report = base / "_reports" / f"{sc['name']}-reclassify-{time.strftime('%Y%m%d-%H%M%S')}.jsonl"
@@ -1088,7 +1099,8 @@ def parse_args(argv=None):
                    help="first move the saved photos the run's scopes list into them, from whatever scope holds them")
     p.add_argument("--samples", metavar="DIR", help="classify samples folder (default: [paths] samples of the conf)")
     p.add_argument("--no-classify", action="store_true", help="no categories: images go into numbered folders of the scope")
-    p.add_argument("--min-confidence", type=float, default=0.7, metavar="X", help="below this an image goes to _unsure")
+    p.add_argument("--min-confidence", type=float, default=0.7, metavar="X",
+                   help="below this the record marks the photo as doubtful; it still goes to its best-guess category")
     p.add_argument("--priority-margin", type=float, metavar="X",
                    help="a category within X of the top score wins when its number is lower (default: [defaults] priority_margin of the conf, 0.15; 0: the top score always wins)")
     p.add_argument("--patches", type=int, default=576, metavar="N", help="encoder patch budget (default 576)")
@@ -1134,7 +1146,8 @@ def parse_args(argv=None):
                    help="a scope's name, folder or name pattern (estonia_*); none: every scope of the base (asks first)")
     p.add_argument("--yes", action="store_true", help="do not ask before working on every scope of the base")
     p.add_argument("--samples", metavar="DIR", help="classify samples folder (default: [paths] samples of the conf)")
-    p.add_argument("--min-confidence", type=float, default=0.7, metavar="X", help="below this an image goes to _unsure")
+    p.add_argument("--min-confidence", type=float, default=0.7, metavar="X",
+                   help="below this the record marks the photo as doubtful; it still goes to its best-guess category")
     p.add_argument("--priority-margin", type=float, metavar="X",
                    help="a category within X of the top score wins when its number is lower (default: [defaults] priority_margin of the conf, 0.15; 0: the top score always wins)")
     p.add_argument("--patches", type=int, default=576, metavar="N", help="encoder patch budget (default 576)")
@@ -1142,6 +1155,9 @@ def parse_args(argv=None):
     p.add_argument("--override-manual", action="store_true",
                    help="also sort the photos that were moved to another category by hand (default: they stay)")
     p.add_argument("--undo", action="store_true", help="put back the moves of the last reclassify of the scope")
+    p.add_argument("--unsure", action="store_true",
+                   help="only move the photos in _unsure folders (made by older versions) into their best-guess "
+                        "categories; no classifier")
 
     p = sub.add_parser("autocaption", help="caption saved photos with a VLM, from each image and its caption")
     p.add_argument("target", nargs="+", metavar="SCOPE|FOLDER",
