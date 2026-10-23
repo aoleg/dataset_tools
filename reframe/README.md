@@ -16,7 +16,9 @@ It creates the shared `..\venv` folder when it is missing and installs `torch` a
 | `face_yolov8m.pt` | `Bingsu/adetailer` on Hugging Face | faces |
 | `yolo26x-pose.pt` | ultralytics | body keypoints (head, shoulders, hips, knees, ankles) |
 
-The ultralytics models go into `models` next to the script. The face model goes into the Hugging Face cache, where the face mask tool and ADetailer also find it. After the install, the tool does not use the network.
+All three models go into `models` next to the script. The face model is downloaded into the Hugging Face cache first, where the face mask tool and ADetailer also find it, and then copied into `models`. After the install, the tool does not use the network.
+
+If the face model download fails, the installer tries again without the Hugging Face Xet transfer, because some networks block its download servers. If that also fails, the installation still finishes, with a warning. Reframe does not run until you download `face_yolov8m.pt` with a browser from https://huggingface.co/Bingsu/adetailer/resolve/main/face_yolov8m.pt and put it into `models`.
 
 ## Usage
 

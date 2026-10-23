@@ -85,12 +85,33 @@ if errorlevel 1 (
 )
 
 echo.
-echo Downloading the person, face and pose models...
+echo Downloading the person, face and pose models into %~dp0models ...
+rem Exit code 3: only the face model from Hugging Face failed. The Xet
+rem transfer of huggingface_hub uses its own CDN, which some networks block;
+rem the plain HTTPS download often still works. If it does not, the
+rem installation still finishes, with a warning.
+set "FACE_MISSING="
 "%VPY%" reframe.py --fetch-models
-if errorlevel 1 goto :fail
+if errorlevel 3 (
+    echo Retrying the download without the Hugging Face Xet transfer...
+    set "HF_HUB_DISABLE_XET=1"
+    "%VPY%" reframe.py --fetch-models
+)
+if errorlevel 3 (
+    set "FACE_MISSING=1"
+) else (
+    if errorlevel 1 goto :fail
+)
 
 echo.
 echo Installation finished. Reframe photos with run.bat ^<folder^> [^<folder^> ...] [options]
+if not defined FACE_MISSING goto :done
+echo.
+echo [WARNING] face_yolov8m.pt could not be downloaded. Reframe does not run without it.
+echo           Download it with a browser from
+echo           https://huggingface.co/Bingsu/adetailer/resolve/main/face_yolov8m.pt
+echo           and put it into %~dp0models
+:done
 pause
 exit /b 0
 

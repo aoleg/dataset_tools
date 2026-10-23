@@ -115,21 +115,35 @@ SKELETON = [(5, 6), (5, 7), (7, 9), (6, 8), (8, 10), (5, 11), (6, 12), (11, 12),
 def model_path(name: str, download: bool) -> Path:
     """Local path of a model; with download, fetch it if it is missing.
 
-    Hugging Face files are looked up in the cache first, so a run with the
-    models present makes no network request.
+    Every model is used from MODELS_DIR. A Hugging Face file missing there is
+    copied from the Hugging Face cache, and downloaded into that cache first
+    when it is not there either, so the face mask tool and ADetailer still
+    find it. A run with the models present makes no network request.
     """
     source, fname = MODELS[name]
-    if source == "hf":
+    path = MODELS_DIR / fname
+    if source == "hf" and not path.exists():
         from huggingface_hub import hf_hub_download
         from huggingface_hub.utils import LocalEntryNotFoundError
         try:
-            return Path(hf_hub_download(HF_REPO, fname, local_files_only=True))
+            cached = hf_hub_download(HF_REPO, fname, local_files_only=True)
         except LocalEntryNotFoundError:
             if not download:
-                raise
+                raise FileNotFoundError(f"{path} is missing; run install.bat or reframe.py --fetch-models")
             print(f"downloading {fname} from {HF_REPO}", flush=True)
-            return Path(hf_hub_download(HF_REPO, fname))
-    path = MODELS_DIR / fname
+            try:
+                cached = hf_hub_download(HF_REPO, fname)
+            except Exception as e:
+                raise RuntimeError(
+                    f"download of {fname} failed: {e}\n\n"
+                    f"Download it with a browser from\n"
+                    f"  https://huggingface.co/{HF_REPO}/resolve/main/{fname}\n"
+                    f"and put it into\n  {MODELS_DIR}") from e
+        MODELS_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".part")
+        shutil.copyfile(cached, tmp)
+        tmp.replace(path)
+        return path
     if not path.exists():
         if not download:
             raise FileNotFoundError(f"{path} is missing; run install.bat or reframe.py --fetch-models")
@@ -1864,9 +1878,20 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
 
     if args.fetch_models:
-        models = load_models(download=True)
-        for name in MODELS:
-            print(f"{name}: {model_path(name, False)}")
+        # Exit code 3: only a Hugging Face model failed. install.bat retries
+        # it without the Xet transfer, then finishes with a warning.
+        failed = []
+        for name, (source, _) in MODELS.items():
+            try:
+                print(f"{name}: {model_path(name, True)}", flush=True)
+            except RuntimeError as e:
+                print(f"\n[ERROR] {e}\n", file=sys.stderr)
+                if source != "hf":
+                    return 1
+                failed.append(name)
+        if failed:
+            return 3
+        models = load_models()
         print(f"{len(models)} models load OK")
         if not args.folders:
             return 0
