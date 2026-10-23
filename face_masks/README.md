@@ -29,7 +29,9 @@ It creates the shared `..\venv` folder when it is missing and installs `torch==2
 
 Last, it downloads the default face detector `face_yolov8m.pt` from `Bingsu/adetailer` and loads it once as a check. The model goes into the Hugging Face cache (`%USERPROFILE%\.cache\huggingface\hub`, or `HF_HOME` if set). ADetailer uses the same cache, so a copy it already downloaded is reused. When `--model` names another file, the script downloads that file on its first run.
 
-After that, the scripts do not use the network. They look for the model in the cache first and contact Hugging Face only when the file is not there. They also set `YOLO_OFFLINE=1` before they load ultralytics, which stops its online check and the usage analytics it sends when it is online.
+If the download fails, the installer tries again without the Hugging Face Xet transfer, because some networks block its download servers. If that also fails, the installation still finishes, with a warning. The scripts do not run until you download `face_yolov8m.pt` with a browser from https://huggingface.co/Bingsu/adetailer/resolve/main/face_yolov8m.pt and put it into `models` in this folder.
+
+After that, the scripts do not use the network. They look for the model in `models` in this folder, then in `..\reframe\models`, where reframe keeps its copy of the same model, then in the cache, and contact Hugging Face only when the file is in none of them. They also set `YOLO_OFFLINE=1` before they load ultralytics, which stops its online check and the usage analytics it sends when it is online.
 
 Running `install.bat` again installs what is missing. The virtual environment is shared by all tools of this repository: it is the `venv` folder in the repository root, next to the tool folders, and each tool's `install.bat` installs only its own dependencies into it.
 

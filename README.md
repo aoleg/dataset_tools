@@ -193,6 +193,8 @@ All tools share one virtual environment: the `venv` folder in the repository roo
 
 The `install.bat` in the repository root runs the `install.bat` of every tool in this table that has one, one after the other: remove_borders, reframe, jpeg_cleanup, face_masks and watermark first, then deduplicate, k2prep, ddg_images, classify and duck. Use it to set up everything at once, or run the `install.bat` of single tools.
 
+When a tool's installation fails, the root `install.bat` runs it once more without the Hugging Face Xet transfer, because some networks block its download servers, and keeps the Xet transfer off for the tools after it. reframe and face_masks finish without the face model `face_yolov8m.pt` when it cannot be downloaded; the root `install.bat` then ends with a warning that tells you where to put it by hand.
+
 The GPU tools install the same torch build, so they share it in the `venv`.
 
 MIT License.

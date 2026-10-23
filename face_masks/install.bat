@@ -86,11 +86,32 @@ if errorlevel 1 (
 
 echo.
 echo Downloading the face detector model...
-"%VPY%" -c "import make_face_masks as m; print(m.fetch_model(m.DEFAULT_MODEL)); m.load_model(m.DEFAULT_MODEL); print('model loads OK')"
-if errorlevel 1 goto :fail
+rem Exit code 3: only the download failed. The Xet transfer of
+rem huggingface_hub uses its own CDN, which some networks block; the plain
+rem HTTPS download often still works. If it does not, the installation
+rem still finishes, with a warning.
+set "FACE_MISSING="
+"%VPY%" -c "import sys, make_face_masks as m; sys.exit(m.install_check())"
+if errorlevel 3 (
+    echo Retrying the download without the Hugging Face Xet transfer...
+    set "HF_HUB_DISABLE_XET=1"
+    "%VPY%" -c "import sys, make_face_masks as m; sys.exit(m.install_check())"
+)
+if errorlevel 3 (
+    set "FACE_MISSING=1"
+) else (
+    if errorlevel 1 goto :fail
+)
 
 echo.
 echo Installation finished. Make masks with run.bat ^<img_dir^> [mask_dir] [options]
+if not defined FACE_MISSING goto :done
+echo.
+echo [WARNING] face_yolov8m.pt could not be downloaded. The face mask tools do not run without it.
+echo           Download it with a browser from
+echo           https://huggingface.co/Bingsu/adetailer/resolve/main/face_yolov8m.pt
+echo           and put it into %~dp0models
+:done
 pause
 exit /b 0
 

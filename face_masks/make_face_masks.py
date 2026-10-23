@@ -36,14 +36,24 @@ MASK_EXTS = (".jpg", ".jpeg", ".png", ".webp")
 MASK_JPEG_QUALITY = 95
 MODEL_REPO = "Bingsu/adetailer"
 DEFAULT_MODEL = "face_yolov8m.pt"
+# A model file put into one of these folders is used before the Hugging Face
+# cache. reframe keeps its copy of the same face model in its models folder.
+HERE = os.path.dirname(os.path.abspath(__file__))
+MODELS_DIRS = (os.path.join(HERE, "models"),
+               os.path.join(os.path.dirname(HERE), "reframe", "models"))
 
 
 def fetch_model(name: str) -> str:
     """Local path of the model, downloaded into the Hugging Face cache the first time.
 
     A plain hf_hub_download asks the Hub for the latest revision on every call,
-    even when the file is cached, so the cache is tried first with the network off.
+    even when the file is cached, so the models folders and the cache are
+    tried first with the network off.
     """
+    for folder in MODELS_DIRS:
+        path = os.path.join(folder, name)
+        if os.path.isfile(path):
+            return path
     from huggingface_hub import hf_hub_download
     from huggingface_hub.utils import LocalEntryNotFoundError
 
@@ -51,7 +61,30 @@ def fetch_model(name: str) -> str:
         return hf_hub_download(MODEL_REPO, name, local_files_only=True)
     except LocalEntryNotFoundError:
         print(f"downloading {name} from {MODEL_REPO}", flush=True)
-        return hf_hub_download(MODEL_REPO, name)
+        try:
+            return hf_hub_download(MODEL_REPO, name)
+        except Exception as e:
+            raise RuntimeError(
+                f"download of {name} failed: {e}\n\n"
+                f"Download it with a browser from\n"
+                f"  https://huggingface.co/{MODEL_REPO}/resolve/main/{name}\n"
+                f"and put it into\n  {MODELS_DIRS[0]}") from e
+
+
+def install_check() -> int:
+    """install.bat: fetch the default model and load it once.
+
+    Returns 3 when only the download failed; install.bat then retries it
+    without the Xet transfer and finishes with a warning.
+    """
+    try:
+        print(fetch_model(DEFAULT_MODEL), flush=True)
+    except RuntimeError as e:
+        print(f"\n[ERROR] {e}\n", file=sys.stderr)
+        return 3
+    load_model(DEFAULT_MODEL)
+    print("model loads OK")
+    return 0
 
 
 def load_model(name: str):
