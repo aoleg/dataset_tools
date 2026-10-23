@@ -110,6 +110,7 @@ kyrgyzstan                       = 30                   ; Kyrgyzstan / Кирг�
 tajikistan                       = 32                   ; Tajikistan / Таджикистан, 2,572 photos
 turkmenistan                     = 31                   ; Turkmenistan / Туркмения, 6,090 photos
 ussr                             = 1, 20, 22, 24, 29, 30, 31, 32, 35, 45, 92, 149, 154, 189, 267 ; Russia, Ukraine, Belarus, Uzbekistan, Kazakhstan, Kyrgyzstan, Turkmenistan, Tajikistan, Azerbaijan, Armenia, Georgia, Latvia, Lithuania, Moldova, Estonia
+ussr_without_russia              = 20, 22, 24, 29, 30, 31, 32, 35, 45, 92, 149, 154, 189, 267 ; Ukraine, Belarus, Uzbekistan, Kazakhstan, Kyrgyzstan, Turkmenistan, Tajikistan, Azerbaijan, Armenia, Georgia, Latvia, Lithuania, Moldova, Estonia
 baltics                          = 149, 154, 267        ; Latvia, Lithuania, Estonia
 caucasus                         = 35, 45, 92           ; Azerbaijan, Armenia, Georgia
 central_asia                     = 24, 29, 30, 31, 32   ; Uzbekistan, Kazakhstan, Kyrgyzstan, Turkmenistan, Tajikistan

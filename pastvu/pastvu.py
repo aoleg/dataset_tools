@@ -47,7 +47,9 @@ from client import Client, filter_string  # noqa: E402
 from store import DB_NAME, Store  # noqa: E402
 
 USSR = [1, 20, 22, 189, 267, 149, 154, 92, 45, 35, 29, 24, 30, 32, 31]   # the order of the countries section
-GROUPS = {"ussr": [1, 20, 22, 24, 29, 30, 31, 32, 35, 45, 92, 149, 154, 189, 267], "baltics": [149, 154, 267],
+GROUPS = {"ussr": [1, 20, 22, 24, 29, 30, 31, 32, 35, 45, 92, 149, 154, 189, 267],
+          "ussr_without_russia": [20, 22, 24, 29, 30, 31, 32, 35, 45, 92, 149, 154, 189, 267],
+          "baltics": [149, 154, 267],
           "caucasus": [35, 45, 92], "central_asia": [24, 29, 30, 31, 32]}
 CAPITALS = {"Moscow", "Saint Petersburg", "Sevastopol", "Kiev", "Minsk", "Tashkent", "Astana", "Bishkek", "City of Osh",
             "Ashgabat", "Dushanbe", "Yerevan", "Tbilisi", "Chișinău", "Bălți"}
