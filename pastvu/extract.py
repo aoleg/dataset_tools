@@ -20,6 +20,12 @@ folder for training, keeping only the bw/ and color/ level.
   extract.json holds the criteria and the files it copied.
 - Images are copied; --link hard-links them instead (captions are always
   copied).
+- --min-res N keeps photos of at least N x N pixels (area, as k2prep).
+  --target N picks N photos: --colour-share of them colour (0.5 by default;
+  a side that runs short is filled from the other), and within black-and-white
+  and colour each decade gets a share proportional to its photos in the
+  selection. Inside a decade the largest photos come first (there is no
+  quality score yet), so a top-up keeps what it picked before.
 """
 
 from __future__ import annotations
@@ -117,10 +123,12 @@ def select(store, base: Path, scopes: list[dict], args_categories: list[str], fi
     region_set = set(filters.get("regions") or [])
     years, decade = filters.get("years"), filters.get("decade")
     want_mode = filters.get("mode")
+    min_area = (filters.get("min_res") or 0) ** 2
     out = {}
     for arg in args_categories:
         hits = resolve_category(arg, names)
         photos: dict[int, tuple[str | None, Path]] = {}
+        info: dict[int, dict] = {}
         for sc in scopes:
             found = {}
             for n in hits:
@@ -146,8 +154,13 @@ def select(store, base: Path, scopes: list[dict], args_categories: list[str], fi
                     continue
                 if region_set and not (region_set & set(f["chain"])):
                     continue
+                area = (f["width"] or 0) * (f["height"] or 0)
+                if min_area and area < min_area:
+                    continue
                 photos[cid] = (mode, found[cid][1])
-        out[label_of(hits, names)] = {"arg": arg, "hits": hits, "photos": photos}
+                info[cid] = {"mode": mode or "bw", "decade": (y0 // 10 * 10) if y0 is not None else None,
+                             "area": area}
+        out[label_of(hits, names)] = {"arg": arg, "hits": hits, "photos": photos, "info": info}
     return out
 
 
@@ -157,11 +170,11 @@ def _facts(store, cids: list[int], need_regions: bool) -> dict[int, dict]:
         for i in range(0, len(cids), 900):
             part = cids[i:i + 900]
             q = ",".join("?" * len(part))
-            for cid, state, scope, mode, year, year2, rs in store.db.execute(
-                    f"SELECT s.cid, s.state, s.scope, s.mode, p.year, p.year2, p.rs FROM status s "
+            for cid, state, scope, mode, width, height, year, year2, rs in store.db.execute(
+                    f"SELECT s.cid, s.state, s.scope, s.mode, s.width, s.height, p.year, p.year2, p.rs FROM status s "
                     f"LEFT JOIN photos p ON p.cid=s.cid WHERE s.cid IN ({q})", part):
-                out[cid] = {"state": state, "scope": scope, "mode": mode, "year": year, "year2": year2,
-                            "rs": json.loads(rs or "[]"), "chain": []}
+                out[cid] = {"state": state, "scope": scope, "mode": mode, "width": width, "height": height,
+                            "year": year, "year2": year2, "rs": json.loads(rs or "[]"), "chain": []}
     if need_regions:
         for cid, f in out.items():
             rec = store.record(cid) or {}
@@ -176,6 +189,46 @@ def _facts(store, cids: list[int], need_regions: bool) -> dict[int, dict]:
     return out
 
 
+def _quotas(total: int, counts: dict) -> dict:
+    """total split over the keys in proportion to counts (largest remainder), never above a count."""
+    n = sum(counts.values())
+    if n == 0 or total <= 0:
+        return {k: 0 for k in counts}
+    total = min(total, n)
+    raw = {k: total * c / n for k, c in counts.items()}
+    out = {k: int(v) for k, v in raw.items()}
+    rest = total - sum(out.values())
+    for k in sorted(raw, key=lambda k: (-(raw[k] - out[k]), str(k)))[:rest]:
+        out[k] += 1
+    return out
+
+
+def pick_target(info: dict[int, dict], target: int, colour_share: float = 0.5) -> tuple[list[int], dict]:
+    """--target: N photos, colour_share of them colour (a side that runs short
+    is filled from the other), each side spread over the decades in proportion
+    to its photos, the largest photos first inside a decade.
+    -> (the chosen cids, {(mode, decade): (chosen, available)})."""
+    by_mode = {m: [c for c, i in info.items() if i["mode"] == m] for m in ("bw", "color")}
+    want_colour = round(target * colour_share)
+    want = {"color": min(want_colour, len(by_mode["color"])), "bw": min(target - want_colour, len(by_mode["bw"]))}
+    short = target - want["color"] - want["bw"]                # fill a short side from the other
+    for m in ("bw", "color"):
+        extra = min(short, len(by_mode[m]) - want[m])
+        want[m] += extra
+        short -= extra
+    chosen, table = [], {}
+    for m, cids in by_mode.items():
+        cells = {}
+        for c in cids:
+            cells.setdefault(info[c]["decade"], []).append(c)
+        quotas = _quotas(want[m], {d: len(v) for d, v in cells.items()})
+        for d, members in cells.items():
+            members.sort(key=lambda c: (-info[c]["area"], c))
+            chosen.extend(members[:quotas[d]])
+            table[(m, d)] = (quotas[d], len(members))
+    return sorted(chosen), table
+
+
 def folder_name(label: str, filters: dict) -> str:
     parts = [label]
     if filters.get("region_labels"):
@@ -188,6 +241,11 @@ def folder_name(label: str, filters: dict) -> str:
         parts.append("+".join(layout.slug(s.replace("*", "")) or "all" for s in filters["scopes"]))
     if filters.get("mode"):
         parts.append(filters["mode"])
+    if filters.get("min_res"):
+        parts.append(f"min{filters['min_res']}")
+    if filters.get("target"):
+        share = filters.get("colour_share", 0.5)
+        parts.append(f"n{filters['target']}" + ("" if abs(share - 0.5) < 1e-9 else f"c{round(share * 100)}"))
     return "_".join(parts)
 
 

@@ -155,7 +155,8 @@ run.bat reclassify [<scope> ...] [--dry-run] [--undo] [--yes]
 run.bat captions <scope> [...] [--txt-fields LIST] [--dry-run]
 run.bat autocaption <scope or folder> [...] [--limit N] [--recaption] [--undo]
 run.bat export <scope> [...] [--format jsonl|parquet]
-run.bat extract <category> [...] [--region R] [--years A B | --decade D] [--bw | --color] [-o DIR]
+run.bat extract <category> [...] [--region R] [--years A B | --decade D] [--bw | --color] [--min-res N]
+                   [--target N [--colour-share X]] [-o DIR]
 run.bat scopes | aliases | count --region <alias> | regions [--find TEXT]
 ```
 
@@ -470,6 +471,8 @@ run.bat extract transport --decade 1970
 run.bat extract 100-environment_outdoors --region moscow --color
 run.bat extract 050 060 --years 1960 1979 --scope "russia_*"
 run.bat extract 050 -o D:\train\transport --link
+run.bat extract 140-aerial --target 15000 --min-res 1024
+run.bat extract 050 --target 5000 --colour-share 0.4 --decade 1970
 ```
 
 Copies the photos of a category out of the base folder into a flat folder for training. Only the `bw\` and `color\` level stays; there are no decade, place or numbered folders:
@@ -484,7 +487,9 @@ Copies the photos of a category out of the base folder into a flat folder for tr
 - **The category** is named by its number (`050` or `50`), its name (`transport`) or its full name (`050-transport`). Folders written differently but meaning the same category (`50_transport` from older samples) are taken together. When a number or name matches two different categories, for example `140-aerial` and `140-monuments`, extract refuses and asks for the full name. Several categories at once each go into their own folder.
 - **The photos are found where they are on disk**, in the category folders of every scope, so a photo you moved by hand to another category, or between `bw\` and `color\`, is extracted from where it sits now. Only finished photos are taken, so extract can run beside a download.
 - **Filters narrow the selection and never add folders:** `--region` (one or more, matched against the photo's own region chain, so `--region crimea` finds Crimean photos in `russia_1970s`), `--years` (dating overlaps the years), `--decade` (dating starts in the decade), `--scope` (names or patterns), `--bw` or `--color`.
-- **The output folder** is `<base parent>\<category>` with the filters added to the name (`050-transport_1970s`, `050-transport_ukraine_1960-1979`), or `-o` for one category. `--split N` puts at most N images into each numbered folder under `bw\` and `color\` when a flat folder grows too large.
+- **`--min-res N`** keeps photos of at least N×N pixels, measured as area as in [k2prep](../k2prep/README.md): `--min-res 1024` is 1,048,576 pixels whatever the shape, so 1536×768 passes and 1200×800 does not.
+- **`--target N`** picks N photos for balancing categories against each other. `--colour-share` of them are colour (0.5 by default; 0.4 is 40 % colour), and a side that has too few is filled from the other. Within black-and-white and within colour, each decade gets a share proportional to its photos in the selection, so the decades keep the proportions they have; the scope options (`--decade`, `--years`, `--region`) decide which decades take part. Inside a decade the largest photos come first: there is no quality score yet, and size is stable, so a top-up keeps what it picked before. The run prints what it took from each decade, for example `bw 50: 1930s 12/53, 1940s 5/22, ...`.
+- **The output folder** is `<base parent>\<category>` with the filters added to the name (`050-transport_1970s`, `050-transport_ukraine_1960-1979`, `140-aerial_min1024_n15000`), or `-o` for one category. `--split N` puts at most N images into each numbered folder under `bw\` and `color\` when a flat folder grows too large.
 - **Each image comes with its caption** (`.txt`, the VLM caption where there is one) and its `.short` caption if [recaption_json](../recaption_json/README.md) made one.
 - **Running it again tops the folder up:** new photos are copied, files already there are left as they are (captions you edited for training stay), and files from earlier extracts that no longer match (reclassified, moved, dropped) are reported; `--prune` deletes them. Files you put there yourself are never pruned. `extract.json` holds the criteria and the files extract copied.
 - **Copy or link.** Images are copied by default. `--link` hard-links them instead, so they take no extra disk space on the same drive; captions are always copied. A tool that edits images in place (remove_borders, jpeg_cleanup) would then change the base's files too, which is why it is not the default; every run without `--link` prints a reminder that it exists. `--dry-run` counts and copies nothing.

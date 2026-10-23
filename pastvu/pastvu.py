@@ -796,8 +796,13 @@ def cmd_extract(args, conf, client) -> int:
         decade = args.decade
     elif args.years:
         years = tuple(args.years)
+    if not 0.0 <= args.colour_share <= 1.0:
+        raise SystemExit("--colour-share is a fraction from 0 to 1, e.g. 0.4 for 40 % colour")
+    if args.target is not None and args.target < 1:
+        raise SystemExit("--target takes a number of photos, 1 or more")
     filters = {"years": years, "decade": decade, "scopes": args.scope or [],
-               "mode": "bw" if args.bw else "color" if args.color else None, "regions": [], "region_labels": []}
+               "mode": "bw" if args.bw else "color" if args.color else None, "regions": [], "region_labels": [],
+               "min_res": args.min_res, "target": args.target, "colour_share": args.colour_share}
     if args.region:
         regions, labels = ix.resolve(store, conf.aliases, args.region)
         filters["regions"] = sorted(r["cid"] for r in regions)
@@ -807,6 +812,17 @@ def cmd_extract(args, conf, client) -> int:
         for label, sel in picked.items():
             out = Path(args.out).resolve() if args.out else base.parent / xt.folder_name(label, filters)
             photos = sel["photos"]
+            if args.target:
+                chosen, table = xt.pick_target(sel["info"], args.target, args.colour_share)
+                print(f"{label}: --target {args.target:,} of {len(photos):,} photos that pass the filters; "
+                      f"picked {len(chosen):,} (the largest first in each decade):")
+                for m in ("bw", "color"):
+                    row = sorted((d, v) for (mm, d), v in table.items() if mm == m)
+                    if row:
+                        cells = ", ".join(f"{d if d is not None else 'undated'}{'s' if d is not None else ''} "
+                                          f"{c:,}/{n:,}" for d, (c, n) in row)
+                        print(f"  {'bw' if m == 'bw' else 'colour'} {sum(c for _, (c, _) in row):,}: {cells}")
+                photos = {c: photos[c] for c in chosen}
             modes = Counter(m or "none" for m, _ in photos.values())
             also = f" (also written {', '.join(h for h in sel['hits'] if h != label)})" if len(sel["hits"]) > 1 else ""
             no_mode = f" / no mode {modes['none']:,}" if modes.get("none") else ""
@@ -1237,6 +1253,13 @@ def parse_args(argv=None):
     g = p.add_mutually_exclusive_group()
     g.add_argument("--bw", action="store_true", help="only black-and-white photos")
     g.add_argument("--color", action="store_true", help="only colour photos")
+    p.add_argument("--min-res", type=int, default=0, metavar="N",
+                   help="only photos of at least N x N pixels, as area (512, 768, 1024, 1280, ...)")
+    p.add_argument("--target", type=int, metavar="N",
+                   help="pick N photos, spread over the decades in proportion to their photos, the largest first")
+    p.add_argument("--colour-share", type=float, default=0.5, metavar="X",
+                   help="with --target: the share of colour photos (default 0.5; a short side is filled from the "
+                        "other)")
     p.add_argument("--split", type=int, default=0, metavar="N",
                    help="numbered folders of at most N images under bw/ and color/ (default 0: flat)")
     p.add_argument("--link", action="store_true",
