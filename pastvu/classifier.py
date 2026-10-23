@@ -4,6 +4,9 @@ once, and each image gets classify's decision: the probe's class, the share
 of its 10 nearest examples, the confidence gate, and the byte-identical
 example rule. The embeddings of the saved images go into the store, keyed by
 PastVu number, so reclassify needs the GPU only for images without one.
+
+The quality folders (_quality_good, _quality_bad) are embedded in the same
+pass and cache, and train the quality probe on the same embedding.
 """
 
 from __future__ import annotations
@@ -11,12 +14,12 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
 
 import numpy as np
 
 import process as pr  # puts the tool folders on sys.path
 import classify as cl
+import quality
 
 
 class LazyEncoder:
@@ -88,7 +91,7 @@ class Verdict:
 
 class Classifier:
     def __init__(self, samples: Path, patches: int, min_confidence: float, encoder=None,
-                 priority_margin: float = DEFAULT_PRIORITY_MARGIN):
+                 priority_margin: float = DEFAULT_PRIORITY_MARGIN, quality_threshold: float = quality.THRESHOLD):
         from threadpoolctl import threadpool_limits
         threadpool_limits(limits=getattr(cl, "BLAS_THREADS", 8))
         if not samples or not Path(samples).is_dir():
@@ -98,14 +101,21 @@ class Classifier:
         self.min_confidence = min_confidence
         self.priority_margin = max(0.0, float(priority_margin))
         self.encoder = encoder or LazyEncoder(patches)
-        classes = cl.discover_samples(self.samples, cl.sidecar_set(cl.DEFAULT_SIDECARS))
+        sidecars = cl.sidecar_set(cl.DEFAULT_SIDECARS)
+        classes = cl.discover_samples(self.samples, sidecars)
         cl.check_samples(classes)
-        args = SimpleNamespace(patches=patches, threads=8, batch=64, reembed=False)
-        res = cl.embed_samples(self.samples, classes, self.encoder, args)
-        self.sample_vectors = res.vectors          # rel -> embedding, for the colour probe
+        q_items = quality.sample_items(self.samples, lambda root: cl.scan_root(root, sidecars))
+        items = [it for c in classes for v in c.subclasses.values() for it in v]
+        # one pass and one cache for both: the cache keeps only the files of the pass that saves it
+        cache = cl.EmbeddingCache(self.samples, self.encoder.model_id, patches)
+        res = cl.embed_root(self.samples, items + q_items[0] + q_items[1], self.encoder, cache, 8, 64, False,
+                            "Samples")
+        rels = {it.rel for it in items}
+        self.sample_vectors = {r: v for r, v in res.vectors.items() if r in rels}   # for the colour probe
         rep = cl.Report()
         self.ts, self.cv, self.probe, self.example_hashes = cl.fit_probe(classes, res, rep)
         self.n_classes = len(self.ts.class_names)
+        self.quality = quality.probe_from_samples(q_items, res.vectors, quality_threshold)
 
     @property
     def model_id(self) -> str:
@@ -141,6 +151,14 @@ class Classifier:
                                self.ts.class_names[int(shares[i].argmax())], reason,
                                top=self.ts.class_names[top] if top != ci else "", group=group))
         return out
+
+    def low_quality(self, X) -> np.ndarray:
+        """P(bad) of each embedding when it is at or above the threshold, else NaN (all NaN with the filter off)."""
+        X = np.asarray(X, np.float32).reshape(-1, self.ts.X.shape[1])
+        if self.quality is None or not len(X):
+            return np.full(len(X), np.nan)
+        p = self.quality.p_bad(X)
+        return np.where(p >= self.quality.threshold, p, np.nan)
 
     def decide(self, vec: np.ndarray) -> Verdict:
         return self.decide_many(vec[None])[0]

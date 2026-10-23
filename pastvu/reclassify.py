@@ -8,6 +8,10 @@ joined.
 - A photo whose file is not where the store says was moved by hand. Its new
   place is kept and recorded (--override-manual sorts it like the rest).
 - A photo whose file is gone is reported and left alone.
+- A photo the quality probe scores at or above its threshold is deleted
+  (image, caption, JSON sidecar, export links) and marked skipped, so no run
+  fetches it again. Hand-sorted photos are kept unless --override-manual.
+  Deleting cannot be undone.
 - Every move goes into the store, so --undo puts the last reclassify back.
 """
 
@@ -18,10 +22,13 @@ import time
 from collections import Counter
 from pathlib import Path
 
+import numpy as np
+
 import folders
 import layout
 from folders import move_pair, prune_empty, scan_scope  # noqa: F401
-from store import Store
+import quality
+from store import SKIPPED, Store
 
 
 def update_record(store: Store, cid: int, rel: str, verdict_dict: dict | None, note: dict,
@@ -43,7 +50,8 @@ def update_record(store: Store, cid: int, rel: str, verdict_dict: dict | None, n
 
 
 def plan(store: Store, base: Path, scope: dict, classifier, override_manual: bool, log=print) -> dict:
-    """What a reclassify would do. -> {"moves": [...], "manual": [...], "missing": [...], "kept": n, "embedded": n}
+    """What a reclassify would do.
+    -> {"moves": [...], "low_quality": [...], "manual": [...], "missing": [...], "kept": n, "embedded": n}
 
     Paths and categories are relative to the scope; in a base split by black-and-white
     and colour they start with the mode (bw/50_transport), so a photo moved by hand
@@ -76,6 +84,11 @@ def plan(store: Store, base: Path, scope: dict, classifier, override_manual: boo
             if embedded % 200 == 0:
                 log(f"  embedded {embedded:,} images without a stored embedding ({time.time() - t0:.0f} s)")
         vecs.append(v)
+    bad = classifier.low_quality(vecs) if vecs else np.zeros(0)
+    low = [{"cid": cid, "src": actual, "category": cat_now, "p_bad": round(float(b), 4)}
+           for (cid, actual, cat_now, _), b in zip(todo, bad) if not np.isnan(b)]
+    keep = [i for i, b in enumerate(bad) if np.isnan(b)]
+    todo, vecs = [todo[i] for i in keep], [vecs[i] for i in keep]
     verdicts = classifier.decide_many(vecs) if vecs else []
     moves, kept = [], 0
     for (cid, actual, cat_now, sha), v in zip(todo, verdicts):
@@ -88,8 +101,8 @@ def plan(store: Store, base: Path, scope: dict, classifier, override_manual: boo
             kept += 1
         else:
             moves.append({"cid": cid, "src": actual, "from": cat_now, "to": to, "verdict": v.as_dict()})
-    return {"moves": moves, "manual": manual, "missing": missing, "kept": kept, "embedded": embedded,
-            "checked": len(rows)}
+    return {"moves": moves, "low_quality": low, "manual": manual, "missing": missing, "kept": kept,
+            "embedded": embedded, "checked": len(rows)}
 
 
 UNSURE = "_unsure"
@@ -117,13 +130,38 @@ def plan_unsure(store: Store, base: Path, scope: dict) -> dict:
         verdict["folder"] = best
         moves.append({"cid": cid, "src": actual, "from": cat, "to": layout.with_mode(scope, mode, best),
                       "verdict": verdict})
-    return {"moves": moves, "manual": [], "missing": missing, "kept": kept, "embedded": 0, "checked": len(rows)}
+    return {"moves": moves, "low_quality": [], "manual": [], "missing": missing, "kept": kept, "embedded": 0,
+            "checked": len(rows)}
 
 
 def _follow(store: Store, exporter, cid: int) -> None:
     if exporter is not None:
         st = store.status(cid)
         exporter.move(cid, st.get("mode"), st.get("category") or "")
+
+
+def delete_low_quality(store: Store, base: Path, scope: dict, low: list, chunks, log=print, exporter=None) -> int:
+    """Delete the low-quality photos and mark them skipped: no run fetches them again."""
+    name = scope["name"]
+    deleted = 0
+    scans: dict = {}
+    for m in low:
+        cid, src = m["cid"], m["src"]
+        if not (base / layout.to_base(scope, src)).is_file():
+            here = folders.locate(base, scope, cid, None, scans)
+            if here is None:
+                log(f"  {cid}: not found; marked low quality all the same")
+            else:
+                src = layout.to_scope(scope, here)
+        img = base / layout.to_base(scope, src)
+        for f in (img, img.with_suffix(".txt"), img.with_suffix(".json"), layout.record_file(base, cid)):
+            f.unlink(missing_ok=True)
+        chunks.remove(src)
+        if exporter is not None:
+            exporter.remove(cid)
+        store.reject(cid, name, SKIPPED, f"{quality.REASON} (P(bad) {m['p_bad']:.2f})", {})
+        deleted += 1
+    return deleted
 
 
 def apply(store: Store, base: Path, scope: dict, p: dict, samples: str, log=print, exporter=None) -> dict:
@@ -138,6 +176,7 @@ def apply(store: Store, base: Path, scope: dict, p: dict, samples: str, log=prin
         store.move(cid, rel, plain, rec, mode)
         _follow(store, exporter, cid)
     chunks = folders.ScopeChunks(store, base, scope, log, defer=True)
+    deleted = delete_low_quality(store, base, scope, p.get("low_quality") or [], chunks, log, exporter)
     run = store.start_reclass(name, samples)
     moved = failed = 0
     scans: dict = {}
@@ -170,7 +209,8 @@ def apply(store: Store, base: Path, scope: dict, p: dict, samples: str, log=prin
     chunks.settle()
     pruned = folders.prune_scope(base, scope)
     store.recount(name)
-    return {"run": run, "moved": moved, "failed": failed, "pruned": pruned, "manual": len(p["manual"])}
+    return {"run": run, "moved": moved, "failed": failed, "pruned": pruned, "manual": len(p["manual"]),
+            "deleted": deleted}
 
 
 def undo(store: Store, base: Path, scope: dict, log=print, exporter=None) -> dict:
@@ -227,6 +267,7 @@ def undo(store: Store, base: Path, scope: dict, log=print, exporter=None) -> dic
 def summary(p: dict) -> str:
     flows = Counter((m["from"], m["to"]) for m in p["moves"])
     lines = [f"{p['checked']:,} photos: {len(p['moves']):,} to move, {p['kept']:,} stay, "
+             f"{len(p.get('low_quality') or []):,} low quality (to delete), "
              f"{len(p['manual']):,} moved by hand (kept), {len(p['missing']):,} files missing; "
              f"{p['embedded']:,} embedded from their files"]
     for (a, b), n in flows.most_common(25):

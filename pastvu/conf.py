@@ -12,6 +12,7 @@ the defaults of a run, and the region aliases, in three groups: countries
     fetchers = 4
     json_files = no
     priority_margin = 0.15
+    quality_threshold = 0.88
 
     [aliases.countries]
     belarus = 22
@@ -65,6 +66,8 @@ class Conf:
     fetchers: int = 4
     json_files: bool = False
     priority_margin: float = 0.15
+    quality_threshold: float = 0.88
+    quality_in_file: bool = False      # the key is in the file (else it is written there on first use)
     layout: str | None = None          # the folder tree of a new base; None: not in the file (written on first use)
     bw_color: bool | None = None       # bw/ and color/ at the top of a new base; None: not in the file
     caption: CaptionConf = field(default_factory=CaptionConf)
@@ -110,6 +113,11 @@ BW_COLOR_COMMENT = [
     "; Black-and-white and colour photos in two trees: <base>\\bw\\... and",
     "; <base>\\color\\..., each with the layout above. A base keeps the choice it was made with.",
 ]
+
+
+QUALITY_COMMENT = ["; Photos the quality probe (trained on _quality_good and _quality_bad in the",
+                   "; samples folder) scores at or above this P(bad) are skipped and never saved,",
+                   "; and reclassify deletes the saved ones. 0 turns it off."]
 
 
 def save_layout(path: Path, value: str) -> None:
@@ -175,6 +183,9 @@ def load(path: Path | None = None) -> Conf:
             conf.fetchers = d.getint("fetchers", fallback=conf.fetchers)
             conf.json_files = d.getboolean("json_files", fallback=conf.json_files)
             conf.priority_margin = d.getfloat("priority_margin", fallback=conf.priority_margin)
+            if d.get("quality_threshold", "").strip():
+                conf.quality_threshold = d.getfloat("quality_threshold")
+                conf.quality_in_file = True
         except ValueError as e:
             raise SystemExit(f"{path}: [defaults] {e}")
     if cp.has_section("caption"):

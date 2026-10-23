@@ -19,7 +19,7 @@ You give a place and years, for example “Belarus, 1917 to 1991” or “Ukrain
    - It paints out printed captions, photographer credits and watermarks. It paints only marks it is confident about, so real shop signs and buildings are left alone.
    - Cropping never lowers JPEG quality; only painting re-saves an image.
 3. **Black-and-white or colour:** a fast pixel test tells colour photos from black-and-white ones, and counts sepia, toned prints and yellowed paper as black-and-white.
-4. **Sort:** it puts the photo into your categories, such as transport, people or monuments, learned from example images you put in a samples folder. When two categories fit about equally, the one with the lower folder number wins. Every photo goes into a category, a doubtful one into its best guess.
+4. **Sort:** it first leaves out low-quality photos, such as film and TV frame grabs and blurry or washed-out scans, learned from two folders of examples. Then it puts the photo into your categories, such as transport, people or monuments, learned from example images you put in a samples folder. When two categories fit about equally, the one with the lower folder number wins. Every photo goes into a category, a doubtful one into its best guess.
 5. **Caption:** it writes a short facts line from PastVu’s record: title, years, place and description.
 6. **Describe with a model (optional):** a vision model on your own machine, currently Gemma 4 in KoboldCpp, writes a full English description. It starts from the facts line and adds what is visible in the photo.
 
@@ -29,7 +29,7 @@ Downloads are split into black-and-white and colour first, then filed by decade 
 
 - **Stop and resume:** stop at any time; the same command continues where it left off. I killed runs on purpose several times, and nothing was lost or half-written.
 - **No double downloads:** a photo is downloaded only once, even if two runs cover the same area.
-- **Re-sorting:** after you improve your samples, `reclassify` re-sorts everything already downloaded in seconds. It never undoes your manual moves, and it can be undone.
+- **Re-sorting:** after you improve your samples, `reclassify` re-sorts everything already downloaded in seconds. It never undoes your manual moves, and it can be undone. Only the deletion of low-quality photos cannot be undone, so it asks first.
 - **Splitting and regrouping:** a country can be downloaded straight into one folder per decade, region or country. Photos you already have can be moved between such folders later without downloading them again, and every regroup can be undone ([Splitting and regrouping](#splitting-and-regrouping)).
 - **Captioning later:** `autocaption` captions photos you already have, a whole set or one folder, with a progress bar, statistics and resume. Old captions are backed up and can be restored.
 - **Live display:** a status line shows what is happening and how much GPU memory is in use, above a progress bar. Regular summaries report counts, skips, paints and speed.
@@ -69,6 +69,7 @@ split = 5000                          at most this many images per folder; 0: no
 fetchers = 4                          download threads
 json_files = no                       also write each record as a JSON file
 priority_margin = 0.15                within this of the top score, the lower-numbered category wins
+quality_threshold = 0.88              skip photos the quality probe scores at or above this; 0: off
 
 [caption]                             the VLM of autocaption; see Autocaption
 api_url = http://localhost:5001/v1
@@ -142,6 +143,16 @@ samples\
 ```
 
 Number in steps of 10, so a category can go in between later without renaming the others. The folders sort by the value of the number, so `100_monuments` comes after `90_environment_outdoors`; a folder without a number comes after all numbered ones. The priority is this tool's: [classify](../classify/README.md) itself sorts by the higher score alone. Folders whose names start with `_` are ignored; the samples' embeddings are cached in `_embeddings` inside the samples folder. After you change the samples, `reclassify` sorts what you already downloaded again, in seconds.
+
+### Low-quality photos
+
+Two more folders in the samples folder teach a second probe which photos to leave out: `_quality_good` and `_quality_bad`. Put sharp, ordinary photos into the first. Put the kind you do not want into the second: film and TV frame grabs, and blurry, soft, foggy or washed-out scans. Use photos of at least 512 pixels on the short side; the download skips smaller ones anyway, so they teach the probe little. Each folder needs at least 20 images, or the filter is off.
+
+The probe reads the same SigLIP 2 embedding as the category classifier, so it needs no second model on the GPU, and its time per photo is too small to measure. A photo that it scores at or above `quality_threshold` (P(bad) 0.88 by default) is skipped like a photo under 512 pixels. It is not saved, the store marks it skipped with the reason `low quality` and its score, and no later run downloads it again. `reclassify` deletes the saved photos that score that high ([Reclassify](#reclassify)). The threshold is set in the conf only, in `[defaults]`; a conf without it gets `quality_threshold = 0.88` written into it the first time it is used, and 0 turns the filter off.
+
+At 0.88, with 94 good and 131 bad samples, about 3 % of 28,620 downloaded photos scored that high. Nearly all of them were film and TV frame grabs and soft scans; about one in eight was a photo worth keeping. The scores move whenever the two folders change, so check the threshold again after you edit them: `reclassify --dry-run` lists every photo it would delete in `<base>\_reports\`. Label both kinds: when you add only bad examples, all scores go up.
+
+Other folders whose names start with `_`, such as a folder of photos that you did not sort yet, are ignored by both probes.
 
 ## Usage
 
@@ -259,7 +270,7 @@ Both kinds of regroup move files the same way:
 2. **Band and borders** (download threads): the band rows are known from the record and come off exactly. [remove_borders](../remove_borders/README.md) analyses the picture without the band for scanned frames, mounts, thin lines and text banners.
 3. **Watermarks** (GPU): the [watermark](../watermark/README.md) detector runs on the picture without the band, so the band's own text is never taken for a watermark. Detections from `--wm-conf` (0.1) go into the record; only those from `--wm-paint-conf` (0.4) are painted out with LaMa. Below 0.4 the detector often finds scene text and objects (a shop sign, a building facade); from 0.4 up it found printed captions and credits in every case checked.
 4. **Crop**: the band, the border cuts and a watermark trim (`--wm-mode trim`) make one crop, put on the JPEG block grid: the top and left edges move inward to the next block where a cut set them, so the cut part goes completely, and the far edges are exact.
-5. **Classify** (GPU): the final pixels are embedded with SigLIP 2 and scored by classify's probe, trained once at start on the samples folder. Among the categories within `priority_margin` of the top score, the lowest-numbered takes the image ([The samples folder](#the-samples-folder)). Then classify's gates: the summed score of those near categories against the confidence threshold (`--min-confidence`, 0.7) and their summed share of the 10 nearest examples against 0.3; an image that fails still goes into the chosen category, its best guess, and the record keeps the reason (`low confidence` or `disagree`), so doubtful photos can be found later. A byte-identical copy of a sample takes the sample's category. The record keeps the score of the chosen category and, when the priority chose it over a higher score, which category that was.
+5. **Classify** (GPU): the final pixels are embedded with SigLIP 2 and scored by classify's probe, trained once at start on the samples folder. Among the categories within `priority_margin` of the top score, the lowest-numbered takes the image ([The samples folder](#the-samples-folder)). Then classify's gates: the summed score of those near categories against the confidence threshold (`--min-confidence`, 0.7) and their summed share of the 10 nearest examples against 0.3; an image that fails still goes into the chosen category, its best guess, and the record keeps the reason (`low confidence` or `disagree`), so doubtful photos can be found later. A byte-identical copy of a sample takes the sample's category. The record keeps the score of the chosen category and, when the priority chose it over a higher score, which category that was. Before the categories, the quality probe scores the same embedding, and a photo at or above `quality_threshold` is skipped ([Low-quality photos](#low-quality-photos)).
 6. **Black-and-white or colour** (CPU, about 0.06 s): the pixel test on the final picture, with the painted watermark boxes left out; a borderline photo is decided by the probe on its SigLIP 2 embedding ([Black-and-white and colour](#black-and-white-and-colour)).
 7. **Write** (writer threads): the image and its caption go into the next folder of the category with room, under `bw\` or `color\`; then the photo's status, its record, its embedding and the scope's counters are committed to the store in one transaction.
 
@@ -459,6 +470,8 @@ Sorts the saved photos of a scope again with the samples folder as it is now (or
 
 A photo you moved to another category by hand keeps its place: reclassify sees that its file is not where the store says, records where it is now, and leaves it there (`--override-manual` sorts it like the rest). A photo whose file is gone is reported and left alone. `--dry-run` prints the moves per category pair and writes them to `<base>\_reports\`. `--undo` puts the photos of the last reclassify back into the categories they came from.
 
+A saved photo that the quality probe scores at or above `quality_threshold` is deleted: its image, caption, JSON file and export links. The store marks it skipped (`low quality`), so no run downloads it again, and `--undo` cannot bring it back. Before it deletes, reclassify asks `This deletes N low-quality photos ... Continue? [y/N]`, and `--yes` skips the question. `--dry-run` lists these photos in its report. With `quality_threshold = 0` in the conf, reclassify sorts without deleting. A photo that you moved by hand is kept, unless you give `--override-manual`.
+
 Versions before 2026-10-23 put doubtful photos into `_unsure\<category>`. `reclassify --unsure` moves them into `<category>`, their best guess, without the classifier or the GPU: `run.bat reclassify --unsure` for the whole base (it asks first), or name scopes. `--dry-run` and `--undo` work as for a full reclassify.
 
 Several scopes and name patterns are sorted one after another with one load of the classifier. Without a scope, reclassify works on every scope of the base folder; it first asks `This will reclassify N scope folders ... Continue? [y/N]` with the number of saved photos, and `--yes` skips the question. `reclassify --undo` without a scope undoes the last reclassify of every scope that has one, after the same question.
@@ -488,7 +501,7 @@ Copies the photos of a category out of the base folder into a flat folder for tr
 - **The photos are found where they are on disk**, in the category folders of every scope, so a photo you moved by hand to another category, or between `bw\` and `color\`, is extracted from where it sits now. Only finished photos are taken, so extract can run beside a download.
 - **Filters narrow the selection and never add folders:** `--region` (one or more, matched against the photo's own region chain, so `--region crimea` finds Crimean photos in `russia_1970s`), `--years` (dating overlaps the years), `--decade` (dating starts in the decade), `--scope` (names or patterns), `--bw` or `--color`.
 - **`--min-res N`** keeps photos of at least N×N pixels, measured as area as in [k2prep](../k2prep/README.md): `--min-res 1024` is 1,048,576 pixels whatever the shape, so 1536×768 passes and 1200×800 does not.
-- **`--target N`** picks N photos for balancing categories against each other. `--colour-share` of them are colour (0.5 by default; 0.4 is 40 % colour), and a side that has too few is filled from the other. Within black-and-white and within colour, each decade gets a share proportional to its photos in the selection, so the decades keep the proportions they have; the scope options (`--decade`, `--years`, `--region`) decide which decades take part. Inside a decade the largest photos come first: there is no quality score yet, and size is stable, so a top-up keeps what it picked before. The run prints what it took from each decade, for example `bw 50: 1930s 12/53, 1940s 5/22, ...`.
+- **`--target N`** picks N photos for balancing categories against each other. `--colour-share` of them are colour (0.5 by default; 0.4 is 40 % colour), and a side that has too few is filled from the other. Within black-and-white and within colour, each decade gets a share proportional to its photos in the selection, so the decades keep the proportions they have; the scope options (`--decade`, `--years`, `--region`) decide which decades take part. Inside a decade the largest photos come first: the quality filter only keeps or drops a photo and gives no ranking, and size is stable, so a top-up keeps what it picked before. The run prints what it took from each decade, for example `bw 50: 1930s 12/53, 1940s 5/22, ...`.
 - **The output folder** is `<base parent>\<category>` with the filters added to the name (`050-transport_1970s`, `050-transport_ukraine_1960-1979`, `140-aerial_min1024_n15000`), or `-o` for one category. `--split N` puts at most N images into each numbered folder under `bw\` and `color\` when a flat folder grows too large.
 - **Each image comes with its caption** (`.txt`, the VLM caption where there is one) and its `.short` caption if [recaption_json](../recaption_json/README.md) made one.
 - **Running it again tops the folder up:** new photos are copied, files already there are left as they are (captions you edited for training stay), and files from earlier extracts that no longer match (reclassified, moved, dropped) are reported; `--prune` deletes them. Files you put there yourself are never pruned. `extract.json` holds the criteria and the files extract copied.
@@ -601,6 +614,7 @@ Each record carries what attribution and a takedown need: the PastVu page, the u
 | `partition.py` | the rules of `--by`: which scope a photo belongs to |
 | `regroup.py` | moving photos between scopes, drop, and undo |
 | `colour.py` | the black-and-white or colour test, and the probe for borderline photos |
+| `quality.py` | the quality probe: low-quality photos are skipped, or deleted by reclassify |
 | `folders.py` | finding and moving files, and the move of a category into numbered folders |
 | `runlock.py` | whether the process that holds the lock still runs |
 | `layout.py` | scope names, the folder tree, and the numbered-folder allocator |

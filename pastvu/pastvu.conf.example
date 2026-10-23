@@ -32,6 +32,10 @@ json_files = no
 ; within this margin of the top one, the lowest-numbered of them wins. 0 turns
 ; it off (the top score always wins).
 priority_margin = 0.15
+; Photos the quality probe (trained on _quality_good and _quality_bad in the
+; samples folder) scores at or above this P(bad) are skipped and never saved,
+; and reclassify deletes the saved ones. 0 turns it off.
+quality_threshold = 0.88
 
 [caption]
 ; autocaption: a vision-language model writes each caption from the image and

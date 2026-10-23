@@ -9,6 +9,10 @@ embedding and the counters are committed in one transaction. A photo found
 in state writing at the start of a run was interrupted: its files are
 deleted and it is done again.
 
+A photo the quality probe scores at or above its threshold is skipped after
+the embedding, before the category decision and the writing, and never
+fetched again (like a photo under --min-side).
+
 Ctrl+C finishes the images already fetched and stops; a second Ctrl+C stops
 at once. Either way the store says what is done, and the next run of the same
 command continues with the rest.
@@ -124,6 +128,7 @@ class Stream:
         self.tool = {"name": "dataset_tools/pastvu", "version": TOOL_VERSION, "detector": self.det_name,
                      "detector_conf": opts.wm_conf, "paint_conf": opts.wm_paint_conf, "encoder": enc_model,
                      "priority_margin": getattr(classifier, "priority_margin", None),
+                     "quality_threshold": getattr(getattr(classifier, "quality", None), "threshold", None),
                      "patches": getattr(classifier, "patches", None)}
 
     def log(self, text: str) -> None:
@@ -242,6 +247,10 @@ class Stream:
             d.set(f"{job.cid}: classifying")
             t = time.perf_counter()
             vec = self.classifier.embed(final)
+            bad = float(self.classifier.low_quality(vec)[0])
+            if not np.isnan(bad):          # at or above the threshold
+                s.time("classify", time.perf_counter() - t)
+                raise pr.Rejected(self.classifier.quality.reason(bad))
             verdict = self.classifier.decide(vec)
             s.time("classify", time.perf_counter() - t)
         tone = colour.decide(tone, self.mode_probe, vec)
