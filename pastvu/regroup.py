@@ -296,7 +296,7 @@ def apply(store: Store, base: Path, p: dict, rule: str, target: str, log=print) 
     return {"run": run, **{k: stats[k] for k in KEYS}}
 
 
-def drop_scope(store: Store, base: Path, sc: dict, log=print) -> dict:
+def drop_scope(store: Store, base: Path, sc: dict, log=print, exporter=None) -> dict:
     """Delete the scope's files and forget the scope. Its photos are marked not
     downloaded, with no record, embedding or VLM caption, so a later run
     fetches and processes them from scratch. Cannot be undone."""
@@ -313,6 +313,9 @@ def drop_scope(store: Store, base: Path, sc: dict, log=print) -> dict:
         rf = layout.record_file(base, cid)
         if rf.is_file():
             rf.unlink()
+    if exporter is not None:
+        for cid, *_ in rows:
+            exporter.remove(cid)
     store.forget_photos([r[0] for r in rows])
     store.close_reclass_runs(name)
     store.remove_scope(name)

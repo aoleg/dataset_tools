@@ -120,7 +120,13 @@ def plan_unsure(store: Store, base: Path, scope: dict) -> dict:
     return {"moves": moves, "manual": [], "missing": missing, "kept": kept, "embedded": 0, "checked": len(rows)}
 
 
-def apply(store: Store, base: Path, scope: dict, p: dict, samples: str, log=print) -> dict:
+def _follow(store: Store, exporter, cid: int) -> None:
+    if exporter is not None:
+        st = store.status(cid)
+        exporter.move(cid, st.get("mode"), st.get("category") or "")
+
+
+def apply(store: Store, base: Path, scope: dict, p: dict, samples: str, log=print, exporter=None) -> dict:
     name, width = scope["name"], layout.scope_width(scope)
     # hand-sorted photos: record where they are now (their category, and their mode in a split base)
     for cid, stored, actual in p["manual"]:
@@ -130,6 +136,7 @@ def apply(store: Store, base: Path, scope: dict, p: dict, samples: str, log=prin
         rel = layout.to_base(scope, actual)
         rec = update_record(store, cid, rel, None, {"time": time.time(), "manual": True, "from": old, "to": cat}, mode)
         store.move(cid, rel, plain, rec, mode)
+        _follow(store, exporter, cid)
     chunks = folders.ScopeChunks(store, base, scope, log, defer=True)
     run = store.start_reclass(name, samples)
     moved = failed = 0
@@ -157,6 +164,7 @@ def apply(store: Store, base: Path, scope: dict, p: dict, samples: str, log=prin
         rec = update_record(store, m["cid"], chunks.rel(dst), m["verdict"], note)
         store.move(m["cid"], chunks.rel(dst), layout.mode_category(scope, m["to"])[1], rec)
         chunks.done(dst)
+        _follow(store, exporter, m["cid"])
         store.add_reclass_move(run, seq, m["cid"], src, dst, m["from"], m["to"])
         moved += 1
     chunks.settle()
@@ -165,7 +173,7 @@ def apply(store: Store, base: Path, scope: dict, p: dict, samples: str, log=prin
     return {"run": run, "moved": moved, "failed": failed, "pruned": pruned, "manual": len(p["manual"])}
 
 
-def undo(store: Store, base: Path, scope: dict, log=print) -> dict:
+def undo(store: Store, base: Path, scope: dict, log=print, exporter=None) -> dict:
     """Put the photos of the last reclassify back into the categories they came
     from (into a numbered folder with room when the category was chunked since)."""
     name = scope["name"]
@@ -207,6 +215,7 @@ def undo(store: Store, base: Path, scope: dict, log=print) -> dict:
             rec = json.dumps(rec, ensure_ascii=False, indent=1, default=str)
         store.move(cid, chunks.rel(back_to), layout.mode_category(scope, cat_from)[1], rec)
         chunks.done(back_to)
+        _follow(store, exporter, cid)
         back += 1
     chunks.settle()
     store.undo_reclass(last["id"])

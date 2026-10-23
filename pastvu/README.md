@@ -492,7 +492,29 @@ Copies the photos of a category out of the base folder into a flat folder for tr
 - **The output folder** is `<base parent>\<category>` with the filters added to the name (`050-transport_1970s`, `050-transport_ukraine_1960-1979`, `140-aerial_min1024_n15000`), or `-o` for one category. `--split N` puts at most N images into each numbered folder under `bw\` and `color\` when a flat folder grows too large.
 - **Each image comes with its caption** (`.txt`, the VLM caption where there is one) and its `.short` caption if [recaption_json](../recaption_json/README.md) made one.
 - **Running it again tops the folder up:** new photos are copied, files already there are left as they are (captions you edited for training stay), and files from earlier extracts that no longer match (reclassified, moved, dropped) are reported; `--prune` deletes them. Files you put there yourself are never pruned. `extract.json` holds the criteria and the files extract copied.
-- **Copy or link.** Images are copied by default. `--link` hard-links them instead, so they take no extra disk space on the same drive; captions are always copied. A tool that edits images in place (remove_borders, jpeg_cleanup) would then change the base's files too, which is why it is not the default; every run without `--link` prints a reminder that it exists. `--dry-run` counts and copies nothing.
+- **Copy or link.** Images are copied by default. `--link` hard-links them instead, so they take no extra disk space on the same drive; captions are always copied. Deleting a hard-linked file removes that link only: the base keeps its file, and the disk space comes back only when both are gone. Editing is what to watch: the dataset tools of this repository (remove_borders, watermark, jpeg_cleanup) write a new file and rename it over the old one, which breaks the link and leaves the base as it was; an editor that saves into the same file changes both. Every run without `--link` prints a reminder that it exists. `--dry-run` counts and copies nothing.
+
+## Live export: `run --export`
+
+```
+run.bat run --region ussr --by country --export
+```
+
+Hard-links every saved photo into `pastvu_export` next to the base folder as it is written, one folder per category, then `bw\` and `color\`, then numbered folders of at most `split` images (the conf's split, 5,000 by default):
+
+```
+<base parent>\pastvu_export\
+  050-transport\bw\001\123456.jpg, 123456.txt
+                     002\...
+               color\001\...
+  100-environment_outdoors\...
+```
+
+- **Hard links, image and caption.** The export takes no extra disk space on the drive of the base, and a caption that autocaption writes later lands in both places, as it writes the file in place. Deleting a hard-linked file removes that link only: the base keeps its file, and the disk space comes back only when both are gone. Editing is what to watch: the dataset tools of this repository (remove_borders, watermark, jpeg_cleanup) write a new file and rename it over the old one, which breaks the link and leaves the base as it was; an editor that saves into the same file changes both. On another drive, or a file system without hard links, the files are copied and the run says so.
+- **Photos saved before** the export existed are linked when a run with `--export` starts; that pass only creates links, so it is fast.
+- **Curating by deleting.** An image you delete from the export is remembered as excluded and never linked again, and its caption link is tidied away. A photo you move to another folder inside the export is recorded where you put it. `--export-reset` forgets the exclusions and links those photos again.
+- **The export follows the base.** `reclassify` moves a photo's links to its new category or into the other of `bw\` and `color\` (unless you moved it inside the export yourself), and `drop` deletes the links of the dropped photos. Moves inside the base (regroup, a category passing the split) keep the links valid by themselves, since a link points to the file, not to its folder.
+- **Only with the flag.** A run without `--export` on a base that has an export says so and does not link; the next run with `--export` catches up.
 
 ## Progress and resume
 
@@ -522,6 +544,8 @@ Each saved photo costs one API call and one image download; a photo skipped as t
 | `--scope NAME` | | resume a scope by its name or folder |
 | `--by RULE` | | split the download into scopes by `decade`, `country`, `region`, `country,decade` or `region,decade` |
 | `--regroup` | off | first move the saved photos the run's scopes list into them |
+| `--export` | off | hard-link every saved photo into `<base parent>\pastvu_export\<category>\<bw or color>\<NNN>\` as it is written |
+| `--export-reset` | off | with `--export`: link again the images you deleted from the export |
 | `--split N` | conf (5000) | at most N images per folder, for a new scope; 0: no split |
 | `--samples DIR` | conf | the classify samples folder |
 | `--no-classify` | off | no categories |
@@ -589,6 +613,7 @@ Each record carries what attribution and a takedown need: the PastVu page, the u
 | `tagging\` | the default prompts of autocaption |
 | `export.py` | records as JSON Lines or Parquet |
 | `extract.py` | a category copied into a flat folder for training |
+| `liveexport.py` | `run --export`: the hard-linked export of every saved photo |
 | `sidecars.py` | the caption and the record |
 | `progress.py` | the live display and the report blocks |
 | `stream.py` | the threads and the run |

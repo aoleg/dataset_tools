@@ -108,8 +108,11 @@ class Store:
             self.db.execute("ALTER TABLE scopes ADD COLUMN label TEXT")
         if "folder" not in cols:
             self.db.execute("ALTER TABLE scopes ADD COLUMN folder TEXT")
-        if "mode" not in {r[1] for r in self.db.execute("PRAGMA table_info(status)")}:
+        status_cols = {r[1] for r in self.db.execute("PRAGMA table_info(status)")}
+        if "mode" not in status_cols:
             self.db.execute("ALTER TABLE status ADD COLUMN mode TEXT")
+        if "export" not in status_cols:
+            self.db.execute("ALTER TABLE status ADD COLUMN export TEXT")
         self.set_meta("schema", SCHEMA_VERSION)
 
     def close(self) -> None:
@@ -506,6 +509,34 @@ class Store:
         with self.lock:
             return [r[0] for r in self.db.execute("SELECT path FROM status WHERE scope=? AND state IN (?, ?) AND path "
                                                   "IS NOT NULL", (scope, DONE, WRITING))]
+
+    # --- run --export: where each photo is linked in the export ("-": excluded by the user) --------
+
+    def export_of(self, cid: int) -> str | None:
+        with self.lock:
+            row = self.db.execute("SELECT export FROM status WHERE cid=?", (cid,)).fetchone()
+        return row[0] if row else None
+
+    def set_export(self, cid: int, rel: str | None) -> None:
+        with self.lock:
+            self.db.execute("UPDATE status SET export=? WHERE cid=?", (rel, cid))
+
+    def set_exports(self, rows: list[tuple[int, str | None]]) -> None:
+        self.tx(lambda db: db.executemany("UPDATE status SET export=? WHERE cid=?", [(r, c) for c, r in rows]))
+
+    def export_rows(self) -> list[tuple[int, str]]:
+        with self.lock:
+            return self.db.execute("SELECT cid, export FROM status WHERE export IS NOT NULL").fetchall()
+
+    def unexported_rows(self) -> list[tuple]:
+        """(cid, path, mode, category) of the saved photos the export has not seen."""
+        with self.lock:
+            return self.db.execute("SELECT cid, path, mode, category FROM status WHERE state=? AND path IS NOT NULL "
+                                   "AND export IS NULL ORDER BY cid", (DONE,)).fetchall()
+
+    def clear_exports(self) -> None:
+        with self.lock:
+            self.db.execute("UPDATE status SET export=NULL WHERE export IS NOT NULL")
 
     def move_paths(self, rows: list[tuple[int, str, str | None]]) -> None:
         """New paths of saved photos in one transaction: (cid, path, record JSON or None)."""

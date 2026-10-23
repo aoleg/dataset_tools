@@ -102,7 +102,7 @@ def cleanup_interrupted(store: Store, base: Path, scope: str) -> int:
 
 class Stream:
     def __init__(self, client: Client, store: Store, opts: Options, classifier=None, detector=None, lama=None,
-                 caption_client=None, vram=None, mode_probe=None):
+                 caption_client=None, vram=None, mode_probe=None, exporter=None):
         self.client, self.store, self.opts = client, store, opts
         self.classifier = classifier
         self.det_name, self.det = detector or (None, None)
@@ -117,6 +117,7 @@ class Stream:
         self.display: Display | None = None
         self.caption_client, self.vram = caption_client, vram
         self.mode_probe = mode_probe       # decides the borderline black-and-white or colour photos
+        self.exporter = exporter           # run --export: links each saved photo into the export
         self.captioner = None
         enc_model = getattr(getattr(classifier, "encoder", None), "model_id", None)
         self.emb_key = (enc_model, getattr(classifier, "patches", None))
@@ -293,6 +294,8 @@ class Stream:
             self.store.unclaim(job.cid)
             raise
         chunker.done(rel_scope)          # may move the category's images into 001 now that it passed the split
+        if self.exporter is not None:
+            self.exporter.add(job.cid, self.store.status(job.cid)["path"], tone["mode"], folder)
         s.time("write", time.perf_counter() - t)
         if self.captioner is not None:
             # after the photo is committed: a wait here (the VLM is behind) slows the stream, nothing else

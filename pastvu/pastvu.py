@@ -597,7 +597,15 @@ def run_locked(args, conf, client, base: Path, store: Store, sm) -> int:
               f"before it that are not done are left for later", flush=True)
     if vram.ok:
         print(f"  {vram.text()}", flush=True)
-    s = sm.Stream(client, store, opts, classifier, detector, lama, caption_client, vram, mode_probe)
+    exporter = None
+    if args.export or args.export_reset:
+        import liveexport as lx
+        exporter = lx.open_for_run(store, base, conf.split, reset=args.export_reset)
+    else:
+        import liveexport as lx
+        if lx.Exporter.exists_for(store):
+            print(f"  This base has an export ({lx.root_of(base)}); add --export to link the new photos into it too")
+    s = sm.Stream(client, store, opts, classifier, detector, lama, caption_client, vram, mode_probe, exporter)
     res = s.run(pairs, total, completed)
     left = len(store.pending_pairs(names, args.retries))
     where = sc["name"] if len(names) == 1 else f"its {len(names)} scopes"
@@ -678,9 +686,11 @@ def cmd_reclassify(args, conf, client) -> int:
                 print("Nothing done.")
                 return 1
     with locked(store, "reclassify", "shared" if args.dry_run else "exclusive"):
+        import liveexport as lx
+        exporter = lx.Exporter(store, base, conf.split) if lx.Exporter.exists_for(store) else None
         if args.undo:
             for sc in scopes:
-                res = rc.undo(store, base, sc)
+                res = rc.undo(store, base, sc, exporter=exporter)
                 print(f"{sc['name']}: undid reclassify run {res['run']}: {res['back']:,} photos moved back, "
                       f"{res['skipped']:,} left where they are, {res['pruned']} empty folders removed")
             return 0
@@ -709,7 +719,7 @@ def cmd_reclassify(args, conf, client) -> int:
                         f.write(json.dumps(m, ensure_ascii=False) + "\n")
                 print(f"Dry run: nothing moved. The planned moves are in {report}")
                 continue
-            res = rc.apply(store, base, sc, p, str(samples))
+            res = rc.apply(store, base, sc, p, str(samples), exporter=exporter)
             print(f"Reclassify run {res['run']}: {res['moved']:,} photos moved, {res['failed']:,} not moved, "
                   f"{res['manual']:,} hand-sorted photos recorded where they are, {res['pruned']} empty folders "
                   f"removed. --undo puts the moves back.")
@@ -911,8 +921,10 @@ def cmd_drop(args, conf, client) -> int:
         if not args.yes:
             print("Nothing deleted. Add --yes to delete these files and forget the scopes; this cannot be undone.")
             return 1
+        import liveexport as lx
+        exporter = lx.Exporter(store, base, conf.split) if lx.Exporter.exists_for(store) else None
         for sc in scopes:
-            res = rg.drop_scope(store, base, sc)
+            res = rg.drop_scope(store, base, sc, exporter=exporter)
             print(f"Dropped {sc['name']}: {res['files']:,} images deleted, {res['photos']:,} photos marked not "
                   f"downloaded")
     return 0
@@ -1161,6 +1173,11 @@ def parse_args(argv=None):
     p.add_argument("--scope", metavar="NAME", help="resume a scope by its name or folder")
     p.add_argument("--resume", action="store_true",
                    help="skip the index (no requests to plan or page it) and download what is listed already")
+    p.add_argument("--export", action="store_true",
+                   help="hard-link every saved photo into <base parent>/pastvu_export/<category>/<bw|color>/<NNN> "
+                        "as it is written (photos saved before are linked at the start)")
+    p.add_argument("--export-reset", action="store_true",
+                   help="with --export: forget the images you deleted from the export and link them again")
     p.add_argument("--regroup", action="store_true",
                    help="first move the saved photos the run's scopes list into them, from whatever scope holds them")
     p.add_argument("--samples", metavar="DIR", help="classify samples folder (default: [paths] samples of the conf)")

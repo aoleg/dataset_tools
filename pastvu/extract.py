@@ -45,8 +45,8 @@ import layout
 SIDECARS = (".txt", ".short")
 MANIFEST = "extract.json"
 LINK_TIP = ("Tip: --link hard-links the images instead of copying them, so they take no extra disk space on the "
-            "same drive (captions are still copied). A tool that edits images in place would then change the "
-            "base's files too.")
+            "same drive (captions are still copied). Deleting a linked image removes the link only; an editor that "
+            "saves into the same file changes the base's image too (the dataset tools write a new file instead).")
 _NUM = re.compile(r"^(\d+)[-_ ]*(.*)$")
 
 
