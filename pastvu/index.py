@@ -11,9 +11,12 @@ skip grows with the page number, so a region with many photos is paged
 through its children (the region tree) until each shard is under SHARD_MAX,
 plus a shard of the rest of the parent: its photos in none of the children,
 by the gallery's exclusion filter, which takes at most 10 regions. A parent with
-more children gets a geo!0 shard (photos without coordinates) instead, and its
-geotagged photos outside every child are reported and taken only with
---full-parent, which pages the parent itself.
+more children has no such shard: its photos in none of the children (placed at
+the parent itself, about 0.15 % of Russia) are reported and taken only with
+--full-parent, which pages the parent itself. A shard of the parent's photos
+without coordinates would cost a query over the whole parent per page (7 s a
+page for Russia) and mostly list photos its children list already, since a
+photo without coordinates still names its oblast or city.
 
 The gallery pages by skipping, so page N makes the server read and drop N x
 100 photos first: a long shard gets slower with every page. A shard of more
@@ -131,14 +134,10 @@ def plan_shards(client: Client, store: Store, scope: str, region: dict, years: t
         log(f"  {region_path(store, region)}: {count:,} photos, paged through {len(children)} children and "
             f"{rest:,} in none of them")
         return shards
-    f0 = filter_string([region["cid"]], years, geo="0")
-    count0 = client.count(f0)
-    shards.append({"key": f"{scope}|{f0}", "region": region["cid"], "filter": f0, "count": count0,
-                   "parts": {"regions": [region["cid"]], "geo": "0"}})
     covered = sum(s["count"] for s in shards)
-    log(f"  {region_path(store, region)}: {count:,} photos, paged through {len(children)} children and "
-        f"{count0:,} without coordinates; up to {max(0, count - covered):,} geotagged photos outside every child "
-        f"are left out (--full-parent takes them; the gallery excludes at most {MAX_EXCLUDE} regions)")
+    log(f"  {region_path(store, region)}: {count:,} photos, paged through {len(children)} children; up to "
+        f"{max(0, count - covered):,} photos in none of them are left out (--full-parent pages the region itself; "
+        f"the gallery excludes at most {MAX_EXCLUDE} regions)")
     return shards
 
 

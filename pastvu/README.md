@@ -571,7 +571,7 @@ Each saved photo costs one API call and one image download; a photo skipped as t
 | `--report-every N` | 500 | a report block every N photos |
 | `--quiet`, `--json-progress` | | report blocks only, or one JSON line per photo |
 | `--autocaption` | off | caption each saved photo with the VLM of `[caption]`; the downloads slow to its pace |
-| `--full-parent` | off | page a large region itself instead of through its children |
+| `--full-parent` | off | page a large region itself instead of through its children, to take the photos placed at the region itself (slower for the server) |
 | `--reindex` | off | page the scope again, to find photos published since |
 | `--resume` | off | skip the index (no requests to plan or page it) and download what is listed already |
 
@@ -579,7 +579,7 @@ Before the subcommand: `--conf FILE` another conf, `--base DIR` another base fol
 
 ## How the index works
 
-PastVu's API has no text search and no topics; it filters by region, years and type. The index pages PastVu's gallery for the scope, 100 photos a page, into the store. A region with more than 50,000 photos in scope is paged through its children in the region tree, plus the photos of the region that have no coordinates; geotagged photos that lie in the region but in none of its children are reported and taken only with `--full-parent`, which pages the region itself and costs the server more. The gallery pages by skipping, so every page of a long shard costs the server more than the one before; a shard of more than 5,000 photos that is not finished is therefore paged in year bands of at most 5,000 photos each (a photo dated across a band boundary is listed in both and kept once). A finished index is not paged again unless `--reindex`.
+PastVu's API has no text search and no topics; it filters by region, years and type. The index pages PastVu's gallery for the scope, 100 photos a page, into the store. A region with more than 50,000 photos in scope is paged through its children in the region tree. With at most 10 children, the photos in none of them are a shard of their own, by the gallery's exclusion filter. With more children (Russia, Moscow, Saint Petersburg) those photos, placed at the region itself and not in any of its parts, are reported and taken only with `--full-parent`, which pages the region itself and costs the server more; for Russia they are about 0.15 % of its photos. A photo without coordinates still names its oblast or city, so its child lists it: a separate pass over the region's photos without coordinates would cost a query over the whole region per page (about 7 s a page for Russia) and find almost nothing new, and the index no longer makes one. The gallery pages by skipping, so every page of a long shard costs the server more than the one before; a shard of more than 5,000 photos that is not finished is therefore paged in year bands of at most 5,000 photos each (a photo dated across a band boundary is listed in both and kept once). A finished index is not paged again unless `--reindex`.
 
 ## The photographs are not PastVu's
 
