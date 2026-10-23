@@ -14,6 +14,14 @@ by the gallery's exclusion filter, which takes at most 10 regions. A parent with
 more children gets a geo!0 shard (photos without coordinates) instead, and its
 geotagged photos outside every child are reported and taken only with
 --full-parent, which pages the parent itself.
+
+The gallery pages by skipping, so page N makes the server read and drop N x
+100 photos first: a long shard gets slower with every page. A shard of more
+than BAND_MAX photos that is not finished is therefore paged in year bands,
+the years halved until each band holds at most BAND_MAX photos (or one year).
+The year filter is an overlap, so a photo dated across a band boundary is
+listed in both bands, which the store takes once. Finished shards stay as
+they are.
 """
 
 from __future__ import annotations
@@ -27,6 +35,7 @@ from store import Store
 PAGE_SIZE = 100
 SHARD_MAX = 50_000
 MAX_EXCLUDE = 10           # the gallery filter takes at most 10 regions to exclude
+BAND_MAX = 5_000           # a shard larger than this is paged in year bands (deep skips get slow)
 REGIONS_MAX_AGE = 30 * 86400
 
 
@@ -103,7 +112,8 @@ def plan_shards(client: Client, store: Store, scope: str, region: dict, years: t
                 shard_max: int, log=print) -> list[dict]:
     f = filter_string([region["cid"]], years)
     count = client.count(f)
-    one = [{"key": f"{scope}|{f}", "region": region["cid"], "filter": f, "count": count}]
+    one = [{"key": f"{scope}|{f}", "region": region["cid"], "filter": f, "count": count,
+            "parts": {"regions": [region["cid"]]}}]
     if count <= shard_max or full_parent or not region["child_len"]:
         return one
     children = store.children(region["cid"])
@@ -116,13 +126,15 @@ def plan_shards(client: Client, store: Store, scope: str, region: dict, years: t
         # the rest of the region: its photos in none of the children, by the gallery's exclusion filter
         fr = filter_string([region["cid"]], years, exclude=[c["cid"] for c in children])
         rest = client.count(fr)
-        shards.append({"key": f"{scope}|{fr}", "region": region["cid"], "filter": fr, "count": rest})
+        shards.append({"key": f"{scope}|{fr}", "region": region["cid"], "filter": fr, "count": rest,
+                       "parts": {"regions": [region["cid"]], "exclude": [c["cid"] for c in children]}})
         log(f"  {region_path(store, region)}: {count:,} photos, paged through {len(children)} children and "
             f"{rest:,} in none of them")
         return shards
     f0 = filter_string([region["cid"]], years, geo="0")
     count0 = client.count(f0)
-    shards.append({"key": f"{scope}|{f0}", "region": region["cid"], "filter": f0, "count": count0})
+    shards.append({"key": f"{scope}|{f0}", "region": region["cid"], "filter": f0, "count": count0,
+                   "parts": {"regions": [region["cid"]], "geo": "0"}})
     covered = sum(s["count"] for s in shards)
     log(f"  {region_path(store, region)}: {count:,} photos, paged through {len(children)} children and "
         f"{count0:,} without coordinates; up to {max(0, count - covered):,} geotagged photos outside every child "
@@ -160,6 +172,33 @@ def describe_progress(p: dict) -> str:
     return text + ")"
 
 
+def band_shards(client: Client, store: Store, scope: str, shard: dict, years: tuple[int, int],
+                band_max: int = BAND_MAX, log=print) -> list[dict]:
+    """A shard over band_max photos, not finished, as year bands of at most band_max photos."""
+    prev = store.shard(shard["key"])
+    if shard["count"] <= band_max or (prev and prev["done"]) or "parts" not in shard:
+        return [shard]
+    parts = shard["parts"]
+    out = []
+
+    def split(y0: int, y1: int) -> None:
+        mid = (y0 + y1) // 2
+        for a, b in ((y0, mid), (mid + 1, y1)):
+            f = filter_string(parts["regions"], (a, b), exclude=parts.get("exclude"), geo=parts.get("geo"))
+            c = client.count(f)
+            if c > band_max and a < b:
+                split(a, b)
+            elif c:
+                out.append({"key": f"{scope}|{f}", "region": shard["region"], "filter": f, "count": c,
+                            "parts": parts, "band": [a, b]})
+
+    if years[0] >= years[1]:
+        return [shard]
+    split(years[0], years[1])
+    log(f"  {shard['filter']}: {shard['count']:,} photos, paged in {len(out)} year bands of at most {band_max:,}")
+    return out
+
+
 def run_index(client: Client, store: Store, scope: dict, full_parent: bool = False, refresh: bool = False,
               shard_max: int = SHARD_MAX, log=print, progress=None, assign=None) -> dict:
     """Page every shard of the scope into the store; a finished shard is not
@@ -172,6 +211,9 @@ def run_index(client: Client, store: Store, scope: dict, full_parent: bool = Fal
     shards = []
     for cid in scope["regions"]:
         shards.extend(plan_shards(client, store, scope["name"], store.region(cid), years, full_parent, shard_max, log))
+    shards = [b for s in shards for b in band_shards(client, store, scope["name"], s, years, BAND_MAX, log)]
+    # unfinished shards the plan no longer has (a long one now paged in bands): their photos stay listed
+    store.forget_shards(scope["name"], {s["key"] for s in shards})
     # the plan, so run --resume can tell how much of the index is done without asking PastVu again
     store.set_meta(f"plan:{scope['name']}", {"years": list(years), "time": time.time(),
                                              "shards": [[s["key"], s["count"]] for s in shards]})

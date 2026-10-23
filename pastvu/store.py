@@ -343,6 +343,16 @@ class Store:
 
         return self.tx(work)
 
+    def forget_shards(self, name: str, keep: set[str]) -> int:
+        """Delete the unfinished shards of a scope or family that are not in keep. -> how many."""
+        prefix = name + "|"
+        with self.lock:
+            rows = self.db.execute("SELECT key FROM shards WHERE substr(key, 1, ?) = ? AND done = 0",
+                                   (len(prefix), prefix)).fetchall()
+            gone = [k for (k,) in rows if k not in keep]
+            self.db.executemany("DELETE FROM shards WHERE key=?", [(k,) for k in gone])
+        return len(gone)
+
     def finish_shard(self, key: str) -> None:
         with self.lock:
             self.db.execute("UPDATE shards SET done=1, updated=? WHERE key=?", (time.time(), key))

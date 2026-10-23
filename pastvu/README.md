@@ -579,7 +579,7 @@ Before the subcommand: `--conf FILE` another conf, `--base DIR` another base fol
 
 ## How the index works
 
-PastVu's API has no text search and no topics; it filters by region, years and type. The index pages PastVu's gallery for the scope, 100 photos a page, into the store. A region with more than 50,000 photos in scope is paged through its children in the region tree, plus the photos of the region that have no coordinates; geotagged photos that lie in the region but in none of its children are reported and taken only with `--full-parent`, which pages the region itself and costs the server more. A finished index is not paged again unless `--reindex`.
+PastVu's API has no text search and no topics; it filters by region, years and type. The index pages PastVu's gallery for the scope, 100 photos a page, into the store. A region with more than 50,000 photos in scope is paged through its children in the region tree, plus the photos of the region that have no coordinates; geotagged photos that lie in the region but in none of its children are reported and taken only with `--full-parent`, which pages the region itself and costs the server more. The gallery pages by skipping, so every page of a long shard costs the server more than the one before; a shard of more than 5,000 photos that is not finished is therefore paged in year bands of at most 5,000 photos each (a photo dated across a band boundary is listed in both and kept once). A finished index is not paged again unless `--reindex`.
 
 ## The photographs are not PastVu's
 
