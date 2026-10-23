@@ -40,6 +40,18 @@ BAND_TOL = 24                  # per-channel distance from the band's median col
 BAND_MIN_LUMA, BAND_MAX_LUMA = 10, 200    # a custom uploader signature comes on a near-black band
 
 
+ASPECT_REASON = "aspect ratio"
+
+
+def aspect_reason(w: int, h: int, max_aspect: float) -> str | None:
+    """The skip reason of a picture whose long side is more than max_aspect times its short side
+    (a panorama, or a strip as tall), or None. max_aspect 0: no limit."""
+    if max_aspect <= 0 or not w or not h:
+        return None
+    r = max(w, h) / min(w, h)
+    return f"{ASPECT_REASON} ({r:.2f}:1)" if r > max_aspect + 1e-9 else None
+
+
 class Rejected(Exception):
     """An image the stream does not take, with the reason (status skipped or failed)."""
 

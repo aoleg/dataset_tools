@@ -548,7 +548,8 @@ def run_locked(args, conf, client, base: Path, store: Store, sm) -> int:
             scopes = {name: store.scope(name) for name in names}
         else:
             sc = store.scope(sc["name"])
-    opts = sm.Options(base=base, scope=sc, scopes=scopes, min_side=args.min_side, png=args.png, wm_conf=args.wm_conf,
+    opts = sm.Options(base=base, scope=sc, scopes=scopes, min_side=args.min_side, max_aspect=aspect_of(conf),
+                      png=args.png, wm_conf=args.wm_conf,
                       wm_paint_conf=args.wm_paint_conf, wm_mode=args.wm_mode, borders=not args.no_borders,
                       dark_borders=not args.no_dark, fetchers=args.fetchers or conf.fetchers, depth=args.depth,
                       writers=args.writers, report_every=args.report_every, limit=args.limit, retries=args.retries,
@@ -711,7 +712,7 @@ def cmd_reclassify(args, conf, client) -> int:
             else:
                 print(f"Sorting {sc['name']} again with {len(classifier.class_names)} classes from {samples} ...",
                       flush=True)
-                p = rc.plan(store, base, sc, classifier, args.override_manual)
+                p = rc.plan(store, base, sc, classifier, args.override_manual, max_aspect=aspect_of(conf))
             print(rc.summary(p))
             if args.dry_run:
                 report = base / "_reports" / f"{sc['name']}-reclassify-{time.strftime('%Y%m%d-%H%M%S')}.jsonl"
@@ -719,21 +720,28 @@ def cmd_reclassify(args, conf, client) -> int:
                 with open(report, "w", encoding="utf-8") as f:
                     for m in p["moves"]:
                         f.write(json.dumps(m, ensure_ascii=False) + "\n")
-                    for m in p["low_quality"]:
-                        f.write(json.dumps({**m, "delete": "low quality"}, ensure_ascii=False) + "\n")
+                    for m in p["low_quality"] + p["aspect"]:
+                        f.write(json.dumps({**m, "delete": m["reason"]}, ensure_ascii=False) + "\n")
                 print(f"Dry run: nothing moved or deleted. The planned moves and deletions are in {report}")
                 continue
             plans.append((sc, p))
         low = sum(len(p["low_quality"]) for _, p in plans)
-        if low and not confirm(f"This deletes {low:,} low-quality photos (P(bad) >= {classifier.quality.threshold}); "
-                               f"they are never downloaded again, and --undo cannot bring them back. Continue? [y/N] ",
-                               args.yes):
-            print("Nothing done. quality_threshold = 0 in [defaults] of the conf reclassifies without deleting.")
-            return 1
+        wide = sum(len(p["aspect"]) for _, p in plans)
+        if low + wide:
+            what = []
+            if low:
+                what.append(f"{low:,} low quality (P(bad) >= {classifier.quality.threshold})")
+            if wide:
+                what.append(f"{wide:,} with an aspect ratio over {conf.max_aspect:.2f}:1")
+            if not confirm(f"This deletes {low + wide:,} photos, {' and '.join(what)}; they are never downloaded "
+                           f"again, and --undo cannot bring them back. Continue? [y/N] ", args.yes):
+                print("Nothing done. quality_threshold = 0 and max_aspect = 0 in [defaults] of the conf reclassify "
+                      "without deleting.")
+                return 1
         for sc, p in plans:
             res = rc.apply(store, base, sc, p, str(samples), exporter=exporter)
             print(f"Reclassify run {res['run']}: {res['moved']:,} photos moved, {res['failed']:,} not moved, "
-                  f"{res['deleted']:,} low-quality photos deleted, "
+                  f"{res['deleted']:,} photos deleted (low quality or aspect ratio), "
                   f"{res['manual']:,} hand-sorted photos recorded where they are, {res['pruned']} empty folders "
                   f"removed. --undo puts the moves back.")
     return 0
@@ -955,6 +963,15 @@ def quality_of(conf: cf.Conf) -> float:
     return q
 
 
+def aspect_of(conf: cf.Conf) -> float:
+    """[defaults] max_aspect of the conf; written into the file with its default when it is not there."""
+    if not conf.aspect_in_file and conf.path and Path(conf.path).is_file():
+        cf.save_default(conf.path, "max_aspect", "21:9", cf.ASPECT_COMMENT)
+        conf.aspect_in_file = True
+        print(f"  max_aspect = 21:9 written into [defaults] of {conf.path}")
+    return conf.max_aspect
+
+
 def margin_of(args, conf: cf.Conf) -> float:
     m = args.priority_margin if getattr(args, "priority_margin", None) is not None else conf.priority_margin
     if not 0 <= m < 1:
@@ -1086,6 +1103,10 @@ priority_margin = 0.15
 ; samples folder) scores at or above this P(bad) are skipped and never saved,
 ; and reclassify deletes the saved ones. 0 turns it off.
 quality_threshold = 0.88
+; Photos whose long side is more than this times the short side (panoramas,
+; strips) are skipped like the ones under 512 pixels, and reclassify deletes
+; the saved ones. W:H or a number; 0 turns it off.
+max_aspect = 21:9
 
 [caption]
 ; autocaption: a vision-language model writes each caption from the image and

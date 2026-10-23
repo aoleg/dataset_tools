@@ -36,6 +36,10 @@ priority_margin = 0.15
 ; samples folder) scores at or above this P(bad) are skipped and never saved,
 ; and reclassify deletes the saved ones. 0 turns it off.
 quality_threshold = 0.88
+; Photos whose long side is more than this times the short side (panoramas,
+; strips) are skipped like the ones under 512 pixels, and reclassify deletes
+; the saved ones. W:H or a number; 0 turns it off.
+max_aspect = 21:9
 
 [caption]
 ; autocaption: a vision-language model writes each caption from the image and

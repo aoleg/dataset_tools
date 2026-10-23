@@ -509,6 +509,12 @@ class Store:
             row = self.db.execute(f"SELECT {', '.join(STATUS_COLS)} FROM status WHERE cid=?", (cid,)).fetchone()
         return dict(zip(STATUS_COLS, row)) if row else None
 
+    def sizes(self, scope: str) -> dict[int, tuple[int, int]]:
+        """cid -> (width, height) of the photos saved under the scope."""
+        with self.lock:
+            return {c: (w, h) for c, w, h in self.db.execute(
+                "SELECT cid, width, height FROM status WHERE state=? AND scope=?", (DONE, scope))}
+
     def done_rows(self, scope: str) -> list[tuple]:
         """(cid, path, category, sha256) of the photos saved under the scope; paths relative to the base."""
         with self.lock:

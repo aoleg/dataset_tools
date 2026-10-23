@@ -13,6 +13,7 @@ the defaults of a run, and the region aliases, in three groups: countries
     json_files = no
     priority_margin = 0.15
     quality_threshold = 0.88
+    max_aspect = 21:9
 
     [aliases.countries]
     belarus = 22
@@ -68,6 +69,8 @@ class Conf:
     priority_margin: float = 0.15
     quality_threshold: float = 0.88
     quality_in_file: bool = False      # the key is in the file (else it is written there on first use)
+    max_aspect: float = 21 / 9         # long side over short side; 0: no limit
+    aspect_in_file: bool = False
     layout: str | None = None          # the folder tree of a new base; None: not in the file (written on first use)
     bw_color: bool | None = None       # bw/ and color/ at the top of a new base; None: not in the file
     caption: CaptionConf = field(default_factory=CaptionConf)
@@ -118,6 +121,27 @@ BW_COLOR_COMMENT = [
 QUALITY_COMMENT = ["; Photos the quality probe (trained on _quality_good and _quality_bad in the",
                    "; samples folder) scores at or above this P(bad) are skipped and never saved,",
                    "; and reclassify deletes the saved ones. 0 turns it off."]
+
+
+ASPECT_COMMENT = ["; Photos whose long side is more than this times the short side (panoramas,",
+                  "; strips) are skipped like the ones under 512 pixels, and reclassify deletes",
+                  "; the saved ones. W:H or a number; 0 turns it off."]
+
+
+def parse_aspect(text: str) -> float:
+    """21:9 or 2.333 -> the long side over the short side; 0: no limit."""
+    t = text.strip()
+    try:
+        if ":" in t:
+            a, b = (float(x) for x in t.split(":", 1))
+            v = max(a, b) / min(a, b) if a > 0 and b > 0 else -1.0
+        else:
+            v = float(t)
+    except ValueError:
+        v = -1.0
+    if v != 0 and v < 1:
+        raise ValueError(f"max_aspect {t!r}: give W:H such as 21:9, a number of at least 1, or 0 (no limit)")
+    return v
 
 
 def save_layout(path: Path, value: str) -> None:
@@ -186,6 +210,9 @@ def load(path: Path | None = None) -> Conf:
             if d.get("quality_threshold", "").strip():
                 conf.quality_threshold = d.getfloat("quality_threshold")
                 conf.quality_in_file = True
+            if d.get("max_aspect", "").strip():
+                conf.max_aspect = parse_aspect(d.get("max_aspect"))
+                conf.aspect_in_file = True
         except ValueError as e:
             raise SystemExit(f"{path}: [defaults] {e}")
     if cp.has_section("caption"):

@@ -9,6 +9,8 @@ embedding and the counters are committed in one transaction. A photo found
 in state writing at the start of a run was interrupted: its files are
 deleted and it is done again.
 
+A photo whose long side is more than max_aspect (21:9) times its short side is
+skipped before the download (by the record's size) or after the crop.
 A photo the quality probe scores at or above its threshold is skipped after
 the embedding, before the category decision and the writing, and never
 fetched again (like a photo under --min-side).
@@ -49,6 +51,7 @@ class Options:
     scope: dict                       # the primary scope (its name titles the run)
     scopes: dict | None = None        # every scope the run writes into (run --by), name -> scope
     min_side: int = 512
+    max_aspect: float = 21 / 9        # long side over short side; 0: no limit
     png: bool = False
     wm_conf: float = 0.1
     wm_paint_conf: float = 0.4
@@ -153,6 +156,9 @@ class Stream:
         w, h = int(p.get("w") or 0), int(p.get("h") or 0)
         if min(w, h) < o.min_side:
             raise pr.Rejected("too small")
+        wide = pr.aspect_reason(w, h, o.max_aspect)
+        if wide:
+            raise pr.Rejected(wide)
         if not p.get("file"):
             raise pr.Rejected("no file in the record", failed=True)
         job.data, job.ctype = self.client.image(p["file"], "a")
@@ -231,6 +237,9 @@ class Stream:
         cw, ch = plan["size"]
         if min(cw, ch) < o.min_side:
             raise pr.Rejected("too small after crop")
+        wide = pr.aspect_reason(cw, ch, o.max_aspect)
+        if wide:
+            raise pr.Rejected(wide + " after crop")
         crop = pr.crop_array(job.array, plan["box"])
         painted = None
         if plan["wm_inside"]:

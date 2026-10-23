@@ -12,7 +12,7 @@ The tool turns PastVu, the big archive of historic photos of the former Soviet U
 
 You give a place and years, for example “Belarus, 1917 to 1991” or “Ukraine in the 1970s”. Places have short names in a settings file: all 15 former Soviet republics, groups such as “baltics”, every oblast and region, and the main cities. The tool asks PastVu for the list of matching photos, then handles them one at a time:
 
-1. **Download:** it fetches the full-size original. It skips photos smaller than 512 pixels on either side, and paintings.
+1. **Download:** it fetches the full-size original. It skips photos smaller than 512 pixels on either side, panoramas and strips wider (or taller) than 21:9, and paintings.
 2. **Clean:**
    - It cuts off PastVu’s grey “pastvu.com, uploaded by…” strip at the bottom.
    - It trims scanned frames and white borders.
@@ -70,6 +70,7 @@ fetchers = 4                          download threads
 json_files = no                       also write each record as a JSON file
 priority_margin = 0.15                within this of the top score, the lower-numbered category wins
 quality_threshold = 0.88              skip photos the quality probe scores at or above this; 0: off
+max_aspect = 21:9                     skip photos whose long side is more than this times the short side; 0: off
 
 [caption]                             the VLM of autocaption; see Autocaption
 api_url = http://localhost:5001/v1
@@ -266,7 +267,7 @@ Both kinds of regroup move files the same way:
 
 ## What happens to one photo
 
-1. **Fetch** (download threads): the PastVu record; the photo is skipped when it is smaller than `--min-side` (512) on either side, a painting, or not public. Then the original file, which is the picture with PastVu's grey band appended at the bottom (`pastvu.com/<cid> uploaded by ...`). The file must have the size the record gives, picture plus band, or the photo counts as failed.
+1. **Fetch** (download threads): the PastVu record; the photo is skipped when it is smaller than `--min-side` (512) on either side, when its long side is more than `max_aspect` (21:9 in the conf) times its short side, when it is a painting, or when it is not public. Then the original file, which is the picture with PastVu's grey band appended at the bottom (`pastvu.com/<cid> uploaded by ...`). The file must have the size the record gives, picture plus band, or the photo counts as failed.
 2. **Band and borders** (download threads): the band rows are known from the record and come off exactly. [remove_borders](../remove_borders/README.md) analyses the picture without the band for scanned frames, mounts, thin lines and text banners.
 3. **Watermarks** (GPU): the [watermark](../watermark/README.md) detector runs on the picture without the band, so the band's own text is never taken for a watermark. Detections from `--wm-conf` (0.1) go into the record; only those from `--wm-paint-conf` (0.4) are painted out with LaMa. Below 0.4 the detector often finds scene text and objects (a shop sign, a building facade); from 0.4 up it found printed captions and credits in every case checked.
 4. **Crop**: the band, the border cuts and a watermark trim (`--wm-mode trim`) make one crop, put on the JPEG block grid: the top and left edges move inward to the next block where a cut set them, so the cut part goes completely, and the far edges are exact.
@@ -282,7 +283,7 @@ Pixels stay in memory from the download to the write; no temporary file is made.
 | only cuts (band, borders, trim) | JPEG: cropped in the DCT domain with libjpeg-turbo, every coefficient kept, EXIF kept with the new size. PNG: the exact pixels in the same format and mode. |
 | a watermark painted | JPEG at quality 97 without chroma subsampling, or PNG with `--png` |
 
-A JPEG crop keeps every coefficient of the kept blocks; the decoded pixels can still differ in the last row or column at a cut, where the decoder's chroma upsampling no longer sees the cut-off neighbours. An image that is smaller than `--min-side` after its crop is skipped.
+A JPEG crop keeps every coefficient of the kept blocks; the decoded pixels can still differ in the last row or column at a cut, where the decoder's chroma upsampling no longer sees the cut-off neighbours. An image that is smaller than `--min-side` after its crop, or more than `max_aspect` times as long as it is wide, is skipped.
 
 ## Output
 
@@ -470,7 +471,7 @@ Sorts the saved photos of a scope again with the samples folder as it is now (or
 
 A photo you moved to another category by hand keeps its place: reclassify sees that its file is not where the store says, records where it is now, and leaves it there (`--override-manual` sorts it like the rest). A photo whose file is gone is reported and left alone. `--dry-run` prints the moves per category pair and writes them to `<base>\_reports\`. `--undo` puts the photos of the last reclassify back into the categories they came from.
 
-A saved photo that the quality probe scores at or above `quality_threshold` is deleted: its image, caption, JSON file and export links. The store marks it skipped (`low quality`), so no run downloads it again, and `--undo` cannot bring it back. Before it deletes, reclassify asks `This deletes N low-quality photos ... Continue? [y/N]`, and `--yes` skips the question. `--dry-run` lists these photos in its report. With `quality_threshold = 0` in the conf, reclassify sorts without deleting. A photo that you moved by hand is kept, unless you give `--override-manual`.
+A saved photo that the quality probe scores at or above `quality_threshold`, or whose long side is more than `max_aspect` (21:9) times its short side, is deleted: its image, caption, JSON file and export links. The store marks it skipped (`low quality` or `aspect ratio`), so no run downloads it again, and `--undo` cannot bring it back. Before it deletes, reclassify asks `This deletes N photos ... Continue? [y/N]`, and `--yes` skips the question. `--dry-run` lists these photos in its report. With `quality_threshold = 0` and `max_aspect = 0` in the conf, reclassify sorts without deleting. Both keys are in `[defaults]` of the conf only; a conf without them gets them written into it the first time they are used. A photo that you moved by hand is kept, unless you give `--override-manual`.
 
 Versions before 2026-10-23 put doubtful photos into `_unsure\<category>`. `reclassify --unsure` moves them into `<category>`, their best guess, without the classifier or the GPU: `run.bat reclassify --unsure` for the whole base (it asks first), or name scopes. `--dry-run` and `--undo` work as for a full reclassify.
 
