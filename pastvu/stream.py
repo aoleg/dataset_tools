@@ -9,6 +9,10 @@ embedding and the counters are committed in one transaction. A photo found
 in state writing at the start of a run was interrupted: its files are
 deleted and it is done again.
 
+An import (importer.py) reads each photo from its source folder instead of
+PastVu (no band), writes it under its source name with its cleaned caption,
+and skips the copies of a base's photos after the embedding.
+
 A photo whose long side is more than max_aspect (21:9) times its short side is
 skipped before the download (by the record's size) or after the crop.
 A photo the quality probe scores at or above its threshold is skipped after
@@ -92,6 +96,7 @@ class Job:
     pic_box: list = None
     borders: dict = None
     comments: dict = None
+    caption: str | None = None        # an import: the source's caption (raw)
     t_fetch: float = 0.0
 
 
@@ -109,7 +114,8 @@ def cleanup_interrupted(store: Store, base: Path, scope: str) -> int:
 
 class Stream:
     def __init__(self, client: Client, store: Store, opts: Options, classifier=None, detector=None, lama=None,
-                 caption_client=None, vram=None, mode_probe=None, exporter=None):
+                 caption_client=None, vram=None, mode_probe=None, exporter=None, source: Path | None = None,
+                 against=None):
         self.client, self.store, self.opts = client, store, opts
         self.classifier = classifier
         self.det_name, self.det = detector or (None, None)
@@ -125,6 +131,8 @@ class Stream:
         self.caption_client, self.vram = caption_client, vram
         self.mode_probe = mode_probe       # decides the borderline black-and-white or colour photos
         self.exporter = exporter           # run --export: links each saved photo into the export
+        self.source = Path(source) if source else None      # an import: the folder the photos are read from
+        self.against = against             # an import: importer.Against, the base whose copies are skipped
         self.captioner = None
         enc_model = getattr(getattr(classifier, "encoder", None), "model_id", None)
         self.emb_key = (enc_model, getattr(classifier, "patches", None))
@@ -140,7 +148,47 @@ class Stream:
 
     # --- fetch threads -------------------------------------------------------------
 
+    def fetch_local(self, cid: int, scope: str) -> Job:
+        """An import: the photo from its source file; no PastVu record, so no band to cut."""
+        import importer
+        o = self.opts
+        t0 = time.perf_counter()
+        job = Job(cid, scope)
+        rel = self.store.source_of(cid)
+        if rel is None:
+            raise pr.Rejected("not in the source list", failed=True)
+        path = self.source / rel
+        try:
+            job.data = path.read_bytes()
+        except OSError as e:
+            raise pr.Rejected(f"read: {e.strerror or e}", failed=True)
+        try:
+            job.head = pr.head_of(job.data)
+        except Exception as e:  # noqa: BLE001
+            raise pr.Rejected(f"unreadable image ({type(e).__name__})", failed=True)
+        if job.head["frames"] > 1:
+            raise pr.Rejected("animated")
+        job.rows = 0
+        job.array = pr.decode(job.data, job.head)
+        h, w = job.array.shape[:2]
+        if min(w, h) < o.min_side:
+            raise pr.Rejected("too small")
+        wide = pr.aspect_reason(w, h, o.max_aspect)
+        if wide:
+            raise pr.Rejected(wide)
+        job.photo = {"name": layout.stem_of(cid), "src": rel, "w": w, "h": h}
+        job.result = {}
+        job.ctype = "image/" + str(job.head.get("format") or "").lower()
+        job.pic_box = pr.picture_box(job.head, 0)
+        if o.borders:
+            job.borders = pr.borders_plan(job.array, {"dark": o.dark_borders})
+        job.caption = importer.read_caption(path)
+        job.t_fetch = time.perf_counter() - t0
+        return job
+
     def fetch(self, cid: int, scope: str) -> Job:
+        if self.source is not None:
+            return self.fetch_local(cid, scope)
         o = self.opts
         t0 = time.perf_counter()
         job = Job(cid, scope)
@@ -260,6 +308,12 @@ class Stream:
             if not np.isnan(bad):          # at or above the threshold
                 s.time("classify", time.perf_counter() - t)
                 raise pr.Rejected(self.classifier.quality.reason(bad))
+            if self.against is not None:
+                d.set(f"{job.cid}: looking for a copy in the base")
+                hit = self.against.match(vec, final)
+                if hit:
+                    s.time("classify", time.perf_counter() - t)
+                    raise pr.Rejected(self.against.reason(hit))
             verdict = self.classifier.decide(vec)
             s.time("classify", time.perf_counter() - t)
         tone = colour.decide(tone, self.mode_probe, vec)
@@ -280,7 +334,7 @@ class Stream:
         scope = job.scope
         chunker = self.chunkers[scope]
         tone = tone or colour.decide({"off_hue": 0.0, "strong": 0.0, "tone": 0.0})
-        rel_scope = chunker.place(layout.with_mode(chunker.sc, tone["mode"], folder), f"{job.cid}{ext}")
+        rel_scope = chunker.place(layout.with_mode(chunker.sc, tone["mode"], folder), f"{layout.stem_of(job.cid)}{ext}")
         rel = chunker.rel(rel_scope)
         path = o.base / rel
         d.set(f"{job.cid}: saving {rel_scope}")
@@ -289,8 +343,14 @@ class Stream:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(data)
-            facts = sidecars.caption(job.photo, o.txt_fields)
-            path.with_suffix(".txt").write_text(facts, encoding="utf-8")
+            if self.source is not None:
+                import importer
+                facts = importer.clean_caption(job.caption) if job.caption else ""
+                if facts:                                     # no caption left: no .txt
+                    path.with_suffix(".txt").write_text(facts, encoding="utf-8")
+            else:
+                facts = sidecars.caption(job.photo, o.txt_fields)
+                path.with_suffix(".txt").write_text(facts, encoding="utf-8")
             sha = hashlib.sha256(data).hexdigest()
             doc = self.record_json(job, plan, boxes, mode, rel, data, sha, fw, fh, verdict, tone)
             if o.json_files:
@@ -328,6 +388,19 @@ class Stream:
     def record_json(self, job: Job, plan, boxes, mode, rel, data, sha, fw, fh, verdict, tone=None) -> str:
         o = self.opts
         p = job.photo
+        if self.source is not None:
+            import importer
+            processing = {"borders": pr.describe_borders(job.borders) if job.borders else None,
+                          "watermarks": {"detected": boxes, "painted": plan["wm_inside"], "trim": plan["trim"],
+                                         "mode": o.wm_mode, "conf": o.wm_conf, "paint_conf": o.wm_paint_conf,
+                                         "dilate": o.wm_dilate},
+                          "box": plan["box"], "stored_box": plan["stored_box"], "changed": plan["changed"],
+                          "write": mode, "colour": tone,
+                          "output": {"path": rel, "bytes": len(data), "sha256": sha, "size": [fw, fh],
+                                     "stored_size": list(enc.size_of(data)),
+                                     "orientation": job.head["orientation"] if mode != "array" else 1}}
+            return importer.record_json(job.cid, p["name"], p["src"], job.data, job.caption, processing,
+                                        verdict.as_dict() if verdict else None, {**self.tool, "scope": job.scope})
         download = {"url": f"{IMG}/a/{p['file']}", "bytes": len(job.data), "sha256": hashlib.sha256(job.data).hexdigest(),
                     "content_type": job.ctype, "format": job.head["format"], "stored_size": job.head["stored"],
                     "orientation": job.head["orientation"], "mcu": job.head["mcu"]}

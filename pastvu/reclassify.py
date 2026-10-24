@@ -8,8 +8,9 @@ joined.
 - A photo whose file is not where the store says was moved by hand. Its new
   place is kept and recorded (--override-manual sorts it like the rest).
 - A photo whose file is gone is reported and left alone.
-- A photo the quality probe scores at or above its threshold, or whose long
-  side is more than max_aspect times its short side, is deleted (image,
+- A photo the quality probe scores at or above its threshold, whose long
+  side is more than max_aspect times its short side, or (an import with a
+  base to check against) that is a copy of one of the base's photos, is deleted (image,
   caption, JSON sidecar, export links) and marked skipped, so no run fetches
   it again. Hand-sorted photos are kept unless --override-manual. Deleting
   cannot be undone.
@@ -52,9 +53,10 @@ def update_record(store: Store, cid: int, rel: str, verdict_dict: dict | None, n
 
 
 def plan(store: Store, base: Path, scope: dict, classifier, override_manual: bool, log=print,
-         max_aspect: float = 0.0) -> dict:
-    """What a reclassify would do. -> {"moves": [...], "low_quality": [...], "aspect": [...], "manual": [...],
-    "missing": [...], "kept": n, "embedded": n}; low_quality and aspect are the photos to delete.
+         max_aspect: float = 0.0, against=None) -> dict:
+    """What a reclassify would do. -> {"moves": [...], "low_quality": [...], "aspect": [...], "copies": [...],
+    "manual": [...], "missing": [...], "kept": n, "embedded": n}; low_quality, aspect and copies are the photos
+    to delete. against: importer.Against, the base whose copies an import deletes.
 
     Paths and categories are relative to the scope; in a base split by black-and-white
     and colour they start with the mode (bw/50_transport), so a photo moved by hand
@@ -98,6 +100,13 @@ def plan(store: Store, base: Path, scope: dict, classifier, override_manual: boo
            for (cid, actual, cat_now, _), b in zip(todo, bad) if not np.isnan(b)]
     keep = [i for i, b in enumerate(bad) if np.isnan(b)]
     todo, vecs = [todo[i] for i in keep], [vecs[i] for i in keep]
+    copies = []
+    if against is not None and todo:
+        hits = against.matches(np.stack(vecs), [base / layout.to_base(scope, t[1]) for t in todo], log)
+        copies = [{"cid": todo[i][0], "src": todo[i][1], "category": todo[i][2], "base_cid": hit[0],
+                   "cos": round(hit[1], 4), "reason": against.reason(hit)} for i, hit in sorted(hits.items())]
+        keep = [i for i in range(len(todo)) if i not in hits]
+        todo, vecs = [todo[i] for i in keep], [vecs[i] for i in keep]
     verdicts = classifier.decide_many(vecs) if vecs else []
     moves, kept = [], 0
     for (cid, actual, cat_now, sha), v in zip(todo, verdicts):
@@ -110,8 +119,8 @@ def plan(store: Store, base: Path, scope: dict, classifier, override_manual: boo
             kept += 1
         else:
             moves.append({"cid": cid, "src": actual, "from": cat_now, "to": to, "verdict": v.as_dict()})
-    return {"moves": moves, "low_quality": low, "aspect": aspect, "manual": manual, "missing": missing,
-            "kept": kept, "embedded": embedded, "checked": len(rows)}
+    return {"moves": moves, "low_quality": low, "aspect": aspect, "copies": copies, "manual": manual,
+            "missing": missing, "kept": kept, "embedded": embedded, "checked": len(rows)}
 
 
 UNSURE = "_unsure"
@@ -139,8 +148,8 @@ def plan_unsure(store: Store, base: Path, scope: dict) -> dict:
         verdict["folder"] = best
         moves.append({"cid": cid, "src": actual, "from": cat, "to": layout.with_mode(scope, mode, best),
                       "verdict": verdict})
-    return {"moves": moves, "low_quality": [], "aspect": [], "manual": [], "missing": missing, "kept": kept,
-            "embedded": 0, "checked": len(rows)}
+    return {"moves": moves, "low_quality": [], "aspect": [], "copies": [], "manual": [], "missing": missing,
+            "kept": kept, "embedded": 0, "checked": len(rows)}
 
 
 def _follow(store: Store, exporter, cid: int) -> None:
@@ -186,8 +195,8 @@ def apply(store: Store, base: Path, scope: dict, p: dict, samples: str, log=prin
         store.move(cid, rel, plain, rec, mode)
         _follow(store, exporter, cid)
     chunks = folders.ScopeChunks(store, base, scope, log, defer=True)
-    deleted = delete_photos(store, base, scope, (p.get("low_quality") or []) + (p.get("aspect") or []), chunks,
-                            log, exporter)
+    deleted = delete_photos(store, base, scope, (p.get("low_quality") or []) + (p.get("aspect") or [])
+                            + (p.get("copies") or []), chunks, log, exporter)
     run = store.start_reclass(name, samples)
     moved = failed = 0
     scans: dict = {}
@@ -278,8 +287,8 @@ def undo(store: Store, base: Path, scope: dict, log=print, exporter=None) -> dic
 def summary(p: dict) -> str:
     flows = Counter((m["from"], m["to"]) for m in p["moves"])
     lines = [f"{p['checked']:,} photos: {len(p['moves']):,} to move, {p['kept']:,} stay, "
-             f"{len(p.get('low_quality') or []):,} low quality and {len(p.get('aspect') or []):,} over the aspect "
-             f"ratio (to delete), "
+             f"{len(p.get('low_quality') or []):,} low quality, {len(p.get('aspect') or []):,} over the aspect "
+             f"ratio and {len(p.get('copies') or []):,} copies of base photos (to delete), "
              f"{len(p['manual']):,} moved by hand (kept), {len(p['missing']):,} files missing; "
              f"{p['embedded']:,} embedded from their files"]
     for (a, b), n in flows.most_common(25):

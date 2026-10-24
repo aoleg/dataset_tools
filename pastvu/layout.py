@@ -58,15 +58,28 @@ def check_scope_name(name: str) -> str:
 
 
 MODES = ("bw", "color")
+# Where black-and-white and colour sit in a split tree. A PastVu base puts them at
+# the top (bw/<scope folder>/<category>); an import, like the live export, follows
+# the conf's export_layout: categories_first (<category>/<bw|color>) or color_first.
+CATEGORY_FIRST, COLOR_FIRST = "categories_first", "color_first"
+EXPORT_LAYOUTS = (CATEGORY_FIRST, COLOR_FIRST)
+
+
+def _join(*parts: str) -> str:
+    return "/".join(p for p in parts if p)
 
 
 def scope_roots(sc: dict) -> list[tuple[str, str]]:
     """Where a scope's photos live: (the start of a scope-relative path, the
     folder relative to the base) per root. A base split by black-and-white
     and colour gives every scope two roots, bw/<folder> and color/<folder>,
-    and a scope-relative path starts with its mode: bw/50_transport/123.jpg."""
+    and a scope-relative path starts with its mode: bw/50_transport/123.jpg.
+    A scope with its categories first has one root, its folder, and swaps the
+    mode and the category on the way in and out (to_base, to_scope)."""
+    if sc.get("split_mode") and sc.get("order") == CATEGORY_FIRST:
+        return [("", sc["folder"])]
     if sc.get("split_mode"):
-        return [(f"{m}/", f"{m}/{sc['folder']}") for m in MODES]
+        return [(f"{m}/", _join(m, sc["folder"])) for m in MODES]
     return [("", sc["folder"])]
 
 
@@ -74,18 +87,61 @@ def to_base(sc: dict, rel: str) -> str:
     """A scope-relative path (or category folder) -> relative to the base."""
     if sc.get("split_mode"):
         mode, _, rest = rel.partition("/")
-        return f"{mode}/{sc['folder']}" + (f"/{rest}" if rest else "")
-    return sc["folder"] + (f"/{rel}" if rel else "")
+        if sc.get("order") == CATEGORY_FIRST:
+            cat, _, tail = rest.partition("/")
+            return _join(sc["folder"], cat, mode, tail)
+        return _join(mode, sc["folder"], rest)
+    return _join(sc["folder"], rel)
 
 
 def to_scope(sc: dict, base_rel: str) -> str | None:
     """Relative to the base -> relative to the scope (None when outside it)."""
     for prefix, root in scope_roots(sc):
+        if root and base_rel != root and not base_rel.startswith(root + "/"):
+            continue
+        rest = base_rel[len(root) + 1:] if root else base_rel
         if base_rel == root:
-            return prefix.rstrip("/")
-        if base_rel.startswith(root + "/"):
-            return prefix + base_rel[len(root) + 1:]
+            rest = ""
+        if sc.get("split_mode") and sc.get("order") == CATEGORY_FIRST:
+            cat, _, tail = rest.partition("/")
+            mode, _, tail = tail.partition("/")
+            if mode not in MODES:
+                return None if rest else ""
+            return _join(mode, cat, tail)
+        return (prefix + rest) if rest else prefix.rstrip("/")
     return None
+
+
+# File names. A PastVu base names each image by its PastVu number. An import
+# keeps the source's names: its store maps each name to a number of its own,
+# and registers the map here when it opens (one base per process).
+_NAMES: dict[str, int] | None = None
+_STEMS: dict[int, str] = {}
+
+
+def use_names(mapping: dict[str, int] | None) -> None:
+    """Register the name -> number map of an import base (None: numeric names, a PastVu base)."""
+    global _NAMES, _STEMS
+    _NAMES = dict(mapping) if mapping is not None else None
+    _STEMS = {c: n for n, c in (_NAMES or {}).items()}
+
+
+def add_name(name: str, cid: int) -> None:
+    if _NAMES is not None:
+        _NAMES[name] = cid
+        _STEMS[cid] = name
+
+
+def cid_of(stem: str) -> int | None:
+    """The photo number of a file name without its extension, or None."""
+    if _NAMES is not None:
+        return _NAMES.get(stem)
+    return int(stem) if stem.isdigit() else None
+
+
+def stem_of(cid: int) -> str:
+    """The file name (without extension) of a photo."""
+    return _STEMS.get(cid, str(cid)) if _NAMES is not None else str(cid)
 
 
 def mode_category(sc: dict, folder: str) -> tuple[str | None, str]:

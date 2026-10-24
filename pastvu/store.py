@@ -12,6 +12,8 @@ scope in it.
   classifier's embedding of the saved pixels, per photo.
 - counters: per-scope totals for the reports.
 - reclass_runs, reclass_moves: what reclassify moved, for --undo.
+- names: an import base only (meta kind = import): the file name of each
+  photo, its source path, size and mtime. Photo numbers are the import's own.
 - captions, caption_log, caption_fails, caption_runs: autocaption. captions
   holds each photo's current VLM caption and the caption it had before the
   first one (the original); caption_log holds, per run, the text a file had
@@ -76,6 +78,8 @@ CREATE TABLE IF NOT EXISTS regroup_runs (
 CREATE TABLE IF NOT EXISTS regroup_moves (
     run INTEGER, seq INTEGER, cid INTEGER, src_scope TEXT, src_path TEXT, dst_scope TEXT, dst_path TEXT, kind TEXT,
     new_member INTEGER, PRIMARY KEY (run, seq)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS names (
+    cid INTEGER PRIMARY KEY, name TEXT UNIQUE, src TEXT, bytes INTEGER, mtime INTEGER);
 CREATE TABLE IF NOT EXISTS caption_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT, scope TEXT, target TEXT, model TEXT, prompt_sha TEXT, started REAL,
     ended REAL, captioned INTEGER DEFAULT 0, failed INTEGER DEFAULT 0, undone REAL);
@@ -114,6 +118,9 @@ class Store:
         if "export" not in status_cols:
             self.db.execute("ALTER TABLE status ADD COLUMN export TEXT")
         self.set_meta("schema", SCHEMA_VERSION)
+        if self.get_meta("kind") == "import":
+            import layout as lay
+            lay.use_names(self.names())
 
     def close(self) -> None:
         with self.lock:
@@ -191,8 +198,51 @@ class Store:
             return None
         return {"name": row[0], "regions": json.loads(row[1]), "years": tuple(json.loads(row[2])), "decade": row[3],
                 "split": row[4], "width": row[5], "created": row[6], "indexed": row[7],
-                "label": row[8] or row[0].rsplit("_", 1)[0], "folder": row[9] or row[0],
-                "split_mode": bool(self.get_meta("bw_color", False))}
+                "label": row[8] or row[0].rsplit("_", 1)[0], "folder": row[9] if row[9] is not None else row[0],
+                "split_mode": bool(self.get_meta("bw_color", False)),
+                "order": self.get_meta("tree_order")}
+
+    # --- an import base: file names --------------------------------------------------
+
+    @property
+    def is_import(self) -> bool:
+        return self.get_meta("kind") == "import"
+
+    def names(self) -> dict[str, int]:
+        with self.lock:
+            return {n: c for c, n in self.db.execute("SELECT cid, name FROM names")}
+
+    def name_rows(self) -> dict[str, tuple]:
+        """source path -> (cid, name, bytes, mtime)."""
+        with self.lock:
+            return {s: (c, n, b, m) for c, n, s, b, m in self.db.execute("SELECT cid, name, src, bytes, mtime FROM names")}
+
+    def source_of(self, cid: int) -> str | None:
+        with self.lock:
+            row = self.db.execute("SELECT src FROM names WHERE cid=?", (cid,)).fetchone()
+        return row[0] if row else None
+
+    def add_sources(self, scope: str, items: list[tuple[str, str, int, int]]) -> list[int]:
+        """New source files (name, source path, bytes, mtime) of an import: the next numbers,
+        a name each, a member row and a pending status. -> their numbers."""
+        import layout as lay
+
+        def work(db):
+            top = db.execute("SELECT COALESCE(MAX(cid), 0) FROM names").fetchone()[0]
+            out = []
+            for i, (name, src, size, mtime) in enumerate(items, 1):
+                cid = top + i
+                db.execute("INSERT INTO names (cid, name, src, bytes, mtime) VALUES (?,?,?,?,?)",
+                           (cid, name, src, size, mtime))
+                db.execute("INSERT OR IGNORE INTO members (scope, cid) VALUES (?, ?)", (scope, cid))
+                db.execute("INSERT OR IGNORE INTO status (cid, state, updated) VALUES (?, ?, ?)",
+                           (cid, PENDING, time.time()))
+                out.append(cid)
+            return out
+        cids = self.tx(work)
+        for (name, *_), cid in zip(items, cids):
+            lay.add_name(name, cid)
+        return cids
 
     def layout(self) -> str:
         """The folder tree of the base: set when its first scope is made; bases

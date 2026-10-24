@@ -14,6 +14,7 @@ the defaults of a run, and the region aliases, in three groups: countries
     priority_margin = 0.15
     quality_threshold = 0.88
     max_aspect = 21:9
+    export_layout = categories_first
 
     [aliases.countries]
     belarus = 22
@@ -71,6 +72,8 @@ class Conf:
     quality_in_file: bool = False      # the key is in the file (else it is written there on first use)
     max_aspect: float = 21 / 9         # long side over short side; 0: no limit
     aspect_in_file: bool = False
+    export_layout: str = "categories_first"   # the live export and an import: categories_first or color_first
+    export_layout_in_file: bool = False
     layout: str | None = None          # the folder tree of a new base; None: not in the file (written on first use)
     bw_color: bool | None = None       # bw/ and color/ at the top of a new base; None: not in the file
     caption: CaptionConf = field(default_factory=CaptionConf)
@@ -126,6 +129,12 @@ QUALITY_COMMENT = ["; Photos the quality probe (trained on _quality_good and _qu
 ASPECT_COMMENT = ["; Photos whose long side is more than this times the short side (panoramas,",
                   "; strips) are skipped like the ones under 512 pixels, and reclassify deletes",
                   "; the saved ones. W:H or a number; 0 turns it off."]
+
+
+EXPORT_LAYOUT_COMMENT = ["; The folder order of the live export (run --export) and of an import:",
+                         "; categories_first (<category>\\bw, <category>\\color) or color_first",
+                         "; (bw\\<category>, color\\<category>). A change reorders an existing export",
+                         "; at its next run --export or reclassify, and an import at its next reclassify."]
 
 
 def parse_aspect(text: str) -> float:
@@ -213,6 +222,12 @@ def load(path: Path | None = None) -> Conf:
             if d.get("max_aspect", "").strip():
                 conf.max_aspect = parse_aspect(d.get("max_aspect"))
                 conf.aspect_in_file = True
+            if d.get("export_layout", "").strip():
+                v = d.get("export_layout").strip().lower()
+                if v not in ("categories_first", "color_first"):
+                    raise ValueError(f"export_layout {v!r}: give categories_first or color_first")
+                conf.export_layout = v
+                conf.export_layout_in_file = True
         except ValueError as e:
             raise SystemExit(f"{path}: [defaults] {e}")
     if cp.has_section("caption"):

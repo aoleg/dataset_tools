@@ -71,6 +71,7 @@ json_files = no                       also write each record as a JSON file
 priority_margin = 0.15                within this of the top score, the lower-numbered category wins
 quality_threshold = 0.88              skip photos the quality probe scores at or above this; 0: off
 max_aspect = 21:9                     skip photos whose long side is more than this times the short side; 0: off
+export_layout = categories_first      folder order of the live export and of an import: categories_first or color_first
 
 [caption]                             the VLM of autocaption; see Autocaption
 api_url = http://localhost:5001/v1
@@ -167,6 +168,8 @@ run.bat reclassify [<scope> ...] [--dry-run] [--undo] [--yes]
 run.bat captions <scope> [...] [--txt-fields LIST] [--dry-run]
 run.bat autocaption <scope or folder> [...] [--limit N] [--recaption] [--undo]
 run.bat export <scope> [...] [--format jsonl|parquet]
+run.bat import --dataset <folder> [-o <folder>] [--against <base>] [--split N] [--limit N]
+run.bat --base <import folder> reclassify [--dry-run] [--yes]
 run.bat extract <category> [...] [--region R] [--years A B | --decade D] [--bw | --color] [--min-res N]
                    [--target N [--colour-share X]] [-o DIR]
 run.bat scopes | aliases | count --region <alias> | regions [--find TEXT]
@@ -514,7 +517,7 @@ Copies the photos of a category out of the base folder into a flat folder for tr
 run.bat run --region ussr --by country --export
 ```
 
-Hard-links every saved photo into `pastvu_export` next to the base folder as it is written, one folder per category, then `bw\` and `color\`, then numbered folders of at most `split` images (the conf's split, 5,000 by default):
+Hard-links every saved photo into `pastvu_export` next to the base folder as it is written, one folder per category, then `bw\` and `color\`, then numbered folders of at most `split` images (the conf's split, 5,000 by default). With `export_layout = color_first` in the conf, `bw\` and `color\` come first and the categories inside them:
 
 ```
 <base parent>\pastvu_export\
@@ -529,6 +532,27 @@ Hard-links every saved photo into `pastvu_export` next to the base folder as it 
 - **Curating by deleting.** An image you delete from the export is remembered as excluded and never linked again, and its caption link is tidied away. A photo you move to another folder inside the export is recorded where you put it. `--export-reset` forgets the exclusions and links those photos again.
 - **The export follows the base.** `reclassify` moves a photo's links to its new category or into the other of `bw\` and `color\` (unless you moved it inside the export yourself), and `drop` deletes the links of the dropped photos. Moves inside the base (regroup, a category passing the split) keep the links valid by themselves, since a link points to the file, not to its folder.
 - **Only with the flag.** A run without `--export` on a base that has an export says so and does not link; the next run with `--export` catches up.
+- **Changing the order.** After you change `export_layout`, the next `run --export` or `reclassify` moves every link that is where the export put it into the new order, and numbers the folders again. Links you moved by hand stay where you put them, and the images you deleted stay out.
+
+## Import a local dataset
+
+```
+run.bat import --dataset D:\datasets\photos --against D:\pastvu
+run.bat import --dataset D:\datasets\photos -o D:\imported\photos --against D:\pastvu
+run.bat --base D:\imported\photos reclassify
+```
+
+Processes a folder of images that this tool did not download, for example reposts from Telegram channels, with every stage of a download, into a folder of its own. The source is only read.
+
+- **The output folder** is `-o`, the imported dataset itself; without `-o` it is `<source>_pastvu` next to the source. The import stops and asks for `-o` when it cannot write there. The base folder of the conf does not apply. The output folder holds the images, their captions, its own store `pastvu.db` (with the embeddings) and `_reports`.
+- **The tree** follows `export_layout` of the conf: `<category>\bw\` and `<category>\color\` (`categories_first`, the default), or `bw\<category>\` and `color\<category>\` (`color_first`). There are no years, decades or places. Numbered folders are off; `--split N` turns them on when the import is made.
+- **File names** stay those of the source. The category folders of the source are ignored: every photo is sorted again with your samples folder, like a download.
+- **The stages:** `--min-side` (512) and `max_aspect` (21:9), borders, watermarks, the quality probe, black-and-white or colour, and the category. There is no PastVu band to cut. A photo that fails a filter is not copied, and the store remembers it, so a second import does not look at it again.
+- **The caption** is the source's `.txt` without hashtags, links (`http`, `www`, `t.me`) and @mentions. A photo whose caption is then empty, or that has none, gets no `.txt`. The record in the store keeps the original text.
+- **Copies of your PastVu photos.** With `--against <base>`, a photo that is a copy of a photo in that base is skipped: PastVu holds the original, and the channels repost it recompressed. The import remembers the base, so a later import or reclassify uses it without the option. A copy is a photo whose embedding is at least 0.96 similar to a base photo, or at least 0.85 and confirmed by the feature test of the [deduplicate](../deduplicate/README.md) tool (the same picture under another crop, scale or compression). A colourised repost of a black-and-white base photo counts as a copy. On 34,300 Telegram reposts against 210,801 PastVu photos about 9 % were copies.
+- **Running it again** picks up the files added to the source since, and continues an import that was stopped. It does not process again the images it has seen.
+- **Reclassify** (`run.bat --base <import folder> reclassify`) sorts the import again with your samples, and deletes what fails the filters now: low quality, the aspect ratio, and the copies of base photos, including copies of photos that the base downloaded after the import. It asks once before deleting, as on a PastVu base. After you change `export_layout`, it first moves every photo into the new order.
+- **Other commands.** `autocaption` works on an import (`run.bat --base <import folder> autocaption <folder>`); the commands that need PastVu (`run`, `index`, `regroup`, `drop`, `captions`, `extract`, `export`) stop with a message.
 
 ## Progress and resume
 
@@ -629,6 +653,7 @@ Each record carries what attribution and a takedown need: the PastVu page, the u
 | `export.py` | records as JSON Lines or Parquet |
 | `extract.py` | a category copied into a flat folder for training |
 | `liveexport.py` | `run --export`: the hard-linked export of every saved photo |
+| `importer.py` | `import`: a local dataset processed like a download, and the test for copies of base photos |
 | `sidecars.py` | the caption and the record |
 | `progress.py` | the live display and the report blocks |
 | `stream.py` | the threads and the run |

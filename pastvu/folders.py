@@ -22,15 +22,17 @@ JOURNAL = "chunking"          # meta key: [[scope, category], ...] whose move ha
 
 
 def scan_scope(scope_dir: Path) -> dict[int, str]:
-    """PastVu number -> path of its image relative to the scope folder."""
+    """Photo number -> path of its image relative to the folder (names by layout.cid_of)."""
     out = {}
     for dirpath, dirnames, filenames in os.walk(scope_dir):
         dirnames[:] = [d for d in dirnames if not d.startswith(".")]
         for fn in filenames:
             stem, ext = os.path.splitext(fn)
-            if stem.isdigit() and ext.lower() in layout.IMAGE_EXTS:
-                rel = os.path.relpath(os.path.join(dirpath, fn), scope_dir).replace("\\", "/")
-                out[int(stem)] = rel
+            if ext.lower() not in layout.IMAGE_EXTS:
+                continue
+            cid = layout.cid_of(stem)
+            if cid is not None:
+                out[cid] = os.path.relpath(os.path.join(dirpath, fn), scope_dir).replace("\\", "/")
     return out
 
 
@@ -114,12 +116,12 @@ def chunk_category(store, base: Path, sc: dict, category: str, width: int, log=p
     if cat_dir.is_dir():
         for e in os.scandir(cat_dir):
             stem, ext = os.path.splitext(e.name)
-            if e.is_file() and stem.isdigit() and ext.lower() in layout.IMAGE_EXTS:
+            if e.is_file() and layout.cid_of(stem) is not None and ext.lower() in layout.IMAGE_EXTS:
                 loose.append(Path(e.path))
             elif e.is_dir() and e.name.isdigit() and len(e.name) == width:
                 counts[int(e.name)] = sum(1 for f in os.scandir(e.path) if f.is_file()
                                           and os.path.splitext(f.name)[1].lower() in layout.IMAGE_EXTS)
-    loose.sort(key=lambda f: int(f.stem))
+    loose.sort(key=lambda f: layout.cid_of(f.stem))
     placed: Counter = Counter()
     owned = {cid: path for cid, path, _, _ in store.done_rows(name)}
     batch = []
@@ -141,7 +143,7 @@ def chunk_category(store, base: Path, sc: dict, category: str, width: int, log=p
             continue
         counts[chunk] += 1
         placed[chunk] += 1
-        cid = int(f.stem)
+        cid = layout.cid_of(f.stem)
         rel = dst.relative_to(base).as_posix()
         if cid in owned and owned[cid] != rel:
             batch.append((cid, rel, record_with_path(store, base, cid, rel)))
@@ -156,8 +158,8 @@ def chunk_category(store, base: Path, sc: dict, category: str, width: int, log=p
             continue
         for e in os.scandir(cdir):
             stem, ext = os.path.splitext(e.name)
-            if stem.isdigit() and ext.lower() in layout.IMAGE_EXTS:
-                cid, rel = int(stem), Path(e.path).relative_to(base).as_posix()
+            if layout.cid_of(stem) is not None and ext.lower() in layout.IMAGE_EXTS:
+                cid, rel = layout.cid_of(stem), Path(e.path).relative_to(base).as_posix()
                 if cid in owned and owned[cid] != rel and not (base / owned[cid]).is_file():
                     batch.append((cid, rel, record_with_path(store, base, cid, rel)))
                     owned[cid] = rel
@@ -215,12 +217,14 @@ class ScopeChunks:
 
 
 def scan_rels(base: Path, sc: dict) -> dict[int, str]:
-    """PastVu number -> scope-relative path of its image, over every root of the scope."""
+    """Photo number -> scope-relative path of its image, over every root of the scope."""
     out = {}
-    for prefix, root in layout.scope_roots(sc):
+    for _, root in layout.scope_roots(sc):
         if (base / root).is_dir():
             for cid, rel in scan_scope(base / root).items():
-                out[cid] = prefix + rel
+                scope_rel = layout.to_scope(sc, layout._join(root, rel))
+                if scope_rel is not None:
+                    out[cid] = scope_rel
     return out
 
 

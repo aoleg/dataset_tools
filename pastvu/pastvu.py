@@ -65,10 +65,18 @@ UKRAINE_PRESETS = [          # name, regions, comment
 
 # --- setup -------------------------------------------------------------------------------
 
+IMPORT_COMMANDS = ("reclassify", "autocaption", "scopes")
+
+
 def open_base(args, conf: cf.Conf) -> tuple[Path, Store]:
     base = Path(args.base).resolve() if getattr(args, "base", None) else conf.need_base()
     base.mkdir(parents=True, exist_ok=True)
     store = Store(base / DB_NAME)
+    if store.is_import:
+        if args.cmd not in IMPORT_COMMANDS:
+            raise SystemExit(f"{base} is the import of {store.get_meta('source')}; {args.cmd} works on PastVu base "
+                             f"folders only (an import takes {', '.join(IMPORT_COMMANDS)} and import)")
+        return base, store
     base_layout(conf, store, base)
     return base, store
 
@@ -560,33 +568,7 @@ def run_locked(args, conf, client, base: Path, store: Store, sm) -> int:
     caption_client = None
     if args.autocaption:
         caption_client = vlm_client(conf)
-    import vram as vr
-    vram = vr.VramMonitor().start()
-    print("Loading the models ...", flush=True)
-    t0 = time.time()
-    import numpy as np
-    import torch
-    detector = lama = None
-    if not args.no_watermark:
-        import watermark as wm
-        detector = wm.detector_lazy()
-        lama = wm.lama_lazy()
-        print(f"  watermark detector {detector[0]}, LaMa", flush=True)
-    classifier = mode_probe = None
-    if not args.no_classify:
-        import classifier as clf
-        samples = Path(args.samples).resolve() if args.samples else conf.samples
-        classifier = clf.Classifier(samples, args.patches, args.min_confidence,
-                                    priority_margin=margin_of(args, conf), quality_threshold=quality_of(conf))
-        classifier.embed(np.zeros((64, 64, 3), np.uint8))         # load the encoder now
-        print(f"  classifier: {len(classifier.class_names)} classes from {samples}", flush=True)
-        import colour
-        mode_probe = colour.probe_from_samples(samples, classifier.sample_vectors)
-    if torch.cuda.is_available():
-        print(f"  loaded in {time.time() - t0:.0f} s; GPU memory in use {torch.cuda.memory_allocated() / 2**30:.1f} GB",
-              flush=True)
-    import encode
-    encode.turbo()
+    vram, detector, lama, classifier, mode_probe = load_models(args, conf)
 
     total = sum(store.scope_counts(name)["total"] for name in names)
     pairs = store.pending_pairs(names, args.retries)
@@ -601,7 +583,7 @@ def run_locked(args, conf, client, base: Path, store: Store, sm) -> int:
     exporter = None
     if args.export or args.export_reset:
         import liveexport as lx
-        exporter = lx.open_for_run(store, base, conf.split, reset=args.export_reset)
+        exporter = lx.open_for_run(store, base, conf.split, reset=args.export_reset, order=export_layout_of(conf))
     else:
         import liveexport as lx
         if lx.Exporter.exists_for(store):
@@ -629,6 +611,122 @@ def run_locked(args, conf, client, base: Path, store: Store, sm) -> int:
             if cres.get("stopped"):
                 break
     vram.stop()
+    return 0
+
+
+def load_models(args, conf: cf.Conf) -> tuple:
+    """The watermark detector and LaMa, the classifier with its quality probe, and the colour
+    probe, all resident on the GPU. -> (vram monitor, detector, lama, classifier, colour probe)"""
+    import vram as vr
+    vram = vr.VramMonitor().start()
+    print("Loading the models ...", flush=True)
+    t0 = time.time()
+    import numpy as np
+    import torch
+    detector = lama = None
+    if not args.no_watermark:
+        import watermark as wm
+        detector = wm.detector_lazy()
+        lama = wm.lama_lazy()
+        print(f"  watermark detector {detector[0]}, LaMa", flush=True)
+    classifier = mode_probe = None
+    if not getattr(args, "no_classify", False):
+        import classifier as clf
+        samples = Path(args.samples).resolve() if args.samples else conf.samples
+        classifier = clf.Classifier(samples, args.patches, args.min_confidence,
+                                    priority_margin=margin_of(args, conf), quality_threshold=quality_of(conf))
+        classifier.embed(np.zeros((64, 64, 3), np.uint8))         # load the encoder now
+        print(f"  classifier: {len(classifier.class_names)} classes from {samples}", flush=True)
+        import colour
+        mode_probe = colour.probe_from_samples(samples, classifier.sample_vectors)
+    if torch.cuda.is_available():
+        print(f"  loaded in {time.time() - t0:.0f} s; GPU memory in use {torch.cuda.memory_allocated() / 2**30:.1f} GB",
+              flush=True)
+    import encode
+    encode.turbo()
+    return vram, detector, lama, classifier, mode_probe
+
+
+def import_out(args, src: Path) -> Path:
+    """-o, or <source>_pastvu next to the source; it must be writable and must not nest with the source."""
+    out = Path(args.o).resolve() if args.o else src.parent / f"{src.name}_pastvu"
+    if out == src or src in out.parents or out in src.parents:
+        raise SystemExit(f"the output {out} and the source {src} must not be inside each other; give another -o")
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+        probe = out / ".pastvu_write_test"
+        probe.write_bytes(b"")
+        probe.unlink()
+    except OSError as e:
+        raise SystemExit(f"cannot write into {out} ({e.strerror or e}); give an output folder with -o")
+    return out
+
+
+def cmd_import(args, conf, client) -> int:
+    import importer
+    import stream as sm
+    src = Path(args.dataset).resolve()
+    if not src.is_dir():
+        raise SystemExit(f"--dataset {src}: no such folder")
+    out = import_out(args, src)
+    store = Store(out / DB_NAME)
+    if store.scopes() and not store.is_import:
+        raise SystemExit(f"{out} is a PastVu base folder; an import needs a folder of its own (-o)")
+    if store.is_import:
+        if Path(store.get_meta("source")) != src:
+            raise SystemExit(f"{out} is the import of {store.get_meta('source')}, not of {src}")
+    else:
+        store.set_meta("kind", importer.KIND)
+        store.set_meta("source", str(src))
+        store.set_meta("layout", "flat")
+        store.set_meta("bw_color", True if conf.bw_color is None else bool(conf.bw_color))
+        store.set_meta("tree_order", export_layout_of(conf))
+        layout.use_names(store.names())
+    if args.against:
+        store.set_meta("against", str(Path(args.against).resolve()))
+    against_base = store.get_meta("against")
+    order = export_layout_of(conf)
+    name = layout.slug(src.name) or "import"
+    sc = store.scope(name)
+    if sc is None:
+        sc = store.add_scope(name, [], (0, 0), None, args.split, label=name, width=3 if args.split > 0 else 0,
+                             folder="")
+    with locked(store, "import"):
+        if store.get_meta("tree_order") != order:
+            print(f"Moving the saved photos into {order} folders (export_layout of the conf) ...", flush=True)
+            n = importer.reorder(store, out, sc, order)
+            print(f"  {n:,} photos moved")
+            sc = store.scope(name)
+        res = importer.index_source(store, name, src)
+        print(f"Import of {src} into {out}: {res['new']:,} new images listed ({res['known']:,} known before"
+              + (f"; {res['renamed']:,} renamed because the name was taken" if res["renamed"] else "") + ")",
+              flush=True)
+        n = sm.cleanup_interrupted(store, out, name)
+        if n:
+            print(f"  {n} photos were being written when the last import stopped; they are done again")
+        total = store.scope_counts(name)["total"]
+        pairs = store.pending_pairs([name], args.retries)
+        if not pairs:
+            print(f"Nothing to do: all {total:,} images are processed.")
+            return 0
+        args.no_classify = False
+        vram, detector, lama, classifier, mode_probe = load_models(args, conf)
+        against = None
+        if against_base:
+            against = importer.Against(Path(against_base), classifier.model_id, classifier.patches)
+        opts = sm.Options(base=out, scope=sc, min_side=args.min_side, max_aspect=aspect_of(conf), png=args.png,
+                          wm_conf=args.wm_conf, wm_paint_conf=args.wm_paint_conf, wm_mode=args.wm_mode,
+                          borders=not args.no_borders, dark_borders=not args.no_dark, fetchers=args.threads,
+                          depth=args.depth, writers=args.writers, report_every=args.report_every, limit=args.limit,
+                          retries=args.retries, json_files=False,
+                          display="json" if args.json_progress else "quiet" if args.quiet else "live")
+        s = sm.Stream(client, store, opts, classifier, detector, lama, None, vram, mode_probe, None,
+                      source=src, against=against)
+        res = s.run(pairs, total, total - len(pairs))
+        left = len(store.pending_pairs([name], args.retries))
+        print(f"This import: {res['done']:,} saved, {res['skipped']:,} skipped, {res['failed']:,} failed in "
+              f"{res['seconds'] / 60:.1f} min. Left to do: {left:,}.")
+        vram.stop()
     return 0
 
 
@@ -688,7 +786,16 @@ def cmd_reclassify(args, conf, client) -> int:
                 return 1
     with locked(store, "reclassify", "shared" if args.dry_run else "exclusive"):
         import liveexport as lx
-        exporter = lx.Exporter(store, base, conf.split) if lx.Exporter.exists_for(store) else None
+        exporter = lx.Exporter(store, base, conf.split, order=export_layout_of(conf)) \
+            if lx.Exporter.exists_for(store) and not args.dry_run else None
+        if store.is_import and not args.dry_run and not args.undo:
+            import importer
+            order = export_layout_of(conf)
+            if store.get_meta("tree_order") != order:
+                print(f"Moving the saved photos into {order} folders (export_layout of the conf) ...", flush=True)
+                for sc in scopes:
+                    print(f"  {importer.reorder(store, base, sc, order):,} photos moved")
+                scopes = [store.scope(sc["name"]) for sc in scopes]
         if args.undo:
             for sc in scopes:
                 res = rc.undo(store, base, sc, exporter=exporter)
@@ -703,6 +810,10 @@ def cmd_reclassify(args, conf, client) -> int:
             classifier = clf.Classifier(samples, args.patches, args.min_confidence,
                                         priority_margin=margin_of(args, conf),
                                         quality_threshold=quality_of(conf))
+        against = None
+        if classifier is not None and store.is_import and store.get_meta("against"):
+            import importer
+            against = importer.Against(Path(store.get_meta("against")), classifier.model_id, classifier.patches)
         plans = []
         for sc in scopes:
             if classifier is None:
@@ -712,7 +823,8 @@ def cmd_reclassify(args, conf, client) -> int:
             else:
                 print(f"Sorting {sc['name']} again with {len(classifier.class_names)} classes from {samples} ...",
                       flush=True)
-                p = rc.plan(store, base, sc, classifier, args.override_manual, max_aspect=aspect_of(conf))
+                p = rc.plan(store, base, sc, classifier, args.override_manual, max_aspect=aspect_of(conf),
+                            against=against)
             print(rc.summary(p))
             if args.dry_run:
                 report = base / "_reports" / f"{sc['name']}-reclassify-{time.strftime('%Y%m%d-%H%M%S')}.jsonl"
@@ -720,20 +832,24 @@ def cmd_reclassify(args, conf, client) -> int:
                 with open(report, "w", encoding="utf-8") as f:
                     for m in p["moves"]:
                         f.write(json.dumps(m, ensure_ascii=False) + "\n")
-                    for m in p["low_quality"] + p["aspect"]:
+                    for m in p["low_quality"] + p["aspect"] + p["copies"]:
                         f.write(json.dumps({**m, "delete": m["reason"]}, ensure_ascii=False) + "\n")
                 print(f"Dry run: nothing moved or deleted. The planned moves and deletions are in {report}")
                 continue
             plans.append((sc, p))
         low = sum(len(p["low_quality"]) for _, p in plans)
         wide = sum(len(p["aspect"]) for _, p in plans)
-        if low + wide:
+        copies = sum(len(p["copies"]) for _, p in plans)
+        if low + wide + copies:
             what = []
             if low:
                 what.append(f"{low:,} low quality (P(bad) >= {classifier.quality.threshold})")
             if wide:
                 what.append(f"{wide:,} with an aspect ratio over {conf.max_aspect:.2f}:1")
-            if not confirm(f"This deletes {low + wide:,} photos, {' and '.join(what)}; they are never downloaded "
+            if copies:
+                what.append(f"{copies:,} copies of photos of {store.get_meta('against')}")
+            again = "imported" if store.is_import else "downloaded"
+            if not confirm(f"This deletes {low + wide + copies:,} photos, {', '.join(what)}; they are never {again} "
                            f"again, and --undo cannot bring them back. Continue? [y/N] ", args.yes):
                 print("Nothing done. quality_threshold = 0 and max_aspect = 0 in [defaults] of the conf reclassify "
                       "without deleting.")
@@ -741,7 +857,7 @@ def cmd_reclassify(args, conf, client) -> int:
         for sc, p in plans:
             res = rc.apply(store, base, sc, p, str(samples), exporter=exporter)
             print(f"Reclassify run {res['run']}: {res['moved']:,} photos moved, {res['failed']:,} not moved, "
-                  f"{res['deleted']:,} photos deleted (low quality or aspect ratio), "
+                  f"{res['deleted']:,} photos deleted (low quality, aspect ratio or copies), "
                   f"{res['manual']:,} hand-sorted photos recorded where they are, {res['pruned']} empty folders "
                   f"removed. --undo puts the moves back.")
     return 0
@@ -943,7 +1059,8 @@ def cmd_drop(args, conf, client) -> int:
             print("Nothing deleted. Add --yes to delete these files and forget the scopes; this cannot be undone.")
             return 1
         import liveexport as lx
-        exporter = lx.Exporter(store, base, conf.split) if lx.Exporter.exists_for(store) else None
+        exporter = lx.Exporter(store, base, conf.split, order=export_layout_of(conf)) \
+            if lx.Exporter.exists_for(store) else None
         for sc in scopes:
             res = rg.drop_scope(store, base, sc, exporter=exporter)
             print(f"Dropped {sc['name']}: {res['files']:,} images deleted, {res['photos']:,} photos marked not "
@@ -970,6 +1087,15 @@ def aspect_of(conf: cf.Conf) -> float:
         conf.aspect_in_file = True
         print(f"  max_aspect = 21:9 written into [defaults] of {conf.path}")
     return conf.max_aspect
+
+
+def export_layout_of(conf: cf.Conf) -> str:
+    """[defaults] export_layout of the conf; written into the file with its default when it is not there."""
+    if not conf.export_layout_in_file and conf.path and Path(conf.path).is_file():
+        cf.save_default(conf.path, "export_layout", conf.export_layout, cf.EXPORT_LAYOUT_COMMENT)
+        conf.export_layout_in_file = True
+        print(f"  export_layout = {conf.export_layout} written into [defaults] of {conf.path}")
+    return conf.export_layout
 
 
 def margin_of(args, conf: cf.Conf) -> float:
@@ -1107,6 +1233,11 @@ quality_threshold = 0.88
 ; strips) are skipped like the ones under 512 pixels, and reclassify deletes
 ; the saved ones. W:H or a number; 0 turns it off.
 max_aspect = 21:9
+; The folder order of the live export (run --export) and of an import:
+; categories_first (<category>\\bw, <category>\\color) or color_first
+; (bw\\<category>, color\\<category>). A change reorders an existing export
+; at its next run --export or reclassify, and an import at its next reclassify.
+export_layout = categories_first
 
 [caption]
 ; autocaption: a vision-language model writes each caption from the image and
@@ -1268,6 +1399,43 @@ def parse_args(argv=None):
     p.add_argument("--autocaption", action="store_true",
                    help="caption each saved photo with the VLM of [caption] in the conf (downloads slow to its pace)")
 
+    p = sub.add_parser("import", help="process a local dataset (not from PastVu) like a download, into a folder of "
+                                      "its own; the source is only read")
+    p.add_argument("--dataset", required=True, metavar="DIR", help="the source folder (read only)")
+    p.add_argument("-o", metavar="DIR",
+                   help="the output folder: the imported dataset itself (default: <source>_pastvu next to it)")
+    p.add_argument("--against", metavar="BASE",
+                   help="a PastVu base folder: photos that are copies of its photos are skipped, and reclassify of "
+                        "the import deletes the copies found later (remembered; give it once)")
+    p.add_argument("--split", type=int, default=0, metavar="N",
+                   help="numbered folders of at most N images (default 0: none); set when the import is made")
+    p.add_argument("--samples", metavar="DIR", help="classify samples folder (default: [paths] samples of the conf)")
+    p.add_argument("--min-confidence", type=float, default=0.7, metavar="X",
+                   help="below this the record marks the photo as doubtful; it still goes to its best-guess category")
+    p.add_argument("--priority-margin", type=float, metavar="X",
+                   help="a category within X of the top score wins when its number is lower (default: [defaults] priority_margin of the conf, 0.15; 0: the top score always wins)")
+    p.add_argument("--patches", type=int, default=576, metavar="N", help="encoder patch budget (default 576)")
+    p.add_argument("--min-side", type=int, default=512, metavar="PX",
+                   help="skip images whose picture is smaller than this on either side (default 512)")
+    p.add_argument("--png", action="store_true", help="write images with painted watermarks as PNG instead of JPEG q97")
+    p.add_argument("--no-watermark", action="store_true", help="no watermark detection or painting")
+    p.add_argument("--wm-conf", type=float, default=0.1, metavar="X",
+                   help="watermark detections from this confidence go into the record (default 0.1)")
+    p.add_argument("--wm-paint-conf", type=float, default=0.4, metavar="X",
+                   help="only detections from this confidence are painted out (default 0.4)")
+    p.add_argument("--wm-mode", choices=["inpaint", "trim"], default="inpaint",
+                   help="paint watermarks out (default) or cut the largest clear rectangle when it keeps half the image")
+    p.add_argument("--no-borders", action="store_true", help="no border analysis")
+    p.add_argument("--no-dark", action="store_true", help="leave dark borders alone")
+    p.add_argument("--threads", type=int, default=4, metavar="N", help="reading and decoding threads (default 4)")
+    p.add_argument("--depth", type=int, default=16, metavar="N", help="images read ahead of the GPU (default 16)")
+    p.add_argument("--writers", type=int, default=2, metavar="N", help="encoder and writer threads (default 2)")
+    p.add_argument("--limit", type=int, metavar="N", help="do at most N images in this run")
+    p.add_argument("--retries", type=int, default=3, metavar="N", help="attempts for an image that failed (default 3)")
+    p.add_argument("--report-every", type=int, default=500, metavar="N", help="a report block every N images")
+    p.add_argument("--quiet", action="store_true", help="report blocks only, no live display")
+    p.add_argument("--json-progress", action="store_true", help="one JSON line per image on stdout")
+
     p = sub.add_parser("captions", help="rewrite the captions of a scope from the records, no downloads")
     p.add_argument("scope", nargs="+", metavar="SCOPE", help="a scope's name, folder or name pattern (estonia_*)")
     p.add_argument("--txt-fields", metavar="LIST", help="caption parts in order (see run --help)")
@@ -1365,7 +1533,7 @@ def main(argv=None) -> int:
         cmds = {"regions": cmd_regions, "aliases": cmd_aliases, "count": cmd_count, "scopes": cmd_scopes,
                 "index": cmd_index, "run": cmd_run, "captions": cmd_captions, "reclassify": cmd_reclassify,
                 "export": cmd_export, "autocaption": cmd_autocaption, "regroup": cmd_regroup, "drop": cmd_drop,
-                "extract": cmd_extract}
+                "extract": cmd_extract, "import": cmd_import}
         return cmds[args.cmd](args, conf, client)
     finally:
         client.close()

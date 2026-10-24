@@ -18,6 +18,10 @@ as it is written, in one folder per category:
   (regroup, a category passing the split) keep the links valid by themselves.
 - Photos saved before the export existed are linked when a run with --export
   starts.
+- The order of the folders is the conf's export_layout: categories_first
+  (050-transport/bw/001) or color_first (bw/050-transport/001). When it
+  changes, the next exporter moves every link that is where the export put
+  it into the new order (links you moved by hand stay).
 """
 
 from __future__ import annotations
@@ -49,14 +53,16 @@ def _width(store, split: int) -> int:
 
 
 class Exporter:
-    def __init__(self, store, base: Path, split: int, log=print):
+    def __init__(self, store, base: Path, split: int, log=print, order: str = layout.CATEGORY_FIRST):
         self.store, self.base, self.log = store, base, log
         meta = store.get_meta(META) or {}
         self.root = Path(meta.get("root") or root_of(base))
         self.split = int(meta.get("split", split))
         self.width = int(meta.get("width") or _width(store, self.split))
+        self.order = meta.get("order") or layout.CATEGORY_FIRST       # exports from before the option
         if not meta:
-            store.set_meta(META, {"root": str(self.root), "split": self.split, "width": self.width})
+            self.order = order
+            store.set_meta(META, {"root": str(self.root), "split": self.split, "width": self.width, "order": order})
         self.lock = threading.Lock()
         self.counts: dict[str, Counter] = defaultdict(Counter)
         self.copied_warned = False
@@ -64,6 +70,8 @@ class Exporter:
         for cid, rel in store.export_rows():
             if rel and rel != EXCLUDED:
                 self._count(rel, +1)
+        if order != self.order:
+            self.reorder(order)
 
     @staticmethod
     def exists_for(store) -> bool:
@@ -87,10 +95,51 @@ class Exporter:
             c[chunk] += 1
         return f"{folder}/{chunk:0{self.width}d}/{name}"
 
-    @staticmethod
-    def folder_of(mode: str | None, category: str) -> str:
+    def folder_of(self, mode: str | None, category: str, order: str | None = None) -> str:
         cat = category.replace("\\", "/").strip("/") or NO_CATEGORY
-        return f"{cat}/{mode}" if mode else cat
+        if not mode:
+            return cat
+        return f"{mode}/{cat}" if (order or self.order) == layout.COLOR_FIRST else f"{cat}/{mode}"
+
+    def _folder_part(self, rel: str) -> str:
+        return "/".join(rel.split("/")[:-2 if self.split > 0 else -1])
+
+    def reorder(self, order: str) -> dict:
+        """Move every link that is where the export put it into the folders of the other order;
+        a link you moved by hand stays where it is. -> counts."""
+        moved = kept = 0
+        rows = [(cid, rel) for cid, rel in self.store.export_rows() if rel and rel != EXCLUDED]
+        updates = []
+        for cid, rel in rows:
+            st = self.store.status(cid) or {}
+            mode, category = st.get("mode"), st.get("category") or ""
+            old = self.root / rel
+            if self._folder_part(rel) != self.folder_of(mode, category) or not old.is_file():
+                kept += 1
+                continue
+            new_rel = self._place(self.folder_of(mode, category, order), old.name)
+            new = self.root / new_rel
+            new.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(old, new)
+            for ext in SIDECARS:
+                if old.with_suffix(ext).is_file():
+                    os.replace(old.with_suffix(ext), new.with_suffix(ext))
+            with self.lock:
+                self._count(rel, -1)
+            updates.append((cid, new_rel))
+            moved += 1
+        if updates:
+            self.store.set_exports(updates)
+        self.order = order
+        meta = dict(self.store.get_meta(META) or {})
+        meta["order"] = order
+        self.store.set_meta(META, meta)
+        for _, root in ((None, self.root),):
+            if root.is_dir():
+                import folders
+                folders.prune_empty(root)
+        self.log(f"Export {self.root}: folders now {order}; {moved:,} photos moved, {kept:,} you placed by hand stay")
+        return {"moved": moved, "kept": kept}
 
     # --- files -------------------------------------------------------------------------------
 
@@ -141,7 +190,7 @@ class Exporter:
             return
         old = self.root / rel
         folder = self.folder_of(mode, category)
-        if "/".join(rel.split("/")[:-2 if self.split > 0 else -1]) == folder or not old.is_file():
+        if self._folder_part(rel) == folder or not old.is_file():
             return
         new_rel = self._place(folder, old.name)
         new = self.root / new_rel
@@ -229,8 +278,9 @@ class Exporter:
         return len(on_disk)
 
 
-def open_for_run(store, base: Path, split: int, reset: bool = False, log=print) -> Exporter:
-    ex = Exporter(store, base, split, log)
+def open_for_run(store, base: Path, split: int, reset: bool = False, log=print,
+                 order: str = layout.CATEGORY_FIRST) -> Exporter:
+    ex = Exporter(store, base, split, log, order)
     if reset:
         n = ex.reset()
         log(f"Export {ex.root}: exclusions forgotten; {n:,} files found there are kept, the rest is linked again")

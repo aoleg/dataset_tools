@@ -40,6 +40,11 @@ quality_threshold = 0.88
 ; strips) are skipped like the ones under 512 pixels, and reclassify deletes
 ; the saved ones. W:H or a number; 0 turns it off.
 max_aspect = 21:9
+; The folder order of the live export (run --export) and of an import:
+; categories_first (<category>\bw, <category>\color) or color_first
+; (bw\<category>, color\<category>). A change reorders an existing export
+; at its next run --export or reclassify, and an import at its next reclassify.
+export_layout = categories_first
 
 [caption]
 ; autocaption: a vision-language model writes each caption from the image and
