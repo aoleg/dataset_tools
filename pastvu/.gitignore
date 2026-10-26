@@ -10,3 +10,5 @@ PLAN.md
 ANALYSIS.md
 # the local configuration (install.bat makes it from pastvu.conf.example)
 pastvu.conf
+# a by-hand download of the libjpeg-turbo package (see fetch_turbojpeg.py)
+*.conda

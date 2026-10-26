@@ -2,7 +2,11 @@
 crop). PyTurboJPEG does not bundle the library and libjpeg-turbo publishes its
 Windows builds only as installers, so this takes the DLL out of conda-forge's
 libjpeg-turbo package for win-64: a zip that holds a zstd-compressed tar. No
-conda is involved. The package is pinned by version and sha256.
+conda is involved. The package is pinned by version and sha256. The download
+goes through httpx, which trusts certifi's bundle: the Python that made the venv
+(often a Miniconda one) trusts the Windows certificate store through urllib,
+and a store that has not been updated fails the handshake with "certificate has
+expired".
 """
 
 from __future__ import annotations
@@ -11,7 +15,6 @@ import hashlib
 import io
 import sys
 import tarfile
-import urllib.request
 import zipfile
 from pathlib import Path
 
@@ -33,14 +36,33 @@ def check() -> bool:
         return False
 
 
+def download() -> bytes | None:
+    import httpx
+    print(f"  downloading {URL}")
+    try:
+        r = httpx.get(URL, timeout=120, follow_redirects=True)
+        r.raise_for_status()
+    except httpx.HTTPError as e:
+        print(f"[ERROR] download failed: {type(e).__name__}: {e}")
+        print(f"        Download {PACKAGE} by hand from {URL} and put it next to this")
+        print(f"        script as {HERE / PACKAGE}, then run install.bat again.")
+        return None
+    return r.content
+
+
 def main() -> int:
     if DLL.is_file() and check():
         print(f"  {DLL} is in place")
         return 0
     import zstandard
-    print(f"  downloading {URL}")
-    with urllib.request.urlopen(URL, timeout=120) as r:
-        data = r.read()
+    local = HERE / PACKAGE
+    if local.is_file():
+        print(f"  using {local}")
+        data = local.read_bytes()
+    else:
+        data = download()
+        if data is None:
+            return 1
     digest = hashlib.sha256(data).hexdigest()
     if digest != PACKAGE_SHA256:
         print(f"[ERROR] {PACKAGE}: sha256 {digest}, expected {PACKAGE_SHA256}")
