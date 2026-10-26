@@ -12,6 +12,10 @@ scope in it.
   classifier's embedding of the saved pixels, per photo.
 - counters: per-scope totals for the reports.
 - reclass_runs, reclass_moves: what reclassify moved, for --undo.
+- review, reviewed: cleanup. review lists the photos moved into the review
+  folder (state review): where each came from and its name there. reviewed
+  holds the photos you kept in a review settled with --done (verdict good):
+  no reclassify or cleanup sends them away again for their quality.
 - names: an import base only (meta kind = import): the file name of each
   photo, its source path, size and mtime. Photo numbers are the import's own.
 - captions, caption_log, caption_fails, caption_runs: autocaption. captions
@@ -80,12 +84,16 @@ CREATE TABLE IF NOT EXISTS regroup_moves (
     new_member INTEGER, PRIMARY KEY (run, seq)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS names (
     cid INTEGER PRIMARY KEY, name TEXT UNIQUE, src TEXT, bytes INTEGER, mtime INTEGER);
+CREATE TABLE IF NOT EXISTS review (
+    cid INTEGER PRIMARY KEY, scope TEXT, src TEXT, file TEXT, p_bad REAL, time REAL);
+CREATE TABLE IF NOT EXISTS reviewed (cid INTEGER PRIMARY KEY, verdict TEXT, p_bad REAL, time REAL);
 CREATE TABLE IF NOT EXISTS caption_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT, scope TEXT, target TEXT, model TEXT, prompt_sha TEXT, started REAL,
     ended REAL, captioned INTEGER DEFAULT 0, failed INTEGER DEFAULT 0, undone REAL);
 """
 
 PENDING, WRITING, DONE, SKIPPED, FAILED = "pending", "writing", "done", "skipped", "failed"
+REVIEW = "review"          # moved by cleanup into the review folder, waiting for cleanup --done or --undo
 REGION_COLS = "cid, parent, parents, title_en, title_local, phc, pac, child_len"
 STATUS_COLS = ("cid", "state", "reason", "attempts", "scope", "category", "path", "sha256", "bytes", "width", "height",
                "changed", "mode")
@@ -201,6 +209,48 @@ class Store:
                 "label": row[8] or row[0].rsplit("_", 1)[0], "folder": row[9] if row[9] is not None else row[0],
                 "split_mode": bool(self.get_meta("bw_color", False)),
                 "order": self.get_meta("tree_order")}
+
+    # --- cleanup: the review ---------------------------------------------------------
+
+    def add_review(self, cid: int, scope: str, src: str, file: str, p_bad: float) -> None:
+        """The photo went into the review folder as `file`; src: where it was, relative to the base."""
+        def work(db):
+            db.execute("INSERT OR REPLACE INTO review (cid, scope, src, file, p_bad, time) VALUES (?,?,?,?,?,?)",
+                       (cid, scope, src, file, p_bad, time.time()))
+            db.execute("UPDATE status SET state=?, updated=? WHERE cid=?", (REVIEW, time.time(), cid))
+        self.tx(work)
+
+    def review_items(self) -> list[tuple]:
+        """(cid, scope, src, file, p_bad) of every photo in the review folder."""
+        with self.lock:
+            return self.db.execute("SELECT cid, scope, src, file, p_bad FROM review ORDER BY p_bad DESC, cid").fetchall()
+
+    def review_count(self) -> int:
+        with self.lock:
+            return self.db.execute("SELECT COUNT(*) FROM review").fetchone()[0]
+
+    def end_review(self, cid: int, state: str, path: str | None = None, record: str | None = None,
+                   reason: str = "", good: bool = False, p_bad: float | None = None) -> None:
+        """The photo leaves the review: back (state done, at path), or gone (state skipped, with reason)."""
+        now = time.time()
+
+        def work(db):
+            db.execute("DELETE FROM review WHERE cid=?", (cid,))
+            if state == DONE:
+                db.execute("UPDATE status SET state=?, path=?, updated=? WHERE cid=?", (DONE, path, now, cid))
+                if record is not None:
+                    db.execute("UPDATE records SET json=? WHERE cid=?", (record, cid))
+            else:
+                db.execute("UPDATE status SET state=?, reason=?, path=NULL, updated=? WHERE cid=?",
+                           (state, reason, now, cid))
+            if good:
+                db.execute("INSERT OR REPLACE INTO reviewed (cid, verdict, p_bad, time) VALUES (?,?,?,?)",
+                           (cid, "good", p_bad, now))
+        self.tx(work)
+
+    def reviewed_good(self) -> set[int]:
+        with self.lock:
+            return {r[0] for r in self.db.execute("SELECT cid FROM reviewed WHERE verdict='good'")}
 
     # --- an import base: file names --------------------------------------------------
 

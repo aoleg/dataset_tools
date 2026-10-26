@@ -91,7 +91,10 @@ class Verdict:
 
 class Classifier:
     def __init__(self, samples: Path, patches: int, min_confidence: float, encoder=None,
-                 priority_margin: float = DEFAULT_PRIORITY_MARGIN, quality_threshold: float = quality.THRESHOLD):
+                 priority_margin: float = DEFAULT_PRIORITY_MARGIN, quality_threshold: float = quality.THRESHOLD,
+                 categories: bool = True):
+        """categories False: the quality probe alone (cleanup); the samples are embedded all the same,
+        since the cache keeps only the files of the pass that saves it."""
         from threadpoolctl import threadpool_limits
         threadpool_limits(limits=getattr(cl, "BLAS_THREADS", 8))
         if not samples or not Path(samples).is_dir():
@@ -112,9 +115,12 @@ class Classifier:
                             "Samples")
         rels = {it.rel for it in items}
         self.sample_vectors = {r: v for r, v in res.vectors.items() if r in rels}   # for the colour probe
-        rep = cl.Report()
-        self.ts, self.cv, self.probe, self.example_hashes = cl.fit_probe(classes, res, rep)
-        self.n_classes = len(self.ts.class_names)
+        self.ts = self.cv = self.probe = None
+        self.example_hashes, self.n_classes = {}, 0
+        if categories:
+            rep = cl.Report()
+            self.ts, self.cv, self.probe, self.example_hashes = cl.fit_probe(classes, res, rep)
+            self.n_classes = len(self.ts.class_names)
         self.quality = quality.probe_from_samples(q_items, res.vectors, quality_threshold)
 
     @property
@@ -154,7 +160,8 @@ class Classifier:
 
     def low_quality(self, X) -> np.ndarray:
         """P(bad) of each embedding when it is at or above the threshold, else NaN (all NaN with the filter off)."""
-        X = np.asarray(X, np.float32).reshape(-1, self.ts.X.shape[1])
+        X = np.asarray(X, np.float32)
+        X = X.reshape(len(X), -1) if X.ndim > 1 else X.reshape(1, -1)
         if self.quality is None or not len(X):
             return np.full(len(X), np.nan)
         p = self.quality.p_bad(X)

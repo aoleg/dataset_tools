@@ -65,7 +65,15 @@ UKRAINE_PRESETS = [          # name, regions, comment
 
 # --- setup -------------------------------------------------------------------------------
 
-IMPORT_COMMANDS = ("reclassify", "autocaption", "scopes")
+IMPORT_COMMANDS = ("reclassify", "cleanup", "autocaption", "scopes")
+
+
+def no_open_review(store: Store, base: Path, command: str) -> None:
+    n = store.review_count()
+    if n:
+        import cleanup as cu
+        raise SystemExit(f"{n:,} photos of {base} are in the review folder {cu.review_dir(store, base)}; settle the "
+                         f"review with cleanup --done or cleanup --undo before {command}")
 
 
 def open_base(args, conf: cf.Conf) -> tuple[Path, Store]:
@@ -863,6 +871,77 @@ def cmd_reclassify(args, conf, client) -> int:
     return 0
 
 
+def cmd_cleanup(args, conf, client) -> int:
+    import cleanup as cu
+    base, store = open_base(args, conf)
+    if args.done or args.undo:
+        if args.done and args.undo:
+            raise SystemExit("give --done or --undo, not both")
+        if args.threshold is not None or args.scope:
+            raise SystemExit("--done and --undo settle the whole open review; they take no threshold or scope")
+        with locked(store, "cleanup"):
+            import liveexport as lx
+            exporter = lx.Exporter(store, base, conf.split, order=export_layout_of(conf)) \
+                if lx.Exporter.exists_for(store) else None
+            res = cu.settle(store, base, keep_good=args.done, exporter=exporter)
+        how = "kept for good (no reclassify or cleanup sends them away again for their quality)" if args.done \
+            else "put back as they were"
+        print(f"Review settled: {res['back']:,} photos {how}; {res['gone']:,} you deleted are skipped for good"
+              + (f"; {res['stuck']:,} could not go back and stay in the review folder" if res["stuck"] else ""))
+        if res["left"]:
+            print(f"  {res['folder']} still holds {res['left']:,} files that are not photos of the review; it stays")
+        return 0
+    if args.threshold is None:
+        raise SystemExit("give the threshold, a P(bad) such as 0.8 (cleanup 0.8 [scope ...]); or --done, --undo")
+    try:
+        threshold = float(args.threshold)
+    except ValueError:
+        raise SystemExit(f"cleanup {args.threshold}: the first value is the threshold, a P(bad) such as 0.8")
+    if not 0 < threshold <= 1:
+        raise SystemExit(f"threshold {threshold}: give a P(bad) above 0 and at most 1")
+    scopes = scopes_arg(base, store, args.scope) if args.scope else store.scopes()
+    if not scopes:
+        print(f"no scopes in {base}")
+        return 0
+    with locked(store, "cleanup", "shared" if args.dry_run else "exclusive"):
+        import classifier as clf
+        samples = Path(args.samples).resolve() if args.samples else conf.samples
+        classifier = clf.Classifier(samples, args.patches, 0.7, quality_threshold=threshold, categories=False)
+        if classifier.quality is None:
+            raise SystemExit(f"no quality probe: {samples} needs at least 20 images in _quality_good and in "
+                             f"_quality_bad")
+        plans = []
+        for sc in scopes:
+            p = cu.plan(store, base, sc, classifier, threshold, args.override_manual)
+            print(cu.summary(sc["name"], p, threshold), flush=True)
+            if p["picks"]:
+                plans.append((sc, p))
+        n = sum(len(p["picks"]) for _, p in plans)
+        folder = cu.review_dir(store, base)
+        if args.dry_run:
+            report = base / "_reports" / f"cleanup-{time.strftime('%Y%m%d-%H%M%S')}.jsonl"
+            report.parent.mkdir(parents=True, exist_ok=True)
+            with open(report, "w", encoding="utf-8") as f:
+                for sc, p in plans:
+                    for m in p["picks"]:
+                        f.write(json.dumps({**m, "scope": sc["name"]}, ensure_ascii=False) + "\n")
+            print(f"Dry run: nothing moved. The {n:,} photos to review are in {report}")
+            return 0
+        if not n:
+            print("Nothing to review.")
+            return 0
+        if not confirm(f"This moves {n:,} photos (P(bad) >= {threshold}) with their captions into {folder}. "
+                       f"Continue? [y/N] ", args.yes):
+            print("Nothing done.")
+            return 1
+        moved = sum(cu.move_to_review(store, base, sc, p["picks"], threshold) for sc, p in plans)
+    total = store.review_count()
+    print(f"{moved:,} photos moved into {folder}" + (f" ({total:,} in the review now)" if total != moved else "")
+          + ". Delete the ones that are bad, then run cleanup --done to put the rest back and keep them for good, "
+            "or cleanup --undo to put the rest back as they were.")
+    return 0
+
+
 def caption_targets(base: Path, store: Store, values: list[str]) -> list[tuple[dict, str]]:
     out, seen = [], set()
     for v in values:
@@ -999,6 +1078,8 @@ def cmd_regroup(args, conf, client) -> int:
     import partition as pt
     import regroup as rg
     base, store = open_base(args, conf)
+    if not args.dry_run:
+        no_open_review(store, base, "regroup")
     with locked(store, "regroup", "shared" if args.dry_run else "exclusive"):
         if args.undo:
             res = rg.undo(store, base)
@@ -1047,6 +1128,7 @@ def cmd_drop(args, conf, client) -> int:
     import regroup as rg
     from store import DONE
     base, store = open_base(args, conf)
+    no_open_review(store, base, "drop")
     scopes = scopes_arg(base, store, args.scope)
     with locked(store, "drop"):
         for sc in scopes:
@@ -1461,6 +1543,23 @@ def parse_args(argv=None):
                    help="only move the photos in _unsure folders (made by older versions) into their best-guess "
                         "categories; no classifier")
 
+    p = sub.add_parser("cleanup", help="move the saved photos the quality probe scores at or above a threshold into "
+                                       "<base>_review for you to look at; --done or --undo puts back what you kept")
+    p.add_argument("threshold", nargs="?", metavar="P", help="P(bad) from which a photo goes to review, e.g. 0.8 "
+                                                            "(for this command only; the conf keeps its value)")
+    p.add_argument("scope", nargs="*", metavar="SCOPE",
+                   help="a scope's name, folder or name pattern (estonia_*); none: every scope of the base")
+    p.add_argument("--done", action="store_true",
+                   help="settle the review: the photos left in the folder go back and are kept for good")
+    p.add_argument("--undo", action="store_true",
+                   help="settle the review: the photos left in the folder go back as they were, not marked")
+    p.add_argument("--yes", action="store_true", help="do not ask before moving photos into the review folder")
+    p.add_argument("--dry-run", action="store_true", help="count and list the photos to review, move nothing")
+    p.add_argument("--override-manual", action="store_true",
+                   help="also review the photos that were moved to another category by hand (default: they stay)")
+    p.add_argument("--samples", metavar="DIR", help="classify samples folder (default: [paths] samples of the conf)")
+    p.add_argument("--patches", type=int, default=576, metavar="N", help="encoder patch budget (default 576)")
+
     p = sub.add_parser("autocaption", help="caption saved photos with a VLM, from each image and its caption")
     p.add_argument("target", nargs="+", metavar="SCOPE|FOLDER",
                    help="a scope's name or name pattern (estonia_*), or its folder or any folder inside it")
@@ -1533,7 +1632,7 @@ def main(argv=None) -> int:
         cmds = {"regions": cmd_regions, "aliases": cmd_aliases, "count": cmd_count, "scopes": cmd_scopes,
                 "index": cmd_index, "run": cmd_run, "captions": cmd_captions, "reclassify": cmd_reclassify,
                 "export": cmd_export, "autocaption": cmd_autocaption, "regroup": cmd_regroup, "drop": cmd_drop,
-                "extract": cmd_extract, "import": cmd_import}
+                "extract": cmd_extract, "import": cmd_import, "cleanup": cmd_cleanup}
         return cmds[args.cmd](args, conf, client)
     finally:
         client.close()

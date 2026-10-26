@@ -14,6 +14,8 @@ joined.
   caption, JSON sidecar, export links) and marked skipped, so no run fetches
   it again. Hand-sorted photos are kept unless --override-manual. Deleting
   cannot be undone.
+- A photo kept in a cleanup review (cleanup --done) is never deleted for its
+  quality.
 - Every move goes into the store, so --undo puts the last reclassify back.
 """
 
@@ -95,6 +97,8 @@ def plan(store: Store, base: Path, scope: dict, classifier, override_manual: boo
                 log(f"  embedded {embedded:,} images without a stored embedding ({time.time() - t0:.0f} s)")
         vecs.append(v)
     bad = classifier.low_quality(vecs) if vecs else np.zeros(0)
+    good = store.reviewed_good()                 # kept in a cleanup review: their quality was looked at
+    bad = np.array([np.nan if t[0] in good else b for t, b in zip(todo, bad)])
     low = [{"cid": cid, "src": actual, "category": cat_now, "p_bad": round(float(b), 4),
             "reason": f"{quality.REASON} (P(bad) {b:.2f})"}
            for (cid, actual, cat_now, _), b in zip(todo, bad) if not np.isnan(b)]

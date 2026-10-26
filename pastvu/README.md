@@ -165,6 +165,8 @@ run.bat run --scope <name>
 run.bat regroup --by RULE [<scope> ...] [--dry-run] [--undo]
 run.bat drop <scope> [...] [--yes]
 run.bat reclassify [<scope> ...] [--dry-run] [--undo] [--yes]
+run.bat cleanup <threshold> [<scope> ...] [--dry-run] [--yes]
+run.bat cleanup --done | --undo
 run.bat captions <scope> [...] [--txt-fields LIST] [--dry-run]
 run.bat autocaption <scope or folder> [...] [--limit N] [--recaption] [--undo]
 run.bat export <scope> [...] [--format jsonl|parquet]
@@ -480,6 +482,26 @@ Versions before 2026-10-23 put doubtful photos into `_unsure\<category>`. `recla
 
 Several scopes and name patterns are sorted one after another with one load of the classifier. Without a scope, reclassify works on every scope of the base folder; it first asks `This will reclassify N scope folders ... Continue? [y/N]` with the number of saved photos, and `--yes` skips the question. `reclassify --undo` without a scope undoes the last reclassify of every scope that has one, after the same question.
 
+## Cleanup: review photos by their quality
+
+```
+run.bat cleanup 0.8 --dry-run
+run.bat cleanup 0.8
+run.bat cleanup --done
+run.bat cleanup --undo
+```
+
+Moves the saved photos that the quality probe scores at or above the threshold into one flat folder for you to look at, `<base>_review` next to the base folder. You delete the images that are bad there, and `--done` or `--undo` puts the rest back. Nothing is deleted unless you delete it.
+
+- **The threshold** is given for this command only; `quality_threshold` in the conf keeps its value. The category classifier is not used, so photos do not change category. The GPU is needed only for photos without a stored embedding.
+- **Which photos:** every saved photo of the scopes given (or of every scope) at or above the threshold. Photos that you moved to another category by hand are left out, as in reclassify (`--override-manual` takes them too), and so are the photos that you kept in an earlier review.
+- **In the review folder** each image has its caption next to it, and its name starts with its score (`0.934_123456.jpg`), so a sort by name shows the worst first. On the drive of the base, a move takes no time. A second cleanup before you settle the review adds its photos to the same folder.
+- **While a review is open** its photos are neither saved nor waiting to download: no run downloads them again, and reclassify, extract, export and autocaption leave them alone. `regroup` and `drop` stop until the review is settled. The live export keeps its links to these photos until then.
+- **`cleanup --done`** puts every image still in the folder back into its category, with its caption, and marks it as kept: no later reclassify or cleanup sends it away for its quality.
+- **`cleanup --undo`** puts them back in the same way, without that mark, so a later reclassify or cleanup can pick them again.
+- **The images you deleted,** with either one, are marked skipped (`low quality (reviewed)`) and never downloaded again. Their captions left in the folder are deleted, and so are their export links. The review folder is deleted when nothing else is left in it; a file that you put there yourself keeps it.
+- The images you keep are not copied into `_quality_good`: a photo may be worth keeping for its picture although its quality is poor. Add the ones that show good quality there yourself, then check the threshold again ([Low-quality photos](#low-quality-photos)).
+
 ## Extract
 
 ```
@@ -552,7 +574,7 @@ Processes a folder of images that this tool did not download, for example repost
 - **Copies of your PastVu photos.** With `--against <base>`, a photo that is a copy of a photo in that base is skipped: PastVu holds the original, and the channels repost it recompressed. The import remembers the base, so a later import or reclassify uses it without the option. A copy is a photo whose embedding is at least 0.96 similar to a base photo, or at least 0.85 and confirmed by the feature test of the [deduplicate](../deduplicate/README.md) tool (the same picture under another crop, scale or compression). A colourised repost of a black-and-white base photo counts as a copy. On 34,300 Telegram reposts against 210,801 PastVu photos about 9 % were copies.
 - **Running it again** picks up the files added to the source since, and continues an import that was stopped. It does not process again the images it has seen.
 - **Reclassify** (`run.bat --base <import folder> reclassify`) sorts the import again with your samples, and deletes what fails the filters now: low quality, the aspect ratio, and the copies of base photos, including copies of photos that the base downloaded after the import. It asks once before deleting, as on a PastVu base. After you change `export_layout`, it first moves every photo into the new order.
-- **Other commands.** `autocaption` works on an import (`run.bat --base <import folder> autocaption <folder>`); the commands that need PastVu (`run`, `index`, `regroup`, `drop`, `captions`, `extract`, `export`) stop with a message.
+- **Other commands.** `cleanup` and `autocaption` work on an import (`run.bat --base <import folder> autocaption <folder>`); the commands that need PastVu (`run`, `index`, `regroup`, `drop`, `captions`, `extract`, `export`) stop with a message.
 
 ## Progress and resume
 
@@ -647,6 +669,7 @@ Each record carries what attribution and a takedown need: the PastVu page, the u
 | `encode.py` | the save rules, in memory |
 | `classifier.py` | classify's sorter, one image at a time or in batches |
 | `reclassify.py` | sorting a scope again, and undo |
+| `cleanup.py` | the review of saved photos by their quality: `cleanup`, `--done`, `--undo` |
 | `autocaption.py` | the VLM client, the caption runs, and undo |
 | `vram.py` | the GPU memory of the whole card, through NVML |
 | `tagging\` | the default prompts of autocaption |
