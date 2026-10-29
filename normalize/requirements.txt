@@ -1,0 +1,3 @@
+pillow>=11.3
+# HEIC/HEIF photos from phones; without it they are reported as failed
+pillow-heif>=0.22

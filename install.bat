@@ -8,7 +8,7 @@ rem  install.bat - runs the install.bat of every tool that needs one, one
 rem  after the other. First the five tools the pipeline uses:
 rem  remove_borders, reframe, jpeg_cleanup, face_masks and watermark; the
 rem  GPU ones install torch from the PyTorch CUDA index. Then deduplicate,
-rem  k2prep, ddg_images, classify, duck and pastvu. Each one creates the shared
+rem  k2prep, ddg_images, classify, duck, pastvu and normalize. Each one creates the shared
 rem  venv when it is missing and installs only its own dependencies into
 rem  it, so running this file again installs what is missing and changes
 rem  nothing that is there. duck needs git on PATH, and classify downloads
@@ -18,7 +18,7 @@ rem ============================================================
 
 cd /d "%~dp0"
 
-for %%T in (remove_borders reframe jpeg_cleanup face_masks watermark deduplicate k2prep ddg_images classify duck pastvu) do (
+for %%T in (remove_borders reframe jpeg_cleanup face_masks watermark deduplicate k2prep ddg_images classify duck pastvu normalize) do (
     echo.
     echo ============================================================
     echo  %%T
