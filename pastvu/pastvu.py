@@ -1078,7 +1078,9 @@ def cmd_cherrypick(args, conf, client) -> int:
     import cherrypick as cp
     base, store = open_base(args, conf)
     c = cp.parse_values(args.value, args.quality, args.top, args.per_category)
-    balance = args.balance or c["per_category"] is not None
+    balance = args.balance if args.balance is not None else (50 if c["per_category"] is not None else None)
+    if balance is not None and not 0 <= balance <= 100:
+        raise SystemExit(f"--balance {balance}: a percentage of colour photos, 0 to 100")
     decades = cp.parse_decades(args.decades)
     if decades and store.is_import:
         raise SystemExit("--decades: an import has no years")
@@ -1666,8 +1668,9 @@ def parse_args(argv=None):
     p.add_argument("--quality", type=float, metavar="P", help="the threshold, named")
     p.add_argument("--top", type=int, metavar="X", help="the percentile, named")
     p.add_argument("--per-category", type=int, metavar="N", help="the number per category, named (implies --balance)")
-    p.add_argument("--balance", action="store_true",
-                   help="black-and-white never exceeds colour (always on with a number per category)")
+    p.add_argument("--balance", nargs="?", type=int, const=50, metavar="PERCENT",
+                   help="the share of colour photos to aim at, per category, as far as the pools allow "
+                        "(--balance alone: 50; always on, at 50, with a number per category)")
     p.add_argument("--decades", nargs="+", metavar="DECADE", help="only these decades, e.g. 1960s 1970s (default: all)")
     p.add_argument("--category", nargs="+", metavar="CATEGORY",
                    help="only these categories, by number, name or full name (default: all but 200-outliers)")

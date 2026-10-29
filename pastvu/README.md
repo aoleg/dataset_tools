@@ -172,7 +172,7 @@ run.bat autocaption <scope or folder> [...] [--limit N] [--recaption] [--undo]
 run.bat export <scope> [...] [--format jsonl|parquet]
 run.bat import --dataset <folder> [-o <folder>] [--against <base>] [--split N] [--limit N]
 run.bat --base <import folder> reclassify [--dry-run] [--yes]
-run.bat cherrypick <0.85 | 30 | 5000> [...] -o <folder> [--balance] [--decades 1960s 1970s] [--link] [--prune]
+run.bat cherrypick <0.85 | 30 | 5000> [...] -o <folder> [--balance 70] [--decades 1960s 1970s] [--link] [--prune]
 run.bat extract <category> [...] [--region R] [--years A B | --decade D] [--bw | --color] [--min-res N]
                    [--target N [--colour-share X]] [-o DIR]
 run.bat scopes | aliases | count --region <alias> | regions [--find TEXT]
@@ -507,7 +507,7 @@ Moves the saved photos that the quality probe scores at or above the threshold i
 
 ```
 run.bat cherrypick 0.85 30 5000 -o D:\training
-run.bat cherrypick 90 --balance -o D:\training --link
+run.bat cherrypick 90 --balance 70 -o D:\training --link
 run.bat cherrypick 2000 --decades 1960s 1970s -o D:\training_60s_70s
 run.bat --base D:\imported\photos cherrypick 2000 -o D:\training
 ```
@@ -515,7 +515,7 @@ run.bat --base D:\imported\photos cherrypick 2000 -o D:\training
 Picks the best photos of every category, by the quality probe, into one folder for training, balanced between colour and black-and-white. The unit is one category in one mode: the probe's scores of colour and black-and-white photos are not comparable, so each is ranked on its own. The score is P(good) = 1 - P(bad) of the probe ([Low-quality photos](#low-quality-photos)), read from the embeddings the store holds, so the GPU is not used.
 
 - **Three ceilings**, any of them, in any order, told apart by their shape: a value with a dot is a threshold (`0.85`: P(good) at or above it); an integer from 1 to 100 is a percentile (`30`: the top 30 % of each category and mode, as they are in the base); an integer over 100 is a number per category (`5000`). The lowest ceiling wins. `--quality`, `--top` and `--per-category` are the same, named. The command prints its reading of the values before it copies anything.
-- **Balance** (`--balance`, always on with a number per category): black-and-white never exceeds colour. After the threshold and the percentile, black-and-white is cut down to the colour count. With a number per category, the number is split between the modes in the ratio of the two pools: 4,000 colour and 1,000 black-and-white under 2,000 gives 1,600 and 400. More colour than black-and-white is fine; a category without colour picks nothing under balance, and the report says so. Without balance each mode is cut on its own.
+- **Balance** (`--balance 70`: the share of colour photos to aim at, per category; `--balance` alone is 50, and a number per category turns it on at 50): after the threshold and the percentile, the two modes are cut to that share, as far as the smaller pool allows. 100 colour and 20 black-and-white at 50 give 20 and 20; at 80 they give 80 and 20; 4,000 and 1,000 under 2,000 at 50 give 1,000 and 1,000. A category with none of a mode the share asks for picks nothing, and the report says so. Without balance each mode is cut on its own.
 - **Which photos:** every saved photo of the base, in the categories and modes the store records (run `reclassify` first to record hand moves), `200-outliers` never. `--decades 1960s 1970s` keeps only those decades, by the photo's start year, still as one bucket per category and mode; an import has no years. `--category` narrows to some categories, by number, name or full name. A photo that has no embedding is left out and counted.
 - **The output:** `<folder>\<category>\bw\` and `color\` (`export_layout = color_first` in the conf puts `bw\` and `color\` first); `--split N` adds numbered folders. Images are copied, or hard-linked with `--link`; `.txt` and `.short` captions are copied. The report lists each category's pools and picks.
 - **Running it again** copies what is picked and missing, keeps what is there, and reports the files of this base that are no longer picked; `--prune` deletes them. So without `--prune` the folder can hold more than the ceilings say, and nothing you edited there is lost. `cherrypick.json` in the folder holds the criteria and the files per base; a PastVu base and an import can go into the same folder, since their names do not collide.

@@ -10,13 +10,17 @@ store holds, and cut by whichever of the ceilings given is the lowest:
 - a threshold (a value with a dot, 0.85): P(good) at or above it;
 - a percentile (1 to 100): the top X % of the bucket as it is in the base;
 - a number per category (over 100): the category's photos, split between the
-  modes by their pools' ratio (see balance).
+  modes by the balance.
 
-Balance (--balance, always on with a number per category): black-and-white
-never exceeds colour. After the threshold and the percentile, with pools c
-and b, b' = min(b, c) and c' = c; with a number N, total = min(N, c' + b')
-is split in the ratio c' : b'. More colour than black-and-white is fine; the
-other way round is not. Without balance each mode is cut on its own.
+Balance (--balance PERCENT, the target share of colour photos; --balance
+alone is 50, and a number per category turns it on at 50): after the
+threshold and the percentile, with pools c and b, the total is the largest
+that the two pools allow at that share, min(c / f, b / (1 - f)) with f =
+PERCENT / 100, at most N with a number per category; colour = round(total *
+f), black-and-white = the rest. So the pool that falls short limits the
+other: 100 colour and 20 black-and-white at 50 give 20 and 20, at 80 give 80
+and 20. A category with none of a mode the share asks for picks nothing.
+Without balance each mode is cut on its own.
 
 The decades are all, or --decades (from the photo's start year; not on an
 import, which has no years). 200-outliers is never included. Photos come
@@ -35,6 +39,7 @@ longer selected, and deletes them with --prune.
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import time
@@ -98,7 +103,7 @@ def _float(t: str) -> float:
         raise SystemExit(f"{t}: not a number")
 
 
-def describe(c: dict, balance: bool, decades: list[int] | None) -> str:
+def describe(c: dict, balance: int | None, decades: list[int] | None) -> str:
     """The reading of the parameters, in words."""
     parts = []
     if c["quality"] is not None:
@@ -108,9 +113,9 @@ def describe(c: dict, balance: bool, decades: list[int] | None) -> str:
     if c["per_category"] is not None:
         parts.append(f"at most {c['per_category']:,} photos per category")
     text = "For each category, in black-and-white and in colour separately: " + "; ".join(parts) + "."
-    if balance:
-        text += (" Balance: black-and-white is cut down to the colour count"
-                 + (", and the number per category is split in the ratio of the two pools" if c["per_category"] else "")
+    if balance is not None:
+        text += (f" Balance: {balance} % colour and {100 - balance} % black-and-white, as far as the smaller "
+                 f"pool allows" + (", the number per category split the same way" if c["per_category"] else "")
                  + ".")
     else:
         text += " No balance: each mode is cut on its own."
@@ -190,7 +195,20 @@ def _cut(ranked: list[int], scores: dict[int, float], c: dict) -> list[int]:
     return ranked[:n]
 
 
-def select(photos: dict, scores: dict[int, float], c: dict, balance: bool) -> tuple[dict[int, dict], list[dict]]:
+def balanced(colour: int, bw: int, percent: int, n: int | None = None) -> tuple[int, int]:
+    """The counts at percent % colour that two pools of that size allow, at most n in all."""
+    f = percent / 100
+    if (colour / f if f else math.inf) <= (bw / (1 - f) if f < 1 else math.inf):
+        c, b = colour, min(bw, int(colour * (1 - f) / f + 0.5) if f else bw)       # colour is the short pool
+    else:
+        c, b = min(colour, int(bw * f / (1 - f) + 0.5) if f < 1 else colour), bw   # black-and-white is
+    if n is not None and c + b > n:
+        c = int(n * f + 0.5)
+        b = n - c
+    return c, b
+
+
+def select(photos: dict, scores: dict[int, float], c: dict, balance: int | None) -> tuple[dict[int, dict], list[dict]]:
     """The picked photos and a table row per category.
     -> ({cid: photo}, [{"cat", "color_pool", "bw_pool", "color", "bw", "note"}])"""
     buckets: dict[str, dict[str, list[int]]] = defaultdict(lambda: {"color": [], "bw": []})
@@ -208,15 +226,12 @@ def select(photos: dict, scores: dict[int, float], c: dict, balance: bool) -> tu
         cut = {m: _cut(v, scores, c) for m, v in ranked.items()}
         want = {m: len(v) for m, v in cut.items()}
         note = ""
-        if balance:
-            want["bw"] = min(want["bw"], want["color"])
-            if c["per_category"] is not None:
-                total = min(c["per_category"], want["color"] + want["bw"])
-                if total:
-                    colour = round(total * want["color"] / (want["color"] + want["bw"]))
-                    want = {"color": colour, "bw": total - colour}
-            if not want["color"] and pools["bw"]:
-                note = "no colour photos pass: nothing picked under balance"
+        if balance is not None:
+            had = dict(want)
+            want = dict(zip(("color", "bw"), balanced(want["color"], want["bw"], balance, c["per_category"])))
+            if not want["color"] + want["bw"] and had["color"] + had["bw"]:
+                short = "colour" if not had["color"] else "black-and-white"
+                note = f"no {short} photos pass: nothing picked at {balance} % colour"
         for m in ("color", "bw"):
             for cid in cut[m][:want[m]]:
                 picked[cid] = photos[cid]
