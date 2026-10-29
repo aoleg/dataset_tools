@@ -65,7 +65,7 @@ UKRAINE_PRESETS = [          # name, regions, comment
 
 # --- setup -------------------------------------------------------------------------------
 
-IMPORT_COMMANDS = ("reclassify", "cleanup", "autocaption", "scopes")
+IMPORT_COMMANDS = ("reclassify", "cleanup", "cherrypick", "autocaption", "scopes")
 
 
 def no_open_review(store: Store, base: Path, command: str) -> None:
@@ -1074,6 +1074,57 @@ def cmd_extract(args, conf, client) -> int:
     return 0
 
 
+def cmd_cherrypick(args, conf, client) -> int:
+    import cherrypick as cp
+    base, store = open_base(args, conf)
+    c = cp.parse_values(args.value, args.quality, args.top, args.per_category)
+    balance = args.balance or c["per_category"] is not None
+    decades = cp.parse_decades(args.decades)
+    if decades and store.is_import:
+        raise SystemExit("--decades: an import has no years")
+    out = Path(args.out).resolve()
+    if out == base or base in out.parents:
+        raise SystemExit(f"-o {out} is inside the base folder; give a folder outside it")
+    print(cp.describe(c, balance, decades), flush=True)
+    with locked(store, "cherrypick", "shared"):
+        photos = cp.load_photos(store, decades, args.category)
+        if not photos:
+            print("No saved photos match.")
+            return 0
+        import classifier as clf
+        samples = Path(args.samples).resolve() if args.samples else conf.samples
+        classifier = clf.Classifier(samples, args.patches, 0.7, quality_threshold=0.5, categories=False)
+        if classifier.quality is None:
+            raise SystemExit(f"no quality probe: {samples} needs at least 20 images in _quality_good and in "
+                             f"_quality_bad")
+        scores = cp.score(store, classifier.quality, classifier.model_id, classifier.patches, set(photos))
+        picked, table = cp.select(photos, scores, c, balance)
+        print(f"{len(photos):,} saved photos in {len({p['cat'] for p in photos.values()})} categories; "
+              f"pool -> picked per category:")
+        print(cp.table_text(table), flush=True)
+        criteria = {"base": str(base), **{k: v for k, v in c.items() if v is not None}, "balance": balance,
+                    "decades": decades, "categories": args.category or [], "samples": str(samples)}
+        res = cp.write(picked, base, out, criteria, export_layout_of(conf), args.split, args.link, args.prune,
+                       args.dry_run)
+        if args.dry_run:
+            print(f"Dry run: {res['new']:,} to copy into {out}, {res['there']:,} there already, "
+                  f"{res['stale']:,} files of this base there that are no longer picked")
+            return 0
+        done = res["linked"] + res["copied"]
+        how = f"{res['linked']:,} linked, {res['copied']:,} copied" if args.link else f"{done:,} copied"
+        print(f"{out}: {how}, {res['there']:,} there already, {res['failed'] + res['gone']:,} not copied; "
+              f"{res['stale']:,} files of this base from earlier picks are no longer picked"
+              + (" and were deleted" if args.prune else (" (--prune deletes them)" if res["stale"] else "")))
+    if not args.link:
+        print(xt_link_tip())
+    return 0
+
+
+def xt_link_tip() -> str:
+    import extract as xt
+    return xt.LINK_TIP
+
+
 def cmd_regroup(args, conf, client) -> int:
     import partition as pt
     import regroup as rg
@@ -1605,6 +1656,30 @@ def parse_args(argv=None):
                    help="delete the files of earlier extracts into this folder that no longer match")
     p.add_argument("--dry-run", action="store_true", help="count, copy nothing")
 
+    p = sub.add_parser("cherrypick", help="pick a training set by quality: per category and mode, a threshold "
+                                          "(0.85), a top percentile (30) and/or a number per category (5000), "
+                                          "balanced between colour and black-and-white")
+    p.add_argument("value", nargs="*", metavar="VALUE",
+                   help="a P(good) threshold with a dot (0.85), a top percentile from 1 to 100 (30), a number per "
+                        "category over 100 (5000); any of them, in any order")
+    p.add_argument("-o", "--out", required=True, metavar="DIR", help="the output folder (outside the base)")
+    p.add_argument("--quality", type=float, metavar="P", help="the threshold, named")
+    p.add_argument("--top", type=int, metavar="X", help="the percentile, named")
+    p.add_argument("--per-category", type=int, metavar="N", help="the number per category, named (implies --balance)")
+    p.add_argument("--balance", action="store_true",
+                   help="black-and-white never exceeds colour (always on with a number per category)")
+    p.add_argument("--decades", nargs="+", metavar="DECADE", help="only these decades, e.g. 1960s 1970s (default: all)")
+    p.add_argument("--category", nargs="+", metavar="CATEGORY",
+                   help="only these categories, by number, name or full name (default: all but 200-outliers)")
+    p.add_argument("--link", action="store_true", help="hard-link the images instead of copying them")
+    p.add_argument("--prune", action="store_true", help="delete the files of this base in the folder that are no "
+                                                        "longer picked")
+    p.add_argument("--split", type=int, default=0, metavar="N",
+                   help="numbered folders of at most N images under each category and mode (default 0: none)")
+    p.add_argument("--dry-run", action="store_true", help="count and report, copy nothing")
+    p.add_argument("--samples", metavar="DIR", help="classify samples folder (default: [paths] samples of the conf)")
+    p.add_argument("--patches", type=int, default=576, metavar="N", help="encoder patch budget (default 576)")
+
     p = sub.add_parser("regroup", help="move saved photos into scopes by decade, country or region, no downloads")
     p.add_argument("target", nargs="*", metavar="SCOPE",
                    help="scopes to split (names, folders or patterns); none: group every scope of the base")
@@ -1632,7 +1707,8 @@ def main(argv=None) -> int:
         cmds = {"regions": cmd_regions, "aliases": cmd_aliases, "count": cmd_count, "scopes": cmd_scopes,
                 "index": cmd_index, "run": cmd_run, "captions": cmd_captions, "reclassify": cmd_reclassify,
                 "export": cmd_export, "autocaption": cmd_autocaption, "regroup": cmd_regroup, "drop": cmd_drop,
-                "extract": cmd_extract, "import": cmd_import, "cleanup": cmd_cleanup}
+                "extract": cmd_extract, "import": cmd_import, "cleanup": cmd_cleanup,
+                "cherrypick": cmd_cherrypick}
         return cmds[args.cmd](args, conf, client)
     finally:
         client.close()

@@ -172,6 +172,7 @@ run.bat autocaption <scope or folder> [...] [--limit N] [--recaption] [--undo]
 run.bat export <scope> [...] [--format jsonl|parquet]
 run.bat import --dataset <folder> [-o <folder>] [--against <base>] [--split N] [--limit N]
 run.bat --base <import folder> reclassify [--dry-run] [--yes]
+run.bat cherrypick <0.85 | 30 | 5000> [...] -o <folder> [--balance] [--decades 1960s 1970s] [--link] [--prune]
 run.bat extract <category> [...] [--region R] [--years A B | --decade D] [--bw | --color] [--min-res N]
                    [--target N [--colour-share X]] [-o DIR]
 run.bat scopes | aliases | count --region <alias> | regions [--find TEXT]
@@ -502,6 +503,24 @@ Moves the saved photos that the quality probe scores at or above the threshold i
 - **The images you deleted,** with either one, are marked skipped (`low quality (reviewed)`) and never downloaded again. Their captions left in the folder are deleted, and so are their export links. The review folder is deleted when nothing else is left in it; a file that you put there yourself keeps it.
 - The images you keep are not copied into `_quality_good`: a photo may be worth keeping for its picture although its quality is poor. Add the ones that show good quality there yourself, then check the threshold again ([Low-quality photos](#low-quality-photos)).
 
+## Cherrypick: a training set by quality
+
+```
+run.bat cherrypick 0.85 30 5000 -o D:\training
+run.bat cherrypick 90 --balance -o D:\training --link
+run.bat cherrypick 2000 --decades 1960s 1970s -o D:\training_60s_70s
+run.bat --base D:\imported\photos cherrypick 2000 -o D:\training
+```
+
+Picks the best photos of every category, by the quality probe, into one folder for training, balanced between colour and black-and-white. The unit is one category in one mode: the probe's scores of colour and black-and-white photos are not comparable, so each is ranked on its own. The score is P(good) = 1 - P(bad) of the probe ([Low-quality photos](#low-quality-photos)), read from the embeddings the store holds, so the GPU is not used.
+
+- **Three ceilings**, any of them, in any order, told apart by their shape: a value with a dot is a threshold (`0.85`: P(good) at or above it); an integer from 1 to 100 is a percentile (`30`: the top 30 % of each category and mode, as they are in the base); an integer over 100 is a number per category (`5000`). The lowest ceiling wins. `--quality`, `--top` and `--per-category` are the same, named. The command prints its reading of the values before it copies anything.
+- **Balance** (`--balance`, always on with a number per category): black-and-white never exceeds colour. After the threshold and the percentile, black-and-white is cut down to the colour count. With a number per category, the number is split between the modes in the ratio of the two pools: 4,000 colour and 1,000 black-and-white under 2,000 gives 1,600 and 400. More colour than black-and-white is fine; a category without colour picks nothing under balance, and the report says so. Without balance each mode is cut on its own.
+- **Which photos:** every saved photo of the base, in the categories and modes the store records (run `reclassify` first to record hand moves), `200-outliers` never. `--decades 1960s 1970s` keeps only those decades, by the photo's start year, still as one bucket per category and mode; an import has no years. `--category` narrows to some categories, by number, name or full name. A photo that has no embedding is left out and counted.
+- **The output:** `<folder>\<category>\bw\` and `color\` (`export_layout = color_first` in the conf puts `bw\` and `color\` first); `--split N` adds numbered folders. Images are copied, or hard-linked with `--link`; `.txt` and `.short` captions are copied. The report lists each category's pools and picks.
+- **Running it again** copies what is picked and missing, keeps what is there, and reports the files of this base that are no longer picked; `--prune` deletes them. So without `--prune` the folder can hold more than the ceilings say, and nothing you edited there is lost. `cherrypick.json` in the folder holds the criteria and the files per base; a PastVu base and an import can go into the same folder, since their names do not collide.
+- **What the score is.** The probe was trained to find film frames and soft scans, and its order holds beyond that: in both modes the top is sharp, well-exposed and clear, the bottom faded, halftone or damaged. It is not a judge of composition. It favours late decades (sharp press photos and slides), so the top 30 % of black-and-white holds fewer 1910s-1940s photos than the base; `--decades` holds a decade's share. The threshold treats categories unequally (at 0.8, transport keeps two thirds, postcards almost nothing, since reproductions look like the probe's "bad"); the percentile and the number per category take the best of each category whatever its scores, so the threshold is best used as a floor under them.
+
 ## Extract
 
 ```
@@ -574,7 +593,7 @@ Processes a folder of images that this tool did not download, for example repost
 - **Copies of your PastVu photos.** With `--against <base>`, a photo that is a copy of a photo in that base is skipped: PastVu holds the original, and the channels repost it recompressed. The import remembers the base, so a later import or reclassify uses it without the option. A copy is a photo whose embedding is at least 0.96 similar to a base photo, or at least 0.85 and confirmed by the feature test of the [deduplicate](../deduplicate/README.md) tool (the same picture under another crop, scale or compression). A colourised repost of a black-and-white base photo counts as a copy. On 34,300 Telegram reposts against 210,801 PastVu photos about 9 % were copies.
 - **Running it again** picks up the files added to the source since, and continues an import that was stopped. It does not process again the images it has seen.
 - **Reclassify** (`run.bat --base <import folder> reclassify`) sorts the import again with your samples, and deletes what fails the filters now: low quality, the aspect ratio, and the copies of base photos, including copies of photos that the base downloaded after the import. It asks once before deleting, as on a PastVu base. After you change `export_layout`, it first moves every photo into the new order.
-- **Other commands.** `cleanup` and `autocaption` work on an import (`run.bat --base <import folder> autocaption <folder>`); the commands that need PastVu (`run`, `index`, `regroup`, `drop`, `captions`, `extract`, `export`) stop with a message.
+- **Other commands.** `cleanup`, `cherrypick` and `autocaption` work on an import (`run.bat --base <import folder> autocaption <folder>`); the commands that need PastVu (`run`, `index`, `regroup`, `drop`, `captions`, `extract`, `export`) stop with a message.
 
 ## Progress and resume
 
@@ -670,6 +689,7 @@ Each record carries what attribution and a takedown need: the PastVu page, the u
 | `classifier.py` | classify's sorter, one image at a time or in batches |
 | `reclassify.py` | sorting a scope again, and undo |
 | `cleanup.py` | the review of saved photos by their quality: `cleanup`, `--done`, `--undo` |
+| `cherrypick.py` | the training set picked by quality, balanced between colour and black-and-white |
 | `autocaption.py` | the VLM client, the caption runs, and undo |
 | `vram.py` | the GPU memory of the whole card, through NVML |
 | `tagging\` | the default prompts of autocaption |
