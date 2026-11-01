@@ -42,7 +42,7 @@ import numpy as np
 from PIL import Image, ImageOps
 from tqdm import tqdm
 
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 
 EPS = 1e-6
 
@@ -88,6 +88,15 @@ def use_by_tier(on: bool) -> None:
 
 def tier_first() -> bool:
     return _tier_first
+
+
+_in_place = False
+
+
+def use_in_place(on: bool) -> None:
+    """--in-place for the run: the source tree is the dataset (merge_pooled)."""
+    global _in_place
+    _in_place = on
 
 
 def by_tier_dirname(tier: int) -> str:
@@ -836,6 +845,8 @@ class Result:
 
     # set when the merge pass moved this image out of its natural bucket
     merged: bool = False
+    # set when the source was already the render and was copied byte for byte
+    copied_as_is: bool = False
 
     @property
     def bucket_family(self) -> str:
@@ -1142,8 +1153,32 @@ def render_to(res: Result, dest: Path, resample: int) -> None:
     out.close()
 
 
+def can_copy_as_is(res: Result, ext: str) -> bool:
+    """The source already is the render: at its bucket, upright, in the
+    output's format and a plain colour mode. Copying it saves a lossy
+    generation; its EXIF and ICC profile come along, which a render drops."""
+    if (res.src_w, res.src_h) != res.bucket:
+        return False
+    try:
+        with Image.open(res.path) as img:
+            if img.format != ("PNG" if ext == ".png" else "JPEG"):
+                return False
+            if img.mode not in ("RGB", "L"):        # alpha, palette, CMYK: rendered
+                return False
+            return (img.getexif().get(274, 1) or 1) == 1
+    except Exception:
+        return False
+
+
 def write_output(res: Result, out_dir: Path, resample: int, ext: str) -> None:
-    render_to(res, out_dir / (res.out_stem + ext), resample)
+    dest = out_dir / (res.out_stem + ext)
+    if can_copy_as_is(res, ext):
+        # copyfile, not copy2: a read-only source must not make a read-only
+        # output, which the next run's sweep could not remove.
+        shutil.copyfile(res.path, dest)
+        res.copied_as_is = True
+    else:
+        render_to(res, dest, resample)
     for cap in res.captions:
         shutil.copyfile(cap, out_dir / f"{res.out_stem}{cap.suffix.lower()}")
 
@@ -1413,15 +1448,15 @@ def _rescue_stranded(accepted, counts, moves, moved) -> bool:
 
 
 def merge_pooled() -> bool:
-    """Whether small buckets are merged across the whole tree, per tier.
+    """Whether small buckets are merged across the whole tree.
 
     The pool is what one training folder batches together. AI Toolkit trains a
-    _<tier> folder of the --by-tier layout, subfolders and all, as one dataset.
-    Musubi reads no subfolders: each folder is its own [[datasets]] block and
-    batches never cross blocks, so there the pool stays one folder, whatever
-    the layout.
+    folder, subfolders and all, as one dataset: a _<tier> folder of the
+    --by-tier layout, or the source tree that --in-place resizes. Musubi reads
+    no subfolders: each folder is its own [[datasets]] block and batches never
+    cross blocks, so there the pool stays one folder, whatever the layout.
     """
-    return _tier_first and _active_buckets is OSTRIS
+    return (_tier_first or _in_place) and _active_buckets is OSTRIS
 
 
 def plan_merge(accepted: list["Result"]):
@@ -2793,7 +2828,10 @@ def build_report(args, folder: Path, results: list[Result], unknown: list[str],
         w(f"              healthy bucket in the same tier or the one below, so long")
         w(f"              as the move crops no more than {MERGE_MAX_CROP:.0f}% "
           f"of the source.")
-        if merge_pooled():
+        if merge_pooled() and in_place:
+            w("              Pooled across the whole tree: AI Toolkit trains a")
+            w("              folder, subfolders and all, as one dataset.")
+        elif merge_pooled():
             w("              Pooled per tier across all folders: AI Toolkit trains a")
             w("              tier folder, subfolders and all, as one dataset.")
     if in_place:
@@ -3055,7 +3093,9 @@ def build_report(args, folder: Path, results: list[Result], unknown: list[str],
                      for t in active_tiers() for f in AR_FAMILIES))
 
     w("BUCKET DISTRIBUTION" + ("   (was -> now, across the merge)" if show_before else ""))
-    if pooled and getattr(args, "recursive", False):
+    if pooled and in_place:
+        w("  all folders: AI Toolkit trains the folder, subfolders and all, as one dataset")
+    elif pooled and getattr(args, "recursive", False):
         w("  all folders: AI Toolkit trains each tier folder as one dataset")
     for ds in ds_list:
         if label_datasets:
@@ -3915,7 +3955,10 @@ def parse_args(argv=None):
                         f"one is overwritten by its crop and resize onto the "
                         f"bucket of its tier "
                         f"({', '.join(str(t) for t in TIERS)}), under its own "
-                        f"name and format. No quality scoring. An image "
+                        f"name and format, in the folder and all its "
+                        f"subfolders at any depth (implies --recursive; "
+                        f"folders starting with '_' or '.' are skipped). No "
+                        f"quality scoring. An image "
                         f"already at its bucket is left as it is. An image "
                         f"too small for the {TIERS[-1]} tier is DELETED, with "
                         f"its captions. Undersized buckets are merged as in a "
@@ -3960,6 +4003,7 @@ def parse_args(argv=None):
         for given, why in ((args.sort is not None, "--sort"),
                            (args.copy_to is not None, "--copy-to and --move-to"),
                            (args.by_tier, "--by-tier"),
+                           (args.each, "-R"),
                            (args.threshold, "--threshold"),
                            (args.single_pass, "--single-pass"),
                            (args.png, "--png"),
@@ -3972,6 +4016,11 @@ def parse_args(argv=None):
     # scans the whole tree, at every depth. On a flat folder that changes
     # nothing: the recursive scan of a folder without subfolders is the flat one.
     if args.by_tier:
+        args.recursive = True
+    # --in-place resizes a dataset where it is, and a dataset's images are
+    # often two or three folders down: it always takes the whole tree, as
+    # --by-tier does. -R would only visit the subfolders a second time.
+    if args.in_place:
         args.recursive = True
     if args.vl is not None and args.sort is None:
         p.error("--vl is only available with --sort. A model's opinion is not "
@@ -4431,12 +4480,16 @@ def run_in_place(args, folder: Path, reports_dir: Path, pairs, unknown,
             r.status = ST_ACCEPTED
     accepted = [r for r in results if r.status == ST_ACCEPTED]
 
-    # Per folder, as a build without --by-tier: the folders stay where they are.
+    # The whole tree under --ostris, which AI Toolkit trains as one dataset;
+    # per folder under --musubi, which reads no subfolders (merge_pooled).
     moves: list[Move] = []
     unmerged: list[tuple[Result, str]] = []
     if not args.no_merge and accepted:
-        for ds in sorted({r.dataset for r in accepted}):
-            m, u, _before, _after = plan_merge([r for r in accepted if r.dataset == ds])
+        pools = ([accepted] if merge_pooled() else
+                 [[r for r in accepted if r.dataset == ds]
+                  for ds in sorted({r.dataset for r in accepted})])
+        for pool in pools:
+            m, u, _before, _after = plan_merge(pool)
             moves.extend(m)
             unmerged.extend(u)
 
@@ -4531,6 +4584,7 @@ def main(argv=None) -> int:
     # Selected once, before any work: worker threads read it, nothing writes it.
     use_buckets(BUCKET_SETS[args.buckets or DEFAULT_BUCKETS.key])
     use_by_tier(args.by_tier)
+    use_in_place(args.in_place)
     print(buckets_notice(args))
     if args.in_place and not args.report:
         try:
@@ -4814,6 +4868,15 @@ def run_one_folder(args) -> int:
     finished = datetime.now()
 
     notes: list[str] = list(scan_notes)
+    if args.report:
+        as_is = sum(can_copy_as_is(r, ext) for r in to_write)
+    else:
+        as_is = sum(r.copied_as_is for r in to_write if r.status == ST_ACCEPTED)
+    if as_is:
+        notes.append(f"{as_is} image(s) already at their bucket, upright and "
+                     f"in the output format {'would be' if args.report else 'were'} "
+                     f"copied byte for byte, not encoded again; they keep "
+                     f"their EXIF and colour profile.")
     if args.recursive:
         for ds in find_stale_datasets(prep_dir, seen_dirs):
             notes.append(f"stale output folder {prep_dir.name}/{ds} has no "
@@ -4898,6 +4961,8 @@ def run_one_folder(args) -> int:
             print(f"  {label:<11} {by_tier[tier]:>7}")
     print(f"  written     {counts[ST_ACCEPTED]:>7}"
           f"{'  (dry run: nothing written)' if args.report else ''}")
+    if as_is:
+        print(f"  as is       {as_is:>7}   (of those: copied, not encoded again)")
     print(f"  already     {counts[ST_ALREADY]:>7}")
     print(f"  below thr.  {counts[ST_BELOW]:>7}")
     print(f"  too small   {counts[ST_SMALL]:>7}")

@@ -266,6 +266,8 @@ Default: JPEG, `quality=97`, `subsampling=0` (4:4:4), `optimize=True`. Roughly 2
 
 Output extension always matches the format actually written, regardless of input extension.
 
+Pass-through (`can_copy_as_is`): a source whose displayed size equals its bucket, with no EXIF rotation (orientation absent or 1), mode RGB or L, and in the output format (JPEG, or PNG with `--png`), is copied with `shutil.copyfile` instead of rendered, sparing a lossy generation. `copyfile`, not `copy2`, so a read-only source does not make a read-only output that the next sweep cannot remove. The copy keeps EXIF and ICC, which a render drops. `Result.copied_as_is` marks it; the console prints an `as is` count and the final report a note (a dry run counts what would be copied). Scoring is unchanged: the rendered pixels it measures are the source's.
+
 ### 5.7 Caption sidecars
 
 A caption sidecar is `<stem><ext>` next to the source, for `ext` in `CAPTION_EXTENSIONS` = `.txt`, `.short`, `.caption`, `.json`. Every one that exists is copied into the tier folder beside the produced image, renamed to match the output stem, with its extension in lower case. Copy verbatim; do not re-encode or strip whitespace. The copy modes (`--sort`, `--copy-to`, `--move-to`) carry every one under its own name. A file with one of these extensions is caption data, not an unknown extension.
@@ -501,7 +503,7 @@ AI Toolkit has its settings per dataset folder and reads a dataset folder with `
 `--by-tier` sets `--recursive`: its purpose is a tree in every tier folder, and a root that holds only folders would otherwise scan as empty. On a flat folder the recursive scan is the flat one, so nothing is lost. `tier_dir()` and `copy_dest_dir()` are the only places that know a layout. The underscore keeps the tier folders out of k2prep's, cleanup's and deduplicate's scans.
 
 - **Tier.** The tier an image is rendered at, by the run's bucket set (section 4.4). In the copy modes the tier is a header-only geometry test kept in `Result.dest_tier`, apart from the 1024 tier the score is taken at. An image that fills no tier, 256 included, is skipped; under `--move-to` it stays in the source.
-- **Merge pool.** What one training folder batches together (`merge_pooled()`): under `--ostris --by-tier` all images of a tier across the tree, because AI Toolkit trains a tier folder as one dataset; otherwise one folder, because musubi's `glob_images` reads no subfolders and each folder is its own `[[datasets]]` block.
+- **Merge pool.** What one training folder batches together (`merge_pooled()`): under `--ostris --by-tier` all images of a tier across the tree (under `--ostris --in-place` the whole tree, section 7.7), because AI Toolkit trains a tier folder as one dataset; otherwise one folder, because musubi's `glob_images` reads no subfolders and each folder is its own `[[datasets]]` block.
 - **TOML.** `--musubi` only: one block per populated `_<tier>/<relpath>`, `batch_size = 16` at 256.
 - **Reserved names.** Neither of section 7.4's collides tier first. A first-level source folder named `cache` does: `_prep/_1024/cache` is musubi's cache folder of the root dataset's 1024 block. `ScanError`.
 - **Sweep.** `sweep_superseded` clears the run's own layout as before and every file in the other layout's tier folders of the same datasets, so switching `--by-tier` on or off rebuilds `_prep`. Only files are removed, never folders, so musubi's cache folders stay.
@@ -514,12 +516,13 @@ AI Toolkit has its settings per dataset folder and reads a dataset folder with `
 
 The build's geometry and merge pass, applied to the source folder itself. No output folder but the reports in `_prep_<folder>/reports/` (`in-place-*`, `scan-in-place-*` with `--report`).
 
-- **Prompt.** Before any work, and once for `-R`, `main` asks `WARNING: --in-place overwrites existing images with their smaller copies and DELETES images smaller than 512^2. Continue? y/N`. Only `y` goes on; anything else, or end of input, prints "Cancelled. Nothing was changed." and exits 0. `--report` asks nothing and changes nothing.
+- **Tree.** `--in-place` sets `--recursive`: the folder and every subfolder at any depth, `_` and `.` folders skipped, links not followed (section 7.4's scan).
+- **Prompt.** Before any work, `main` asks `WARNING: --in-place overwrites existing images with their smaller copies and DELETES images smaller than 512^2. Continue? y/N`. Only `y` goes on; anything else, or end of input, prints "Cancelled. Nothing was changed." and exits 0. `--report` asks nothing and changes nothing.
 - **Tiers.** `TIERS` (1024, 768, 512), as a build without `--by-tier`. Header-only geometry (`analyse_geometry`), no scoring. Every image that fits a tier is accepted.
-- **Merge.** `plan_merge` per folder, as a build without `--by-tier`; `--no-merge` turns it off. The preliminary report is written before it.
+- **Merge.** `plan_merge` over one pool for the whole tree under `--ostris` (`merge_pooled()`, set by `use_in_place`), because AI Toolkit trains a folder with its subfolders as one dataset; per folder under `--musubi`. `--no-merge` turns it off. The preliminary report is written before it; the final report says the merge was pooled and shows one bucket distribution.
 - **Write.** `write_in_place`: crop and resize from the source, saved under the same name in the format the extension names (`IN_PLACE_FORMATS`: JPEG q97 4:4:4, PNG compress 6, WebP and AVIF q97, BMP), through a temporary file in the same folder and `os.replace`. No EXIF; orientation applied to the pixels. An image whose displayed size already equals its bucket is not written (status `already`), so a second run changes nothing.
 - **Delete.** `delete_too_small`: an image that fits no tier is deleted with each caption that no other image which stays, an unreadable one included, still uses. Unreadable images are left alone.
-- **Refused with** `--sort`, `--copy-to`, `--move-to`, `--by-tier`, `--threshold`, `--single-pass`, `--png` and `--force`. `scan_tree` runs without the reserved-name checks, since nothing is mirrored. No TOML.
+- **Refused with** `--sort`, `--copy-to`, `--move-to`, `--by-tier`, `-R`, `--threshold`, `--single-pass`, `--png` and `--force`. `scan_tree` runs without the reserved-name checks, since nothing is mirrored. No TOML.
 - **No backup.** The prompt is the guard; the README says to run `--report` first.
 
 ---

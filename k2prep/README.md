@@ -69,6 +69,8 @@ k2prep.py <folder> [options]
 
 `--report` and `--threshold` compose: `--report --threshold 7` shows what a threshold-7 run *would* do without writing anything.
 
+A source that already is its render is copied byte for byte instead of being encoded again: it is exactly its bucket's size, has no EXIF rotation, is RGB or greyscale, and is a JPEG (a PNG with `--png`). It keeps its EXIF and colour profile, which a render drops. The run counts these as `as is`, and the final report has a note.
+
 Use `--filter box` for heavily compressed sources. Box averaging suppresses 8×8 block artifacts more cleanly than Lanczos, which can ring on them.
 
 Output goes to the output folder `_prep_<folder>`, next to the folder: `L:\photos` gets `L:\_prep_photos`, or the folder that `--out` names. In it: `{1024,768,512}/`, flat, with the caption sidecars copied alongside (`.txt`, `.short`, `.caption` and `.json`, every one an image has), plus `dataset.toml` with `--musubi` (under `--recursive`, each dataset gets its tier folders at `<subfolder>/<tier>/` instead, and under `--by-tier` the tier comes first: `_<tier>/<subfolder>/`). Every run writes two timestamped reports to `reports/` in it:
@@ -214,16 +216,18 @@ run.bat "L:\train\alice" --in-place
 WARNING: --in-place overwrites existing images with their smaller copies and DELETES images smaller than 512^2. Continue? y/N
 ```
 
-Only `y` starts it; anything else changes nothing. `--report` asks nothing and changes nothing. With `-R` the question is asked once, before the first folder.
+Only `y` starts it; anything else changes nothing. `--report` asks nothing and changes nothing.
 
-- **The same buckets.** Each image goes to the largest of the 1024, 768 and 512 tiers that it fills, onto the bucket of its aspect ratio, as in a build. The preliminary report shows that natural assignment; then undersized buckets are merged as in a build (per folder; `--no-merge` turns it off), and the final report shows the result.
+- **The whole tree.** The folder and all its subfolders, at any depth, as with `--recursive` (which it implies). Folders starting with `_` or `.` (output folders, `_controls`, backups) are skipped, and links and junctions are not followed.
+
+- **The same buckets.** Each image goes to the largest of the 1024, 768 and 512 tiers that it fills, onto the bucket of its aspect ratio, as in a build. The preliminary report shows that natural assignment; then undersized buckets are merged (`--no-merge` turns it off), and the final report shows the result. With Ostris buckets the whole tree is one pool, because AI Toolkit trains a folder with all its subfolders as one dataset: three 4:5 photos in one folder stay 4:5 when the tree has eight of them. With `--musubi` each folder is its own pool, because musubi reads no subfolders.
 - **No quality scoring.** Every image that fits a tier is kept. `--threshold` and `--single-pass` are refused.
 - **Own name, own format.** An image is overwritten by its crop and resize under the same name: JPEG at quality 97 with 4:4:4, PNG, WebP and AVIF at quality 97, BMP. Its captions, masks and other files that go by the name still match. `--png` is refused. The new file is written next to the old one and then replaces it, so an interrupted run leaves the original. EXIF is not kept, and the orientation is applied to the pixels.
 - **Already done.** An image already at its bucket is not written again, so a second run changes nothing, and a JPEG is not encoded again for nothing.
 - **Too small.** An image too small for the 512 tier (its crop to its own ratio has less than the bucket's area divided by 1.15², about 445×445 for a square) is **deleted**, with its caption sidecars. A caption that another image still uses (`x.jpg` and `x.png` both use `x.txt`) stays. Unreadable images stay too, listed under `ERRORS`.
-- **Reports** go to `_prep_<folder>\reports\`, as `in-place-*-preliminary.txt` and `in-place-*-final.txt` (`scan-in-place-*` with `--report`). No `dataset.toml` is written. `--recursive` resizes every folder of the tree, and folders named like a tier are fine there.
+- **Reports** go to `_prep_<folder>\reports\`, as `in-place-*-preliminary.txt` and `in-place-*-final.txt` (`scan-in-place-*` with `--report`). No `dataset.toml` is written. Folders named like a tier are fine.
 
-There is no backup. Run `--report` first, and keep a copy of anything you want back. `--in-place` cannot be combined with `--sort`, `--copy-to`, `--move-to`, `--by-tier` or `--force`.
+There is no backup. Run `--report` first, and keep a copy of anything you want back. `--in-place` cannot be combined with `--sort`, `--copy-to`, `--move-to`, `--by-tier`, `-R` or `--force`.
 
 ## `cleanup.bat`: moving undersized images out
 
