@@ -2,7 +2,7 @@
 """cleanup.py - move undersized images out of a training folder.
 
 Walks a folder and all its subfolders, at any depth, and moves every image
-smaller than a given size, together with its .txt caption sidecar, into a
+smaller than a given size, together with its caption sidecars, into a
 sidecar folder named after the source with a leading underscore. The original
 folder structure is preserved inside it:
 
@@ -36,6 +36,7 @@ __version__ = "1.1.0"
 # matched; they are counted and listed so you notice them.
 IMAGE_EXTENSIONS = [".jpg", ".jpeg", ".png", ".webp", ".bmp", ".avif"]
 KNOWN_EXTENSIONS = set(IMAGE_EXTENSIONS) | {e.upper() for e in IMAGE_EXTENSIONS}
+CAPTION_EXTENSIONS = (".txt", ".short", ".caption", ".json")
 
 # A leading underscore marks a folder as somebody's output rather than source
 # material: k2prep's _prep, and this script's own destination. Skipping the
@@ -70,8 +71,8 @@ def _size_arg(text: str) -> tuple[int, int]:
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
         prog="cleanup",
-        description="Move images below a size threshold, and their .txt "
-                    "sidecars, out of a folder and all its subfolders "
+        description="Move images below a size threshold, and their caption "
+                    "sidecars (.txt, .short, .caption, .json), out of a folder and all its subfolders "
                     "into a _foldername sidecar folder next to it.",
     )
     p.add_argument("folder", help="Folder to clean. Subfolders at any depth "
@@ -156,7 +157,7 @@ def folders_to_clean(root: Path) -> tuple[list[Path], list[str], list[str]]:
 
 def images_in(folder: Path) -> tuple[list[Path], list[str]]:
     """Non-recursive. Returns (image paths by filename, unknown-extension
-    filenames). .txt is not unknown: it is caption data."""
+    filenames). Captions are not unknown: they are caption data."""
     images: list[Path] = []
     unknown: list[str] = []
     for entry in os.scandir(folder):
@@ -165,16 +166,17 @@ def images_in(folder: Path) -> tuple[list[Path], list[str]]:
         ext = os.path.splitext(entry.name)[1]
         if ext in KNOWN_EXTENSIONS:
             images.append(Path(entry.path))
-        elif ext.lower() != ".txt":
+        elif ext.lower() not in CAPTION_EXTENSIONS:
             unknown.append(entry.name)
     images.sort(key=lambda p: p.name)
     unknown.sort()
     return images, unknown
 
 
-def caption_for(path: Path) -> Path | None:
-    cap = path.parent / f"{path.stem}.txt"
-    return cap if cap.is_file() else None
+def captions_for(path: Path) -> list[Path]:
+    """The caption sidecars of an image, <stem><ext> next to it."""
+    return [cap for ext in CAPTION_EXTENSIONS
+            if (cap := path.parent / f"{path.stem}{ext}").is_file()]
 
 
 def plural(n: int, word: str, plural_form: str | None = None) -> str:
@@ -228,10 +230,8 @@ def clean_folder(folder: Path, dest: Path, threshold: tuple[int, int],
             kept += 1
             continue
 
-        pairs = [(path, dest / path.name)]
-        cap = caption_for(path)
-        if cap is not None:
-            pairs.append((cap, dest / cap.name))
+        caps = captions_for(path)
+        pairs = [(path, dest / path.name)] + [(cap, dest / cap.name) for cap in caps]
 
         # Never overwrite. Renaming on collision would be friendlier right up
         # until the image and its caption disagree about their new stem, so a
@@ -244,7 +244,7 @@ def clean_folder(folder: Path, dest: Path, threshold: tuple[int, int],
             continue
 
         if dry_run:
-            cap_note = " (+ .txt)" if cap is not None else ""
+            cap_note = "".join(f" (+ {cap.suffix})" for cap in caps)
             print(f"    move   {path.name}  {size[0]}x{size[1]}{cap_note}")
             moved += 1
             continue

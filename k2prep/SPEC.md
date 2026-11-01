@@ -184,7 +184,7 @@ AI Toolkit's `setup_buckets` calls `get_bucket_for_image_size(w, h, resolution, 
 
 The ratio-first rule was chosen over AI Toolkit's own area-first choice, which keeps more pixels but drifts the ratios: it would crop a 4:5 photo by 9 percent at 1024 and by 20 percent at 512, where 4:5, 1:1 and 5:4 all become 512×512. At 256 the 64-pixel grid is too coarse even for ratio first: 9:16 and 2:3 share 192×320, 3:2 and 16:9 share 320×192, and 4:5, 1:1 and 5:4 share 256×256. `family_of_bucket` names shared buckets together, "4:5/1:1/5:4".
 
-One of `--ostris` and `--musubi` is required whenever k2prep resizes (the build, its `--report` dry run, and `-R`). With neither, `main` prints the two options and the user's command with each one added, every argument that is not a plain word quoted, and exits 2 before any work. `--sort`, `--copy-to` and `--move-to` keep the originals as they are; they score with musubi buckets unless `--ostris` is given. Every run prints `Using <label> buckets` first, and every report has a `buckets` line.
+`--ostris` is the default (`DEFAULT_BUCKETS`) in every mode, the scoring of `--sort`, `--copy-to` and `--move-to` included; `--musubi` selects musubi's set. Until 1.4.0 one of the two was required whenever k2prep resized, and the copy modes scored with musubi buckets. Every run prints `Using <label> buckets` first, with "(the default; --musubi changes it)" when neither was given, and every report has a `buckets` line.
 
 ---
 
@@ -266,9 +266,9 @@ Default: JPEG, `quality=97`, `subsampling=0` (4:4:4), `optimize=True`. Roughly 2
 
 Output extension always matches the format actually written, regardless of input extension.
 
-### 5.7 Caption sidecar
+### 5.7 Caption sidecars
 
-If `<stem>.txt` exists next to the source, copy it into the tier folder beside the produced image, renamed to match the output stem. Copy verbatim; do not re-encode or strip whitespace.
+A caption sidecar is `<stem><ext>` next to the source, for `ext` in `CAPTION_EXTENSIONS` = `.txt`, `.short`, `.caption`, `.json`. Every one that exists is copied into the tier folder beside the produced image, renamed to match the output stem, with its extension in lower case. Copy verbatim; do not re-encode or strip whitespace. The copy modes (`--sort`, `--copy-to`, `--move-to`) carry every one under its own name. A file with one of these extensions is caption data, not an unknown extension.
 
 Missing captions are counted and listed in the report. They are not an error and do not prevent processing.
 
@@ -417,7 +417,7 @@ The intended recovery workflow: lower `--threshold` and re-run. Because existing
 
 Two sources can produce the same output name (`photo.jpg` and `photo.png` both become `photo.jpg`). Resolve by suffixing `_2`, `_3`, … in scan order.
 
-Caption handling for collisions: if only one of the colliding sources has a `.txt`, copy that same caption to **both** output stems. Colliding stems are almost always the same photograph in two formats, so the caption applies to both. Log every collision in the report.
+Caption handling for collisions: if only one of the colliding sources has captions, copy those same captions to **both** output stems. Colliding stems are almost always the same photograph in two formats, so the caption applies to both. Log every collision in the report.
 
 Collisions are resolved per tier folder, not globally. Two images that collide by name but land in different tiers do not need suffixing.
 
@@ -510,6 +510,18 @@ AI Toolkit has its settings per dataset folder and reads a dataset folder with `
 
 `--by-tier` is refused with `--sort`.
 
+### 7.7 `--in-place`: resize the source where it is
+
+The build's geometry and merge pass, applied to the source folder itself. No output folder but the reports in `_prep_<folder>/reports/` (`in-place-*`, `scan-in-place-*` with `--report`).
+
+- **Prompt.** Before any work, and once for `-R`, `main` asks `WARNING: --in-place overwrites existing images with their smaller copies and DELETES images smaller than 512^2. Continue? y/N`. Only `y` goes on; anything else, or end of input, prints "Cancelled. Nothing was changed." and exits 0. `--report` asks nothing and changes nothing.
+- **Tiers.** `TIERS` (1024, 768, 512), as a build without `--by-tier`. Header-only geometry (`analyse_geometry`), no scoring. Every image that fits a tier is accepted.
+- **Merge.** `plan_merge` per folder, as a build without `--by-tier`; `--no-merge` turns it off. The preliminary report is written before it.
+- **Write.** `write_in_place`: crop and resize from the source, saved under the same name in the format the extension names (`IN_PLACE_FORMATS`: JPEG q97 4:4:4, PNG compress 6, WebP and AVIF q97, BMP), through a temporary file in the same folder and `os.replace`. No EXIF; orientation applied to the pixels. An image whose displayed size already equals its bucket is not written (status `already`), so a second run changes nothing.
+- **Delete.** `delete_too_small`: an image that fits no tier is deleted with each caption that no other image which stays, an unreadable one included, still uses. Unreadable images are left alone.
+- **Refused with** `--sort`, `--copy-to`, `--move-to`, `--by-tier`, `--threshold`, `--single-pass`, `--png` and `--force`. `scan_tree` runs without the reserved-name checks, since nothing is mirrored. No TOML.
+- **No backup.** The prompt is the guard; the README says to run `--report` first.
+
 ---
 
 ## 8. Command-line interface
@@ -521,7 +533,8 @@ k2prep.py <folder> [options]
 | Option | Default | Meaning |
 |---|---|---|
 | `<folder>` | required | Input folder, positional. One dataset, unless `--recursive`. |
-| `--ostris`, `--musubi` | one required to resize | The trainer whose bucket sizes k2prep renders to. Section 4.4. |
+| `--ostris`, `--musubi` | `--ostris` | The trainer whose bucket sizes k2prep renders to. Section 4.4. |
+| `--in-place` | off | Resize the source where it is and delete what fits no tier. Section 7.7. |
 | `--by-tier` | off | Tier-first layout and the 256 tier. Section 7.6. |
 | `--report` | off | Dry run. Analyse and write a report; write no images. |
 | `--recursive` | off | Every subfolder that directly contains images is its own dataset, sharing one `_prep` and one TOML. Section 7.4. |
@@ -730,6 +743,7 @@ Rules:
 - Skip tiers with zero images.
 - `batch_size`: 2 at 1024, 3 at 768, 8 at 512.
 - Never overwrite an existing `dataset.toml`; write `dataset-2.toml` and say so in the console output and the report.
+- A tier folder with no `.txt` caption gets its own `caption_extension`, the first of `CAPTION_EXTENSIONS` it holds; one with `.txt`, or with none, inherits `[general]`.
 
 ---
 
