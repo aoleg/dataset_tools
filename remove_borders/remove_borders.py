@@ -6,7 +6,8 @@ Every folder given is a root and is scanned at any depth. Light and dark frames,
 thin edge lines and banners with text at the top or bottom are cut off. JPEG
 files are cropped losslessly (whole DCT blocks); PNG and other lossless formats
 to the exact pixel; other lossy formats are cropped into a PNG. Before a crop,
-the original and its sidecars are copied to <root>_backup/<same relative path>,
+the original and its sidecars (every other file of its folder with its name:
+captions, caches, ...) are copied to <root>_backup/<same relative path>,
 next to the root and outside it, so a trainer never sees them. An image whose
 crop would be smaller than --min-area is not cropped; it moves to the same
 backup tree with its sidecars. A _backup folder inside the root, where the
@@ -72,7 +73,8 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".jpe", ".jfif", ".png", ".webp", ".bmp", ".tif",
 # names.
 DEFAULT_EXCLUDES = [OLD_BACKUP_DIRNAME, "_duplicates", "_prep", "_classify", "_embeddings",
                     MASKS_DIRNAME, OLD_MASKS_DIRNAME, "faces"]
-DEFAULT_SIDECARS = ".txt"
+DEFAULT_SIDECARS = "all"            # every file of the image's name that is not an image; or a list of extensions
+CAPTION_EXTS = (".txt", ".short", ".caption", ".json")   # what "captioned" means in the summary
 DEFAULT_MIN_AREA = 256 * 256      # smaller than this after a crop: moved to the backup, not cropped
 DEFAULT_THREADS = 8
 
@@ -106,6 +108,17 @@ class Item:
         return action_of(self.head, self.result)
 
 
+def parse_sidecars(text: str) -> list[str] | None:
+    """The extensions of a --sidecars list, with a dot; None for 'all'."""
+    if text.strip().lower() == "all":
+        return None
+    return [e if e.startswith(".") else "." + e for e in (s.strip() for s in text.split(",")) if e]
+
+
+def has_caption(it: Item) -> bool:
+    return any(sc.suffix.casefold() in CAPTION_EXTS for sc in it.sidecars)
+
+
 def action_of(head: dict, result: dict) -> str:
     """What the analysis of one image leads to: skip, review, crop, too small
     or "" (nothing to do). result is analyse_array's dict with its "plan"."""
@@ -121,12 +134,15 @@ def action_of(head: dict, result: dict) -> str:
 
 # --- scan ---------------------------------------------------------------------
 
-def scan(root: Path, excludes, sidecar_exts) -> list[Item]:
+def scan(root: Path, excludes, sidecar_exts=None) -> list[Item]:
     """The images under root at any depth, with their sidecars and masks.
+    The sidecars of an image are the files of its folder with its stem and a
+    non-image extension (a.txt, a.short, a.npz for a.jpg), or, when
+    sidecar_exts is given, only those with one of these extensions.
     Folders are skipped by exact name (case-insensitive), at any depth, and
     so is a backup folder of the dataset tools."""
     excl = {e.casefold() for e in excludes}
-    exts = {e.casefold() for e in sidecar_exts}
+    exts = {e.casefold() for e in sidecar_exts} if sidecar_exts is not None else None
     items = []
     for dirpath, dirnames, filenames in os.walk(root):
         here = Path(dirpath)
@@ -136,10 +152,10 @@ def scan(root: Path, excludes, sidecar_exts) -> list[Item]:
         images_by_stem: dict[str, int] = {}
         for fn in filenames:
             stem, ext = os.path.splitext(fn)
-            if ext.casefold() in exts:
-                side_by_stem.setdefault(stem.casefold(), []).append(fn)
-            elif ext.casefold() in IMAGE_EXTS:
+            if ext.casefold() in IMAGE_EXTS:
                 images_by_stem[stem.casefold()] = images_by_stem.get(stem.casefold(), 0) + 1
+            elif fn != BACKUP_MARK and ext != ".part" and (exts is None or ext.casefold() in exts):
+                side_by_stem.setdefault(stem.casefold(), []).append(fn)
         masks: dict[str, list[Path]] = {}
         for masks_dir in reversed(mask_dirs):         # _controls first, so its masks win
             for key, found in mask_files(here / masks_dir).items():
@@ -1154,7 +1170,7 @@ def summary(root: Path, items, min_area: int) -> list[str]:
     if areas:
         lines.append(f"  area:    min {areas[0]:,}, median {areas[len(areas) // 2]:,}, max {areas[-1]:,} px; "
                      f"{sum(a < min_area for a in areas)} below {min_area:,} already")
-    lines.append(f"  sidecars: {count(lambda it: it.sidecars)} images with, {count(lambda it: not it.sidecars)} without; "
+    lines.append(f"  captions: {count(has_caption)} images with, {count(lambda it: not has_caption(it))} without; "
                  f"{count(lambda it: it.shared_stem)} share their stem with another image")
     lines.append(f"  masks:   {count(lambda it: it.mask)}")
     extra = [f"{count(lambda it: it.head['frames'] > 1 and not it.head['error'])} animated (skipped)",
@@ -1939,7 +1955,8 @@ def main(argv=None) -> int:
                     help="another folder name to skip at any depth; may repeat. Always skipped: "
                          + ", ".join(DEFAULT_EXCLUDES))
     ap.add_argument("--sidecars", default=DEFAULT_SIDECARS, metavar="LIST",
-                    help=f"sidecar extensions, comma-separated (default {DEFAULT_SIDECARS})")
+                    help="what travels with an image: 'all' (default), every file of its name that is not "
+                         "an image, or extensions, comma-separated, such as .txt,.json")
     ap.add_argument("--min-area", type=int, default=DEFAULT_MIN_AREA, metavar="N",
                     help="an image smaller than N pixels after its crop moves to the backup instead "
                          f"(default {DEFAULT_MIN_AREA})")
@@ -1951,7 +1968,7 @@ def main(argv=None) -> int:
 
     if args.undo and args.dry_run:
         ap.error("--undo and --dry-run do not go together")
-    sidecar_exts = [e if e.startswith(".") else "." + e for e in (s.strip() for s in args.sidecars.split(",")) if e]
+    sidecar_exts = parse_sidecars(args.sidecars)
     roots = check_roots(args.folders)
     excludes = DEFAULT_EXCLUDES + args.exclude
 

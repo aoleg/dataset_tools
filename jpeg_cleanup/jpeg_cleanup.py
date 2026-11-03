@@ -6,8 +6,8 @@ and restore them with FBCNN.
 --extract: every image of every folder given is
 scanned at any depth, its JPEG quality factor (QF) is predicted from the stored
 pixels, and each image under the highest band limit is copied with its sidecars
-into one folder per band, outside the dataset, so a threshold can be chosen by
-eye. The dataset itself is never changed; the only file written into it is the
+(every other file of its folder with its name: captions, caches, ...) into one
+folder per band, outside the dataset, so a threshold can be chosen by eye. The dataset itself is never changed; the only file written into it is the
 measurement cache in <folder>_backup/_jpeg_cleanup/cache.json, next to it.
 
 An extract folder given instead of a dataset folder is sorted again in place,
@@ -17,7 +17,7 @@ move the copies between the band folders.
 The fix: every image with a QF under --threshold is restored in memory, at
 its QF plus --qf-offset, encoded as it would be written, and judged: only a
 restoration that removes enough of the artifacts is saved. Its original and
-captions go to <folder>_backup/<same relative path> first, next to the
+sidecars go to <folder>_backup/<same relative path> first, next to the
 dataset folder and outside it, so a trainer never sees them; the restoration
 then replaces the image under its own name. --dry-run does all of it but the
 writing and draws contact sheets (before and after, at 100% and magnified);
@@ -97,7 +97,7 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".jpe", ".jfif", ".png", ".webp", ".bmp", ".tif",
 # skipped too. Any other folder is scanned; --exclude adds names.
 DEFAULT_EXCLUDES = [OLD_BACKUP_DIRNAME, "_duplicates", "_prep", "_classify", "_embeddings",
                     "_controls", "masks", "faces"]
-DEFAULT_SIDECARS = ".txt"
+DEFAULT_SIDECARS = "all"            # every file of the image's name that is not an image; or a list of extensions
 DEFAULT_BANDS = "60,70,80,85"
 DEFAULT_MAX_PIXELS = 2048 * 2048  # larger images are skipped: the downscale to 1024^2 hides their artifacts
 DEFAULT_THREADS = 8
@@ -141,12 +141,21 @@ class Item:
 
 # --- scan ---------------------------------------------------------------------
 
-def scan(root: Path, excludes, sidecar_exts) -> list[Item]:
-    """The images under root at any depth, with their sidecars. Folders are
-    skipped by exact name (case-insensitive), at any depth, and so is a
-    backup folder of the dataset tools."""
+def parse_sidecars(text: str) -> list[str] | None:
+    """The extensions of a --sidecars list, with a dot; None for 'all'."""
+    if text.strip().lower() == "all":
+        return None
+    return [e if e.startswith(".") else "." + e for e in (s.strip() for s in text.split(",")) if e]
+
+
+def scan(root: Path, excludes, sidecar_exts=None) -> list[Item]:
+    """The images under root at any depth, with their sidecars: the files of
+    the image's folder with its stem and a non-image extension (a.txt, a.short,
+    a.npz for a.jpg), or only those with an extension of sidecar_exts when it
+    is given. Folders are skipped by exact name (case-insensitive), at any
+    depth, and so is a backup folder of the dataset tools."""
     excl = {e.casefold() for e in excludes}
-    exts = {e.casefold() for e in sidecar_exts}
+    exts = {e.casefold() for e in sidecar_exts} if sidecar_exts is not None else None
     items = []
     for dirpath, dirnames, filenames in os.walk(root):
         here = Path(dirpath)
@@ -154,7 +163,8 @@ def scan(root: Path, excludes, sidecar_exts) -> list[Item]:
         side_by_stem: dict[str, list[str]] = {}
         for fn in filenames:
             stem, ext = os.path.splitext(fn)
-            if ext.casefold() in exts:
+            if (ext.casefold() not in IMAGE_EXTS and fn != BACKUP_MARK and ext != ".part"
+                    and (exts is None or ext.casefold() in exts)):
                 side_by_stem.setdefault(stem.casefold(), []).append(fn)
         for fn in sorted(filenames):
             stem, ext = os.path.splitext(fn)
@@ -1501,7 +1511,7 @@ def fix_folder(root: Path, args, model_box: list) -> int:
     """Measure, restore, judge, and in a real run write. -> failed writes."""
     t0 = time.perf_counter()
     dry = args.dry_run
-    sidecar_exts = [e if e.startswith(".") else "." + e for e in (s.strip() for s in args.sidecars.split(",")) if e]
+    sidecar_exts = parse_sidecars(args.sidecars)
     claim_backup(root)
     items = scan(root, DEFAULT_EXCLUDES + args.exclude, sidecar_exts)
     print(f"{root}: {len(items):,} images found", flush=True)
@@ -1659,7 +1669,7 @@ def output_dirs(roots: list[Path], out_arg: str | None) -> list[Path]:
 def extract_dataset(root: Path, out: Path, args, model_box: list) -> None:
     t0 = time.perf_counter()
     bands = args.bands or parse_bands(DEFAULT_BANDS)
-    sidecar_exts = [e if e.startswith(".") else "." + e for e in (s.strip() for s in args.sidecars.split(",")) if e]
+    sidecar_exts = parse_sidecars(args.sidecars)
     claim_backup(root)
     items = scan(root, DEFAULT_EXCLUDES + args.exclude, sidecar_exts)
     print(f"{root}: {len(items):,} images found", flush=True)
@@ -1800,7 +1810,8 @@ def main(argv=None) -> int:
                     help="another folder name to skip at any depth; may repeat. Always skipped: "
                          + ", ".join(DEFAULT_EXCLUDES))
     ap.add_argument("--sidecars", default=DEFAULT_SIDECARS, metavar="LIST",
-                    help=f"sidecar extensions, comma-separated (default {DEFAULT_SIDECARS})")
+                    help="what travels with an image: 'all' (default), every file of its name that is not "
+                         "an image, or extensions, comma-separated, such as .txt,.json")
     ap.add_argument("--reanalyse", action="store_true", help="ignore the measurement cache of the last run")
     ap.add_argument("--threads", type=threads_arg, default=DEFAULT_THREADS, metavar="N",
                     help=f"decoder threads (default {DEFAULT_THREADS})")

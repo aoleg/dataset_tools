@@ -1,6 +1,6 @@
 # JPEG cleanup
 
-Finds the images of a dataset that were saved with heavy JPEG compression, restores them with [FBCNN](https://github.com/jiaxi-jiang/FBCNN), and replaces only those where the restoration removes enough of the damage. Originals and captions go to the backup folder `<folder>_backup` next to the dataset folder; `--review` draws them next to the restored files, and `--undo` puts them back.
+Finds the images of a dataset that were saved with heavy JPEG compression, restores them with [FBCNN](https://github.com/jiaxi-jiang/FBCNN), and replaces only those where the restoration removes enough of the damage. Originals and sidecars (captions and any other file with their name) go to the backup folder `<folder>_backup` next to the dataset folder; `--review` draws them next to the restored files, and `--undo` puts them back.
 
 ## Why
 
@@ -35,7 +35,7 @@ A typical artifact-removal script runs the model over a folder and overwrites ev
 - **Keeps the grain.** FBCNN is told a quality 10 points above the image's own, so it removes a little less, and black-and-white images go through the colour model.
 - **Skips what it cannot fix.** Formats with their own kind of compression (lossy WebP, AVIF, HEIC, GIF), transparent, animated, CMYK and 16-bit images are listed and left alone.
 - **Shows the result first.** `--dry-run` writes a report and contact sheets with every image before and after, at 100% and magnified, split into the restorations it would save and the ones it would leave. A real run saves exactly what its dry run listed.
-- **Backs up before it writes.** The original and its captions go to `<folder>_backup` under the same relative path. A backup is never overwritten, and an earlier original from another tool keeps its place.
+- **Backs up before it writes.** The original and its sidecars go to `<folder>_backup` under the same relative path. A backup is never overwritten, and an earlier original from another tool keeps its place.
 - **Writes safely.** Each image is logged before it is touched. The restoration goes to a `.part` file and replaces the image in one step, with the original's name, times, read-only flag, EXIF block and ICC profile.
 - **Shows what it wrote.** `--review` draws the contact sheets of the last run from the originals in the backup folder and the files now in place.
 - **Undoes a run.** `--undo` puts back the last run, also one that was interrupted.
@@ -85,16 +85,16 @@ The first command measures every image of `D:\photos` and its subfolders and cop
 | `--out DIR` | the output folder (default `<folder>_jpeg_extract` next to the dataset folder); with several folders, one subfolder per folder name |
 | `--max-pixels N` | skip images larger than N pixels (default 4194304, which is 2048 x 2048) |
 | `--exclude NAME` | another folder name to skip, at any depth; may repeat |
-| `--sidecars LIST` | the extensions of the files that travel with an image, comma-separated (default `.txt`) |
+| `--sidecars LIST` | the files that travel with an image: `all` (the default), every file with the name of the image that is not an image, such as `.txt`, `.short` or `.npz`; or extensions, comma-separated, such as `.txt,.json` |
 | `--reanalyse` | ignore the cache and measure every image again |
 | `--threads N` | threads that decode the images (default 8) |
 
 What a run does:
 
-1. Scans the folder at any depth. Images are `.jpg`, `.jpeg`, `.jpe`, `.jfif`, `.png`, `.webp`, `.bmp`, `.tif`, `.tiff`, `.gif`, `.avif`, `.heic` and `.heif`. A `.txt` file with the same name as an image is its caption. Folders named `_backup`, `_duplicates`, `_prep`, `_classify`, `_embeddings`, `_controls`, `masks` and `faces` are skipped, at any depth, and so is a folder the dataset tools made next to a dataset (marked by `_dataset_tools.json`).
+1. Scans the folder at any depth. Images are `.jpg`, `.jpeg`, `.jpe`, `.jfif`, `.png`, `.webp`, `.bmp`, `.tif`, `.tiff`, `.gif`, `.avif`, `.heic` and `.heif`. Every other file in the same folder with the same name as an image is its sidecar: its captions (`.txt`, `.short`, ...) and any cache or other file. The tool's own `.part` files and `_dataset_tools.json` are never sidecars. Folders named `_backup`, `_duplicates`, `_prep`, `_classify`, `_embeddings`, `_controls`, `masks` and `faces` are skipped, at any depth, and so is a folder the dataset tools made next to a dataset (marked by `_dataset_tools.json`).
 2. Measures the QF of every image on its stored pixels, before EXIF rotation, so the 8 x 8 grid stays where the model expects it. A black-and-white image (one channel, or three channels within 2 levels of each other) is measured with both models, and the gray model decides. An unchanged image is taken from the cache.
 3. Puts each image in the band of the first limit above its QF. With the default limits, band `60` holds QF under 60, `70` holds 60 to 69.9, `80` holds 70 to 79.9 and `85` holds 80 to 84.9. Each image is in one band, so neighbouring bands can be compared side by side; a threshold of 80 takes the bands `60`, `70` and `80`.
-4. Copies each image of a band, with its captions, as `q<QF>__<name>` (for example `q057__photo.jpg` and `q057__photo.txt`), so a folder sorted by name is sorted by QF. When two images of different folders have the same name and QF, the second gets `~2`.
+4. Copies each image of a band, with its sidecars, as `q<QF>__<name>` (for example `q057__photo.jpg`, `q057__photo.txt` and `q057__photo.npz`), so a folder sorted by name is sorted by QF. When two images of different folders have the same name and QF, the second gets `~2`.
 5. Writes `extract.csv`, `summary.txt` and `manifest.json` and prints the summary.
 
 A new run into the same output folder first deletes the copies of the last run, which `manifest.json` lists; other files in the band folders stay.
@@ -114,7 +114,7 @@ The run prints a progress line every 500 images with the time left. Ctrl+C stops
 
 ### Re-sorting an extract folder
 
-When the folder given is an extract folder, it is re-sorted in place from its `extract.csv` and `manifest.json`, without the dataset or the model. New `--bands` move copies with their captions between the band folders, and copies above a lower top limit are deleted with their captions. Images above the old top limit were never copied; the run says how many there are, and a run on the dataset folder adds them.
+When the folder given is an extract folder, it is re-sorted in place from its `extract.csv` and `manifest.json`, without the dataset or the model. New `--bands` move copies with their sidecars between the band folders, and copies above a lower top limit are deleted with their sidecars. Images above the old top limit were never copied; the run says how many there are, and a run on the dataset folder adds them.
 
 `extract.csv` and `manifest.json` are written first, then the moves are made. A stopped re-sort is finished by the next run, from `moves.json`.
 
@@ -159,8 +159,8 @@ What the fix does with each image under the threshold:
 1. Restores the stored pixels with the colour model of FBCNN. A black-and-white image goes in as three equal channels, and only the luma of the result is kept, so no colour can appear. FBCNN is told the QF the colour model predicts, plus `--qf-offset`; told a higher quality, it removes less and keeps more grain. The effect is mild: from +0 to +20 the fine detail kept rises from about 78% to 87% of the original's.
 2. Encodes the result as it would be written: a JPEG source as JPEG at `--quality` with full-resolution colour (4:4:4, so the re-save adds no colour bleeding), a PNG, BMP, TIFF or lossless WebP source in its own format. The re-save at 97 differs from the restoration by 46 to 51 dB PSNR, far below the artifacts removed.
 3. Measures the QF of the result, the blockiness before and after, and the mean change from the original.
-4. Judges whether the restoration is worth saving. If it is not, the image and its captions stay untouched.
-5. In a real run, if it is: logs the image, copies the original and its captions to `<folder>_backup`, writes the restoration to a `.part` file and puts it in place of the image in one step. The image keeps its name, modification time, read-only flag, EXIF block (with the orientation) and ICC profile; a gray result leaves out an RGB profile, which does not fit it.
+4. Judges whether the restoration is worth saving. If it is not, the image and its sidecars stay untouched.
+5. In a real run, if it is: logs the image, copies the original and its sidecars to `<folder>_backup`, writes the restoration to a `.part` file and puts it in place of the image in one step. The image keeps its name, modification time, read-only flag, EXIF block (with the orientation) and ICC profile; a gray result leaves out an RGB profile, which does not fit it.
 
 The restorations are computed deterministically, so a real run saves exactly what its dry run listed as `fix`. A second run reads the restored images at QF 90 or so and leaves them alone.
 
@@ -179,9 +179,9 @@ On the 3,258 images under QF 80 of the dataset above, the rule saved 68 of 75 un
 
 ### Backup and undo
 
-The original of a restored image goes to `<folder>_backup\<relative path>`, next to the dataset folder and outside it, with copies of its captions. When the backup folder already holds an original of that path (from `remove_borders`, the pipeline, or an earlier run), that one stays: a backup is the one untouched original of an image, shared by every tool, and it is never overwritten.
+The original of a restored image goes to `<folder>_backup\<relative path>`, next to the dataset folder and outside it, with copies of its sidecars. When the backup folder already holds an original of that path (from `remove_borders`, the pipeline, or an earlier run), that one stays: a backup is the one untouched original of an image, shared by every tool, and it is never overwritten.
 
-`--undo` takes the last run that is not undone yet and returns every image it restored to its original in the backup folder, newest first; an earlier run's change to the same image goes with it, since the only backup is the original. A backup the run made is removed; one that was there before stays. Caption copies the run made are removed while the caption in place is unchanged, and a missing caption comes back. Each `--undo` goes one run further back. A run that wrote nothing logs no run.
+`--undo` takes the last run that is not undone yet and returns every image it restored to its original in the backup folder, newest first; an earlier run's change to the same image goes with it, since the only backup is the original. A backup the run made is removed; one that was there before stays. Sidecar copies the run made are removed while the sidecar in place is unchanged, and a missing sidecar comes back. Each `--undo` goes one run further back. A run that wrote nothing logs no run.
 
 The backup folder is shared with the other dataset tools; see [The backup folder](../README.md#the-backup-folder) in the main README. A `_backup` folder inside the dataset, where the backup was until 2026-10-11, is moved to `<folder>_backup` on the next run, dry run, undo or review, and the undo log of an old run still works. A folder named `<folder>_backup` that the tools did not make stops the run.
 
@@ -193,7 +193,7 @@ The backup folder is shared with the other dataset tools; see [The backup folder
 
 ```
 <folder>_jpeg_extract\
-  60\q050__photo.jpg         the images with QF under 60, and their captions
+  60\q050__photo.jpg         the images with QF under 60, and their sidecars
   70\ 80\ 85\                the other bands
   extract.csv                one row per image of the dataset
   summary.txt                counts per band, a QF histogram, the skipped images
@@ -201,7 +201,7 @@ The backup folder is shared with the other dataset tools; see [The backup folder
 <folder>_backup\
   _dataset_tools.json        marks the folder as the backup folder of the dataset tools
   <relative path>\<image>    the original of a restored image
-  <relative path>\<name>.txt its captions
+  <relative path>\<name>.*   its sidecars
   _jpeg_cleanup\
     cache.json               the QF measurements, reused while a file is unchanged
     report.csv               the last fix, dry or real, one row per image
