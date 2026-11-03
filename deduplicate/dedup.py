@@ -6,22 +6,30 @@ Every folder given is scanned recursively, and all of them form one pool. Two
 images are copies when their perceptual hashes are close, or when local image
 features (ORB) show the same picture under another crop, border, scale or a
 mock-up. Copies connected through such matches form one group. In each group the
-best copy stays; every other copy, and its .txt caption, moves to
+best copy stays; every other copy, with its sidecars (every other file of its
+name: <stem>.txt, <stem>.short, <stem>.npz, ...), moves to
 <root>_duplicates/<same relative path>, next to <root>, where <root> is the
-folder given on the command line that contains it. If the kept copy has no caption and a moved copy
-has one, that caption is also copied next to the kept copy, under its name.
-No prompt.
+folder given on the command line that contains it. A sidecar stays in place when
+another image of the same stem stays. For each caption extension (CAPTION_EXTS)
+that the kept copy lacks, the caption of the best moved copy that has one is
+also copied next to the kept copy, under its name; other sidecars are never
+copied that way. No prompt.
 
 Quality is judged the k2prep way: each copy is scored as the trainer would see it,
 cropped and resized to the 512, 768 or 1024 bucket it reaches. A copy that reaches
 a larger bucket wins, unless it scores GUARD or more points lower. Equal copies:
-one in a sorted folder wins, then the one with a caption, then the oldest file.
+one in a sorted folder wins, then the one with a caption (any of CAPTION_EXTS),
+then the oldest file.
 
 Sorted folders (--sorted) are curated trees. A better unsorted copy moves into the
 sorted copy's place under the sorted name (promotion), when it is a bucket up or
-PROMOTE_MARGIN points better and matches by hash. Sorted captions are never moved
-or overwritten. The same picture in several sorted folders keeps every folder's
-slot and gives each the best copy (--sorted-copies keep), or keeps one (one).
+PROMOTE_MARGIN points better and matches by hash. The sidecars of a sorted copy
+that is replaced stay for the new file, extension by extension, and the new file's
+own sidecars fill the extensions that are free. Sorted captions are never moved or
+overwritten. The latent caches (CACHE_EXTS) of a replaced sorted copy leave with
+it, because they describe the pixels that go. The same picture in several sorted
+folders keeps every folder's slot and gives each the best copy (--sorted-copies
+keep), or keeps one (one).
 Copies that match by features only are listed for review and left alone.
 
 Watermarks (--watermark): the watermark tool's detectors (../watermark; both of
@@ -73,6 +81,11 @@ MOVES_NAME = "moves.jsonl"
 CACHE_VERSION = 1
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".gif", ".avif"}
+# A caption is any of these; a sidecar is every other file of an image's name, whatever its
+# extension. Only a caption is ever copied from one image to another; the caches describe the
+# pixels of their own image and leave with it.
+CAPTION_EXTS = (".txt", ".short", ".caption", ".json")
+CACHE_EXTS = (".npz", ".safetensors")
 # Folders never scanned, at any depth: the output folders of the dataset tools.
 # _duplicates was this tool's own and _prep k2prep's, before both moved out
 # next to the dataset; _classify and _embeddings are classify's, _controls
@@ -449,14 +462,27 @@ def hash_file(path: str) -> dict:
 # ---------------------------------------------------------------------------
 
 class Item:
-    __slots__ = ("idx", "root_idx", "root", "rel", "path", "size", "mtime", "caption", "data", "role")
+    __slots__ = ("idx", "root_idx", "root", "rel", "path", "size", "mtime", "sidecars", "mates", "data", "role")
 
     def __init__(self, idx, root_idx, root, rel, path, size, mtime, role=0):
         self.idx, self.root_idx, self.root, self.rel, self.path = idx, root_idx, root, rel, path
         self.size, self.mtime = size, mtime
-        self.caption = None
+        self.sidecars = []               # every other file of its folder and stem that is not an image
+        self.mates = []                  # idx of the other images of its folder and stem (link_stems)
         self.data = {}
         self.role = role                 # 0 unsorted (raw downloads), 1 sorted (curated tree)
+
+    @property
+    def captioned(self) -> bool:
+        return any(p.suffix.lower() in CAPTION_EXTS for p in self.sidecars)
+
+    @property
+    def stem_key(self) -> str:
+        return os.path.normcase(os.path.splitext(str(self.path))[0])
+
+    def side_by_ext(self, exts=None) -> dict:
+        """The sidecars by lower-case extension, only those in exts when given."""
+        return {p.suffix.lower(): p for p in self.sidecars if exts is None or p.suffix.lower() in exts}
 
 
 def scan(roots, excludes, roles=None):
@@ -469,11 +495,11 @@ def scan(roots, excludes, roles=None):
         for dirpath, dirnames, filenames in os.walk(root):
             dirnames[:] = sorted(d for d in dirnames if d.casefold() not in excl
                                  and not os.path.isfile(os.path.join(dirpath, d, BACKUP_MARK)))
-            stems = {}
-            for fn in filenames:
+            stems = {}                   # the sidecars of the folder by stem
+            for fn in sorted(filenames):
                 stem, ext = os.path.splitext(fn)
-                if ext.lower() == ".txt":
-                    stems.setdefault(stem.casefold(), {})["txt"] = fn
+                if ext.lower() not in IMAGE_EXTS and fn != BACKUP_MARK:
+                    stems.setdefault(os.path.normcase(stem), []).append(Path(dirpath) / fn)
             for fn in sorted(filenames):
                 if os.path.splitext(fn)[1].lower() not in IMAGE_EXTS:
                     continue
@@ -484,8 +510,7 @@ def scan(roots, excludes, roles=None):
                     continue
                 rel = p.relative_to(root).as_posix()
                 it = Item(len(items), ri, root, rel, p, st.st_size, st.st_mtime_ns, role)
-                txt = stems.get(os.path.splitext(fn)[0].casefold(), {}).get("txt")
-                it.caption = Path(dirpath) / txt if txt else None
+                it.sidecars = stems.get(os.path.normcase(os.path.splitext(fn)[0]), [])
                 items.append(it)
     return items
 
@@ -1343,12 +1368,12 @@ def rank_members(members, items):
     if len(ties) > 1:
         def tie_key(i):
             it = items[i]
-            return (it.role == 0, it.caption is None, it.mtime, it.root_idx, it.rel.casefold())
+            return (it.role == 0, not it.captioned, it.mtime, it.root_idx, it.rel.casefold())
         top = min(ties, key=tie_key)
         others = [items[i] for i in ties if i != top]
         if items[top].role == 1 and any(o.role == 0 for o in others):
             reason = "equal quality; in a sorted folder"
-        elif items[top].caption is not None and any(o.caption is None for o in others):
+        elif items[top].captioned and any(not o.captioned for o in others):
             reason = "equal quality; has a caption"
         else:
             reason = "equal quality; oldest file"
@@ -1390,17 +1415,39 @@ def plan_groups(items, edges, scorer, wm_thr=None):
 # Moving
 # ---------------------------------------------------------------------------
 
-def free_dest(dest: Path, stem_peer: Path | None = None) -> Path:
-    """dest, or dest with " (N)" before the extension if taken."""
-    if not dest.exists() and (stem_peer is None or not stem_peer.exists()):
+def free_dest(dest: Path, peers=()) -> Path:
+    """dest, or dest with " (N)" before the extension if it is taken. peers: the
+    extensions of the sidecars that go with it; the name must be free for each."""
+    def free(cand: Path) -> bool:
+        return not cand.exists() and not any(cand.with_suffix(s).exists() for s in peers)
+
+    if free(dest):
         return dest
     n = 1
     while True:
         cand = dest.with_name(f"{dest.stem} ({n}){dest.suffix}")
-        peer = stem_peer.with_name(f"{dest.stem} ({n}){stem_peer.suffix}") if stem_peer else None
-        if not cand.exists() and (peer is None or not peer.exists()):
+        if free(cand):
             return cand
         n += 1
+
+
+def stem_files(path: Path):
+    """The other files of path's folder that have its stem, by one directory
+    listing: (images, sidecars). A sidecar is any file that is not an image."""
+    images, sidecars = [], []
+    key = os.path.normcase(os.path.splitext(path.name)[0])
+    try:
+        names = sorted(os.listdir(path.parent))
+    except OSError:
+        return images, sidecars
+    for fn in names:
+        stem, ext = os.path.splitext(fn)
+        if fn == path.name or fn == BACKUP_MARK or os.path.normcase(stem) != key:
+            continue
+        p = path.parent / fn
+        if p.is_file():
+            (images if ext.lower() in IMAGE_EXTS else sidecars).append(p)
+    return images, sidecars
 
 
 def move_file(src: Path, dst: Path) -> None:
@@ -1414,18 +1461,25 @@ def move_file(src: Path, dst: Path) -> None:
         shutil.move(str(src), str(dst))
 
 
-def caption_shared(it, items, moving) -> bool:
-    """True if another image with the same stem stays in the folder; its caption stays too."""
-    if it.caption is None:
-        return False
-    return any(o.caption == it.caption and o.idx != it.idx and o.idx not in moving for o in items)
+def link_stems(items) -> None:
+    """Give each item the idx of the other images that have its folder and stem."""
+    by_stem = {}
+    for it in items:
+        by_stem.setdefault(it.stem_key, []).append(it.idx)
+    for it in items:
+        it.mates = [i for i in by_stem[it.stem_key] if i != it.idx]
+
+
+def sidecars_shared(it, moving) -> bool:
+    """True if another image with the same stem stays in the folder; its sidecars stay too."""
+    return bool(it.sidecars) and any(i not in moving for i in it.mates)
 
 
 def describe(it, wm_thr=None):
     s = it.data.get("score_info", {})
     return {"path": str(it.path), "role": "sorted" if it.role == 1 else "unsorted",
             "w": it.data.get("w"), "h": it.data.get("h"),
-            "tier": s.get("tier"), "score": s.get("score"), "caption": it.caption is not None,
+            "tier": s.get("tier"), "score": s.get("score"), "caption": it.captioned,
             "mtime": datetime.fromtimestamp(it.mtime / 1e9).isoformat(timespec="seconds"),
             "bytes": it.size,
             **({"watermark": wm_class(it.data, wm_thr), "watermark_conf": wm_conf(it.data, wm_thr[2])} if wm_thr else {})}
@@ -1520,19 +1574,27 @@ def role_report(keeper, losers, items, edges, margin, wm_thr=None):
     return rep
 
 
-def caption_source(keeper, losers, items):
-    """The moved copy whose caption the kept copy inherits, or None.
+def caption_sources(have, losers, items):
+    """The captions the kept copy inherits from moved copies: {extension: path}.
 
-    Only when the kept copy has no caption. The best captioned copy by the same
-    ranking (tier, score), then the oldest file.
+    Each caption extension on its own: when the kept copy has none of that
+    extension (`have`, the extensions it will have), it gets the one of the best
+    moved copy that has it, by the same ranking (tier, score), then the oldest
+    file. Nothing else of a moved copy is copied, whatever its extension.
     """
-    if items[keeper].caption is not None:
-        return None
-    captioned = [items[i] for i in losers if items[i].caption is not None and items[i].caption.exists()]
-    if not captioned:
-        return None
-    return min(captioned, key=lambda it: (-it.data["score_info"]["tier"], -it.data["score_info"]["score"],
-                                          it.mtime, it.root_idx, it.rel.casefold()))
+    ranked = sorted((items[i] for i in losers),
+                    key=lambda it: (-it.data["score_info"]["tier"], -it.data["score_info"]["score"],
+                                    it.mtime, it.root_idx, it.rel.casefold()))
+    found = {}
+    for ext in CAPTION_EXTS:
+        if ext in have:
+            continue
+        for it in ranked:
+            p = it.side_by_ext(CAPTION_EXTS).get(ext)
+            if p is not None:
+                found[ext] = p
+                break
+    return found
 
 
 def file_sha256(path: Path) -> str:
@@ -1547,22 +1609,33 @@ class Names:
 
     def __init__(self):
         self.freed, self.taken = set(), set()
-        self.copies = {}                 # planned caption copy: destination -> source
+        self.copies = {}                 # planned sidecar copy: destination -> source
 
     def exists(self, p: Path) -> bool:
         return p in self.taken or (p not in self.freed and p.exists())
 
-    def free_dest(self, dest: Path, stem_peer: Path | None = None) -> Path:
+    def free_dest(self, dest: Path, peers=None) -> Path:
         """dest, or dest with " (N)" before the extension if taken; the chosen
-        name and its peer are taken from then on."""
-        cand, peer, n = dest, stem_peer, 0
-        while self.exists(cand) or (peer is not None and self.exists(peer)):
+        name and the names of its sidecars are taken from then on. peers:
+        {extension: source} of the sidecars that go with it; a sidecar that is
+        only a planned copy of the same source does not count as taken."""
+        peers = peers or {}
+
+        def blocked(cand: Path) -> bool:
+            if self.exists(cand):
+                return True
+            for ext, src in peers.items():
+                peer = cand.with_suffix(ext)
+                if self.exists(peer) and (src is None or self.copies.get(peer) != src):
+                    return True
+            return False
+
+        cand, n = dest, 0
+        while blocked(cand):
             n += 1
             cand = dest.with_name(f"{dest.stem} ({n}){dest.suffix}")
-            peer = stem_peer.with_name(f"{dest.stem} ({n}){stem_peer.suffix}") if stem_peer else None
         self.taken.add(cand)
-        if peer is not None:
-            self.taken.add(peer)
+        self.taken.update(cand.with_suffix(ext) for ext in peers)
         return cand
 
 
@@ -1709,46 +1782,49 @@ def decide_group(group, items, edges, with_roles, margin, policy="keep", wm_thr=
     return d
 
 
-def plan_placement(best, slot, items, names, leaving, action, best_caption=None):
+def plan_placement(best, slot, items, names, leaving, action, slot_stay, best_side=None):
     """Where the best copy goes for one slot: a move for the promoted keeper
     (action "move"), a copy for slot sync (action "copy"). The slot's image is
     already planned out, so its name is free unless another image of the same
-    stem stays. A caption that belongs to the slot is never moved or
-    overwritten; best_caption is the caption the best copy will have, for a
-    synced slot that has none."""
+    stem stays. The sidecars of the slot that stay (slot_stay, {extension: path})
+    are never moved or overwritten: for each extension the slot has, the slot's
+    file wins; the best copy's sidecar of any other extension comes along.
+    best_side is the sidecars the best copy will have, {extension: path}, for a
+    synced slot."""
     b, sl = items[best], items[slot]
     dest = sl.path.parent / (sl.path.stem + b.path.suffix)
     renamed = names.exists(dest)
+    # a renamed image does not inherit the slot's caches: they describe other pixels
+    held = {ext: p for ext, p in slot_stay.items() if not (renamed and ext in CACHE_EXTS)}
+    own = b.side_by_ext() if action == "move" else best_side
+    shared = action == "move" and sidecars_shared(b, leaving)
+    placed = {ext: p for ext, p in own.items() if ext not in held}
     if renamed:
-        dest = names.free_dest(dest, dest.with_suffix(".txt"))
+        dest = names.free_dest(dest, {p.suffix: None for p in (*held.values(), *placed.values())})
     else:
         names.taken.add(dest)
-    slot_cap = sl.caption if sl.caption and sl.caption.exists() else None
-    captions = []
-    if slot_cap is not None and renamed:
-        captions.append({"action": "copy", "from": str(slot_cap), "to": str(dest.with_suffix(".txt")),
-                         "reason": "caption of the slot, under the new name"})
-    if action == "move":
-        own_cap = b.caption if b.caption and b.caption.exists() else None
-        own_shared = own_cap is not None and caption_shared(b, items, leaving)
-        if slot_cap is not None:
-            if own_cap is not None and not own_shared:
-                park = names.free_dest((out_dir(b.root) / b.rel).with_suffix(".txt"))
-                captions.append({"action": "move", "from": str(own_cap), "to": str(park),
-                                 "reason": "caption of a promoted copy; the caption of the slot wins"})
-        elif own_cap is not None:
-            captions.append({"action": "copy" if own_shared else "move", "from": str(own_cap),
-                             "to": str(dest.with_suffix(".txt")), "reason": "caption of a promoted copy"})
-        has_caption = slot_cap is not None or own_cap is not None
-    else:
-        if slot_cap is None and best_caption is not None:
-            captions.append({"action": "copy", "from": str(best_caption), "to": str(dest.with_suffix(".txt")),
-                             "reason": "caption of the best copy, for a slot without one"})
-        has_caption = slot_cap is not None or best_caption is not None
-    if has_caption:
-        names.taken.add(dest.with_suffix(".txt"))
+    sidecars = []
+    if renamed:
+        for p in held.values():
+            sidecars.append({"action": "copy", "from": str(p), "to": str(dest.with_suffix(p.suffix)),
+                             "reason": "sidecar of the slot, under the new name"})
+    parked = {ext: p for ext, p in own.items() if ext in held} if action == "move" and not shared else {}
+    if parked:
+        first = sorted(parked)[0]
+        park = names.free_dest((out_dir(b.root) / b.rel).with_suffix(parked[first].suffix),
+                               {p.suffix: None for e, p in parked.items() if e != first})
+        for p in parked.values():
+            sidecars.append({"action": "move", "from": str(p), "to": str(park.with_suffix(p.suffix)),
+                             "reason": "sidecar of a promoted copy; the one of the slot wins"})
+    for p in placed.values():
+        sidecars.append({"action": "move" if action == "move" and not shared else "copy",
+                         "from": str(p), "to": str(dest.with_suffix(p.suffix)),
+                         "reason": "sidecar of a promoted copy" if action == "move"
+                                   else "sidecar of the best copy, for a slot without one"})
+    exts = sorted({p.suffix for p in (*held.values(), *placed.values())})
+    names.taken.update(dest.with_suffix(e) for e in exts)
     return {"action": action, "from": str(b.path), "to": str(dest), "renamed": renamed,
-            "slot_of": str(sl.path), "slot_idx": slot, "has_caption": has_caption, "captions": captions}
+            "slot_of": str(sl.path), "slot_idx": slot, "exts": exts, "sidecars": sidecars}
 
 
 # ---------------------------------------------------------------------------
@@ -1912,6 +1988,7 @@ def main(argv=None) -> int:
     # 2. matches and groups; scores only for images that have a copy
     for k, it in enumerate(good):
         it.idx = k
+    link_stems(good)
     verified = load_verified(roots)
     edges = find_edges(good, args.match, verified, args.workers, args.gpu)
     if args.match == "loose":
@@ -1963,43 +2040,52 @@ def main(argv=None) -> int:
         d["moves"] = []
         for i in d["losers"]:
             it = good[i]
-            cap = it.caption if it.caption and it.caption.exists() else None
-            if cap is None:
-                mode = None
-            elif i in d["slot_like"]:
-                mode = "copy"                       # the slot keeps its caption for the copy that replaces it
-            elif caption_shared(it, good, leaving):
-                mode = None                         # stays with the image of the same stem
-            else:
-                mode = "move"
+            shared = sidecars_shared(it, leaving)   # an image of the same stem stays: its sidecars stay
+            side, stay = [], {}                     # the sidecars that go with the image; those that stay
+            for sc in it.sidecars:
+                if i in d["slot_like"]:
+                    # the slot keeps its sidecars for the copy that replaces it; its caches
+                    # describe the pixels that leave, so they leave too
+                    mode = "move" if sc.suffix.lower() in CACHE_EXTS and not shared else "copy"
+                elif shared or sc in names.freed:
+                    mode = None                     # stays, or already moves with another image of the stem
+                else:
+                    mode = "move"
+                if mode != "move":
+                    stay[sc.suffix.lower()] = sc
+                if mode:
+                    side.append((sc, mode))
             out = out_dir(it.root) / it.rel
-            # Two slot images that share one caption may share its copy too.
-            peer = out.with_suffix(".txt") if mode and names.copies.get(out.with_suffix(".txt")) != cap else None
-            dst = names.free_dest(out, peer)
+            # Two slot images that share a sidecar may share its copy too.
+            dst = names.free_dest(out, {sc.suffix: (sc if mode == "copy" else None) for sc, mode in side})
             names.freed.add(it.path)
-            if mode == "move":
-                names.freed.add(cap)
-            elif mode == "copy":
-                names.copies[dst.with_suffix(".txt")] = cap
-            d["moves"].append({"idx": i, "to": dst, "cap": cap if mode else None, "cap_mode": mode,
-                               "cap_to": dst.with_suffix(".txt") if mode else None})
+            for sc, mode in side:
+                if mode == "move":
+                    names.freed.add(sc)
+                else:
+                    names.copies[dst.with_suffix(sc.suffix)] = sc
+            d["moves"].append({"idx": i, "to": dst, "stay": stay,
+                               "side": [{"from": sc, "to": dst.with_suffix(sc.suffix), "mode": mode}
+                                        for sc, mode in side]})
+    move_of = {m["idx"]: m for d in acted for m in d["moves"]}
     for d in acted:
         k = good[d["keeper"]]
-        d["promotion"] = (plan_placement(d["keeper"], d["promote"], good, names, leaving, "move")
+        d["promotion"] = (plan_placement(d["keeper"], d["promote"], good, names, leaving, "move",
+                                         move_of[d["promote"]]["stay"])
                           if d["promote"] is not None else None)
         final = Path(d["promotion"]["to"]) if d["promotion"] else k.path
-        has_caption = d["promotion"]["has_caption"] if d["promotion"] else (k.caption is not None and k.caption.exists())
-        d["copy_caption"] = None
-        if not has_caption:
-            src = caption_source(d["keeper"], d["losers"], good)
-            if src is not None:
-                d["copy_caption"] = (src, final.with_suffix(".txt"))
-                names.taken.add(final.with_suffix(".txt"))
-                has_caption = True
-        best_caption = final.with_suffix(".txt") if has_caption else None
+        # the sidecars the kept copy will have: {extension: path}, once the plan has run
+        final_side = ({e.lower(): final.with_suffix(e) for e in d["promotion"]["exts"]} if d["promotion"]
+                      else k.side_by_ext())
+        d["copy_caption"] = []
+        for ext, src in caption_sources(set(final_side), d["losers"], good).items():
+            cdst = final.with_suffix(src.suffix)
+            d["copy_caption"].append((src, cdst))
+            names.taken.add(cdst)
+            final_side[ext] = cdst
         d["syncs"] = []
         for i in d["sync"]:
-            pc = plan_placement(d["keeper"], i, good, names, leaving, "copy", best_caption)
+            pc = plan_placement(d["keeper"], i, good, names, leaving, "copy", move_of[i]["stay"], final_side)
             pc["from"] = str(final)
             d["syncs"].append(pc)
         # the replacement copy: one per place the kept copy ends up in, under
@@ -2008,7 +2094,8 @@ def main(argv=None) -> int:
         if d["replacement"]:
             r = good[d["replacement"]["idx"]]
             fmt = r.data["score_info"].get("format", "")
-            targets = [(final, has_caption)] + [(Path(pc["to"]), pc["has_caption"]) for pc in d["syncs"]]
+            targets = ([(final, any(e in CAPTION_EXTS for e in final_side))]
+                       + [(Path(pc["to"]), any(e.lower() in CAPTION_EXTS for e in pc["exts"])) for pc in d["syncs"]])
             for target, with_caption in targets:
                 root = next(rr for rr in roots if target.is_relative_to(rr))
                 suffix, conv = repl_conversion(fmt, target)
@@ -2079,10 +2166,10 @@ def main(argv=None) -> int:
             if d["syncs"]:
                 entry["sync"] = [{x: v for x, v in pc.items() if x not in ("action", "slot_idx")} for pc in d["syncs"]]
             if d["copy_caption"]:
-                src, cdst = d["copy_caption"]
-                entry["copy_caption"] = {"from": str(src.caption), "to": str(cdst)}
+                entry["copy_caption"] = [{"from": str(src), "to": str(cdst)} for src, cdst in d["copy_caption"]]
             entry["move"] = [{**copy_info(k, m["idx"], d["steps"]), "to": str(m["to"]),
-                              **({"caption_to": str(m["cap_to"]), "caption_action": m["cap_mode"]} if m["cap_mode"] else {})}
+                              **({"sidecars": [{"to": str(s["to"]), "action": s["mode"]} for s in m["side"]]}
+                                 if m["side"] else {})}
                              for m in d["moves"]]
             if d.get("repl_copies"):
                 entry["replacement"] = [{x: (str(v) if x == "root" else v) for x, v in rc.items() if x != "loser_idx"}
@@ -2093,7 +2180,7 @@ def main(argv=None) -> int:
     n_bytes = sum(good[i].size for i in moving)
     skipped = [d for d in decisions if d["skip"] is not None]
     promotions = [d for d in acted if d["promotion"]]
-    caption_copies = [d for d in acted if d["copy_caption"]]
+    caption_copies = [c for d in acted for c in d["copy_caption"]]
     n_ren = sum(1 for d in promotions if d["promotion"]["renamed"])
     n_sync = sum(len(d["syncs"]) for d in acted)
     n_left = sum(1 for d in acted for sl in d["slots"] if sl["action"].startswith("left"))
@@ -2121,8 +2208,8 @@ def main(argv=None) -> int:
     if guarded:
         print(f"{len(guarded)} group(s) keep a smaller copy because the larger one scores much lower")
     if caption_copies:
-        print(f"{len(caption_copies)} kept image(s) without a caption get a copy of the caption "
-              f"of a moved copy")
+        print(f"{len(caption_copies)} caption file(s) of moved copies are copied to kept images "
+              f"that lack that caption")
     if with_roles:
         n_mixed = sum(verdicts.values())
         print(f"sorted/unsorted: {n_mixed} group(s) with copies in both"
@@ -2161,10 +2248,10 @@ def main(argv=None) -> int:
         return 0
 
     # 4. move, in passes: captions copied to kept images, move-outs, promotions,
-    #    then the caption actions of the promotions. A promotion is logged in the
+    #    then the sidecar actions of the promotions. A promotion is logged in the
     #    sorted root's log, after the move-out it depends on, so --undo replays
     #    the sequence in the right order.
-    moved = {r: [0, 0, 0, 0, 0, 0, 0] for r in roots}  # images, captions, bytes, captions copied, promoted in, synced, replacements
+    moved = {r: [0, 0, 0, 0, 0, 0, 0] for r in roots}  # images, sidecars, bytes, captions copied, promoted in, synced, replacements
     logs = {}
 
     def log_for(root):
@@ -2179,8 +2266,8 @@ def main(argv=None) -> int:
                            ensure_ascii=False) + "\n")
         f.flush()
 
-    def copy_caption(src: Path, dst: Path, root: Path, reason: str) -> bool:
-        if dst.exists() or not src.exists():        # never overwrite a caption
+    def copy_side(src: Path, dst: Path, root: Path, reason: str) -> bool:
+        if dst.exists() or not src.exists():        # never overwrite a sidecar
             return False
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
@@ -2192,10 +2279,9 @@ def main(argv=None) -> int:
 
     try:
         for d in acted:                                            # pass 0: captions for kept images
-            if d["copy_caption"]:
-                src, cdst = d["copy_caption"]
+            for src, cdst in d["copy_caption"]:
                 root = next(r for r, ro in zip(roots, roles) if cdst.is_relative_to(r))
-                if copy_caption(src.caption, cdst, root, "kept image had no caption"):
+                if copy_side(src, cdst, root, "kept image had no caption of this kind"):
                     moved[root][3] += 1
         for d in acted:                                            # pass 1: move-outs
             kept = final_path(d)
@@ -2206,20 +2292,21 @@ def main(argv=None) -> int:
                     continue
                 dst = m["to"]
                 if dst.exists():
-                    dst = free_dest(dst, dst.with_suffix(".txt") if m["cap_mode"] else None)
+                    dst = free_dest(dst, [s["from"].suffix for s in m["side"]])
                     print(f"  planned name was taken, used {dst.name}: {it.path}")
                 move_file(it.path, dst)
                 log(it.root, **{"from": str(it.path), "to": str(dst)}, kept=kept, reason=d["reason"])
                 moved[it.root][0] += 1
                 moved[it.root][2] += it.size
-                if m["cap_mode"] == "move" and m["cap"].exists():
-                    move_file(m["cap"], dst.with_suffix(".txt"))
-                    log(it.root, **{"from": str(m["cap"]), "to": str(dst.with_suffix(".txt"))}, kept=kept,
-                        reason="caption of a moved copy")
-                    moved[it.root][1] += 1
-                elif m["cap_mode"] == "copy":
-                    copy_caption(m["cap"], dst.with_suffix(".txt"), it.root,
-                                 "caption of the slot; a copy for the moved image")
+                for s in m["side"]:
+                    sdst = dst.with_suffix(s["from"].suffix)
+                    if s["mode"] == "move" and s["from"].exists():
+                        move_file(s["from"], sdst)
+                        log(it.root, **{"from": str(s["from"]), "to": str(sdst)}, kept=kept,
+                            reason="sidecar of a moved copy")
+                        moved[it.root][1] += 1
+                    elif s["mode"] == "copy":
+                        copy_side(s["from"], sdst, it.root, "sidecar of the slot; a copy for the moved image")
         for d in acted:                                            # pass 2: promotions
             if not d["promotion"]:
                 continue
@@ -2229,21 +2316,21 @@ def main(argv=None) -> int:
                 print(f"  GONE before the move, slot left empty, run --undo: {src} -> {dst}")
                 continue
             if dst.exists():
-                dst = free_dest(dst, dst.with_suffix(".txt"))
+                dst = free_dest(dst, d["promotion"]["exts"])
                 print(f"  planned name was taken, used {dst.name}: {src}")
             move_file(src, dst)
             log(slot.root, action="promote", **{"from": str(src), "to": str(dst)}, slot_of=str(slot.path),
                 reason=d["reason"])
             moved[slot.root][4] += 1
             d["promotion"]["to"] = str(dst)
-        for d in acted:                                            # pass 3: captions of promotions
+        for d in acted:                                            # pass 3: sidecars of promotions
             if not d["promotion"]:
                 continue
             slot = good[d["promote"]]
-            for c in d["promotion"]["captions"]:
+            for c in d["promotion"]["sidecars"]:
                 src, dst = Path(c["from"]), Path(c["to"])
                 if c["action"] == "copy":
-                    copy_caption(src, dst, slot.root, c["reason"])
+                    copy_side(src, dst, slot.root, c["reason"])
                 elif src.exists() and not dst.exists():
                     move_file(src, dst)
                     log(slot.root, **{"from": str(src), "to": str(dst)}, kept=d["promotion"]["to"],
@@ -2256,7 +2343,7 @@ def main(argv=None) -> int:
                     print(f"  GONE before the copy, slot left empty, run --undo: {src} -> {dst}")
                     continue
                 if dst.exists():
-                    dst = free_dest(dst, dst.with_suffix(".txt"))
+                    dst = free_dest(dst, pc["exts"])
                     print(f"  planned name was taken, used {dst.name}: {dst}")
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src, dst)
@@ -2264,8 +2351,8 @@ def main(argv=None) -> int:
                     slot_of=str(slot.path), reason="slot sync: the best copy of this picture")
                 moved[slot.root][5] += 1
                 pc["to"] = str(dst)
-                for c in pc["captions"]:
-                    copy_caption(Path(c["from"]), Path(c["to"]), slot.root, c["reason"])
+                for c in pc["sidecars"]:
+                    copy_side(Path(c["from"]), Path(c["to"]), slot.root, c["reason"])
         manifests = {}
         for d in acted:                                            # pass 5: replacement copies
             for rc in d.get("repl_copies", []):
@@ -2286,14 +2373,16 @@ def main(argv=None) -> int:
                 log(root, action="copy", **{"from": str(src), "to": str(dst)}, sha256=file_sha256(dst),
                     replaces=rc["replaces"], reason="replacement: " + rc["why"] + ", carries a watermark")
                 moved[root][6] += 1
-                # its caption: the one of the place it replaces, else the copy's own
-                cap_dst = dst.with_suffix(".txt")
-                own = [Path(mv["cap_to"])] if mv and mv["cap_to"] else []
-                own.append(Path(rc["from"]).with_suffix(".txt"))
-                for cap in [Path(rc["replaces"]).with_suffix(".txt")] + own:
-                    if cap.exists():
-                        copy_caption(cap, cap_dst, root, "caption for a replacement copy")
-                        break
+                # its sidecars, extension by extension: the ones of the place it replaces, else the
+                # copy's own; no caches, the file is there to be changed
+                lend = {}
+                for group in (stem_files(Path(rc["replaces"]))[1], [s["to"] for s in mv["side"]] if mv else [],
+                              good[rc["loser_idx"]].sidecars):
+                    for sc in group:
+                        if sc.suffix.lower() not in lend and sc.suffix.lower() not in CACHE_EXTS and sc.exists():
+                            lend[sc.suffix.lower()] = sc
+                for sc in lend.values():
+                    copy_side(sc, dst.with_suffix(sc.suffix), root, "sidecar for a replacement copy")
                 manifests.setdefault(root, []).append(
                     {"to": str(dst), "from": rc["from"], "replaces": rc["replaces"], "match": rc["match"],
                      "why": rc["why"], "watermark_conf": rc["watermark_conf"],
@@ -2317,7 +2406,7 @@ def main(argv=None) -> int:
         carry_cache(root, entries)
 
     for root, (n_img, n_cap, n_b, n_copied, n_in, n_sync, n_repl) in moved.items():
-        print(f"{root}: moved {n_img} image(s) and {n_cap} caption(s), {n_b / 1e6:.1f} MB "
+        print(f"{root}: moved {n_img} image(s) and {n_cap} sidecar file(s), {n_b / 1e6:.1f} MB "
               f"-> {out_dir(root)}" + (f"; copied {n_copied} caption(s) to kept images" if n_copied else "")
               + (f"; {n_in} image(s) promoted into it" if n_in else "")
               + (f"; {n_sync} slot(s) synced" if n_sync else "")

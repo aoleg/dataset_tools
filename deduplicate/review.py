@@ -6,7 +6,9 @@ Reads <folder>_duplicates/plan.json and shows one group per screen: the kept
 copy and every moved copy, drawn from the files themselves, scaled to fit.
 Click a copy to choose it as the kept one. When you move on to another group,
 the chosen copy returns to its place and the old kept copy moves to
-_duplicates. Press B after the click to keep both instead: the copy returns
+_duplicates; each image takes all the files of its name (captions, caches,
+...) with it, except those that another image of the same stem still needs,
+which are copied. Press B after the click to keep both instead: the copy returns
 and the kept copy stays. Every move is appended to moves.jsonl, so --undo of
 the run still puts everything back. Your position and decisions are saved in
 <first folder>_duplicates/compare/review.json, and the next launch resumes.
@@ -153,28 +155,28 @@ class Review:
             f.write(json.dumps({"time": datetime.now().isoformat(timespec="seconds"), **entry}, ensure_ascii=False) + "\n")
 
     def move(self, m: Member, target: Path, keeper: Path, reason: str) -> bool:
-        """Move a member's image, and its caption, from where it is to target; log both."""
+        """Move a member's image, and its sidecars, from where it is to target; log them all."""
         if m.cur == target or not m.cur.exists():
             return False
-        if target.exists():
-            target = dedup.free_dest(target, target.with_suffix(".txt"))
-        root = self.root_of(m.orig)
         src = m.cur
+        images, sidecars = dedup.stem_files(src)
+        if target.exists():
+            target = dedup.free_dest(target, [sc.suffix for sc in sidecars])
+        root = self.root_of(m.orig)
         dedup.move_file(src, target)
         self.log(root, **{"from": str(src), "to": str(target)}, kept=str(keeper), reason=reason)
-        cap = src.with_suffix(".txt")
-        if cap.exists() and not target.with_suffix(".txt").exists():
-            cdst = target.with_suffix(".txt")
-            shared = any(p.is_file() and p.suffix.lower() in dedup.IMAGE_EXTS and p.stem.casefold() == src.stem.casefold()
-                         for p in src.parent.iterdir())
-            if shared:                       # another image of the same stem stays with the caption
-                shutil.copy2(cap, cdst)
-                self.log(root, action="copy", **{"from": str(cap), "to": str(cdst)}, sha256=dedup.file_sha256(cdst),
-                         reason="review: caption of a moved copy, shared with another image")
+        for sc in sidecars:
+            sdst = target.with_suffix(sc.suffix)
+            if sdst.exists():                # never over a sidecar that is already there
+                continue
+            if images:                       # another image of the same stem stays with the sidecars
+                shutil.copy2(sc, sdst)
+                self.log(root, action="copy", **{"from": str(sc), "to": str(sdst)}, sha256=dedup.file_sha256(sdst),
+                         reason="review: sidecar of a moved copy, shared with another image")
             else:
-                dedup.move_file(cap, cdst)
-                self.log(root, **{"from": str(cap), "to": str(cdst)}, kept=str(keeper),
-                         reason="review: caption of a moved copy")
+                dedup.move_file(sc, sdst)
+                self.log(root, **{"from": str(sc), "to": str(sdst)}, kept=str(keeper),
+                         reason="review: sidecar of a moved copy")
         m.cur = target
         return True
 
@@ -182,7 +184,7 @@ class Review:
         root = self.root_of(m.orig)
         rel = m.orig.relative_to(root) if m.orig.is_relative_to(root) else Path(m.orig.name)
         out = dedup.out_dir(root) / rel
-        return dedup.free_dest(out, out.with_suffix(".txt"))
+        return dedup.free_dest(out, [sc.suffix for sc in dedup.stem_files(m.cur)[1]])
 
     def apply(self, g: Group, keeper: Path, kept_add=()) -> int:
         """Bring the group to: keeper and kept members at their original paths,

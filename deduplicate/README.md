@@ -2,9 +2,9 @@
 
 `dedup.py` finds copies of the same picture in one or more image folders and moves the worse copies out. It is for raw downloads, where the same picture often arrives several times: as other scans, at other sizes, with borders or watermarks, cropped, or as a shop mock-up on a wall or in a frame.
 
-All folders that you give, with all their subfolders, form one pool. In each group of copies the best copy stays. Every other copy, with its `.txt` caption, moves to a `<folder>_duplicates` folder next to the folder that you gave. If the copy that stays has no caption and a moved copy has one, that caption is also copied next to the copy that stays. Nothing is deleted, and `--undo` puts the files back.
+All folders that you give, with all their subfolders, form one pool. In each group of copies the best copy stays. Every other copy moves to a `<folder>_duplicates` folder next to the folder that you gave, together with its sidecars: every other file with the same name and a different extension, such as `.txt`, `.short`, `.json` or `.npz`. If the copy that stays lacks a caption file that a moved copy has, that caption file is also copied next to the copy that stays. Nothing is deleted, and `--undo` puts the files back.
 
-A folder can also be a curated collection, given with `--sorted`. Then a better copy from a raw folder moves into the collection, under the name of the copy it replaces, and the collection's captions stay as they are. See [Sorted folders](#sorted-folders).
+A folder can also be a curated collection, given with `--sorted`. Then a better copy from a raw folder moves into the collection, under the name of the copy it replaces, and the collection's captions and other sidecars stay as they are. See [Sorted folders](#sorted-folders).
 
 ## Install
 
@@ -37,7 +37,7 @@ You can also drop a folder onto `run.bat` in Explorer. There is no prompt: the t
 |---|---|---|
 | `--match` | `loose` | `loose`: hashes plus a feature check; finds other scans, crops, borders, frames, mock-ups and watermarks. `strict`: resized and recompressed copies, hashes only. `exact`: identical files only. |
 | `--dry-run` | off | write `hashes.json` and `plan.json`, move nothing |
-| `--undo` | off | move the files of the last run back to where they were, and remove the captions it copied (a copied caption that was edited since stays). Give the same folders and `--sorted` folders as the run. |
+| `--undo` | off | move the files of the last run back to where they were, and remove the files it copied (a copied file that was edited since stays). Give the same folders and `--sorted` folders as the run. |
 | `--sorted FOLDER` | none | a curated folder whose subfolders are categories; can be given more than once. See [Sorted folders](#sorted-folders). |
 | `--sorted-copies` | `keep` | the same picture in several sorted folders: `keep` keeps every folder's copy and gives each the best copy; `one` keeps a single copy and moves the others out. See [Sorted folders](#sorted-folders). |
 | `--promote-margin X` | 1.0 | the score margin a copy from an unsorted folder needs, in the same bucket, to replace a copy in a sorted folder; a larger bucket always qualifies |
@@ -84,7 +84,7 @@ This is the workflow for a curated collection that receives new downloads. The r
    run.bat D:\data\downloads1 D:\data\downloads2 --sorted D:\data\collection --undo
    ```
 
-   It puts everything back, including the copies it placed into the collection, and skips any copied caption you have edited since.
+   It puts everything back, including the copies it placed into the collection, and skips any copied file you have edited since.
 
 For larger datasets:
 
@@ -128,7 +128,7 @@ compare.bat D:\data\downloads --skip-exact --review
 
 The first opens the review of the last run in that folder at any time. The second runs the tool and opens the review right after it. The third builds the sheets and the list first, then opens the review.
 
-Each screen shows the kept copy with a green frame and every moved copy, labelled with name, size, bucket, score, match kind and folder. Click a copy to choose it as the kept one; the frame turns yellow. When you move on to another group, the chosen copy returns to its place and the old kept copy moves to `_duplicates`, with its caption, like any other copy. Press `B` after the click to keep both instead: the copy returns and the kept copy stays. Every move is appended to `moves.jsonl`, so `--undo` of the run still puts everything back, including your changes.
+Each screen shows the kept copy with a green frame and every moved copy, labelled with name, size, bucket, score, match kind and folder. Click a copy to choose it as the kept one; the frame turns yellow. When you move on to another group, the chosen copy returns to its place and the old kept copy moves to `_duplicates`, with its sidecars, like any other copy. Press `B` after the click to keep both instead: the copy returns and the kept copy stays. Every move is appended to `moves.jsonl`, so `--undo` of the run still puts everything back, including your changes.
 
 | key | action |
 |---|---|
@@ -146,13 +146,13 @@ The help is shown at the top until you hide it. Your position and your decisions
 
 ## Where the files go
 
-Each copy that moves keeps its path relative to the folder that you gave. For example, with `run.bat D:\data`, the file `D:\data\set2\a.jpg` moves to `D:\data_duplicates\set2\a.jpg`, and `D:\data\set2\a.txt` moves with it. If you give several folders, each one gets its own `_duplicates` folder next to it for its own files, but copies are found across all of them.
+Each copy that moves keeps its path relative to the folder that you gave. For example, with `run.bat D:\data`, the file `D:\data\set2\a.jpg` moves to `D:\data_duplicates\set2\a.jpg`, and `D:\data\set2\a.txt`, `D:\data\set2\a.short` and every other file called `a` with another extension move with it. If you give several folders, each one gets its own `_duplicates` folder next to it for its own files, but copies are found across all of them.
 
 The `_duplicates` folder is next to the folder, not inside it, because a trainer that reads all subfolders (Ostris AI Toolkit trains every subfolder whose name does not start with a dot) would train the moved copies again. It holds a `_dataset_tools.json` file that marks it as made by the dataset tools, so no tool of this repository scans it. If a folder of that name exists without the mark and is not empty, the tool stops and asks you to rename it. A drive root has no folder next to it, so give a subfolder. Until 2026-10-11 the folder was `_duplicates` inside the folder; the next run, `--undo`, `compare.bat` or `review.bat` moves it out, and the logs and plans of earlier runs still work. Move a folder and its `_duplicates` folder together, or `--undo` finds no log. The one exception is a copy that moves into a sorted folder, described in [Sorted folders](#sorted-folders).
 
-A name that is already taken in `_duplicates` gets ` (1)`, ` (2)` and so on. A caption stays in place if another image with the same name (for example `a.png` next to `a.jpg`) stays in the folder.
+A name that is already taken in `_duplicates` gets ` (1)`, ` (2)` and so on. The sidecars stay in place if another image with the same name (for example `a.png` next to `a.jpg`) stays in the folder.
 
-If the copy that stays has no caption, the tool copies the caption of a moved copy next to it and renames it to match: for `b.jpg` that stays and `a.jpg` that moves, `a.txt` is copied to `b.txt`. If several moved copies have captions, the caption of the best of them is used (same ranking as below, then the oldest file). An existing caption is never overwritten. The moved copy keeps its own caption in `_duplicates`.
+A caption file is a file with one of the extensions `.txt`, `.short`, `.caption` or `.json`. The tool copies caption files one extension at a time. If the copy that stays has no `.short`, for example, and a moved copy has one, that `.short` is copied next to the copy that stays and renamed to match: for `b.jpg` that stays and `a.jpg` that moves, `a.short` is copied to `b.short`. If several moved copies have a file of that extension, the one of the best of them is used (same ranking as below, then the oldest file). Other sidecars, such as latent caches, are never copied from one image to another. An existing file is never overwritten. The moved copy keeps all its own files in `_duplicates`.
 
 Each `_duplicates` folder also holds:
 
@@ -161,7 +161,7 @@ Each `_duplicates` folder also holds:
 | `hashes.json` | hashes and scores of every image of that folder; a second run reads them and processes only new or changed files. A file that a run moved or copied into a sorted folder is entered there too, so it is not hashed again. |
 | `verified.json` | feature-check results, keyed by the content of both images |
 | `plan.json` | a `summary` with the counts of the run, then every group: the kept copy, the moved copies with their destinations, the reason, the tier and score of each, the match details, and with sorted folders the role report, the `slots`, the `promote` and `sync` placements, or `review` and `members` for a group nothing moves in |
-| `moves.jsonl` | one line per moved file, per copied caption (`action: copy`, with a hash), per promoted file (`action: promote`) and per synced slot (`action: copy`); `--undo` reads it |
+| `moves.jsonl` | one line per moved file, per copied file (`action: copy`, with a hash), per promoted file (`action: promote`) and per synced slot (`action: copy`); `--undo` reads it |
 
 ## Sorted folders
 
@@ -169,18 +169,19 @@ A sorted folder is a curated tree: its subfolders are the categories, and its fi
 
 When a copy in an unsorted folder is better than the copy in a sorted folder, the unsorted copy moves into the sorted copy's place: the same folder, the same name, its own extension. The worse sorted copy goes to the sorted folder's `_duplicates`, like any other copy. Better means a larger bucket, or a score at least `--promote-margin` higher in the same bucket, and the two copies must match by hash, not only by features. Equal copies keep the sorted one. The rest of the group, the other unsorted copies, moves to `_duplicates` as usual.
 
-A caption in a sorted folder is never moved, overwritten or edited:
+A caption or other sidecar in a sorted folder is never moved, overwritten or edited, except the latent caches of the copy that is replaced (see below). The rules work one extension at a time:
 
-- The caption of the slot stays, and the new file takes it over by name. The moved-out copy gets a copy of it in `_duplicates`.
-- If the new file needs another name, because an image of the same stem stays (for example `1.png` next to the moved-out `1.jpg`), it becomes `1 (1).png`, and `1 (1).txt` is a copy of `1.txt`.
-- If the slot has no caption and the new file has one, that caption moves with it and takes the slot's name.
-- If both have one, the sorted caption wins. The unsorted caption moves to the unsorted folder's `_duplicates`.
+- The sidecars of the slot stay, and the new file takes them over by name. The moved-out copy gets a copy of each of them in `_duplicates`.
+- If the new file needs another name, because an image of the same stem stays (for example `1.png` next to the moved-out `1.jpg`), it becomes `1 (1).png`, and `1 (1).txt` is a copy of `1.txt`, `1 (1).short` a copy of `1.short`, and so on.
+- If the slot lacks a file of some extension and the new file has one, that file moves with the new file and takes the slot's name.
+- If both have a file of the same extension, the sorted file wins. The unsorted file moves to the unsorted folder's `_duplicates`.
+- The files `.npz` and `.safetensors` of the replaced sorted copy are latent and text encoder caches of its pixels. They move out with it, so that a trainer does not read them for the new picture. The new file brings its own.
 
 Nothing moves in a group when the unsorted copy and the sorted copy match by features only, so that a border, a crop, a frame or a footer differs. A higher score does not mean a better picture then: on real folders, every such case was a photo of a print or a catalogue page replacing a clean scan. The plan lists such groups with a `review` field, and the summary counts them.
 
 ### The same picture in several sorted folders
 
-A sorted tree can hold one picture under several categories, and the copies can differ in quality. The default, `--sorted-copies keep`, keeps every folder's copy and gives each one the best copy of the group. In each folder one slot survives, the best copy in that folder, and a second copy in the same folder moves out as usual. Every surviving slot whose image matches the best copy by hash gets the best copy: the slot's own image moves to `_duplicates`, the best copy is placed under the slot's name, and the slot's caption stays, exactly as for a promotion. A slot without a caption gets a copy of the best copy's caption. A slot whose image is byte-identical to the best copy is left as it is, and so is a slot whose image matches by features only; the plan says so under `slots`. With `--sorted-copies one` a single slot survives across all sorted folders, the one of the best copy, and the other sorted copies move to `_duplicates` together with their captions.
+A sorted tree can hold one picture under several categories, and the copies can differ in quality. The default, `--sorted-copies keep`, keeps every folder's copy and gives each one the best copy of the group. In each folder one slot survives, the best copy in that folder, and a second copy in the same folder moves out as usual. Every surviving slot whose image matches the best copy by hash gets the best copy: the slot's own image moves to `_duplicates`, the best copy is placed under the slot's name, and the slot's sidecars stay, exactly as for a promotion. A slot that lacks a sidecar that the best copy has gets a copy of it. A slot whose image is byte-identical to the best copy is left as it is, and so is a slot whose image matches by features only; the plan says so under `slots`. With `--sorted-copies one` a single slot survives across all sorted folders, the one of the best copy, and the other sorted copies move to `_duplicates` together with their sidecars.
 
 The dry run shows the final name of every file, also the ` (N)` names. `--undo` needs the same `--sorted` arguments as the run.
 
@@ -197,7 +198,7 @@ Every copy gets one of three classes from its strongest detection: watermarked a
 - A clean unsorted copy replaces a watermarked sorted copy when it reaches a larger bucket, or the same bucket with a score not more than `--promote-margin` below. The margin is a tolerance here, not a requirement. A clean copy from a smaller bucket, or more than the margin worse, goes to the review list, and nothing moves in that group.
 - The framing guard is unchanged: a clean copy that matches the sorted copy by features only goes to the review list. Heavy watermarks often break the hash match, so expect such groups there.
 
-A watermarked copy that is much better than the copy that stays, a bucket up or `--promote-margin` or more higher in the same bucket, is not only moved to `_duplicates`. A copy of it also goes to `<folder>_replacements` next to the folder of the copy it would replace, under that copy's relative path, stem and extension, with a copy of that copy's caption. When the formats differ, the copy is converted to the target's format: JPEG at quality 97 without chroma subsampling, PNG lossless. Run the watermark tool on that folder and copy the cleaned files over the originals; the names match, so nothing sits next to anything. `replacements.json` in the folder lists for each file which file it replaces, the match kind, the detection confidence and why it qualified. A replacement that matched by features only may differ in framing, so look at it before you copy it over. The folder carries no `_dataset_tools.json` mark, because the watermark tool refuses a marked folder; no tool of this repository scans it unless you give it. `--undo` removes the replacement copies it wrote, unless their bytes changed since, and removes the folder when it is empty.
+A watermarked copy that is much better than the copy that stays, a bucket up or `--promote-margin` or more higher in the same bucket, is not only moved to `_duplicates`. A copy of it also goes to `<folder>_replacements` next to the folder of the copy it would replace, under that copy's relative path, stem and extension, with copies of that copy's sidecars (or of the watermarked copy's own, for the extensions the first has none of), without the latent caches, because the file is meant to be changed. When the formats differ, the copy is converted to the target's format: JPEG at quality 97 without chroma subsampling, PNG lossless. Run the watermark tool on that folder and copy the cleaned files over the originals; the names match, so nothing sits next to anything. `replacements.json` in the folder lists for each file which file it replaces, the match kind, the detection confidence and why it qualified. A replacement that matched by features only may differ in framing, so look at it before you copy it over. The folder carries no `_dataset_tools.json` mark, because the watermark tool refuses a marked folder; no tool of this repository scans it unless you give it. `--undo` removes the replacement copies it wrote, unless their bytes changed since, and removes the folder when it is empty.
 
 The detections go into `hashes.json` next to the hashes and scores, per detector, with every box and its confidence down to 0.01, so a run with other thresholds or another detector choice reuses them; a detector that is missing from an entry is run alone and added. A run without `--watermark` keeps them and ignores them. The plan shows the class and the confidence of every copy, and the summary counts the groups that hold a watermarked and a clean copy, the groups in which the watermark decided against the better copy, and the replacement copies. `compare.bat` and `review.bat` show the class next to the score.
 
@@ -225,11 +226,11 @@ Quality is measured the k2prep way: each copy is cropped and resized to the buck
 1. The copy that reaches the largest bucket stays.
 2. In the same bucket, the higher score stays.
 3. Exception: a copy from a smaller bucket stays if it scores 3 or more points higher than the larger copy. A badly compressed large copy then loses to a clean smaller one.
-4. Scores less than 0.1 apart count as equal. Then a copy in a sorted folder stays; then the copy with a `.txt` caption; if both or neither have one, the oldest file (modification time) stays; then the first folder on the command line, then the first path in alphabetical order.
+4. Scores less than 0.1 apart count as equal. Then a copy in a sorted folder stays; then the copy with a caption file; if both or neither have one, the oldest file (modification time) stays; then the first folder on the command line, then the first path in alphabetical order.
 5. With sorted folders, a copy from an unsorted folder replaces a copy in a sorted folder only when it reaches a larger bucket or scores `--promote-margin` higher in the same bucket, and only on a hash match. Otherwise the sorted copy stays although the unsorted copy scored higher. The margin was set on a real collection: below 1.0, the same-bucket differences were resolution steps inside the 1024 bucket, which the bucketed score cannot see.
 6. With `--watermark`, a clean copy stays over a watermarked one before any of the above, and a clean unsorted copy replaces a watermarked sorted copy unless it is a bucket down or more than the margin worse. See [Watermarks](#watermarks).
 
-A caption does not make a copy win: quality decides. The caption is copied instead, as described in [Where the files go](#where-the-files-go).
+A caption does not make a copy win: quality decides. The caption files are copied instead, as described in [Where the files go](#where-the-files-go).
 
 ## Speed
 
