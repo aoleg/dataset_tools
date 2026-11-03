@@ -37,12 +37,12 @@ def scan_scope(scope_dir: Path) -> dict[int, str]:
 
 
 def move_pair(src: Path, dst: Path) -> None:
-    """Move an image and its caption (and a JSON sidecar, if any); refuse to overwrite."""
+    """Move an image and its captions (and a JSON sidecar, if any); refuse to overwrite."""
     if dst.exists():
         raise FileExistsError(f"{dst} exists")
     dst.parent.mkdir(parents=True, exist_ok=True)
     os.replace(src, dst)
-    for ext in (".txt", ".json"):
+    for ext in layout.SIDECARS:
         s2, d2 = src.with_suffix(ext), dst.with_suffix(ext)
         if s2.exists():
             os.replace(s2, d2)

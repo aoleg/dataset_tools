@@ -74,6 +74,7 @@ class Options:
     json_files: bool = False
     json_sidecar: bool = False
     comments: bool = False
+    colour: bool = True               # tell black-and-white from colour (an import with --top none does not)
     display: str = "live"
 
     @property
@@ -97,6 +98,8 @@ class Job:
     borders: dict = None
     comments: dict = None
     caption: str | None = None        # an import: the source's caption (raw)
+    sidecars: dict = None             # an import: the source's other sidecars, copied as they are
+    written: list = None              # an import: the sidecars written next to the image
     t_fetch: float = 0.0
 
 
@@ -106,7 +109,7 @@ def cleanup_interrupted(store: Store, base: Path, scope: str) -> int:
     for cid, path in rows:
         if path:
             img = base / path
-            for f in (img, img.with_suffix(".txt"), img.with_suffix(".json")):
+            for f in (img, *(img.with_suffix(e) for e in layout.SIDECARS)):
                 f.unlink(missing_ok=True)
         store.unclaim(cid)
     return len(rows)
@@ -183,6 +186,7 @@ class Stream:
         if o.borders:
             job.borders = pr.borders_plan(job.array, {"dark": o.dark_borders})
         job.caption = importer.read_caption(path)
+        job.sidecars = importer.read_sidecars(path)
         job.t_fetch = time.perf_counter() - t0
         return job
 
@@ -297,7 +301,7 @@ class Stream:
             s.time("paint", time.perf_counter() - t)
         final = painted if painted is not None else crop
         t = time.perf_counter()
-        tone = colour.scores(final, plan["wm_inside"], o.wm_dilate)    # painted boxes left out
+        tone = colour.scores(final, plan["wm_inside"], o.wm_dilate) if o.colour else None  # painted boxes left out
         s.time("colour", time.perf_counter() - t)
         vec = verdict = None
         if self.classifier is not None:
@@ -316,7 +320,8 @@ class Stream:
                     raise pr.Rejected(self.against.reason(hit))
             verdict = self.classifier.decide(vec)
             s.time("classify", time.perf_counter() - t)
-        tone = colour.decide(tone, self.mode_probe, vec)
+        if tone is not None:
+            tone = colour.decide(tone, self.mode_probe, vec)
         return plan, boxes, painted, vec, verdict, final.shape[1], final.shape[0], final, tone
 
     # --- writer threads ------------------------------------------------------------
@@ -333,8 +338,10 @@ class Stream:
         folder = verdict.folder if verdict else ""
         scope = job.scope
         chunker = self.chunkers[scope]
-        tone = tone or colour.decide({"off_hue": 0.0, "strong": 0.0, "tone": 0.0})
-        rel_scope = chunker.place(layout.with_mode(chunker.sc, tone["mode"], folder), f"{layout.stem_of(job.cid)}{ext}")
+        if o.colour:
+            tone = tone or colour.decide({"off_hue": 0.0, "strong": 0.0, "tone": 0.0})
+        tone_mode = tone["mode"] if tone else None
+        rel_scope = chunker.place(layout.with_mode(chunker.sc, tone_mode, folder), f"{layout.stem_of(job.cid)}{ext}")
         rel = chunker.rel(rel_scope)
         path = o.base / rel
         d.set(f"{job.cid}: saving {rel_scope}")
@@ -345,9 +352,8 @@ class Stream:
             path.write_bytes(data)
             if self.source is not None:
                 import importer
-                facts = importer.clean_caption(job.caption) if job.caption else ""
-                if facts:                                     # no caption left: no .txt
-                    path.with_suffix(".txt").write_text(facts, encoding="utf-8")
+                facts = importer.clean_caption(job.caption) if job.caption else ""   # none left: no .txt
+                job.written = importer.write_sidecars(path, facts, job.sidecars or {})
             else:
                 facts = sidecars.caption(job.photo, o.txt_fields)
                 path.with_suffix(".txt").write_text(facts, encoding="utf-8")
@@ -363,17 +369,17 @@ class Stream:
             counters = self.counters(job, plan, mode, folder, boxes, tone)
             self.store.finish(job.cid, scope, {"category": folder, "path": rel, "sha256": sha, "bytes": len(data),
                                                     "width": fw, "height": fh, "changed": plan["changed"],
-                                                    "mode": tone["mode"]},
+                                                    "mode": tone_mode},
                               doc, emb, counters)
         except BaseException:
             chunker.abandon(rel_scope)
-            for f in (path, path.with_suffix(".txt"), path.with_suffix(".json")):
+            for f in (path, *(path.with_suffix(e) for e in layout.SIDECARS)):
                 f.unlink(missing_ok=True)
             self.store.unclaim(job.cid)
             raise
         chunker.done(rel_scope)          # may move the category's images into 001 now that it passed the split
         if self.exporter is not None:
-            self.exporter.add(job.cid, self.store.status(job.cid)["path"], tone["mode"], folder)
+            self.exporter.add(job.cid, self.store.status(job.cid)["path"], tone_mode, folder)
         s.time("write", time.perf_counter() - t)
         if self.captioner is not None:
             # after the photo is committed: a wait here (the VLM is behind) slows the stream, nothing else
@@ -382,7 +388,7 @@ class Stream:
         s.add(done=1)
         d.advance(saved=True)
         d.line({"cid": job.cid, "state": DONE, "path": rel, "write": mode, "changed": plan["changed"],
-                "colour": tone["mode"],
+                "colour": tone_mode,
                 "class": verdict.cls if verdict else None})
 
     def record_json(self, job: Job, plan, boxes, mode, rel, data, sha, fw, fh, verdict, tone=None) -> str:
@@ -400,7 +406,8 @@ class Stream:
                                      "stored_size": list(enc.size_of(data)),
                                      "orientation": job.head["orientation"] if mode != "array" else 1}}
             return importer.record_json(job.cid, p["name"], p["src"], job.data, job.caption, processing,
-                                        verdict.as_dict() if verdict else None, {**self.tool, "scope": job.scope})
+                                        verdict.as_dict() if verdict else None, {**self.tool, "scope": job.scope},
+                                        job.written)
         download = {"url": f"{IMG}/a/{p['file']}", "bytes": len(job.data), "sha256": hashlib.sha256(job.data).hexdigest(),
                     "content_type": job.ctype, "format": job.head["format"], "stored_size": job.head["stored"],
                     "orientation": job.head["orientation"], "mcu": job.head["mcu"]}

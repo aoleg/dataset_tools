@@ -66,6 +66,7 @@ UKRAINE_PRESETS = [          # name, regions, comment
 # --- setup -------------------------------------------------------------------------------
 
 IMPORT_COMMANDS = ("reclassify", "cleanup", "cherrypick", "autocaption", "scopes")
+IMPORT_TOPS = ("color", "category", "none")
 
 
 def no_open_review(store: Store, base: Path, command: str) -> None:
@@ -622,9 +623,10 @@ def run_locked(args, conf, client, base: Path, store: Store, sm) -> int:
     return 0
 
 
-def load_models(args, conf: cf.Conf) -> tuple:
-    """The watermark detector and LaMa, the classifier with its quality probe, and the colour
-    probe, all resident on the GPU. -> (vram monitor, detector, lama, classifier, colour probe)"""
+def load_models(args, conf: cf.Conf, quality: float | None = None, colour_probe: bool = True) -> tuple:
+    """The watermark detector and LaMa, the classifier with its quality probe (at quality,
+    default the conf's threshold), and the colour probe, all resident on the GPU.
+    -> (vram monitor, detector, lama, classifier, colour probe)"""
     import vram as vr
     vram = vr.VramMonitor().start()
     print("Loading the models ...", flush=True)
@@ -642,11 +644,13 @@ def load_models(args, conf: cf.Conf) -> tuple:
         import classifier as clf
         samples = Path(args.samples).resolve() if args.samples else conf.samples
         classifier = clf.Classifier(samples, args.patches, args.min_confidence,
-                                    priority_margin=margin_of(args, conf), quality_threshold=quality_of(conf))
+                                    priority_margin=margin_of(args, conf),
+                                    quality_threshold=quality_of(conf) if quality is None else quality)
         classifier.embed(np.zeros((64, 64, 3), np.uint8))         # load the encoder now
         print(f"  classifier: {len(classifier.class_names)} classes from {samples}", flush=True)
-        import colour
-        mode_probe = colour.probe_from_samples(samples, classifier.sample_vectors)
+        if colour_probe:
+            import colour
+            mode_probe = colour.probe_from_samples(samples, classifier.sample_vectors)
     if torch.cuda.is_available():
         print(f"  loaded in {time.time() - t0:.0f} s; GPU memory in use {torch.cuda.memory_allocated() / 2**30:.1f} GB",
               flush=True)
@@ -683,25 +687,35 @@ def cmd_import(args, conf, client) -> int:
     if store.is_import:
         if Path(store.get_meta("source")) != src:
             raise SystemExit(f"{out} is the import of {store.get_meta('source')}, not of {src}")
+        split = bool(store.get_meta("bw_color"))
+        if args.top and (args.top != "none") != split:
+            raise SystemExit(f"{out} was made {'with' if split else 'without'} black-and-white and colour folders; "
+                             f"--top {args.top} cannot change that. Import into a new folder (-o) instead")
     else:
+        top = args.top or ("none" if conf.bw_color is False else
+                           "color" if export_layout_of(conf) == layout.COLOR_FIRST else "category")
+        split = top != "none"
         store.set_meta("kind", importer.KIND)
         store.set_meta("source", str(src))
         store.set_meta("layout", "flat")
-        store.set_meta("bw_color", True if conf.bw_color is None else bool(conf.bw_color))
-        store.set_meta("tree_order", export_layout_of(conf))
+        store.set_meta("bw_color", split)
+        store.set_meta("tree_order", top_order(top) or export_layout_of(conf))
         layout.use_names(store.names())
+    if args.top:
+        store.set_meta("top", args.top)
+    quality = quality_for(store, conf, args.quality_threshold)
     if args.against:
         store.set_meta("against", str(Path(args.against).resolve()))
     against_base = store.get_meta("against")
-    order = export_layout_of(conf)
+    order = import_order(store, conf)
     name = layout.slug(src.name) or "import"
     sc = store.scope(name)
     if sc is None:
         sc = store.add_scope(name, [], (0, 0), None, args.split, label=name, width=3 if args.split > 0 else 0,
                              folder="")
     with locked(store, "import"):
-        if store.get_meta("tree_order") != order:
-            print(f"Moving the saved photos into {order} folders (export_layout of the conf) ...", flush=True)
+        if split and store.get_meta("tree_order") != order:
+            print(f"Moving the saved photos into {order} folders ({import_order_source(store)}) ...", flush=True)
             n = importer.reorder(store, out, sc, order)
             print(f"  {n:,} photos moved")
             sc = store.scope(name)
@@ -709,16 +723,24 @@ def cmd_import(args, conf, client) -> int:
         print(f"Import of {src} into {out}: {res['new']:,} new images listed ({res['known']:,} known before"
               + (f"; {res['renamed']:,} renamed because the name was taken" if res["renamed"] else "") + ")",
               flush=True)
+        tree = ("<category>" if not split else
+                "<category>/<bw|color>" if order == layout.CATEGORY_FIRST else "<bw|color>/<category>")
+        print(f"  tree {tree}, quality threshold {quality:g}"
+              + (" (off)" if not quality else ""), flush=True)
         n = sm.cleanup_interrupted(store, out, name)
         if n:
             print(f"  {n} photos were being written when the last import stopped; they are done again")
+        added = importer.sync_sidecars(store, out, src, name)
+        if added:
+            print("  sidecars copied for photos imported before: "
+                  + ", ".join(f"{n:,} {ext}" for ext, n in sorted(added.items())), flush=True)
         total = store.scope_counts(name)["total"]
         pairs = store.pending_pairs([name], args.retries)
         if not pairs:
             print(f"Nothing to do: all {total:,} images are processed.")
             return 0
         args.no_classify = False
-        vram, detector, lama, classifier, mode_probe = load_models(args, conf)
+        vram, detector, lama, classifier, mode_probe = load_models(args, conf, quality, colour_probe=split)
         against = None
         if against_base:
             against = importer.Against(Path(against_base), classifier.model_id, classifier.patches)
@@ -726,7 +748,7 @@ def cmd_import(args, conf, client) -> int:
                           wm_conf=args.wm_conf, wm_paint_conf=args.wm_paint_conf, wm_mode=args.wm_mode,
                           borders=not args.no_borders, dark_borders=not args.no_dark, fetchers=args.threads,
                           depth=args.depth, writers=args.writers, report_every=args.report_every, limit=args.limit,
-                          retries=args.retries, json_files=False,
+                          retries=args.retries, json_files=False, colour=split,
                           display="json" if args.json_progress else "quiet" if args.quiet else "live")
         s = sm.Stream(client, store, opts, classifier, detector, lama, None, vram, mode_probe, None,
                       source=src, against=against)
@@ -796,11 +818,11 @@ def cmd_reclassify(args, conf, client) -> int:
         import liveexport as lx
         exporter = lx.Exporter(store, base, conf.split, order=export_layout_of(conf)) \
             if lx.Exporter.exists_for(store) and not args.dry_run else None
-        if store.is_import and not args.dry_run and not args.undo:
+        if store.is_import and store.get_meta("bw_color") and not args.dry_run and not args.undo:
             import importer
-            order = export_layout_of(conf)
+            order = import_order(store, conf)
             if store.get_meta("tree_order") != order:
-                print(f"Moving the saved photos into {order} folders (export_layout of the conf) ...", flush=True)
+                print(f"Moving the saved photos into {order} folders ({import_order_source(store)}) ...", flush=True)
                 for sc in scopes:
                     print(f"  {importer.reorder(store, base, sc, order):,} photos moved")
                 scopes = [store.scope(sc["name"]) for sc in scopes]
@@ -817,7 +839,7 @@ def cmd_reclassify(args, conf, client) -> int:
             samples = Path(args.samples).resolve() if args.samples else conf.samples
             classifier = clf.Classifier(samples, args.patches, args.min_confidence,
                                         priority_margin=margin_of(args, conf),
-                                        quality_threshold=quality_of(conf))
+                                        quality_threshold=quality_for(store, conf))
         against = None
         if classifier is not None and store.is_import and store.get_meta("against"):
             import importer
@@ -860,7 +882,10 @@ def cmd_reclassify(args, conf, client) -> int:
             if not confirm(f"This deletes {low + wide + copies:,} photos, {', '.join(what)}; they are never {again} "
                            f"again, and --undo cannot bring them back. Continue? [y/N] ", args.yes):
                 print("Nothing done. quality_threshold = 0 and max_aspect = 0 in [defaults] of the conf reclassify "
-                      "without deleting.")
+                      "without deleting" + (" (this import keeps the quality threshold it was given: import "
+                                            "--quality-threshold 0 changes it)"
+                                            if store.is_import and store.get_meta("quality_threshold") is not None
+                                            else "") + ".")
                 return 1
         for sc, p in plans:
             res = rc.apply(store, base, sc, p, str(samples), exporter=exporter)
@@ -1081,6 +1106,11 @@ def cmd_cherrypick(args, conf, client) -> int:
     balance = args.balance if args.balance is not None else (50 if c["per_category"] is not None else None)
     if balance is not None and not 0 <= balance <= 100:
         raise SystemExit(f"--balance {balance}: a percentage of colour photos, 0 to 100")
+    no_modes = store.is_import and not store.get_meta("bw_color")
+    if no_modes:
+        if args.balance is not None:
+            raise SystemExit("--balance: this import does not tell black-and-white from colour (--top none)")
+        balance = None
     decades = cp.parse_decades(args.decades)
     if decades and store.is_import:
         raise SystemExit("--decades: an import has no years")
@@ -1106,8 +1136,9 @@ def cmd_cherrypick(args, conf, client) -> int:
         print(cp.table_text(table), flush=True)
         criteria = {"base": str(base), **{k: v for k, v in c.items() if v is not None}, "balance": balance,
                     "decades": decades, "categories": args.category or [], "samples": str(samples)}
-        res = cp.write(picked, base, out, criteria, export_layout_of(conf), args.split, args.link, args.prune,
-                       args.dry_run)
+        res = cp.write(picked, base, out, criteria, None if no_modes else export_layout_of(conf), args.split,
+                       args.link, args.prune, args.dry_run,
+                       sidecars=layout.SIDECARS if store.is_import else cp.SIDECARS)
         if args.dry_run:
             print(f"Dry run: {res['new']:,} to copy into {out}, {res['there']:,} there already, "
                   f"{res['stale']:,} files of this base there that are no longer picked")
@@ -1231,6 +1262,34 @@ def export_layout_of(conf: cf.Conf) -> str:
         conf.export_layout_in_file = True
         print(f"  export_layout = {conf.export_layout} written into [defaults] of {conf.path}")
     return conf.export_layout
+
+
+def top_order(top: str | None) -> str | None:
+    """--top of an import -> the order of its tree (None: none, or not given)."""
+    return {"color": layout.COLOR_FIRST, "category": layout.CATEGORY_FIRST}.get(top)
+
+
+def import_order(store: Store, conf: cf.Conf) -> str:
+    """The order of an import's tree: the one its --top named, else export_layout of the conf."""
+    return top_order(store.get_meta("top")) or export_layout_of(conf)
+
+
+def import_order_source(store: Store) -> str:
+    top = store.get_meta("top")
+    return f"--top {top}" if top_order(top) else "export_layout of the conf"
+
+
+def quality_for(store: Store, conf: cf.Conf, given: float | None = None) -> float:
+    """The quality threshold of a base: the one given (an import remembers it), else the
+    one the import was given before, else [defaults] quality_threshold of the conf."""
+    if given is not None:
+        if not 0 <= given <= 1:
+            raise SystemExit(f"--quality-threshold {given}: give a P(bad) from 0 (off) to 1")
+        if store.is_import:
+            store.set_meta("quality_threshold", given)
+        return given
+    q = store.get_meta("quality_threshold") if store.is_import else None
+    return quality_of(conf) if q is None else float(q)
 
 
 def margin_of(args, conf: cf.Conf) -> float:
@@ -1544,6 +1603,13 @@ def parse_args(argv=None):
                         "the import deletes the copies found later (remembered; give it once)")
     p.add_argument("--split", type=int, default=0, metavar="N",
                    help="numbered folders of at most N images (default 0: none); set when the import is made")
+    p.add_argument("--top", choices=IMPORT_TOPS,
+                   help="the top of the tree: color (bw/<category>), category (<category>/bw) or none (<category>, "
+                        "no black-and-white or colour detection). Default: bw_color and export_layout of the conf. "
+                        "Remembered; color and category can be swapped later, none cannot be changed")
+    p.add_argument("--quality-threshold", type=float, metavar="X",
+                   help="skip photos the quality probe scores at or above this P(bad); 0: off (default: [defaults] "
+                        "quality_threshold of the conf). Remembered, also by reclassify of the import")
     p.add_argument("--samples", metavar="DIR", help="classify samples folder (default: [paths] samples of the conf)")
     p.add_argument("--min-confidence", type=float, default=0.7, metavar="X",
                    help="below this the record marks the photo as doubtful; it still goes to its best-guess category")

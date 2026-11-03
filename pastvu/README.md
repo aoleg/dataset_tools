@@ -170,7 +170,7 @@ run.bat cleanup --done | --undo
 run.bat captions <scope> [...] [--txt-fields LIST] [--dry-run]
 run.bat autocaption <scope or folder> [...] [--limit N] [--recaption] [--undo]
 run.bat export <scope> [...] [--format jsonl|parquet]
-run.bat import --dataset <folder> [-o <folder>] [--against <base>] [--split N] [--limit N]
+run.bat import --dataset <folder> [-o <folder>] [--against <base>] [--top color|category|none] [--quality-threshold X] [--split N] [--limit N]
 run.bat --base <import folder> reclassify [--dry-run] [--yes]
 run.bat cherrypick <0.85 | 30 | 5000> [...] -o <folder> [--balance 70] [--decades 1960s 1970s] [--link] [--prune]
 run.bat extract <category> [...] [--region R] [--years A B | --decade D] [--bw | --color] [--min-res N]
@@ -580,20 +580,24 @@ Hard-links every saved photo into `pastvu_export` next to the base folder as it 
 ```
 run.bat import --dataset D:\datasets\photos --against D:\pastvu
 run.bat import --dataset D:\datasets\photos -o D:\imported\photos --against D:\pastvu
+run.bat import --dataset D:\datasets\captioned -o D:\imported\captioned --top none --quality-threshold 0.95
 run.bat --base D:\imported\photos reclassify
 ```
 
 Processes a folder of images that this tool did not download, for example reposts from Telegram channels, with every stage of a download, into a folder of its own. The source is only read.
 
 - **The output folder** is `-o`, the imported dataset itself; without `-o` it is `<source>_pastvu` next to the source. The import stops and asks for `-o` when it cannot write there. The base folder of the conf does not apply. The output folder holds the images, their captions, its own store `pastvu.db` (with the embeddings) and `_reports`.
-- **The tree** follows `export_layout` of the conf: `<category>\bw\` and `<category>\color\` (`categories_first`, the default), or `bw\<category>\` and `color\<category>\` (`color_first`). There are no years, decades or places. Numbered folders are off; `--split N` turns them on when the import is made.
+- **The tree** is set by `--top`: `category` gives `<category>\bw\` and `<category>\color\`, `color` gives `bw\<category>\` and `color\<category>\`, and `none` gives `<category>\` only, with no black-and-white or colour detection. Without `--top`, the conf decides: `bw_color = no` is `none`, else `export_layout` (`categories_first` is `category`, `color_first` is `color`). The import remembers `--top`, so a later import or reclassify keeps it; an import made without it follows the conf. You can change `color` to `category` and back at a later import (every photo moves into the new order). You cannot change `none` to a split tree or a split tree to `none`: import into a new folder. There are no years, decades or places. Numbered folders are off; `--split N` turns them on when the import is made.
 - **File names** stay those of the source. The category folders of the source are ignored: every photo is sorted again with your samples folder, like a download.
-- **The stages:** `--min-side` (512) and `max_aspect` (21:9), borders, watermarks, the quality probe, black-and-white or colour, and the category. There is no PastVu band to cut. A photo that fails a filter is not copied, and the store remembers it, so a second import does not look at it again.
+- **The stages:** `--min-side` (512) and `max_aspect` (21:9), borders, watermarks, the quality probe, black-and-white or colour (not with `--top none`), and the category. There is no PastVu band to cut. A photo that fails a filter is not copied, and the store remembers it, so a second import does not look at it again.
+- **The quality threshold** is `quality_threshold` of the conf. `--quality-threshold X` replaces it for this import (0 turns the probe off). The import remembers the value, and reclassify of the import uses it too. A photo skipped at the old threshold is not looked at again.
 - **The caption** is the source's `.txt` without hashtags, links (`http`, `www`, `t.me`) and @mentions. A photo whose caption is then empty, or that has none, gets no `.txt`. The record in the store keeps the original text.
+- **Other sidecars** go with the image unchanged: `.short` (the one-sentence caption; `.small` is the same under another name), `.caption` and `.json`. A photo that has a `.txt` and a `.short` (or `.small`) but no `.json` gets a MOSS-Image JSON caption made of the two, as [moss-caption.py](../scripts/moss-caption.py) makes it: `{"caption": {"long": <.txt>, "short": <.short>}}`. A `.txt` alone or a `.short` alone makes no `.json`. The `.json` of the source is copied, never replaced.
+- **Sidecars added later.** When a sidecar is added to the source after its photo was imported, the next import copies it, and makes the `.json` if the photo now has both captions. A sidecar that is already in the output is never overwritten, so your edits stay.
 - **Copies of your PastVu photos.** With `--against <base>`, a photo that is a copy of a photo in that base is skipped: PastVu holds the original, and the channels repost it recompressed. The import remembers the base, so a later import or reclassify uses it without the option. A copy is a photo whose embedding is at least 0.96 similar to a base photo, or at least 0.85 and confirmed by the feature test of the [deduplicate](../deduplicate/README.md) tool (the same picture under another crop, scale or compression). A colourised repost of a black-and-white base photo counts as a copy. On 34,300 Telegram reposts against 210,801 PastVu photos about 9 % were copies.
 - **Running it again** picks up the files added to the source since, and continues an import that was stopped. It does not process again the images it has seen.
-- **Reclassify** (`run.bat --base <import folder> reclassify`) sorts the import again with your samples, and deletes what fails the filters now: low quality, the aspect ratio, and the copies of base photos, including copies of photos that the base downloaded after the import. It asks once before deleting, as on a PastVu base. After you change `export_layout`, it first moves every photo into the new order.
-- **Other commands.** `cleanup`, `cherrypick` and `autocaption` work on an import (`run.bat --base <import folder> autocaption <folder>`); the commands that need PastVu (`run`, `index`, `regroup`, `drop`, `captions`, `extract`, `export`) stop with a message.
+- **Reclassify** (`run.bat --base <import folder> reclassify`) sorts the import again with your samples, and deletes what fails the filters now: low quality, the aspect ratio, and the copies of base photos, including copies of photos that the base downloaded after the import. It asks once before deleting, as on a PastVu base. After you change `export_layout` (on an import made without `--top`), it first moves every photo into the new order.
+- **Other commands.** `cleanup`, `cherrypick` and `autocaption` work on an import (`run.bat --base <import folder> autocaption <folder>`); the commands that need PastVu (`run`, `index`, `regroup`, `drop`, `captions`, `extract`, `export`) stop with a message. Moves, the review folder of `cleanup` and deletions take every sidecar with the image. `cherrypick` copies the `.txt`, `.short`, `.small`, `.caption` and `.json` of an import; from an import made with `--top none` it writes `<category>\` folders and takes no `--balance`. `autocaption` replaces the `.txt` only: a `.json` made before keeps the old long caption.
 
 ## Progress and resume
 

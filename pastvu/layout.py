@@ -21,6 +21,11 @@ from collections import defaultdict
 
 SCOPE_NAME = re.compile(r"^[a-z0-9][a-z0-9_+\-]*$")
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff", ".webp"}
+# The files that go with an image under its stem, moved and deleted with it: the
+# caption, the one-sentence caption (.short; .small is another name for it), the
+# caption of other trainers, and the JSON (in a PastVu base the record, written
+# with --json-sidecar; in an import the MOSS-Image caption).
+SIDECARS = (".txt", ".short", ".small", ".caption", ".json")
 
 
 def slug(text: str) -> str:

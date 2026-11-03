@@ -41,7 +41,7 @@ from store import DONE, SKIPPED, Store
 
 META = "review"
 SUFFIX = "_review"
-SIDECARS = (".txt", ".json")
+SIDECARS = layout.SIDECARS
 
 
 def review_dir(store: Store, base: Path) -> Path:

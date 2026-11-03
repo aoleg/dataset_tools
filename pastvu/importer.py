@@ -8,10 +8,16 @@ download into an output folder of its own, which is a base of its own.
   left out); a new name gets the next number, so running the import again
   picks up files added since.
 - Each photo goes through the stages of a download: size and aspect ratio,
-  borders, watermarks, quality, black-and-white or colour, category. There is
-  no PastVu band to cut (no PastVu record says it is there).
+  borders, watermarks, quality, black-and-white or colour (not with --top
+  none), category. There is no PastVu band to cut (no PastVu record says it
+  is there).
 - The caption is the source's .txt without hashtags, links and @mentions; a
-  photo whose caption is empty then gets no .txt.
+  photo whose caption is empty then gets no .txt. The .short (or .small),
+  .caption and .json sidecars are copied as they are. A photo with a .txt and
+  a .short (or .small) but no .json gets a MOSS-Image JSON caption made of
+  the two ({"caption": {"long": .txt, "short": .short}}); one of them alone
+  makes none. Sidecars added to the source after a photo was imported are
+  copied at the next import; a sidecar in the output is never overwritten.
 - With a base to check against (--against), a photo that is a copy of one of
   the base's photos is skipped: PastVu holds the original, which Telegram
   channels repost recompressed. reclassify of the import checks the saved
@@ -29,12 +35,14 @@ place fewer than 40; by cosine, 5 % of the pairs at 0.86-0.90 were copies,
 
 from __future__ import annotations
 
+import codecs
 import hashlib
 import json
 import math
 import os
 import re
 import sqlite3
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -49,6 +57,9 @@ FEATURE_SIDE, ORB_FEATURES = 640, 1500
 MIN_INLIERS, MIN_COVER, MIN_NCC = 40, 0.36, 0.5
 COPY_REASON = "copy in base"
 CAPTION_EXTS = (".txt",)
+SHORT_EXTS = (".short", ".small")           # the one-sentence caption, under either name
+COPIED_EXTS = (".short", ".small", ".caption", ".json")
+JSON_EXT = ".json"
 
 # --- the source ----------------------------------------------------------------------------
 
@@ -108,28 +119,103 @@ def clean_caption(text: str) -> str:
     return "\n".join(lines).strip()
 
 
+def decode(data: bytes) -> str:
+    """Caption text: UTF-16 with a byte order mark, UTF-8 (with or without one) or cp1251."""
+    if data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        return data.decode("utf-16", errors="replace")
+    for enc in ("utf-8-sig", "cp1251"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
 def read_caption(path: Path) -> str | None:
     for ext in CAPTION_EXTS:
         p = path.with_suffix(ext)
         if p.is_file():
-            data = p.read_bytes()
-            for enc in ("utf-8-sig", "cp1251"):
-                try:
-                    return data.decode(enc)
-                except UnicodeDecodeError:
-                    continue
-            return data.decode("utf-8", errors="replace")
+            return decode(p.read_bytes())
     return None
+
+
+def read_sidecars(path: Path) -> dict[str, bytes]:
+    """The image's sidecars that are copied as they are: extension -> contents."""
+    out = {}
+    for ext in COPIED_EXTS:
+        p = path.with_suffix(ext)
+        if p.is_file():
+            out[ext] = p.read_bytes()
+    return out
+
+
+def moss_json(img: Path) -> bool:
+    """Write the MOSS-Image JSON caption of an output image from its .txt and its
+    .short (or .small), when it has both and no .json. -> written"""
+    out = img.with_suffix(JSON_EXT)
+    txt = img.with_suffix(".txt")
+    short = next((img.with_suffix(e) for e in SHORT_EXTS if img.with_suffix(e).is_file()), None)
+    if out.exists() or short is None or not txt.is_file():
+        return False
+    long_text, short_text = decode(txt.read_bytes()).strip(), decode(short.read_bytes()).strip()
+    if not long_text or not short_text:
+        return False
+    doc = {"caption": {"long": long_text, "short": short_text}}
+    out.write_bytes((json.dumps(doc, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
+    return True
+
+
+def write_sidecars(img: Path, facts: str, copied: dict[str, bytes]) -> list[str]:
+    """The captions of a photo written next to its output image: the cleaned
+    caption as .txt (none when nothing is left), the copied sidecars, and the
+    MOSS-Image JSON caption made of the two. -> the extensions written"""
+    out = []
+    if facts:
+        img.with_suffix(".txt").write_text(facts, encoding="utf-8")
+        out.append(".txt")
+    for ext, data in copied.items():
+        img.with_suffix(ext).write_bytes(data)
+        out.append(ext)
+    if moss_json(img):
+        out.append(JSON_EXT)
+    return out
+
+
+def sync_sidecars(store, base: Path, src: Path, scope: str) -> Counter:
+    """Copy the sidecars that were added to the source after its photos were
+    imported, and make the JSON captions the copies complete. Nothing in the
+    output is overwritten. -> written per extension"""
+    written: Counter = Counter()
+    for cid, path, _, _ in store.done_rows(scope):
+        rel = store.source_of(cid)
+        img = base / path if path else None
+        if rel is None or img is None or not img.is_file():
+            continue
+        source = src / rel
+        if not img.with_suffix(".txt").exists():
+            caption = read_caption(source)
+            facts = clean_caption(caption) if caption else ""
+            if facts:
+                img.with_suffix(".txt").write_text(facts, encoding="utf-8")
+                written[".txt"] += 1
+        for ext in COPIED_EXTS:
+            s, d = source.with_suffix(ext), img.with_suffix(ext)
+            if not d.exists() and s.is_file():
+                d.write_bytes(s.read_bytes())
+                written[ext] += 1
+        if moss_json(img):
+            written["made " + JSON_EXT] += 1
+    return written
 
 
 # --- the record ----------------------------------------------------------------------------
 
 
 def record_json(cid: int, name: str, src_rel: str, data: bytes, raw_caption: str | None, processing: dict,
-                classification: dict | None, tool: dict) -> str:
+                classification: dict | None, tool: dict, sidecars: list[str] | None = None) -> str:
     doc = {"cid": cid, "name": name,
            "source": {"path": src_rel, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(),
-                      "caption": raw_caption},
+                      "caption": raw_caption, "sidecars": sidecars or []},
            "processing": processing, "classification": classification, "tool": tool}
     return json.dumps(doc, ensure_ascii=False, indent=1, default=str)
 

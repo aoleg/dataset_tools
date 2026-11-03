@@ -29,7 +29,9 @@ has recorded it. A photo without an embedding is left out and counted.
 
 The output holds <category>/<bw|color>/[NNN/]<name> (color_first in the
 conf's export_layout swaps the first two). Images are copied, or hard-linked
-with --link; .txt and .short captions are copied. cherrypick.json in the
+with --link; .txt and .short captions are copied (from an import also
+.small, .caption and .json; an import made with --top none has no bw/color
+folders and no --balance). cherrypick.json in the
 output holds, per base, the criteria and the files, so an import and the
 PastVu base can go into one folder. A rerun copies what is selected and
 missing, keeps what is there, reports the files of this base that are no
@@ -268,9 +270,11 @@ def _read_manifest(out: Path) -> dict:
     return {"version": 1, "bases": {}}
 
 
-def write(picked: dict[int, dict], base: Path, out: Path, criteria: dict, order: str, split: int = 0,
-          link: bool = False, prune: bool = False, dry_run: bool = False, log=print) -> dict:
-    """Copy (or link) the picked photos into out, keeping what is there. -> counts."""
+def write(picked: dict[int, dict], base: Path, out: Path, criteria: dict, order: str | None, split: int = 0,
+          link: bool = False, prune: bool = False, dry_run: bool = False, log=print,
+          sidecars: tuple[str, ...] = SIDECARS) -> dict:
+    """Copy (or link) the picked photos and their sidecars into out, keeping what is
+    there. order None: no bw/color folders (an import made with --top none). -> counts."""
     manifest = _read_manifest(out)
     mine = manifest["bases"].get(str(base), {})
     old = {int(k): v for k, v in (mine.get("files") or {}).items()}
@@ -292,7 +296,8 @@ def write(picked: dict[int, dict], base: Path, out: Path, criteria: dict, order:
         if not src.is_file():
             stats["gone"] += 1
             continue
-        folder = f"{ph['mode']}/{ph['cat']}" if order == layout.COLOR_FIRST else f"{ph['cat']}/{ph['mode']}"
+        folder = ph["cat"] if order is None else \
+            f"{ph['mode']}/{ph['cat']}" if order == layout.COLOR_FIRST else f"{ph['cat']}/{ph['mode']}"
         rel = numbered.place(folder, src.name) if numbered else f"{folder}/{src.name}"
         dst = out / rel
         if dst.exists():                                   # another base's photo of the same name
@@ -311,7 +316,7 @@ def write(picked: dict[int, dict], base: Path, out: Path, criteria: dict, order:
             else:
                 shutil.copy2(src, dst)
                 stats["copied"] += 1
-            for ext in SIDECARS:
+            for ext in sidecars:
                 s2 = src.with_suffix(ext)
                 if s2.is_file():
                     shutil.copy2(s2, dst.with_suffix(ext))
@@ -327,7 +332,7 @@ def write(picked: dict[int, dict], base: Path, out: Path, criteria: dict, order:
     if prune and not dry_run:
         for cid, rel in stale.items():
             img = out / rel
-            for f in (img, *(img.with_suffix(e) for e in SIDECARS)):
+            for f in (img, *(img.with_suffix(e) for e in sidecars)):
                 if f.is_file():
                     f.unlink()
             files.pop(cid, None)
