@@ -38,7 +38,6 @@ import layout
 ROOT_NAME = "pastvu_export"
 META = "export"
 EXCLUDED = "-"
-SIDECARS = (".txt",)
 NO_CATEGORY = "uncategorised"
 
 
@@ -121,9 +120,8 @@ class Exporter:
             new = self.root / new_rel
             new.parent.mkdir(parents=True, exist_ok=True)
             os.replace(old, new)
-            for ext in SIDECARS:
-                if old.with_suffix(ext).is_file():
-                    os.replace(old.with_suffix(ext), new.with_suffix(ext))
+            for s2 in layout.sidecars(old):
+                os.replace(s2, new.with_name(s2.name))
             with self.lock:
                 self._count(rel, -1)
             updates.append((cid, new_rel))
@@ -170,10 +168,8 @@ class Exporter:
         dst = self.root / rel
         try:
             self._link(src, dst)
-            for ext in SIDECARS:
-                s2 = src.with_suffix(ext)
-                if s2.is_file():
-                    self._link(s2, dst.with_suffix(ext))
+            for s2 in layout.export_sidecars(src):
+                self._link(s2, dst.with_name(s2.name))
         except OSError as e:
             self._count(rel, -1)
             self.log(f"  export: {cid} not linked ({e})")
@@ -196,9 +192,8 @@ class Exporter:
         new = self.root / new_rel
         new.parent.mkdir(parents=True, exist_ok=True)
         os.replace(old, new)
-        for ext in SIDECARS:
-            if old.with_suffix(ext).is_file():
-                os.replace(old.with_suffix(ext), new.with_suffix(ext))
+        for s2 in layout.sidecars(old):
+            os.replace(s2, new.with_name(s2.name))
         with self.lock:
             self._count(rel, -1)
         self.store.set_export(cid, new_rel)
@@ -209,7 +204,7 @@ class Exporter:
         rel = self.store.export_of(cid)
         if rel and rel != EXCLUDED:
             img = self.root / rel
-            for f in (img, *(img.with_suffix(e) for e in SIDECARS)):
+            for f in (img, *layout.sidecars(img)):
                 if f.is_file():
                     f.unlink()
             with self.lock:
@@ -241,10 +236,8 @@ class Exporter:
             if now is None:
                 updates.append((cid, EXCLUDED))
                 excluded += 1
-                for ext in SIDECARS:              # the caption left behind is a link too: tidy it away
-                    orphan = (self.root / rel).with_suffix(ext)
-                    if orphan.is_file():
-                        orphan.unlink()
+                for orphan in layout.sidecars(self.root / rel):   # the captions left behind are links too
+                    orphan.unlink()
             elif now != rel:
                 updates.append((cid, now))
                 moved += 1

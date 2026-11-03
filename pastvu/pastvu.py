@@ -1137,8 +1137,7 @@ def cmd_cherrypick(args, conf, client) -> int:
         criteria = {"base": str(base), **{k: v for k, v in c.items() if v is not None}, "balance": balance,
                     "decades": decades, "categories": args.category or [], "samples": str(samples)}
         res = cp.write(picked, base, out, criteria, None if no_modes else export_layout_of(conf), args.split,
-                       args.link, args.prune, args.dry_run,
-                       sidecars=layout.SIDECARS if store.is_import else cp.SIDECARS)
+                       args.link, args.prune, args.dry_run, record=not store.is_import)
         if args.dry_run:
             print(f"Dry run: {res['new']:,} to copy into {out}, {res['there']:,} there already, "
                   f"{res['stale']:,} files of this base there that are no longer picked")

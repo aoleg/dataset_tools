@@ -37,15 +37,15 @@ def scan_scope(scope_dir: Path) -> dict[int, str]:
 
 
 def move_pair(src: Path, dst: Path) -> None:
-    """Move an image and its captions (and a JSON sidecar, if any); refuse to overwrite."""
+    """Move an image and every file of its name (captions, record, ...), renamed
+    with it; refuse to overwrite the image."""
     if dst.exists():
         raise FileExistsError(f"{dst} exists")
     dst.parent.mkdir(parents=True, exist_ok=True)
+    side = layout.sidecars(src)
     os.replace(src, dst)
-    for ext in layout.SIDECARS:
-        s2, d2 = src.with_suffix(ext), dst.with_suffix(ext)
-        if s2.exists():
-            os.replace(s2, d2)
+    for s2 in side:
+        os.replace(s2, dst.with_name(dst.stem + s2.suffix))
 
 
 def prune_empty(scope_dir: Path) -> int:
@@ -163,9 +163,9 @@ def chunk_category(store, base: Path, sc: dict, category: str, width: int, log=p
                 if cid in owned and owned[cid] != rel and not (base / owned[cid]).is_file():
                     batch.append((cid, rel, record_with_path(store, base, cid, rel)))
                     owned[cid] = rel
-                txt = cat_dir / f"{stem}.txt"          # a caption written to the old place during the move
-                if txt.is_file():
-                    os.replace(txt, Path(e.path).with_suffix(".txt"))
+                if not (cat_dir / e.name).exists():    # a caption written to the old place during the move
+                    for s2 in layout.sidecars(cat_dir / e.name):
+                        os.replace(s2, Path(e.path).with_name(s2.name))
     flush()
     _journal(store, name, category, False)
     if loose:

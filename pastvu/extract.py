@@ -1,7 +1,7 @@
 """extract: copy the photos of one category out of a base folder into a flat
 folder for training, keeping only the bw/ and color/ level.
 
-    <base parent>/050-transport_1970s/bw/123456.jpg (+ .txt, .short)
+    <base parent>/050-transport_1970s/bw/123456.jpg (+ .txt, .short, every file of its name but the record)
                                      color/...
 
 - The category is named by its number (050 or 50), its name (transport) or
@@ -42,7 +42,6 @@ from pathlib import Path
 import folders
 import layout
 
-SIDECARS = (".txt", ".short")
 MANIFEST = "extract.json"
 LINK_TIP = ("Tip: --link hard-links the images instead of copying them, so they take no extra disk space on the "
             "same drive (captions are still copied). Deleting a linked image removes the link only; an editor that "
@@ -316,10 +315,8 @@ def extract(photos: dict[int, tuple[str | None, Path]], out: Path, criteria: dic
             else:
                 shutil.copy2(src, dst)
                 stats["copied"] += 1
-            for ext in SIDECARS:
-                s2 = src.with_suffix(ext)
-                if s2.is_file():
-                    shutil.copy2(s2, dst.with_suffix(ext))
+            for s2 in layout.export_sidecars(src):
+                shutil.copy2(s2, dst.with_name(s2.name))
         except OSError as e:
             log(f"  {cid}: not copied ({e})")
             stats["failed"] += 1
@@ -333,7 +330,7 @@ def extract(photos: dict[int, tuple[str | None, Path]], out: Path, criteria: dic
     if prune and not dry_run:
         for cid, rel in stale.items():
             img = out / rel
-            for f in (img, *(img.with_suffix(e) for e in SIDECARS)):
+            for f in (img, *layout.sidecars(img)):
                 if f.is_file():
                     f.unlink()
             files.pop(cid, None)

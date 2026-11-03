@@ -306,7 +306,7 @@ def drop_scope(store: Store, base: Path, sc: dict, log=print, exporter=None) -> 
     for cid, state, path, category in rows:
         if path:
             img = base / path
-            for f in (img, *(img.with_suffix(e) for e in layout.SIDECARS)):
+            for f in (img, *layout.sidecars(img)):
                 if f.is_file():
                     f.unlink()
                     deleted += f is img

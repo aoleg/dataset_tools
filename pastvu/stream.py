@@ -109,7 +109,7 @@ def cleanup_interrupted(store: Store, base: Path, scope: str) -> int:
     for cid, path in rows:
         if path:
             img = base / path
-            for f in (img, *(img.with_suffix(e) for e in layout.SIDECARS)):
+            for f in (img, *layout.sidecars(img)):
                 f.unlink(missing_ok=True)
         store.unclaim(cid)
     return len(rows)
@@ -353,7 +353,7 @@ class Stream:
             if self.source is not None:
                 import importer
                 facts = importer.clean_caption(job.caption) if job.caption else ""   # none left: no .txt
-                job.written = importer.write_sidecars(path, facts, job.sidecars or {})
+                job.written = importer.write_sidecars(path, facts, job.sidecars or {}, bool(plan["changed"]))
             else:
                 facts = sidecars.caption(job.photo, o.txt_fields)
                 path.with_suffix(".txt").write_text(facts, encoding="utf-8")
@@ -373,7 +373,7 @@ class Stream:
                               doc, emb, counters)
         except BaseException:
             chunker.abandon(rel_scope)
-            for f in (path, *(path.with_suffix(e) for e in layout.SIDECARS)):
+            for f in (path, *layout.sidecars(path)):
                 f.unlink(missing_ok=True)
             self.store.unclaim(job.cid)
             raise

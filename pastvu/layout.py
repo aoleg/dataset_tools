@@ -14,18 +14,103 @@ trainers and the dataset tools read subfolders.
 from __future__ import annotations
 
 import math
+import os
 import re
+import sys
 import threading
 import unicodedata
 from collections import defaultdict
+from pathlib import Path
 
 SCOPE_NAME = re.compile(r"^[a-z0-9][a-z0-9_+\-]*$")
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff", ".webp"}
-# The files that go with an image under its stem, moved and deleted with it: the
-# caption, the one-sentence caption (.short; .small is another name for it), the
-# caption of other trainers, and the JSON (in a PastVu base the record, written
-# with --json-sidecar; in an import the MOSS-Image caption).
-SIDECARS = (".txt", ".short", ".small", ".caption", ".json")
+# Latent and text-encoder caches: made from the pixels, so a changed image does not take them along.
+CACHE_EXTS = (".npz", ".safetensors")
+# In a PastVu base, <cid>.json next to the image is its record (run --json-sidecar), not a
+# caption: it moves with the image but stays out of extracts and training sets.
+RECORD_EXT = ".json"
+
+
+# --- sidecars ------------------------------------------------------------------------------
+
+def sidecars(img: Path) -> list[Path]:
+    """Every file of the image's name in its folder that is not an image: its
+    captions (.txt, .short, .json, ...) and whatever else carries its name. The
+    image itself need not exist. On Windows the name index answers (as fast as
+    a stat); elsewhere the folder is listed."""
+    img = Path(img)
+    key = os.path.normcase(img.stem)
+    names = _names_like(img.parent, img.stem)
+    out = []
+    for name in names:
+        stem, ext = os.path.splitext(name)
+        if os.path.normcase(stem) == key and ext.lower() not in IMAGE_EXTS:
+            out.append(img.parent / name)
+    return sorted(out)
+
+
+def export_sidecars(img: Path, record: bool = True) -> list[Path]:
+    """The sidecars that go into an export or a training set: all but the record of a
+    PastVu base. An import's .json is a caption: record=False keeps it."""
+    return [s for s in sidecars(img) if not (record and s.suffix.lower() == RECORD_EXT)]
+
+
+def _names_like(folder: Path, stem: str) -> list[str]:
+    if sys.platform == "win32" and len(str(folder)) < 200:
+        names = _find_files(os.path.join(str(folder), stem + ".*"))
+        if names is not None:
+            return names
+    try:
+        with os.scandir(folder) as it:
+            return [e.name for e in it if e.is_file()]
+    except OSError:
+        return []
+
+
+_FIND = None
+
+
+def _find_files(pattern: str) -> list[str] | None:
+    """The file names that match a pattern (FindFirstFileExW); None when the call is not available."""
+    global _FIND
+    if _FIND is None:
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class Data(ctypes.Structure):
+                _fields_ = [("attr", wintypes.DWORD), ("created", wintypes.FILETIME),
+                            ("accessed", wintypes.FILETIME), ("written", wintypes.FILETIME),
+                            ("size_hi", wintypes.DWORD), ("size_lo", wintypes.DWORD),
+                            ("reserved0", wintypes.DWORD), ("reserved1", wintypes.DWORD),
+                            ("name", wintypes.WCHAR * 260), ("alt_name", wintypes.WCHAR * 14)]
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.FindFirstFileExW.restype = wintypes.HANDLE
+            k32.FindFirstFileExW.argtypes = [wintypes.LPCWSTR, ctypes.c_int, ctypes.POINTER(Data), ctypes.c_int,
+                                             ctypes.c_void_p, wintypes.DWORD]
+            k32.FindNextFileW.argtypes = [wintypes.HANDLE, ctypes.POINTER(Data)]
+            k32.FindClose.argtypes = [wintypes.HANDLE]
+            _FIND = (ctypes, k32, Data, wintypes.HANDLE(-1).value)
+        except (ImportError, OSError, AttributeError):
+            _FIND = False
+    if not _FIND:
+        return None
+    ctypes, k32, Data, invalid = _FIND
+    d = Data()
+    # FindExInfoBasic (no 8.3 names), FindExSearchNameMatch, FIND_FIRST_EX_LARGE_FETCH
+    h = k32.FindFirstFileExW(pattern, 1, ctypes.byref(d), 0, None, 2)
+    if h == invalid or h is None:
+        return []
+    out = []
+    try:
+        while True:
+            if not d.attr & 0x10:                   # FILE_ATTRIBUTE_DIRECTORY
+                out.append(d.name)
+            if not k32.FindNextFileW(h, ctypes.byref(d)):
+                break
+    finally:
+        k32.FindClose(h)
+    return out
 
 
 def slug(text: str) -> str:

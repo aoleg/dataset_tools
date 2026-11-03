@@ -177,7 +177,7 @@ def delete_photos(store: Store, base: Path, scope: dict, items: list, chunks, lo
             else:
                 src = layout.to_scope(scope, here)
         img = base / layout.to_base(scope, src)
-        for f in (img, *(img.with_suffix(e) for e in layout.SIDECARS), layout.record_file(base, cid)):
+        for f in (img, *layout.sidecars(img), layout.record_file(base, cid)):
             f.unlink(missing_ok=True)
         chunks.remove(src)
         if exporter is not None:

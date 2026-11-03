@@ -41,7 +41,6 @@ from store import DONE, SKIPPED, Store
 
 META = "review"
 SUFFIX = "_review"
-SIDECARS = layout.SIDECARS
 
 
 def review_dir(store: Store, base: Path) -> Path:
@@ -165,8 +164,8 @@ def settle(store: Store, base: Path, keep_good: bool, log=print, exporter=None) 
                 chunks.done(dst_rel)
                 back += 1
             else:
-                for ext in SIDECARS:                        # the caption you left behind
-                    f.with_suffix(ext).unlink(missing_ok=True)
+                for s2 in layout.sidecars(f):              # the captions you left behind
+                    s2.unlink(missing_ok=True)
                 layout.record_file(base, cid).unlink(missing_ok=True)
                 if exporter is not None:
                     exporter.remove(cid)

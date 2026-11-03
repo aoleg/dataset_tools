@@ -29,9 +29,10 @@ has recorded it. A photo without an embedding is left out and counted.
 
 The output holds <category>/<bw|color>/[NNN/]<name> (color_first in the
 conf's export_layout swaps the first two). Images are copied, or hard-linked
-with --link; .txt and .short captions are copied (from an import also
-.small, .caption and .json; an import made with --top none has no bw/color
-folders and no --balance). cherrypick.json in the
+with --link; every other file of the image's name is copied (its captions),
+except the record .json of a PastVu base (an import's .json is a caption).
+An import made with --top none has no bw/color folders and no --balance.
+cherrypick.json in the
 output holds, per base, the criteria and the files, so an import and the
 PastVu base can go into one folder. A rerun copies what is selected and
 missing, keeps what is there, reports the files of this base that are no
@@ -56,7 +57,6 @@ from store import DONE
 
 MANIFEST = "cherrypick.json"
 OUTLIERS = "outliers"
-SIDECARS = xt.SIDECARS
 
 
 # --- the parameters -----------------------------------------------------------------------------
@@ -272,9 +272,10 @@ def _read_manifest(out: Path) -> dict:
 
 def write(picked: dict[int, dict], base: Path, out: Path, criteria: dict, order: str | None, split: int = 0,
           link: bool = False, prune: bool = False, dry_run: bool = False, log=print,
-          sidecars: tuple[str, ...] = SIDECARS) -> dict:
+          record: bool = True) -> dict:
     """Copy (or link) the picked photos and their sidecars into out, keeping what is
-    there. order None: no bw/color folders (an import made with --top none). -> counts."""
+    there. order None: no bw/color folders (an import made with --top none); record:
+    the .json next to an image is a PastVu record and stays behind. -> counts."""
     manifest = _read_manifest(out)
     mine = manifest["bases"].get(str(base), {})
     old = {int(k): v for k, v in (mine.get("files") or {}).items()}
@@ -316,10 +317,8 @@ def write(picked: dict[int, dict], base: Path, out: Path, criteria: dict, order:
             else:
                 shutil.copy2(src, dst)
                 stats["copied"] += 1
-            for ext in sidecars:
-                s2 = src.with_suffix(ext)
-                if s2.is_file():
-                    shutil.copy2(s2, dst.with_suffix(ext))
+            for s2 in layout.export_sidecars(src, record):
+                shutil.copy2(s2, dst.with_name(s2.name))
         except OSError as e:
             log(f"  {cid}: not copied ({e})")
             stats["failed"] += 1
@@ -332,7 +331,7 @@ def write(picked: dict[int, dict], base: Path, out: Path, criteria: dict, order:
     if prune and not dry_run:
         for cid, rel in stale.items():
             img = out / rel
-            for f in (img, *(img.with_suffix(e) for e in sidecars)):
+            for f in (img, *layout.sidecars(img)):
                 if f.is_file():
                     f.unlink()
             files.pop(cid, None)

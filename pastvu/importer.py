@@ -12,8 +12,9 @@ download into an output folder of its own, which is a base of its own.
   none), category. There is no PastVu band to cut (no PastVu record says it
   is there).
 - The caption is the source's .txt without hashtags, links and @mentions; a
-  photo whose caption is empty then gets no .txt. The .short (or .small),
-  .caption and .json sidecars are copied as they are. A photo with a .txt and
+  photo whose caption is empty then gets no .txt. Every other file of the
+  image's name (.short, .caption, .json, ...) is copied as it is, except the
+  latent and text-encoder caches of a picture that was changed. A photo with a .txt and
   a .short (or .small) but no .json gets a MOSS-Image JSON caption made of
   the two ({"caption": {"long": .txt, "short": .short}}); one of them alone
   makes none. Sidecars added to the source after a photo was imported are
@@ -58,7 +59,6 @@ MIN_INLIERS, MIN_COVER, MIN_NCC = 40, 0.36, 0.5
 COPY_REASON = "copy in base"
 CAPTION_EXTS = (".txt",)
 SHORT_EXTS = (".short", ".small")           # the one-sentence caption, under either name
-COPIED_EXTS = (".short", ".small", ".caption", ".json")
 JSON_EXT = ".json"
 
 # --- the source ----------------------------------------------------------------------------
@@ -139,14 +139,15 @@ def read_caption(path: Path) -> str | None:
     return None
 
 
+def copied_sidecars(path: Path) -> list[Path]:
+    """The files of the image's name in the source that are copied as they are: all but
+    the .txt, which is cleaned."""
+    return [s for s in layout.sidecars(path) if s.suffix.lower() not in CAPTION_EXTS]
+
+
 def read_sidecars(path: Path) -> dict[str, bytes]:
     """The image's sidecars that are copied as they are: extension -> contents."""
-    out = {}
-    for ext in COPIED_EXTS:
-        p = path.with_suffix(ext)
-        if p.is_file():
-            out[ext] = p.read_bytes()
-    return out
+    return {s.suffix: s.read_bytes() for s in copied_sidecars(path)}
 
 
 def moss_json(img: Path) -> bool:
@@ -165,16 +166,19 @@ def moss_json(img: Path) -> bool:
     return True
 
 
-def write_sidecars(img: Path, facts: str, copied: dict[str, bytes]) -> list[str]:
+def write_sidecars(img: Path, facts: str, copied: dict[str, bytes], changed: bool = False) -> list[str]:
     """The captions of a photo written next to its output image: the cleaned
-    caption as .txt (none when nothing is left), the copied sidecars, and the
-    MOSS-Image JSON caption made of the two. -> the extensions written"""
+    caption as .txt (none when nothing is left), the copied sidecars (without the
+    caches when the picture was changed), and the MOSS-Image JSON caption made of
+    the two. -> the extensions written"""
     out = []
     if facts:
         img.with_suffix(".txt").write_text(facts, encoding="utf-8")
         out.append(".txt")
     for ext, data in copied.items():
-        img.with_suffix(ext).write_bytes(data)
+        if changed and ext.lower() in layout.CACHE_EXTS:
+            continue
+        img.with_name(img.stem + ext).write_bytes(data)
         out.append(ext)
     if moss_json(img):
         out.append(JSON_EXT)
@@ -198,11 +202,12 @@ def sync_sidecars(store, base: Path, src: Path, scope: str) -> Counter:
             if facts:
                 img.with_suffix(".txt").write_text(facts, encoding="utf-8")
                 written[".txt"] += 1
-        for ext in COPIED_EXTS:
-            s, d = source.with_suffix(ext), img.with_suffix(ext)
-            if not d.exists() and s.is_file():
-                d.write_bytes(s.read_bytes())
-                written[ext] += 1
+        for s in copied_sidecars(source):
+            d = img.with_name(img.stem + s.suffix)
+            if d.exists() or (s.suffix.lower() in layout.CACHE_EXTS and (store.status(cid) or {}).get("changed")):
+                continue
+            d.write_bytes(s.read_bytes())
+            written[s.suffix.lower()] += 1
         if moss_json(img):
             written["made " + JSON_EXT] += 1
     return written
