@@ -42,8 +42,9 @@ With -o <folder> the source folder is not changed and nothing is asked: every
 image goes to the output folder under its relative path, written by the same
 rules, or copied as it is when it needs no change (a JPEG within the size with
 --format jpg). The files next to an image with its stem and another extension
-(its captions: .txt, .short, ...) are copied with it. Files of the same name
-in the output folder are replaced.
+(its captions: .txt, .short, ...) are copied with it, except the caches
+(.npz, .safetensors) of an image that is written: they belong to the old
+pixels. Files of the same name in the output folder are replaced.
 
 Usage:    python normalize.py <folder> <pixels> [-o <folder>]
           [--format original [Q]|jpg [Q]|png] [--dry-run] [--yes] [--workers N]
@@ -71,6 +72,7 @@ Image.MAX_IMAGE_PIXELS = None    # large scans are normal input, not an attack
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".jpe", ".jfif", ".png", ".webp", ".bmp", ".tif", ".tiff",
               ".gif", ".avif", ".heic", ".heif"}
+CACHE_EXTS = (".npz", ".safetensors")  # latent and text-encoder caches of the old pixels: not copied with a changed image
 JPEG_EXTS = {".jpg", ".jpeg", ".jpe", ".jfif"}
 JPEG_FORMATS = {"JPEG", "MPO"}   # MPO: the multi-picture JPEG of some cameras
 LOSSY_FORMATS = {"JPEG", "WEBP", "AVIF", "HEIF"}
@@ -481,12 +483,17 @@ def main(argv=None) -> int:
     ex.shutdown()
 
     # The captions of every image that reached out_root, once per stem, here
-    # and not in the workers: two images of one stem share them.
-    caption_count, caption_failed = 0, []
+    # and not in the workers: two images of one stem share them. The caches
+    # of the old pixels stay behind when any image of the stem was written.
+    caption_count, caption_failed, caches_left = 0, [], 0
     if out_root is not None:
         done = {stem_key(r["path"]) for r in results if r["status"] in ("written", "unchanged")}
+        changed = {stem_key(r["path"]) for r in results if r["status"] == "written"}
         for key in sorted(done):
             for src in sidecars.get(key, []):
+                if key in changed and os.path.splitext(src)[1].lower() in CACHE_EXTS:
+                    caches_left += 1
+                    continue
                 caption_count += 1
                 if args.dry_run:
                     continue
@@ -511,6 +518,8 @@ def main(argv=None) -> int:
     else:
         copied = "would be copied" if args.dry_run else "copied"
         print(f"{unchanged:,} images {copied} as they are, {caption_count:,} captions {copied}.")
+        if caches_left:
+            print(f"{caches_left:,} cache files of the written images {'would be ' if args.dry_run else ''}left out.")
         print(f"{len(skipped):,} skipped, {len(failed):,} failed ({time.monotonic() - t0:.1f} s).")
     if not args.dry_run and written:
         before = sum(r["before"] for r in written)

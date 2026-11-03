@@ -46,6 +46,8 @@ With `-o <folder>` every image goes to the output folder under its path relative
 
 The captions of an image are copied with it: every file in its folder with the same stem and an extension that is not an image extension (`.txt`, `.short`, `.json`, ...). Files that belong to no image are not copied, nor are the captions of an image that was skipped or could not be read.
 
+The cache files `.npz` and `.safetensors` of the same stem are copied only with an image that is copied as it is. An image that is downscaled or re-encoded gets new pixels, so a latent or text-encoder cache of the old pixels would be stale, and a trainer can reuse it without a warning. The run prints how many cache files it left out. When two images share a stem, one written and one copied, the caches are left out too.
+
 The output folder may exist. Files in it with the same name are replaced, so a second run over the same folders brings the output up to date; other files in it stay. The output folder and the source folder must not be inside each other.
 
 ## What is written
@@ -56,7 +58,7 @@ The output folder may exist. Files in it with the same name are replaced, so a s
 - An animated GIF or WebP keeps its first frame; with `--format original` it is left as it is (copied as it is with `-o`).
 - A file is written under a temporary name next to the image first and then moved over it, so an interrupted run never leaves a half-written image. Read-only files are replaced too.
 
-The captions are not touched. The name of an image keeps its stem (`photo.png` becomes `photo.jpg`), so its `.txt` caption still belongs to it. AI Toolkit's latent caches of the changed images are out of date after a run; delete them before the next training.
+The captions are not touched. The name of an image keeps its stem (`photo.png` becomes `photo.jpg`), so its `.txt` caption still belongs to it. In place, AI Toolkit's latent caches of the changed images are out of date after a run; delete them before the next training. With `-o` the caches of a changed image are not copied (section [Output folder](#output-folder)).
 
 ## What is left alone
 
