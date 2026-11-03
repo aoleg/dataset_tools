@@ -31,24 +31,29 @@ the previews (reframe verdicts, border and cleanup contact sheets, watermark
 masks). The detection passes only read the images; the apply pass changes
 files and must run alone.
 
-Two output modes: "in_place" changes the dataset folder, with the original of
-every changed image and its caption copied to <folder>_backup/<same
-relative path> before the write, never over an original that is there
-already (one backup per image, the untouched original, shared with the other
-tools), and the run logged in <folder>_backup/_pipeline/log.jsonl, so that
---undo returns the images of the last run to their originals; "parallel" writes the
-whole tree into a new folder with the unchanged images and the captions
-copied along. Captions are never deleted or changed by a run; the log says
+The sidecars of an image are the other files of its folder with its stem, a
+non-image extension and no .part tail: captions (.txt, .short, ...), caches
+(.npz, .safetensors) and anything else. Two output modes: "in_place" changes the
+dataset folder, with the original of every changed image and its sidecars
+copied to <folder>_backup/<same relative path> before the write, never over
+an original that is there already (one backup per image, the untouched
+original, shared with the other tools), and the run logged in
+<folder>_backup/_pipeline/log.jsonl, so that --undo returns the images of the
+last run to their originals; "parallel" writes the whole tree into a new
+folder with the unchanged images and their sidecars copied along. A changed
+image gets its sidecars without the caches (CACHE_EXTS): a cache of the old
+pixels is stale. Sidecars are never deleted or changed by a run; the log says
 which images changed, so they can be captioned again.
 
 An undo with a file list ("undo": true with "files") returns exactly those
 images to their originals, whichever tool made the backup: the original is
 copied back, a renamed output (a JPEG written as PNG) removed, the mask
-restored from its backup or removed, the backup caption restored over the
-caption in place, and the backup copies deleted, because the backup holds only
+restored from its backup or removed, the backup sidecars restored over the
+ones in place, and the backup copies deleted, because the backup holds only
 the originals of changed images. "delete_captions_without_backup" says what
-happens to a caption of an image whose backup has none: deleted (true) or
-kept (false, the default). An image without a backup is reported as skipped.
+happens to a caption (CAPTION_EXTS) of an image whose backup has none: deleted
+(true) or kept (false, the default); other sidecars without a backup stay.
+An image without a backup is reported as skipped.
 
 The backup folder <folder>_backup is next to the dataset folder, outside it,
 so a trainer that walks every subfolder never sees the originals, the caches
@@ -105,6 +110,8 @@ MASKS_DIRNAME = rb.MASKS_DIRNAME                 # <dir>/_controls/<stem>.png; m
 CACHE_VERSION = 2
 STAGES = ["borders", "watermark", "reframe", "jpeg_cleanup", "face_masks"]
 IMAGE_EXTS = rb.IMAGE_EXTS
+CAPTION_EXTS = (".txt", ".short", ".caption", ".json")   # what a caption is: the per-file undo deletes only these
+CACHE_EXTS = (".npz", ".safetensors")             # latents and text-encoder caches: stale next to a changed image
 DEFAULT_EXCLUDES = rb.DEFAULT_EXCLUDES
 DEFAULT_THREADS = 4
 JPEG_QUALITY = 97
@@ -187,6 +194,27 @@ def read_job(path: Path, args) -> Job:
 
 # --- scan and decode ----------------------------------------------------------------
 
+def sidecars_by_stem(folder: Path, names) -> dict[str, list[Path]]:
+    """The sidecars among the file names of one folder, by lower-case stem:
+    every file that is not an image, whatever its extension. The tools' own
+    files (the backup mark, .part files) are not sidecars."""
+    out: dict[str, list[Path]] = {}
+    for fn in sorted(names):
+        stem, ext = os.path.splitext(fn)
+        if ext.casefold() not in IMAGE_EXTS and fn != rb.BACKUP_MARK and not ext.casefold().startswith(".part"):
+            out.setdefault(stem.casefold(), []).append(folder / fn)
+    return out
+
+
+def folder_sidecars(folder: Path) -> dict[str, list[Path]]:
+    """sidecars_by_stem of the files of a folder (not of its subfolders)."""
+    try:
+        with os.scandir(folder) as entries:
+            return sidecars_by_stem(folder, [e.name for e in entries if e.is_file()])
+    except OSError:
+        return {}
+
+
 def file_key(path: Path) -> list[int]:
     """A file counts as the same while its size and modification time stay."""
     st = os.stat(path)
@@ -194,10 +222,12 @@ def file_key(path: Path) -> list[int]:
 
 
 def scan(job: Job) -> list[Item]:
-    """The images to process, with their .txt captions: the job's file list,
-    or the whole folder at any depth without the tools' output folders."""
+    """The images to process, with their sidecars (every other file of the
+    image's folder with its stem: captions, caches, ...): the job's file
+    list, or the whole folder at any depth without the tools' output folders."""
     root = job.root
     items = []
+    by_folder: dict[Path, dict[str, list[Path]]] = {}      # the sidecars of a folder by stem, listed once
     if job.files:
         for rel in job.files:
             p = root / rel
@@ -210,13 +240,15 @@ def scan(job: Job) -> list[Item]:
         for dirpath, dirnames, filenames in os.walk(root):
             dirnames[:] = sorted(d for d in dirnames
                                  if d.casefold() not in excl and not rb.is_backup_dir(Path(dirpath) / d))
+            by_folder[Path(dirpath)] = sidecars_by_stem(Path(dirpath), filenames)
             for fn in sorted(filenames):
                 if os.path.splitext(fn)[1].casefold() in IMAGE_EXTS:
                     p = Path(dirpath) / fn
                     items.append(Item(path=p, rel=p.relative_to(root).as_posix()))
     for it in items:
-        cap = it.path.with_suffix(".txt")
-        it.sidecars = [cap] if cap.is_file() else []
+        if it.path.parent not in by_folder:
+            by_folder[it.path.parent] = folder_sidecars(it.path.parent)
+        it.sidecars = by_folder[it.path.parent].get(it.path.stem.casefold(), [])
         try:
             it.key = file_key(it.path)
         except OSError:
@@ -824,6 +856,17 @@ def write_array(array: np.ndarray, dst: Path, fmt: str, exif: bytes | None, icc:
     rb.finish_write(tmp, dst, src_stat)
 
 
+def copy_sidecars(job: dict, dst: Path) -> dict:
+    """Parallel mode: the sidecars of an image next to its output. An image
+    that was written changed, so the caches of its old pixels stay behind; an
+    unchanged copy takes everything. -> output path (relative to the target)
+    -> copied, same or kept."""
+    changed = job["write"] != "none"
+    return {(dst.parent / Path(sc).name).relative_to(job["target"]).as_posix():
+            copy_keep(Path(sc), dst.parent / Path(sc).name)
+            for sc in job["sidecars"] if not (changed and Path(sc).suffix.casefold() in CACHE_EXTS)}
+
+
 def write_job(job: dict) -> dict:
     """One image's writes, in a worker process: the backup (in place, once,
     before the first byte changes), the image, the mask. -> the log record."""
@@ -840,8 +883,7 @@ def write_job(job: dict) -> dict:
         if job["write"] == "none":
             if not in_place:
                 copy_keep(src, dst)
-                for sc in job["sidecars"]:
-                    copy_keep(Path(sc), dst.parent / Path(sc).name)
+                rec["sidecars"] = copy_sidecars(job, dst)
         elif job["write"] == "lossless":
             kind = head["kind"]
             if kind == rb.KIND_JPEG:
@@ -855,8 +897,7 @@ def write_job(job: dict) -> dict:
             write_array(job["array"], dst, job["fmt"], exif, icc, st)
         if job["write"] != "none":
             if not in_place:
-                for sc in job["sidecars"]:
-                    copy_keep(Path(sc), dst.parent / Path(sc).name)
+                rec["sidecars"] = copy_sidecars(job, dst)
             elif dst != src:
                 make_writable(src)                        # the image changed its name: the original is in the backup
                 src.unlink()
@@ -894,7 +935,7 @@ def write_job(job: dict) -> dict:
             if rec.get("backup") == "copied" and src.is_file() and same_bytes(src, bk):
                 bk.unlink()
                 rec["backup"] = "removed"
-            for sc, status in list((rec.get("sidecars") or {}).items()):
+            for sc, status in list((rec.get("sidecars") or {}).items() if in_place else []):
                 b = rb.backup_dir(root) / sc
                 if status == "copied" and b.is_file() and same_bytes(b, root / sc):
                     b.unlink()
@@ -965,6 +1006,16 @@ def undo(root: Path) -> dict:
         if rec is None:
             continue
         if mode == "parallel":
+            if "sidecars" in rec:                     # the sidecars this run copied, not ones that were there
+                for sc, status in rec["sidecars"].items():
+                    f = target / sc
+                    if status == "copied" and f.is_file():
+                        make_writable(f)
+                        f.unlink()
+            elif rec.get("out") and intent.get("sidecars"):      # a log from before every sidecar was copied
+                cap = (target / rec["out"]).with_suffix(".txt")
+                if cap.is_file():
+                    cap.unlink()
             for key in ("out", "mask"):
                 f = target / rec[key] if rec.get(key) else None
                 if f and f.is_file():
@@ -975,10 +1026,6 @@ def undo(root: Path) -> dict:
                         f.parent.rmdir()
                     except OSError:
                         pass
-            if rec.get("out"):
-                cap = (target / rec["out"]).with_suffix(".txt")
-                if cap.is_file() and intent.get("sidecars"):
-                    cap.unlink()
             continue
         if intent["write"] != "none":
             bk = rb.backup_dir(root) / intent["rel"]
@@ -1112,7 +1159,7 @@ def undo_files(root: Path, files: list, delete_captions: bool) -> dict:
     by_out = {r["out"]: rel for rel, r in latest.items() if r.get("out") and r["out"] != rel}
     bdir = rb.backup_dir(root)
     counts = {"files": 0, "restored": 0, "skipped": 0, "failed": 0, "masks restored": 0, "masks removed": 0,
-              "captions restored": 0, "captions deleted": 0}
+              "sidecars restored": 0, "captions restored": 0, "captions deleted": 0}
     restored = []
     for raw in files:
         counts["files"] += 1
@@ -1165,21 +1212,27 @@ def undo_files(root: Path, files: list, delete_captions: bool) -> dict:
             for mrel, where in (rec.get("mask_shadowed") or {}).items():
                 if (bdir / where).is_file() and not (root / mrel).exists():
                     os.replace(bdir / where, root / mrel)
-            # the caption
-            cap_rel = Path(rel).with_suffix(".txt").as_posix()
-            cap, cb = root / cap_rel, bdir / cap_rel
-            if cb.is_file():
-                restore_from_backup(cb, cap)
-                line["caption"] = "restored"
-                counts["captions restored"] += 1
-            elif cap.is_file():
-                if delete_captions:
-                    make_writable(cap)
-                    cap.unlink()
-                    line["caption"] = "deleted"
-                    counts["captions deleted"] += 1
-                else:
-                    line["caption"] = "kept"
+            # the sidecars: every one the backup holds goes back over the one in place
+            stem, parent = Path(rel).stem.casefold(), Path(rel).parent
+            backed = folder_sidecars(bdir / parent).get(stem, [])
+            in_place = folder_sidecars(root / parent).get(stem, [])
+            for cb in backed:
+                restore_from_backup(cb, root / parent / cb.name)
+                counts["sidecars restored"] += 1
+                if cb.suffix.casefold() in CAPTION_EXTS:
+                    line["caption"] = "restored"
+                    counts["captions restored"] += 1
+            # a caption without a backup was written after the run: it describes the changed image
+            backed_names = {cb.name.casefold() for cb in backed}
+            for cap in in_place:
+                if cap.suffix.casefold() in CAPTION_EXTS and cap.name.casefold() not in backed_names:
+                    if delete_captions:
+                        make_writable(cap)
+                        cap.unlink()
+                        line["caption"] = "deleted"
+                        counts["captions deleted"] += 1
+                    else:
+                        line["caption"] = "kept"
             counts["restored"] += 1
             restored.append(rel)
         except Exception as e:  # noqa: BLE001 - one bad file is reported, not fatal
