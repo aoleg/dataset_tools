@@ -30,7 +30,7 @@ run.bat "L:\train\photos" --threshold 6
 
 The buckets are Ostris AI Toolkit's unless you add `--musubi` for musubi-tuner. See [The trainer](#the-trainer---ostris-or---musubi).
 
-That is the whole workflow. One run scans, assigns buckets, consolidates the undersized ones, renders and scores every image, writes the ones that pass along with their captions, and, with `--musubi`, emits `_prep_<folder>/dataset.toml` ready to hand to musubi-tuner.
+That is the whole workflow. One run scans, assigns buckets, consolidates the undersized ones, renders and scores every image, writes the ones that pass along with their sidecars, and, with `--musubi`, emits `_prep_<folder>/dataset.toml` ready to hand to musubi-tuner.
 
 **Run `--report` first.** It is a dry run: it analyses everything and writes a report but no images. Because rejections leave no artifact on disk — nothing is copied, moved or marked — the report is the only place a rejected file is ever named. Recovering from too high a threshold means lowering it and re-running, which is cheap (already-written images are skipped), but you cannot recover the list of what was dropped after the fact if you never generated it.
 
@@ -47,7 +47,7 @@ k2prep.py <folder> [options]
 | `<folder>` | required | Input folder, positional. One dataset, unless `--recursive`. |
 | `--ostris` | on | Resize onto Ostris AI Toolkit buckets. The default. See [below](#the-trainer---ostris-or---musubi). |
 | `--musubi` | off | Resize onto musubi-tuner buckets and write `dataset.toml` into the output folder. |
-| `--in-place` | off | Resize the images where they are, under their own names and formats, with no quality scoring, and **delete** the ones too small for the 512 tier with their captions. Asks before it starts. See [below](#resizing-in-place---in-place). |
+| `--in-place` | off | Resize the images where they are, under their own names and formats, with no quality scoring, and **delete** the ones too small for the 512 tier with their sidecars. Asks before it starts. See [below](#resizing-in-place---in-place). |
 | `--by-tier` | off | One folder per tier (`_1024`, `_768`, `_512`, `_256`), each holding the whole source tree, for the dataset and for `--copy-to` and `--move-to`. Scans the whole tree at every depth (implies `--recursive`). Adds the 256 tier. See [below](#one-folder-per-tier-for-ai-toolkit---by-tier). |
 | `--report` | off | Dry run. Analyse and write a report; write no images. |
 | `--recursive` | off | Every subfolder that directly contains images is its own dataset, sharing one output folder and one `dataset.toml`. See [below](#--recursive-several-datasets-one-output-folder). |
@@ -61,9 +61,9 @@ k2prep.py <folder> [options]
 | `--no-merge` | off | Skip bucket consolidation; leave every image in the bucket its own aspect ratio picks. |
 | `--single-pass` | off | Score the source and reject before rendering, instead of scoring the rendered result. |
 | `--sort [N]` | off | Triage mode: score every image and file the **original** by quality. Builds no dataset. Bare `--sort` uses absolute bands (`score1`…`score10`, 10 best); `--sort N` (2–10) cuts N populated tiers from this folder (`quality1` best). |
-| `--move` | off | With `--sort` or `--copy-to`: move the originals and their captions instead of copying them. |
+| `--move` | off | With `--sort` or `--copy-to`: move the originals and their sidecars instead of copying them. |
 | `--vl CRITERIA` | off | With `--sort` only: also have a local vision model rate each image on your own comma-separated criteria, blended with the measured score. |
-| `--copy-to TARGET` | off | Selection mode: copy the **original** of every image that passes `--threshold` and `--min-res`, with its caption, into `TARGET`, mirroring the source tree. Builds no dataset. See [below](#copying-the-best-originals-to-another-folder). |
+| `--copy-to TARGET` | off | Selection mode: copy the **original** of every image that passes `--threshold` and `--min-res`, with its sidecars, into `TARGET`, mirroring the source tree. Builds no dataset. See [below](#copying-the-best-originals-to-another-folder). |
 | `--move-to TARGET` | off | `--copy-to TARGET --move`: move the selected originals out of the source and leave the rest for review. See [below](#moving-instead-of-copying). |
 | `--min-res N` | 0 | With `--copy-to` only: copy only images with at least N×N pixels, measured as area. 0 is no resolution gate. |
 
@@ -73,7 +73,7 @@ A source that already is its render is copied byte for byte instead of being enc
 
 Use `--filter box` for heavily compressed sources. Box averaging suppresses 8×8 block artifacts more cleanly than Lanczos, which can ring on them.
 
-Output goes to the output folder `_prep_<folder>`, next to the folder: `L:\photos` gets `L:\_prep_photos`, or the folder that `--out` names. In it: `{1024,768,512}/`, flat, with the caption sidecars copied alongside (`.txt`, `.short`, `.caption` and `.json`, every one an image has), plus `dataset.toml` with `--musubi` (under `--recursive`, each dataset gets its tier folders at `<subfolder>/<tier>/` instead, and under `--by-tier` the tier comes first: `_<tier>/<subfolder>/`). Every run writes two timestamped reports to `reports/` in it:
+Output goes to the output folder `_prep_<folder>`, next to the folder: `L:\photos` gets `L:\_prep_photos`, or the folder that `--out` names. In it: `{1024,768,512}/`, flat, with the sidecars of each image copied alongside (see [Sidecars](#sidecars)), plus `dataset.toml` with `--musubi` (under `--recursive`, each dataset gets its tier folders at `<subfolder>/<tier>/` instead, and under `--by-tier` the tier comes first: `_<tier>/<subfolder>/`). Every run writes two timestamped reports to `reports/` in it:
 
 - `*-preliminary.txt` — the natural, per-family bucket assignment, before any consolidation and before anything is scored. This is the bucket explosion in its raw form.
 - `*-final.txt` — what was actually written, with the rendered scores, what the merge pass moved, and what it could not.
@@ -85,6 +85,14 @@ The output folder is next to the source, not inside it, because Ostris AI Toolki
 Until 2026-10-11 the output folder was `<folder>/_prep`, inside the source. The next run without `--out` moves it to `_prep_<folder>` in one rename, with its renders, reports, score caches and musubi's cache folders, and rewrites the paths in the `dataset.toml` that k2prep wrote, so nothing is rendered again. When `_prep_<folder>` exists already, or with `--out`, the old `_prep` stays and the run says so: delete it, because a trainer that reads subfolders trains it.
 
 The output folder belongs to k2prep. Each run makes the tier folders match its own plan exactly: outputs left by an earlier run that the current one does not place (because the threshold changed, or merging moved an image elsewhere) are removed and listed under `SUPERSEDED OUTPUTS` in the final report. The source folder is never touched, so anything removed is one re-run away from coming back.
+
+## Sidecars
+
+A sidecar is any file that goes by the name of an image: for `photo.jpg`, every other file in the same folder that is named `photo` plus one extension, such as `photo.txt`, `photo.json`, `photo.npz` or `photo.xyz`. A file with an image extension is never a sidecar. There is no list of extensions. Since 1.5.0 every sidecar travels with its image wherever the image goes: into the output folder, into a score folder, into the `--copy-to` target, into the folder `cleanup.bat` fills. Before 1.5.0 (`cleanup.bat` 1.2.0) only the caption files did. A file is a sidecar of the images that share its name, so `x.jpg` and `x.png` both use `x.txt`.
+
+A caption is a sidecar with the extension `.txt`, `.short`, `.caption` or `.json`. The report counts the images that have no caption, and the TOML names the caption extension, by those four extensions only.
+
+An image that the build resizes or re-encodes leaves the trainer caches behind: `.npz` and `.safetensors` files describe the old pixels, and a trainer can reuse a stale one without saying so. An image that is copied unchanged (a source already at its bucket, or an original sorted, copied or moved) takes them along. `--in-place` rewrites the image where it stands and does not touch the files next to it. Files in the folder that no image goes by are listed as unknown extensions, as before.
 
 ## The trainer: `--ostris` or `--musubi`
 
@@ -224,7 +232,7 @@ Only `y` starts it; anything else changes nothing. `--report` asks nothing and c
 - **No quality scoring.** Every image that fits a tier is kept. `--threshold` and `--single-pass` are refused.
 - **Own name, own format.** An image is overwritten by its crop and resize under the same name: JPEG at quality 97 with 4:4:4, PNG, WebP and AVIF at quality 97, BMP. Its captions, masks and other files that go by the name still match. `--png` is refused. The new file is written next to the old one and then replaces it, so an interrupted run leaves the original. EXIF is not kept, and the orientation is applied to the pixels.
 - **Already done.** An image already at its bucket is not written again, so a second run changes nothing, and a JPEG is not encoded again for nothing.
-- **Too small.** An image too small for the 512 tier (its crop to its own ratio has less than the bucket's area divided by 1.15², about 445×445 for a square) is **deleted**, with its caption sidecars. A caption that another image still uses (`x.jpg` and `x.png` both use `x.txt`) stays. Unreadable images stay too, listed under `ERRORS`.
+- **Too small.** An image too small for the 512 tier (its crop to its own ratio has less than the bucket's area divided by 1.15², about 445×445 for a square) is **deleted**, with its sidecars. A sidecar that another image still uses (`x.jpg` and `x.png` both use `x.txt`) stays. Unreadable images stay too, listed under `ERRORS`.
 - **Reports** go to `_prep_<folder>\reports\`, as `in-place-*-preliminary.txt` and `in-place-*-final.txt` (`scan-in-place-*` with `--report`). No `dataset.toml` is written. Folders named like a tier are fine.
 
 There is no backup. Run `--report` first, and keep a copy of anything you want back. `--in-place` cannot be combined with `--sort`, `--copy-to`, `--move-to`, `--by-tier`, `-R` or `--force`.
@@ -237,7 +245,7 @@ k2prep skips images too small for the 512 tier (256 with `--by-tier`) and names 
 cleanup.bat "L:\train\alice" 1024
 ```
 
-That moves every image with fewer than 1024×1024 pixels, along with its caption sidecars (`.txt`, `.short`, `.caption`, `.json`), out of the folder and all its subfolders, at any depth, into a sidecar folder named after the source with a leading underscore, keeping the structure:
+That moves every image with fewer than 1024×1024 pixels, along with its sidecars (every other file of its name), out of the folder and all its subfolders, at any depth, into a sidecar folder named after the source with a leading underscore, keeping the structure:
 
 ```
 L:\train\alice\small.jpg      ->  L:\train\_alice\small.jpg
@@ -256,7 +264,7 @@ What the walk skips, at every depth, is what k2prep's scan skips: folders starti
 
 The default test is **area**, not dimensions: `1024` means fewer than 1,048,576 pixels. A 2048×400 panorama has 819,200 and is moved; a 1200×900 frame has 1,080,000 and stays. If you would rather reject anything with a short side under the threshold — which is closer to what decides whether an image can fill a bucket — use `--dim`, and that same panorama goes for its 400px side while 1200×900 goes with it.
 
-Nothing is deleted and nothing is overwritten. The images are still on disk, one folder over, so a threshold set too aggressively is undone by moving them back. If a file of that name is already in the sidecar folder the pair is left where it is and reported, rather than renamed — a renamed image and its caption would stop agreeing about their own name. Unreadable files stay put and are listed. Run `--dry-run` first.
+Nothing is deleted and nothing is overwritten. The images are still on disk, one folder over, so a threshold set too aggressively is undone by moving them back. If a file of that name is already in the sidecar folder the image and its sidecars are left where they are and reported, rather than renamed — a renamed image and its caption would stop agreeing about their own name. Unreadable files stay put and are listed. Run `--dry-run` first.
 
 `cleanup.bat` and `-R` skip the same folders, so the usual order needs no special care:
 
@@ -268,7 +276,7 @@ run.bat "L:\train" -R --report
 
 ## Sorting a folder by quality
 
-`--sort` is a different job from building a dataset. It scores every image and files the **original** — untouched, full size, with its caption sidecars — under the folder for its score:
+`--sort` is a different job from building a dataset. It scores every image and files the **original** — untouched, full size, with its sidecars — under the folder for its score:
 
 ```bash
 run.bat "L:\train\photos" --sort
@@ -362,7 +370,7 @@ Everything degrades rather than failing: a missing or malformed `.env`, an endpo
 run.bat "L:\train\photos" --sort --move
 ```
 
-**`--move` is the only thing in k2prep that removes anything from your source folder**, here and with [`--copy-to`](#moving-instead-of-copying). Everywhere else the input folder is strictly read-only, and that has not changed — but `--move` is asked for by name and does exactly what it says: each image and its caption leave the source folder for their score folder.
+**`--move` is the only thing in k2prep that removes anything from your source folder**, here and with [`--copy-to`](#moving-instead-of-copying). Everywhere else the input folder is strictly read-only, and that has not changed — but `--move` is asked for by name and does exactly what it says: each image and its sidecars leave the source folder for their score folder.
 
 What it will not do:
 
@@ -374,7 +382,7 @@ What it will not do:
 
 ## Copying the best originals to another folder
 
-`--copy-to` is the third job, next to building a dataset and sorting. It scores every image in a tree, then copies only the originals that are good enough **and** large enough into a separate folder, with the same subfolder structure and their captions. Nothing is resized or re-encoded: the copies are byte-identical to the sources.
+`--copy-to` is the third job, next to building a dataset and sorting. It scores every image in a tree, then copies only the originals that are good enough **and** large enough into a separate folder, with the same subfolder structure and their sidecars. Nothing is resized or re-encoded: the copies are byte-identical to the sources.
 
 Step 1, the survey. `--report` scores everything and copies nothing. You do not need to know the resolution or the threshold yet; the report shows what each combination would select:
 
@@ -409,14 +417,14 @@ The target is created if it does not exist. It must not overlap the source: the 
 The target is your folder, not k2prep's, so k2prep never deletes anything in it:
 
 - A file that is already there and identical to its source, by size and modification time, counts as `already there`. A re-run copies only what is new.
-- A file that is already there and different is a **conflict**. The image and its caption are not copied, the report lists them under `CONFLICTS`, and the exit code is 1. `--force` overwrites.
+- A file that is already there and different is a **conflict**. The image and its sidecars are not copied, the report lists them under `CONFLICTS`, and the exit code is 1. `--force` overwrites.
 - A copy made by an earlier run that this run does not select, for example after you raise `--threshold`, stays where it is. The report lists it under `IN THE TARGET BUT NOT SELECTED`. Delete it yourself if you do not want it.
 
 `--copy-to` cannot be combined with `--sort`. `--png`, `--single-pass` and `--no-merge` have no effect on it, and the report says so if you give them. With `--by-tier` the target gets one folder per tier; see [`--by-tier`](#one-folder-per-tier-for-ai-toolkit---by-tier).
 
 ### Moving instead of copying
 
-`--move-to` does the same selection as `--copy-to` but **moves** the selected originals and their captions into the target. What stays in the source is exactly what was not selected, so a person can go through it for anything usable. `--copy-to TARGET --move` is the same thing spelled out.
+`--move-to` does the same selection as `--copy-to` but **moves** the selected originals and their sidecars into the target. What stays in the source is exactly what was not selected, so a person can go through it for anything usable. `--copy-to TARGET --move` is the same thing spelled out.
 
 ```bash
 run.bat "L:\photos" --recursive --move-to "L:\selected" --min-res 1024 --threshold 6
@@ -427,8 +435,8 @@ Step 1 is the same `--report` survey as before; `--report` never moves anything.
 Because this removes originals from the source, it is careful about how:
 
 - A file reaches the target before it leaves the source. Within one drive it is renamed; across drives it is copied first and deleted after.
-- An image and its caption move together or not at all. If the caption cannot be moved, for example because another program has it open, the image is moved back and the pair is listed under `ERRORS`.
-- A caption shared by two images (`x.jpg` and `x.png` both use `x.txt`) is copied, not moved, while an image that stays in the source still uses it.
+- An image and its sidecars move together or not at all. If a sidecar cannot be moved, for example because another program has it open, the image is moved back and the pair is listed under `ERRORS`.
+- A sidecar shared by two images (`x.jpg` and `x.png` both use `x.txt`) is copied, not moved, while an image that stays in the source still uses it.
 - A file already in the target from an earlier `--copy-to` run counts as moved, and its source is removed, only when the two are **byte-identical**. If they differ, that is a conflict and the pair stays in the source, as it does for any other conflict.
 
 Re-running with a lower `--threshold` moves the next layer out. Folders that end up empty in the source are left in place.

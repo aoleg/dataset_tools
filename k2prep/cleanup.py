@@ -2,9 +2,10 @@
 """cleanup.py - move undersized images out of a training folder.
 
 Walks a folder and all its subfolders, at any depth, and moves every image
-smaller than a given size, together with its caption sidecars, into a
-sidecar folder named after the source with a leading underscore. The original
-folder structure is preserved inside it:
+smaller than a given size, together with its sidecars (every other file that
+goes by its name: captions, masks, caches), into a sidecar folder named after
+the source with a leading underscore. The original folder structure is
+preserved inside it:
 
     cleanup.py T:\\somefolder 1024
 
@@ -29,13 +30,16 @@ from pathlib import Path
 
 from PIL import Image
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 # Mirrors k2prep's IMAGE_EXTENSIONS, for the same reason: these are the
 # extensions musubi-tuner recognises. Mixed-case variants such as .Jpg are not
 # matched; they are counted and listed so you notice them.
 IMAGE_EXTENSIONS = [".jpg", ".jpeg", ".png", ".webp", ".bmp", ".avif"]
 KNOWN_EXTENSIONS = set(IMAGE_EXTENSIONS) | {e.upper() for e in IMAGE_EXTENSIONS}
+
+# What a caption is: files with these extensions are not "unknown" when no
+# image goes by their name. What moves with an image is every file of its name.
 CAPTION_EXTENSIONS = (".txt", ".short", ".caption", ".json")
 
 # A leading underscore marks a folder as somebody's output rather than source
@@ -71,9 +75,10 @@ def _size_arg(text: str) -> tuple[int, int]:
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
         prog="cleanup",
-        description="Move images below a size threshold, and their caption "
-                    "sidecars (.txt, .short, .caption, .json), out of a folder and all its subfolders "
-                    "into a _foldername sidecar folder next to it.",
+        description="Move images below a size threshold, and their sidecars "
+                    "(every other file of the image's name), out of a folder "
+                    "and all its subfolders into a _foldername sidecar folder "
+                    "next to it.",
     )
     p.add_argument("folder", help="Folder to clean. Subfolders at any depth "
                                   "are cleaned too, except those starting with "
@@ -155,28 +160,43 @@ def folders_to_clean(root: Path) -> tuple[list[Path], list[str], list[str]]:
     return folders, links, unreadable
 
 
-def images_in(folder: Path) -> tuple[list[Path], list[str]]:
-    """Non-recursive. Returns (image paths by filename, unknown-extension
-    filenames). Captions are not unknown: they are caption data."""
+def stem_key(name: str) -> str:
+    """The name without its extension, folded the way the file system folds it:
+    x.jpg and X.PNG are one stem on Windows, two on Linux."""
+    return os.path.normcase(os.path.splitext(name)[0])
+
+
+def images_in(folder: Path) -> tuple[list[Path], dict[str, list[Path]], list[str]]:
+    """Non-recursive. Returns (image paths by filename, sidecars by stem_key,
+    unknown-extension filenames).
+
+    The sidecars of an image are the other files of the folder that go by its
+    name, whatever their extension, taken from this one listing. A mixed-case
+    image extension (.Jpg) is neither an image nor a sidecar: it is unknown.
+    A caption with no image is not unknown: it is caption data."""
     images: list[Path] = []
-    unknown: list[str] = []
+    others: list[os.DirEntry] = []
     for entry in os.scandir(folder):
         if entry.is_dir():
             continue
-        ext = os.path.splitext(entry.name)[1]
-        if ext in KNOWN_EXTENSIONS:
+        if os.path.splitext(entry.name)[1] in KNOWN_EXTENSIONS:
             images.append(Path(entry.path))
-        elif ext.lower() not in CAPTION_EXTENSIONS:
-            unknown.append(entry.name)
+        else:
+            others.append(entry)
     images.sort(key=lambda p: p.name)
-    unknown.sort()
-    return images, unknown
-
-
-def captions_for(path: Path) -> list[Path]:
-    """The caption sidecars of an image, <stem><ext> next to it."""
-    return [cap for ext in CAPTION_EXTENSIONS
-            if (cap := path.parent / f"{path.stem}{ext}").is_file()]
+    stems = {stem_key(p.name) for p in images}
+    sidecars: dict[str, list[Path]] = {}
+    unknown: list[str] = []
+    for entry in sorted(others, key=lambda e: e.name):
+        ext = os.path.splitext(entry.name)[1].lower()
+        key = stem_key(entry.name)
+        if ext in IMAGE_EXTENSIONS:
+            unknown.append(entry.name)
+        elif key in stems:
+            sidecars.setdefault(key, []).append(Path(entry.path))
+        elif ext not in CAPTION_EXTENSIONS:
+            unknown.append(entry.name)
+    return images, sidecars, unknown
 
 
 def plural(n: int, word: str, plural_form: str | None = None) -> str:
@@ -210,8 +230,9 @@ class Counts:
 
 def clean_folder(folder: Path, dest: Path, threshold: tuple[int, int],
                  by_dim: bool, dry_run: bool, counts: Counts) -> None:
-    images, unknown = images_in(folder)
+    images, sidecars, unknown = images_in(folder)
     counts.unknown += len(unknown)
+    gone: set[Path] = set()           # sidecars of a shared name already moved
 
     moved = kept = skipped = errors = 0
     for path in images:
@@ -230,7 +251,9 @@ def clean_folder(folder: Path, dest: Path, threshold: tuple[int, int],
             kept += 1
             continue
 
-        caps = captions_for(path)
+        # x.jpg and x.png share x.txt and every other file of the name x: the
+        # first of them to move takes it along.
+        caps = [s for s in sidecars.get(stem_key(path.name), []) if s not in gone]
         pairs = [(path, dest / path.name)] + [(cap, dest / cap.name) for cap in caps]
 
         # Never overwrite. Renaming on collision would be friendlier right up
@@ -243,6 +266,7 @@ def clean_folder(folder: Path, dest: Path, threshold: tuple[int, int],
             skipped += 1
             continue
 
+        gone.update(caps)
         if dry_run:
             cap_note = "".join(f" (+ {cap.suffix})" for cap in caps)
             print(f"    move   {path.name}  {size[0]}x{size[1]}{cap_note}")

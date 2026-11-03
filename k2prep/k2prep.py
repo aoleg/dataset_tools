@@ -42,7 +42,7 @@ import numpy as np
 from PIL import Image, ImageOps
 from tqdm import tqdm
 
-__version__ = "1.4.1"
+__version__ = "1.5.0"
 
 EPS = 1e-6
 
@@ -396,10 +396,18 @@ MERGE_MAX_ROUNDS = 10
 IMAGE_EXTENSIONS = [".jpg", ".jpeg", ".png", ".webp", ".bmp", ".avif"]
 KNOWN_EXTENSIONS = set(IMAGE_EXTENSIONS) | {e.upper() for e in IMAGE_EXTENSIONS}
 
-# Caption sidecars, <stem><ext> next to the image. Every one an image has goes
-# wherever the image goes; the order is the order of preference where only one
-# can be named (the caption_extension of musubi's TOML).
+# What a caption is, <stem><ext> next to the image. Only the places where the
+# meaning "caption" matters use it: counting the images that have one, the
+# caption_extension of musubi's TOML (the order is the order of preference
+# where only one can be named), and a caption borrowed by a same-stem image.
+# What travels with an image is every file of its name, see sidecars_for.
 CAPTION_EXTENSIONS = (".txt", ".short", ".caption", ".json")
+
+# The caches a trainer keeps next to an image, a latent or a text-encoder
+# output of its pixels. A render of the image gets none of them: they describe
+# the old pixels, and kohya reuses a stale one without a word. An unchanged
+# copy of the image carries them like any other sidecar.
+CACHE_EXTS = (".npz", ".safetensors")
 
 RESAMPLE_FILTERS = {
     "lanczos": Image.LANCZOS,
@@ -839,7 +847,7 @@ class Result:
 
     out_stem: str = ""
     out_name: str = ""
-    captions: list[Path] = field(default_factory=list)
+    sidecars: list[Path] = field(default_factory=list)
     caption_borrowed: bool = False
     collided: bool = False
 
@@ -847,6 +855,12 @@ class Result:
     merged: bool = False
     # set when the source was already the render and was copied byte for byte
     copied_as_is: bool = False
+
+    @property
+    def captions(self) -> list[Path]:
+        """The sidecars that are captions, in CAPTION_EXTENSIONS order."""
+        return [c for ext in CAPTION_EXTENSIONS for c in self.sidecars
+                if c.suffix.lower() == ext]
 
     @property
     def bucket_family(self) -> str:
@@ -1172,15 +1186,25 @@ def can_copy_as_is(res: Result, ext: str) -> bool:
 
 def write_output(res: Result, out_dir: Path, resample: int, ext: str) -> None:
     dest = out_dir / (res.out_stem + ext)
-    if can_copy_as_is(res, ext):
+    as_is = can_copy_as_is(res, ext)
+    if as_is:
         # copyfile, not copy2: a read-only source must not make a read-only
         # output, which the next run's sweep could not remove.
         shutil.copyfile(res.path, dest)
         res.copied_as_is = True
     else:
         render_to(res, dest, resample)
-    for cap in res.captions:
-        shutil.copyfile(cap, out_dir / f"{res.out_stem}{cap.suffix.lower()}")
+    for side in output_sidecars(res, as_is):
+        shutil.copyfile(side, out_dir / f"{res.out_stem}{side.suffix.lower()}")
+
+
+def output_sidecars(res: Result, as_is: bool) -> list[Path]:
+    """The sidecars that go beside the output of res: all of them next to a
+    byte-for-byte copy, all but the caches next to a render, whose pixels are
+    not the ones the caches describe."""
+    if as_is:
+        return res.sidecars
+    return [s for s in res.sidecars if s.suffix.lower() not in CACHE_EXTS]
 
 
 # ---------------------------------------------------------------------------
@@ -1192,7 +1216,7 @@ def write_output(res: Result, out_dir: Path, resample: int, ext: str) -> None:
 # so captions, masks and every other file that goes by the name still match.
 # An image already at its bucket is not touched: a second run changes nothing,
 # and a JPEG is never re-encoded for nothing. An image too small for the
-# smallest tier is deleted, with each caption no other image uses.
+# smallest tier is deleted, with each sidecar no other image uses.
 
 IN_PLACE_FORMATS = {".jpg": "JPEG", ".jpeg": "JPEG", ".png": "PNG",
                     ".webp": "WEBP", ".avif": "AVIF", ".bmp": "BMP"}
@@ -1240,19 +1264,20 @@ def write_in_place(res: Result, resample: int) -> None:
 
 
 def delete_too_small(results: list[Result], dry_run: bool) -> list[str]:
-    """Delete the images that fit no tier and the captions only they use.
+    """Delete the images that fit no tier and the sidecars only they use.
 
-    x.jpg and x.png share x.txt: a caption stays while any image that is not
-    deleted, an unreadable one included, still goes by it. Returns report
-    lines; a failed deletion is marked on the result as an error.
+    x.jpg and x.png share x.txt and every other file of the name x: a sidecar
+    stays while any image that is not deleted, an unreadable one included,
+    still goes by it. Returns report lines; a failed deletion is marked on the
+    result as an error.
     """
     small = [r for r in results if r.status == ST_SMALL]
     kept_caps = {c for r in results if r.status != ST_SMALL
-                 for c in (r.captions or captions_for(r.path))}
+                 for c in (r.sidecars or sidecars_for(r.path))}
     lines: list[str] = []
     gone: set[Path] = set()
     for r in small:
-        files = [r.path] + [c for c in (r.captions or captions_for(r.path))
+        files = [r.path] + [c for c in (r.sidecars or sidecars_for(r.path))
                             if c not in kept_caps and c not in gone]
         for f in files:
             try:
@@ -1491,22 +1516,56 @@ def plan_merge(accepted: list["Result"]):
 # 7.1  Scanning
 # ---------------------------------------------------------------------------
 
+# The sidecars of the images of every folder a scan listed, by stem: the
+# non-image files that go by the image's name, taken from the listing the scan
+# made anyway, so no folder is read twice and no extension is probed one by one.
+# A scan replaces the entry of each folder it lists.
+_sidecar_index: dict[str, dict[str, list[Path]]] = {}
+
+
+def stem_key(name: str) -> str:
+    """The name without its extension, folded the way the file system folds it:
+    x.jpg and X.PNG are one stem on Windows, two on Linux."""
+    return os.path.normcase(os.path.splitext(name)[0])
+
+
+def _folder_sidecars(directory: Path, names: list[str]):
+    """Sort the file names of one folder into images, sidecars and the rest.
+
+    A sidecar is any file that is not an image and has the stem of an image of
+    the folder, whatever its extension. Returns (images, sidecars by stem,
+    unknown): the image paths sorted by filename, the sidecars by stem_key,
+    and the sorted names that are neither, captions without an image aside.
+    A mixed-case image extension (.Jpg) is not an image here and not a sidecar
+    either: it is listed, as it always was.
+    """
+    images = sorted((directory / n for n in names
+                     if os.path.splitext(n)[1] in KNOWN_EXTENSIONS),
+                    key=lambda p: p.name)
+    stems = {stem_key(p.name) for p in images}
+    sidecars: dict[str, list[Path]] = defaultdict(list)
+    unknown: list[str] = []
+    for name in sorted(names):
+        ext = os.path.splitext(name)[1]
+        if ext in KNOWN_EXTENSIONS:
+            continue
+        key = stem_key(name)
+        if (ext.lower() in IMAGE_EXTENSIONS or name.startswith(IN_PLACE_TMP)):
+            unknown.append(name)                  # never an image's sidecar
+        elif key in stems:
+            sidecars[key].append(directory / name)
+        elif ext.lower() not in CAPTION_EXTENSIONS:
+            unknown.append(name)
+    return images, sidecars, unknown
+
+
 def scan_folder(folder: Path) -> tuple[list[Path], list[str]]:
     """One directory, files only. Returns (image paths sorted by filename,
     unknown-extension filenames sorted)."""
-    images: list[Path] = []
-    unknown: list[str] = []
-    for entry in os.scandir(folder):
-        if entry.is_dir():
-            continue                              # includes _prep/
-        name = entry.name
-        ext = os.path.splitext(name)[1]
-        if ext in KNOWN_EXTENSIONS:
-            images.append(Path(entry.path))
-        elif ext.lower() not in CAPTION_EXTENSIONS:
-            unknown.append(name)
-    images.sort(key=lambda p: p.name)
-    unknown.sort()
+    names = [entry.name for entry in os.scandir(folder)
+             if not entry.is_dir()]               # includes _prep/
+    images, sidecars, unknown = _folder_sidecars(folder, names)
+    _sidecar_index[os.path.normcase(str(folder))] = sidecars
     return images, unknown
 
 
@@ -1622,6 +1681,7 @@ def scan_tree(root: Path, recursive: bool, reserved: bool = True,
             return
         dirs.append(rel)
         subdirs: list[tuple[Path, str]] = []
+        files: list[str] = []
         for entry in entries:
             name = entry.name
             relname = qualified_name(rel, name)
@@ -1658,11 +1718,11 @@ def scan_tree(root: Path, recursive: bool, reserved: bool = True,
                         f"--recursive.")
                 subdirs.append((Path(entry.path), relname))
                 continue
-            ext = os.path.splitext(name)[1]
-            if ext in KNOWN_EXTENSIONS:
-                out_images.append((rel, Path(entry.path)))
-            elif ext.lower() not in CAPTION_EXTENSIONS:
-                out_unknown.append(relname)
+            files.append(name)
+        images, sidecars, unknown = _folder_sidecars(directory, files)
+        _sidecar_index[os.path.normcase(str(directory))] = sidecars
+        out_images.extend((rel, p) for p in images)
+        out_unknown.extend(qualified_name(rel, n) for n in unknown)
         for sub, relname in subdirs:
             walk(sub, relname)
 
@@ -1675,14 +1735,15 @@ def scan_tree(root: Path, recursive: bool, reserved: bool = True,
     return out_images, out_unknown, dirs, notes
 
 
-def captions_for(path: Path) -> list[Path]:
-    """The caption sidecars of an image, in CAPTION_EXTENSIONS order."""
-    found = []
-    for ext in CAPTION_EXTENSIONS:
-        cap = path.parent / f"{path.stem}{ext}"
-        if cap.is_file():
-            found.append(cap)
-    return found
+def sidecars_for(path: Path) -> list[Path]:
+    """The sidecars of an image: every other file of its name, by filename.
+    From the scan's listing of the folder; a folder no scan has listed is read."""
+    folder = path.parent
+    index = _sidecar_index.get(os.path.normcase(str(folder)))
+    if index is None:
+        names = [entry.name for entry in os.scandir(folder) if entry.is_file()]
+        index = _folder_sidecars(folder, names)[1]
+    return list(index.get(stem_key(path.name), ()))
 
 
 def _free_path(directory: Path, stem: str, ext: str) -> Path:
@@ -2187,7 +2248,7 @@ def plan_quality_tiers(scored: list[Result], n_tiers: int) -> list[QualityTier]:
 
 def place_sorted(res: Result, prep_dir: Path, move: bool, force: bool,
                  dry_run: bool) -> None:
-    """Put one source image, and its caption, in the folder for its score."""
+    """Put one source image, and its sidecars, in the folder for its score."""
     dest_dir = prep_dir / res.sort_dirname
     dest = dest_dir / res.name
     res.sort_dest = dest
@@ -2205,15 +2266,15 @@ def place_sorted(res: Result, prep_dir: Path, move: bool, force: bool,
             if dest.exists():
                 dest.unlink()
             shutil.move(str(res.path), str(dest))
-            for caption in res.captions:
-                cap_dest = dest_dir / caption.name
-                if cap_dest.exists():
-                    cap_dest.unlink()
-                shutil.move(str(caption), str(cap_dest))
+            for side in res.sidecars:
+                side_dest = dest_dir / side.name
+                if side_dest.exists():
+                    side_dest.unlink()
+                shutil.move(str(side), str(side_dest))
         else:
             shutil.copy2(res.path, dest)
-            for caption in res.captions:
-                shutil.copy2(caption, dest_dir / caption.name)
+            for side in res.sidecars:
+                shutil.copy2(side, dest_dir / side.name)
     except Exception as exc:
         res.sort_action = SORT_FAILED
         res.error = f"{type(exc).__name__}: {exc}"
@@ -2237,7 +2298,7 @@ def find_stale_sorted(prep_dir: Path, results: list[Result]) -> list[str]:
         if not d.is_dir():
             continue
         for path in sorted(d.iterdir(), key=lambda p: p.name):
-            if not path.is_file() or path.suffix.lower() in CAPTION_EXTENSIONS:
+            if not path.is_file():
                 continue
             target = wanted.get(path.name)
             if target is not None and target != folder:
@@ -2251,7 +2312,7 @@ def find_stale_sorted(prep_dir: Path, results: list[Result]) -> list[str]:
 #
 # Copies the ORIGINAL of every image that passes both gates - score and
 # resolution - into a separate target folder, mirroring the source tree, with
-# its caption sidecars. shutil.copy2 copies bytes and keeps the mtime: nothing is
+# its sidecars. shutil.copy2 copies bytes and keeps the mtime: nothing is
 # decoded or re-encoded on the way.
 #
 # The source is read-only here as everywhere else, unless --move asks for the
@@ -2425,10 +2486,10 @@ def _target_state(src: Path, dst: Path) -> str:
 
 
 def place_copy(res: Result, target: Path, force: bool, dry_run: bool) -> None:
-    """Copy one source image, and its caption, to its mirrored place."""
+    """Copy one source image, and its sidecars, to its mirrored place."""
     dest_dir = copy_dest_dir(target, res.dataset, res.dest_tier)
     pairs = [(res.path, dest_dir / res.path.name)]
-    pairs += [(cap, dest_dir / cap.name) for cap in res.captions]
+    pairs += [(side, dest_dir / side.name) for side in res.sidecars]
     res.copy_dest = pairs[0][1]
 
     try:
@@ -2463,27 +2524,27 @@ def place_copy(res: Result, target: Path, force: bool, dry_run: bool) -> None:
 
 
 def place_move(res: Result, target: Path, force: bool, dry_run: bool,
-               keep_captions: set[Path] = frozenset()) -> None:
-    """--move: move one source image, and its caption, to its mirrored place.
+               keep_sidecars: set[Path] = frozenset()) -> None:
+    """--move: move one source image, and its sidecars, to its mirrored place.
 
     What stays in the source is what was not selected, for a person to review.
     The guards are the copy's plus these, because this removes originals:
 
     - shutil.move renames within a volume and copies before it unlinks across
       volumes, so a file is in the target before it leaves the source.
-    - The image and its caption leave together. If the second move fails, the
-      first is moved back, so an image never ends up without its caption.
+    - The image and its sidecars leave together. If a later move fails, the
+      earlier ones are moved back, so an image never ends up without its caption.
     - A target file that matches by size and mtime is the copy an earlier
       --copy-to made. That is enough to skip a copy but not to delete the only
       source, so here the bytes are compared, and the source is removed only
       when they agree. If they differ, it is a conflict.
-    - keep_captions: captions another image still in the source uses (x.jpg
+    - keep_sidecars: sidecars another image still in the source uses (x.jpg
       and x.png share x.txt); they are copied, not moved.
     """
     dest_dir = copy_dest_dir(target, res.dataset, res.dest_tier)
     pairs = [(res.path, dest_dir / res.path.name, True)]
-    pairs += [(cap, dest_dir / cap.name, cap not in keep_captions)
-              for cap in res.captions]
+    pairs += [(side, dest_dir / side.name, side not in keep_sidecars)
+              for side in res.sidecars]
     res.copy_dest = pairs[0][1]
 
     try:
@@ -2703,13 +2764,14 @@ def resolve_names(accepted: list[Result], ext: str) -> list[str]:
         if len(group) < 2:
             continue
         # Colliding stems are almost always the same photograph in two formats,
-        # so a lone caption applies to all of them.
+        # so a lone caption applies to all of them, with the other sidecars
+        # that go by the name.
         with_caption = [r for r in group if r.captions]
         if len(with_caption) == 1:
-            src = with_caption[0].captions
+            src = with_caption[0].sidecars
             for r in group:
                 if not r.captions:
-                    r.captions = list(src)
+                    r.sidecars = list(src)
                     r.caption_borrowed = True
         for r in group:
             if not r.collided:
@@ -2838,7 +2900,7 @@ def build_report(args, folder: Path, results: list[Result], unknown: list[str],
         w("policy      : --in-place OVERWRITES each image with its resize onto its")
         w("              bucket, under its own name and format. One already at its")
         w(f"              bucket is left as it is. One too small for the {active_tiers()[-1]} tier is")
-        w("              DELETED, with each caption no other image uses.")
+        w("              DELETED, with each sidecar no other image uses.")
         w("scoring     : none. --in-place takes every image that fits a tier.")
     else:
         w("policy      : rejected images are skipped, not copied. Source folder unmodified.")
@@ -2985,7 +3047,7 @@ def build_report(args, folder: Path, results: list[Result], unknown: list[str],
     if in_place and stage == STAGE_FINAL:
         verb = "would be deleted" if args.report else "deleted"
         w(f"FILES {verb.upper()}  ({_fmt_int(len(deleted or []))}: the images "
-          f"above and the captions only they used)")
+          f"above and the sidecars only they used)")
         w("-" * 66)
         for line in deleted or []:
             w(f"  {line}")
@@ -3242,7 +3304,7 @@ def build_sort_report(args, folder: Path, results: list[Result],
         w("              columns beside it are still exact, and the cached")
         w("              opinions make a re-run of THIS folder stable.")
     if args.move:
-        w("policy      : --move REMOVES each image and its caption from the source")
+        w("policy      : --move REMOVES each image and its sidecars from the source")
         w("              folder. This is the only k2prep mode that does. Each")
         w("              destination is written before its source is unlinked, so")
         w("              an interrupted run leaves a duplicate, never a hole.")
@@ -3472,15 +3534,15 @@ def build_copy_report(args, folder: Path, target: Path, results: list[Result],
         w(f"              One that fills no tier is not {done_action}.")
     if args.move:
         w("policy      : --move REMOVES each selected original and its")
-        w("              captions from the source, into the target, mirroring the")
+        w("              sidecars from the source, into the target, mirroring the")
         w("              source tree. What stays in the source is NOT SELECTED,")
         w("              for review. Each file reaches the target before it")
-        w("              leaves the source, an image and its caption move")
-        w("              together or not at all, and a caption an image left")
+        w("              leaves the source, an image and its sidecars move")
+        w("              together or not at all, and a sidecar an image left")
         w("              behind still uses is copied instead. A file already in")
         w("              the target removes its source only if the bytes match.")
     else:
-        w("policy      : originals and their captions are copied byte for byte,")
+        w("policy      : originals and their sidecars are copied byte for byte,")
         w("              mirroring the source tree. The source is not modified.")
     w("              Nothing in the target is deleted, and a different file")
     w("              already there is not overwritten without --force.")
@@ -3877,7 +3939,7 @@ def parse_args(argv=None):
                    const=SORT_ABSOLUTE, default=None,
                    help=f"Triage instead of building a dataset: score every "
                         f"image at the {SORT_TIER} tier and copy the ORIGINAL, "
-                        f"with its caption sidecars, into a folder for its "
+                        f"with its sidecars, into a folder for its "
                         f"quality. "
                         f"Bare --sort files by absolute score into "
                         f"{SORT_DIR_PREFIX}1..{SORT_DIR_PREFIX}10 "
@@ -3895,8 +3957,8 @@ def parse_args(argv=None):
                    help="Select instead of building a dataset: score every "
                         f"image at the {SORT_TIER} tier, as --sort does, and "
                         "copy the ORIGINAL of each one that passes "
-                        "--threshold and --min-res, with its caption "
-                        "sidecars, "
+                        "--threshold and --min-res, with its sidecars "
+                        "(every file of its name), "
                         "byte for byte into TARGET, mirroring the source "
                         "tree. TARGET is created if needed and must not "
                         "overlap the source. Nothing in it is deleted or "
@@ -3910,7 +3972,7 @@ def parse_args(argv=None):
                         "does not. Default 0, no resolution gate.")
     p.add_argument("--move-to", metavar="TARGET", dest="move_to",
                    help="--copy-to TARGET --move: move the selected originals "
-                        "and their captions out of the source, leaving only "
+                        "and their sidecars out of the source, leaving only "
                         "what was not selected, for review.")
     p.add_argument("--by-tier", action="store_true", dest="by_tier",
                    help="Put the tier first, one folder per tier (_1024, "
@@ -3926,7 +3988,7 @@ def parse_args(argv=None):
                         "for it is skipped.")
     p.add_argument("--move", action="store_true",
                    help="With --sort or --copy-to, move the originals and "
-                        "their captions instead of copying them. This is the "
+                        "their sidecars instead of copying them. This is the "
                         "only k2prep option that removes anything from the "
                         "source folder.")
     p.add_argument("--vl", metavar="CRITERIA",
@@ -4099,7 +4161,7 @@ def run_sort(args, folder: Path, prep_dir: Path, reports_dir: Path,
     results.sort(key=lambda r: r.name)
     for r in results:
         if r.status == ST_CANDIDATE:
-            r.captions = captions_for(r.path)
+            r.sidecars = sidecars_for(r.path)
 
     # -- score, at the 1024 tier, with the same cache the dataset run uses ----
     todo = [r for r in results if r.status == ST_CANDIDATE]
@@ -4290,7 +4352,7 @@ def run_copy(args, folder: Path, target: Path, prep_dir: Path,
     results.sort(key=lambda r: (r.dataset, r.name))
     for r in results:
         if r.status == ST_CANDIDATE:
-            r.captions = captions_for(r.path)
+            r.sidecars = sidecars_for(r.path)
 
     # -- score everything, small images included -----------------------------
     # The report is the quality survey of the whole tree, so an image that
@@ -4352,18 +4414,19 @@ def run_copy(args, folder: Path, target: Path, prep_dir: Path,
 
     # -- copy or move, sequentially: the disk is the bottleneck, not the CPU --
     selected = [r for r in results if r.status == ST_ACCEPTED]
-    # x.jpg and x.png share x.txt. Under --move a shared caption leaves the
-    # source only with the last selected image that uses it, and never while
-    # an image staying behind for review still needs it.
-    cap_users: dict[Path, int] = defaultdict(int)
+    # x.jpg and x.png share x.txt and every other file of the name. Under
+    # --move a shared sidecar leaves the source only with the last selected
+    # image that uses it, and never while an image staying behind for review
+    # still needs it.
+    side_users: dict[Path, int] = defaultdict(int)
     stays: set[Path] = set()
     if args.move:
         for r in results:
-            for cap in r.captions or captions_for(r.path):
+            for side in r.sidecars or sidecars_for(r.path):
                 if r.status == ST_ACCEPTED:
-                    cap_users[cap] += 1
+                    side_users[side] += 1
                 else:
-                    stays.add(cap)
+                    stays.add(side)
     desc = ("planning " if args.report else
             "moving   " if args.move else "copying  ")
     for r in tqdm(selected, desc=desc, unit="img", disable=not selected):
@@ -4371,10 +4434,10 @@ def run_copy(args, folder: Path, target: Path, prep_dir: Path,
             place_copy(r, target, args.force, args.report)
             continue
         keep = set()
-        for cap in r.captions:
-            cap_users[cap] -= 1
-            if cap in stays or cap_users[cap] > 0:
-                keep.add(cap)
+        for side in r.sidecars:
+            side_users[side] -= 1
+            if side in stays or side_users[side] > 0:
+                keep.add(side)
         place_move(r, target, args.force, args.report, keep)
     left_over = [r for r in results if r.status in (ST_BELOW, ST_SMALL)
                  and (copy_dest_dir(target, r.dataset, r.dest_tier)
@@ -4463,7 +4526,7 @@ def run_in_place(args, folder: Path, reports_dir: Path, pairs, unknown,
     results.sort(key=lambda r: (r.dataset, r.name))
     for r in results:
         if r.status in (ST_CANDIDATE, ST_SMALL):
-            r.captions = captions_for(r.path)
+            r.sidecars = sidecars_for(r.path)
 
     reports_dir.mkdir(parents=True, exist_ok=True)
     kind = "scan-in-place" if args.report else "in-place"
@@ -4546,7 +4609,7 @@ def run_in_place(args, folder: Path, reports_dir: Path, pairs, unknown,
     print(f"  resized     {counts[ST_ACCEPTED]:>7}{dry}")
     print(f"  unchanged   {counts[ST_ALREADY]:>7}   (already at their bucket)")
     print(f"  deleted     {n_small:>7}   too small, and {max(n_caps, 0)} "
-          f"caption file(s){dry}")
+          f"sidecar file(s){dry}")
     print(f"  errors      {counts[ST_ERROR]:>7}")
     if unknown:
         print(f"  unknown ext {len(unknown):>7}")
@@ -4754,7 +4817,7 @@ def run_one_folder(args) -> int:
     results.sort(key=lambda r: (r.dataset, r.name))
     for r in results:
         if r.status == ST_CANDIDATE:
-            r.captions = captions_for(r.path)
+            r.sidecars = sidecars_for(r.path)
 
     # -- preliminary report: the natural, unmerged assignment ----------------
     # Written before merging is decided and, in two-pass mode, before anything
@@ -4833,8 +4896,11 @@ def run_one_folder(args) -> int:
     planned: dict[tuple[str, int], set[str]] = defaultdict(set)
     for r in accepted:
         planned[(r.dataset, r.tier)].add(r.out_name)
-        for cap in r.captions:
-            planned[(r.dataset, r.tier)].add(f"{r.out_stem}{cap.suffix.lower()}")
+        # can_copy_as_is opens the file: asked only where it changes the answer
+        as_is = (any(s.suffix.lower() in CACHE_EXTS for s in r.sidecars)
+                 and can_copy_as_is(r, ext))
+        for side in output_sidecars(r, as_is):
+            planned[(r.dataset, r.tier)].add(f"{r.out_stem}{side.suffix.lower()}")
 
     if not args.force:
         for r in accepted:

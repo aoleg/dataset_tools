@@ -268,9 +268,13 @@ Output extension always matches the format actually written, regardless of input
 
 Pass-through (`can_copy_as_is`): a source whose displayed size equals its bucket, with no EXIF rotation (orientation absent or 1), mode RGB or L, and in the output format (JPEG, or PNG with `--png`), is copied with `shutil.copyfile` instead of rendered, sparing a lossy generation. `copyfile`, not `copy2`, so a read-only source does not make a read-only output that the next sweep cannot remove. The copy keeps EXIF and ICC, which a render drops. `Result.copied_as_is` marks it; the console prints an `as is` count and the final report a note (a dry run counts what would be copied). Scoring is unchanged: the rendered pixels it measures are the source's.
 
-### 5.7 Caption sidecars
+### 5.7 Sidecars
 
-A caption sidecar is `<stem><ext>` next to the source, for `ext` in `CAPTION_EXTENSIONS` = `.txt`, `.short`, `.caption`, `.json`. Every one that exists is copied into the tier folder beside the produced image, renamed to match the output stem, with its extension in lower case. Copy verbatim; do not re-encode or strip whitespace. The copy modes (`--sort`, `--copy-to`, `--move-to`) carry every one under its own name. A file with one of these extensions is caption data, not an unknown extension.
+A sidecar is any file in the source folder, subfolders not included, whose name without its extension equals the image's (compared with `os.path.normcase`) and whose extension is not an image extension. There is no list of extensions. They are taken from the directory listing the scan makes anyway, grouped by `stem_key`, so no extension is probed one by one (`sidecars_for`). Since 1.5.0; before it only the files with an extension in `CAPTION_EXTENSIONS` travelled. Every sidecar is copied into the tier folder beside the produced image, renamed to match the output stem, with its extension in lower case. Copy verbatim; do not re-encode or strip whitespace. The copy modes (`--sort`, `--copy-to`, `--move-to`) carry every one under its own name. A file with a mixed-case image extension (`.Jpg`) is neither an image nor a sidecar. A file that is no image's sidecar and has an extension in `CAPTION_EXTENSIONS` is caption data, not an unknown extension.
+
+`CACHE_EXTS` = `.npz`, `.safetensors`. A render (a cropped and resized or re-encoded image written to the tier folder) gets no file with these extensions: a latent or text-encoder cache of the old pixels is stale, and kohya can reuse it silently. A source copied unchanged (`copied_as_is`, or an original sorted, copied or moved) carries them. `--in-place` leaves the files next to the image as they are. `output_sidecars` makes the choice, and the sweep plans the same names.
+
+`CAPTION_EXTENSIONS` = `.txt`, `.short`, `.caption`, `.json` is what a caption is, and only the places that need that meaning use it: the missing-caption counts (`Result.captions`, the sidecars with one of these extensions), the TOML `caption_extension`, and the caption borrowed by a same-stem image.
 
 Missing captions are counted and listed in the report. They are not an error and do not prevent processing.
 
@@ -402,7 +406,7 @@ If all three are `None` (should be impossible), composite is 10 and the image is
 
 A single `_prep` parent means the input scanner skips exactly one directory name.
 
-Tier folders hold accepted images plus their `.txt` sidecars, flat. Each populated tier folder is one `[[datasets]]` block in the training TOML.
+Tier folders hold accepted images plus their sidecars, flat. Each populated tier folder is one `[[datasets]]` block in the training TOML.
 
 **There is no exclusion folder.** Rejected images are skipped: nothing is written for them, and the source file stays exactly where it is. The report is the only record. This makes the full filename lists in the report's rejection sections load-bearing rather than decorative, so they must not be truncated.
 
@@ -419,7 +423,7 @@ The intended recovery workflow: lower `--threshold` and re-run. Because existing
 
 Two sources can produce the same output name (`photo.jpg` and `photo.png` both become `photo.jpg`). Resolve by suffixing `_2`, `_3`, … in scan order.
 
-Caption handling for collisions: if only one of the colliding sources has captions, copy those same captions to **both** output stems. Colliding stems are almost always the same photograph in two formats, so the caption applies to both. Log every collision in the report.
+Caption handling for collisions: if only one of the colliding sources has captions, copy those same captions, with the other sidecars of that name, to **both** output stems. Colliding stems are almost always the same photograph in two formats, so the caption applies to both. Log every collision in the report.
 
 Collisions are resolved per tier folder, not globally. Two images that collide by name but land in different tiers do not need suffixing.
 
@@ -480,7 +484,7 @@ Placement: `<target>/<relpath>/<filename>`, with `<stem>.txt` beside it when the
 The target belongs to the user, so:
 
 - An existing file with the same size as its source and a modification time within 2 s of it (FAT stores mtime at 2 s resolution) is the copy an earlier run made, and it is skipped. Re-runs are idempotent.
-- An existing file that differs is a conflict. The image and its caption are copied together or not at all, so a conflicting pair is skipped, reported, and makes the exit code 1. `--force` overwrites.
+- An existing file that differs is a conflict. The image and its sidecars are copied together or not at all, so a conflicting set is skipped, reported, and makes the exit code 1. `--force` overwrites.
 - Nothing in the target is deleted. A copy left by an earlier run that the current run does not select is listed under `IN THE TARGET BUT NOT SELECTED` and left alone.
 
 The target must not overlap the source. It is refused when it is the source, contains the source, or is inside `<source>/_prep`. Inside the source, it is accepted only under a folder whose name starts with `_` or `.`, because the scan skips those, and otherwise the next `--recursive` run would ingest the copies as source. The scan uses the `--recursive` rules of section 7.4 without the reserved-name checks: a source folder named `1024` or `reports` is harmless when nothing is mirrored into `_prep`.
@@ -489,7 +493,7 @@ One report per run, in `_prep/reports/`: `copy-scan-YYYYMMDD-HHMMSS.txt` under `
 
 `--copy-to` is refused together with `--sort`, and so is `--vl`, which needs `--sort`.
 
-`--move` with `--copy-to`, or `--move-to TARGET` for short, moves the selected originals and their captions instead of copying them, so the source keeps only what was not selected, for human review. It is the second mode, after `--sort --move`, that removes files from the source, and it adds these guards to the copy's: `shutil.move` (a rename within a volume, copy then unlink across volumes) so a file reaches the target before it leaves the source; an image and its caption move together, and if the second move fails the first is moved back and any duplicate a failed copy-then-unlink left in the target is removed when it is byte-identical; a caption shared with an image that stays in the source, or with a selected image still to come, is copied rather than moved; and a target file that matches by size and mtime removes its source only after a byte comparison agrees, otherwise it is a conflict. `--report` moves nothing. Reports are named `move-scan-*.txt` and `move-*.txt`. Empty source folders are left in place. `--png`, `--single-pass` and `--no-merge` are ignored with a note. `-R` is refused with `--copy-to`, because each per-folder run would copy into the root of the same target and flatten the tree.
+`--move` with `--copy-to`, or `--move-to TARGET` for short, moves the selected originals and their sidecars instead of copying them, so the source keeps only what was not selected, for human review. It is the second mode, after `--sort --move`, that removes files from the source, and it adds these guards to the copy's: `shutil.move` (a rename within a volume, copy then unlink across volumes) so a file reaches the target before it leaves the source; an image and its sidecars move together, and if a later move fails the earlier ones are moved back and any duplicate a failed copy-then-unlink left in the target is removed when it is byte-identical; a sidecar shared with an image that stays in the source, or with a selected image still to come, is copied rather than moved; and a target file that matches by size and mtime removes its source only after a byte comparison agrees, otherwise it is a conflict. `--report` moves nothing. Reports are named `move-scan-*.txt` and `move-*.txt`. Empty source folders are left in place. `--png`, `--single-pass` and `--no-merge` are ignored with a note. `-R` is refused with `--copy-to`, because each per-folder run would copy into the root of the same target and flatten the tree.
 
 ### 7.6 `--by-tier`: one folder per tier
 
@@ -521,7 +525,7 @@ The build's geometry and merge pass, applied to the source folder itself. No out
 - **Tiers.** `TIERS` (1024, 768, 512), as a build without `--by-tier`. Header-only geometry (`analyse_geometry`), no scoring. Every image that fits a tier is accepted.
 - **Merge.** `plan_merge` over one pool for the whole tree under `--ostris` (`merge_pooled()`, set by `use_in_place`), because AI Toolkit trains a folder with its subfolders as one dataset; per folder under `--musubi`. `--no-merge` turns it off. The preliminary report is written before it; the final report says the merge was pooled and shows one bucket distribution.
 - **Write.** `write_in_place`: crop and resize from the source, saved under the same name in the format the extension names (`IN_PLACE_FORMATS`: JPEG q97 4:4:4, PNG compress 6, WebP and AVIF q97, BMP), through a temporary file in the same folder and `os.replace`. No EXIF; orientation applied to the pixels. An image whose displayed size already equals its bucket is not written (status `already`), so a second run changes nothing.
-- **Delete.** `delete_too_small`: an image that fits no tier is deleted with each caption that no other image which stays, an unreadable one included, still uses. Unreadable images are left alone.
+- **Delete.** `delete_too_small`: an image that fits no tier is deleted with each sidecar that no other image which stays, an unreadable one included, still uses. Unreadable images are left alone.
 - **Refused with** `--sort`, `--copy-to`, `--move-to`, `--by-tier`, `-R`, `--threshold`, `--single-pass`, `--png` and `--force`. `scan_tree` runs without the reserved-name checks, since nothing is mirrored. No TOML.
 - **No backup.** The prompt is the guard; the README says to run `--report` first.
 
