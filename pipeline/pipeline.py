@@ -824,13 +824,18 @@ def make_writable(path: Path) -> None:
 
 def copy_keep(src: Path, dst: Path) -> str:
     """Copy src to dst unless dst exists: a backup is the one untouched
-    original and is never overwritten. -> copied, same or kept."""
+    original and is never overwritten. -> copied, same or kept. Two writers
+    may copy one sidecar at once (a.jpg and a.png share a.txt): each writes
+    its own temporary file, and the first rename wins."""
     if dst.exists():
         return "same" if same_bytes(src, dst) else "kept"
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dst.with_name(dst.name + ".part")
+    tmp = rb.own_part_path(dst)
     shutil.copy2(src, tmp)
-    os.replace(tmp, dst)
+    try:
+        os.rename(tmp, dst)                     # never over an existing file on Windows
+    except FileExistsError:
+        tmp.unlink(missing_ok=True)
+        return "same" if same_bytes(src, dst) else "kept"
     return "copied"
 
 
@@ -1133,15 +1138,27 @@ def mask_rel_of(root: Path, rel: str) -> str:
     return (p.parent / MASKS_DIRNAME / (p.stem + ".png")).as_posix()
 
 
-def restore_from_backup(bk: Path, dst: Path) -> None:
+def restore_from_backup(bk: Path, dst: Path, keep: bool = False) -> None:
     """Put the backup's bytes at dst (atomically, over a read-only file too)
-    and delete the backup: the file is the original again."""
+    and delete the backup: the file is the original again. keep: the backup
+    stays (another image still needs it)."""
     make_writable(dst)
     tmp = rb.part_path(dst)
     shutil.copy2(bk, tmp)
     os.replace(tmp, dst)
-    make_writable(bk)
-    bk.unlink()
+    if not keep:
+        make_writable(bk)
+        bk.unlink()
+
+
+def images_of_stem(folder: Path, stem: str) -> list[str]:
+    """The names of the images in folder whose stem is stem (casefolded)."""
+    try:
+        with os.scandir(folder) as entries:
+            return [e.name for e in entries if e.is_file() and os.path.splitext(e.name)[0].casefold() == stem
+                    and os.path.splitext(e.name)[1].casefold() in IMAGE_EXTS]
+    except OSError:
+        return []
 
 
 def undo_files(root: Path, files: list, delete_captions: bool) -> dict:
@@ -1212,12 +1229,16 @@ def undo_files(root: Path, files: list, delete_captions: bool) -> dict:
             for mrel, where in (rec.get("mask_shadowed") or {}).items():
                 if (bdir / where).is_file() and not (root / mrel).exists():
                     os.replace(bdir / where, root / mrel)
-            # the sidecars: every one the backup holds goes back over the one in place
+            # the sidecars: every one the backup holds goes back over the one in place; while
+            # another image of the stem (a.jpg and a.png share a.txt) still has its backup, the
+            # copies stay for its undo, which would otherwise find no backup and take the
+            # restored caption for one written after the run
             stem, parent = Path(rel).stem.casefold(), Path(rel).parent
             backed = folder_sidecars(bdir / parent).get(stem, [])
             in_place = folder_sidecars(root / parent).get(stem, [])
+            shared = bool(backed) and bool(images_of_stem(bdir / parent, stem))
             for cb in backed:
-                restore_from_backup(cb, root / parent / cb.name)
+                restore_from_backup(cb, root / parent / cb.name, keep=shared)
                 counts["sidecars restored"] += 1
                 if cb.suffix.casefold() in CAPTION_EXTS:
                     line["caption"] = "restored"
