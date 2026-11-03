@@ -40,7 +40,7 @@ Each folder is processed with all its subfolders. Folders whose names start with
 
 The output is next to the folder, not inside it, because a trainer that reads all subfolders (Ostris AI Toolkit trains every subfolder whose name does not start with a dot) would train every photo twice. Caption and train `<folder>_reframed` as a dataset of its own. Until 2026-10-11 the output was `<folder>\_reframed\`; the next run without `--out` moves it out. If a `<folder>_reframed` that reframe did not write is in the way, the run stops; rename it or give `--out`.
 
-The detection cache, the plan and the previews go to `<folder>_backup\_reframe\`, the run folder of reframe in the backup folder that the dataset tools share (see [The backup folder](../README.md#the-backup-folder)), so the output holds only photos, captions and `written.json`. A run moves these files there from an output folder of an earlier run.
+The detection cache, the plan and the previews go to `<folder>_backup\_reframe\`, the run folder of reframe in the backup folder that the dataset tools share (see [The backup folder](../README.md#the-backup-folder)), so the output holds only photos, sidecars and `written.json`. A run moves these files there from an output folder of an earlier run.
 
 | option | default | meaning |
 |---|---|---|
@@ -73,7 +73,9 @@ The aspect ratios are k2prep's: 9:16, 2:3, 4:5, 1:1, 5:4, 3:2 and 16:9.
 |---|---|
 | the cropped photo, same name and format | the photo has a subject and a crop |
 | a copy of the photo | the photo stays unchanged (not with `--skip-unchanged`) |
-| the `.txt` caption, next to the output | the photo has a caption with the same name |
+| the sidecars of the photo, next to the output | the photo has other files with the same name, such as `.txt`, `.short` or `.npz` |
+
+The sidecars of a photo are all the other files in its folder with its name. They go along under the name of the output. The `.npz` and `.safetensors` files (latent and text-encoder caches) are left behind for a photo that is cropped, re-encoded or resized, because they belong to the old pixels. A photo that is copied unchanged takes all its sidecars.
 
 **JPEG photos are cropped losslessly.** The tool cuts whole 8×8 pixel blocks out of the compressed image. Nothing is decoded and saved again, so there is no quality loss. Away from the outer 16 pixels of the crop, every pixel is identical to the original. At the new edges, colours can differ by a few levels, because the colour smoothing no longer sees the pixels that were cut off. For a lossless crop, the top-left corner must be on the block grid of the photo, so the tool moves it up and left by up to 15 pixels and corrects the aspect ratio at the opposite edge. The aspect ratio is then correct to within about 0.1%.
 
@@ -93,7 +95,7 @@ The output goes to `<tier>\<name>`, or `<subfolder>\<tier>\<name>` for photos in
 
 **The trainer.** `--resize` needs one of two options, the same as in [k2prep](../k2prep/README.md#the-trainer---ostris-or---musubi). `--ostris` gives Ostris AI Toolkit buckets: sides in steps of 64, the size closest to the aspect ratio with at least 80 percent of the tier's area, which AI Toolkit trains as they are, with no second resize or crop. `--musubi` gives the sizes of musubi-tuner's bucket list. Without either, the run stops before it reads a photo and prints the command with each option added, ready to copy. The first line of a `--resize` run names the buckets it uses. The crop around the subject is planned the same way for both; only the final bucket differs. A second run with the other option writes a resized photo again when its bucket differs; some buckets, such as 1024×1024, are the same in both. Without `--resize` the two options are refused: the crops keep their own size.
 
-**Next runs.** `written.json` in the output folder records what was written for each photo. A second run skips the photos that are done. It writes a photo again when the photo, its caption, the plan or the options changed. It removes outputs that are no longer wanted, for example the old copy of a photo that is now cropped. Each file is written under a temporary name and renamed when it is complete.
+**Next runs.** `written.json` in the output folder records what was written for each photo. A second run skips the photos that are done. It writes a photo again when the photo, one of its sidecars, the plan or the options changed. It removes outputs that are no longer wanted, for example the old copy of a photo that is now cropped. Each file is written under a temporary name and renamed when it is complete.
 
 Other files:
 

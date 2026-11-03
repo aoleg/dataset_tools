@@ -9,9 +9,12 @@ window of context around each one, so only the watermark pixels change. With
 JPEG (whole DCT blocks), when it keeps at least --trim-min-keep of the image;
 otherwise the image is painted. Output goes to <folder>_watermark_removed next
 to the folder (or --out), with the same relative paths: images without a
-watermark are copied unchanged with their captions, painted JPEGs are written
+watermark are copied unchanged with their sidecars (the other files of their
+folder with their stem: captions, caches, ...), painted JPEGs are written
 as JPEG at quality 97 without chroma subsampling, painted images of other
-formats as PNG (--png writes every painted image as PNG). --dry-run writes a
+formats as PNG (--png writes every painted image as PNG); a painted or trimmed
+image gets its sidecars without the .npz and .safetensors caches, which belong
+to the old pixels. --dry-run writes a
 report of the detections and, with --previews, the masks drawn over the images
 into <folder>_backup/_watermark, next to the folder and outside it, so a
 trainer never sees them; the detections are cached there, so a real run after
@@ -88,6 +91,9 @@ PREVIEW_DIRNAME = "previews"
 LOG_NAME = "log.jsonl"
 OUT_SUFFIX = "_watermark_removed"
 IMAGE_EXTS = {".jpg", ".jpeg", ".jpe", ".jfif", ".png", ".webp", ".bmp", ".tif", ".tiff"}
+# Images of the formats the other dataset tools read: not scanned here, and not sidecars either.
+OTHER_IMAGE_EXTS = {".gif", ".avif", ".heic", ".heif"}
+CACHE_EXTS = (".npz", ".safetensors")             # latent and text-encoder caches: stale next to a changed image
 # Folders never scanned, at any depth: the output folders of the dataset tools,
 # and a folder holding BACKUP_MARK (the backup of a subfolder).
 DEFAULT_EXCLUDES = [OLD_BACKUP_DIRNAME, "_duplicates", "_prep", "_classify", "_embeddings",
@@ -417,6 +423,30 @@ def scan(root: Path, excludes) -> list[Path]:
     return out
 
 
+def sidecars_of(path: Path, listed: dict) -> list[Path]:
+    """The sidecars of an image: the files of its folder with its stem and a
+    non-image extension, apart from the .part files of the writers. listed
+    caches the folder listings (folder -> stem -> files)."""
+    folder = path.parent
+    if folder not in listed:
+        by_stem: dict[str, list[Path]] = {}
+        with os.scandir(folder) as entries:
+            for e in sorted(entries, key=lambda e: e.name):
+                stem, ext = os.path.splitext(e.name)
+                if (e.is_file() and ext.casefold() not in IMAGE_EXTS | OTHER_IMAGE_EXTS and e.name != BACKUP_MARK
+                        and not ext.casefold().startswith(".part")):
+                    by_stem.setdefault(stem.casefold(), []).append(folder / e.name)
+        listed[folder] = by_stem
+    return listed[folder].get(path.stem.casefold(), [])
+
+
+def sidecar_pairs(path: Path, out_folder: Path, listed: dict, changed: bool) -> list[tuple[str, str]]:
+    """(source, destination) of the sidecars of an image, next to its output.
+    A changed image leaves the caches behind."""
+    return [(str(sc), str(out_folder / sc.name)) for sc in sidecars_of(path, listed)
+            if not (changed and sc.suffix.casefold() in CACHE_EXTS)]
+
+
 def image_header(path: Path) -> dict:
     """Format, EXIF orientation, stored size and JPEG MCU size from the header."""
     with Image.open(path) as im:
@@ -601,9 +631,9 @@ def write_job(job: dict) -> dict:
             with Image.open(src) as im:
                 exif, icc = im.info.get("exif"), im.info.get("icc_profile")
             write_array(job["array"], dst, job["fmt"], exif, icc)
-        for cap_src, cap_dst in job.get("captions", []):
-            Path(cap_dst).parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(cap_src, cap_dst)
+        for sc_src, sc_dst in job.get("sidecars", []):
+            Path(sc_dst).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(sc_src, sc_dst)
         return {"out": str(dst)}
     except Exception as e:  # noqa: BLE001 - one bad file is reported, not fatal
         return {"error": f"{type(e).__name__}: {e}".strip()}
@@ -803,7 +833,7 @@ def process_folder(root: Path, out: Path, args) -> int:
     mode = "trim" if args.trim else "inpaint"
     options = {"conf": args.conf, "dilate": args.dilate, "mode": mode, "trim_min_keep": args.trim_min_keep,
                "max_size": args.max_size}
-    rows, jobs, new_cache = [], [], {}
+    rows, jobs, new_cache, listed = [], [], {}, {}
     counts = {"painted": 0, "trimmed": 0, "clean": 0, "skipped": 0, "failed": 0}
     preview_dir = run_dir(root) / PREVIEW_DIRNAME
     if args.dry_run and args.previews and preview_dir.is_dir():
@@ -840,25 +870,24 @@ def process_folder(root: Path, out: Path, args) -> int:
                        ",".join(str(v) for v in plan_["trim_box"]) if plan_["trim_box"] else "", result]
                 rows.append(row)
                 if not args.dry_run:
-                    cap = p.with_suffix(".txt")
-                    captions = [(str(cap), str(out / Path(rel).with_suffix(".txt")))] if cap.is_file() else []
+                    sidecars = sidecar_pairs(p, out / Path(rel).parent, listed, plan_["action"] != "")
                     job = None
                     if plan_["action"] == "":
                         if not args.skip_clean:
-                            job = {"kind": "copy", "src": str(p), "dst": str(out / rel), "captions": captions}
+                            job = {"kind": "copy", "src": str(p), "dst": str(out / rel), "sidecars": sidecars}
                     elif plan_["action"] == "trim":
                         stored = lossless_trim_box(plan_["trim_box"], head) if not args.png else None
                         if stored:
                             job = {"kind": "lossless", "src": str(p), "dst": str(out / rel), "stored_box": stored,
-                                   "captions": captions}
+                                   "sidecars": sidecars}
                         else:
                             job = {"kind": "array", "src": str(p), "dst": str(out / output_name(rel, head["format"], args.png)),
                                    "array": apply(array, plan_), "fmt": "JPEG" if head["format"] == "JPEG" and not args.png else "PNG",
-                                   "captions": captions}
+                                   "sidecars": sidecars}
                     else:
                         job = {"kind": "array", "src": str(p), "dst": str(out / output_name(rel, head["format"], args.png)),
                                "array": apply(array, plan_), "fmt": "JPEG" if head["format"] == "JPEG" and not args.png else "PNG",
-                               "captions": captions}
+                               "sidecars": sidecars}
                     if job is not None:
                         if Path(job["dst"]).exists() and not args.overwrite:
                             result = "exists, skipped"

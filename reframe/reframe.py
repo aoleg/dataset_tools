@@ -12,8 +12,10 @@ inside it, where a trainer that reads all subfolders would train every photo
 twice; until 2026-10-11 it was <folder>/_reframed, which the next run moves
 out): JPEG crops are lossless
 (whole DCT blocks, no re-encoding) unless --reencode is given, other formats are
-re-encoded in their own format, unchanged photos are copied, and .txt captions
-are copied along. With --resize every photo is instead cropped and resized into
+re-encoded in their own format, unchanged photos are copied, and the sidecars of
+a photo (every other file of its folder with its stem: captions, caches, ...)
+are copied along; a cropped, re-encoded or resized photo gets its sidecars
+without the .npz and .safetensors caches, which belong to the old pixels. With --resize every photo is instead cropped and resized into
 its k2prep bucket and filed under <tier>/ the way k2prep does it; --resize needs
 --ostris (Ostris AI Toolkit buckets) or --musubi (musubi-tuner buckets).
 --dry-run writes only plan.json and the previews: --previews draws the
@@ -78,6 +80,7 @@ OUTPUT_VERSION = 1                # bump when the files written for a plan chang
 OVERRIDES_NAME = "overrides.txt"
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
+CACHE_EXTS = (".npz", ".safetensors")   # latent and text-encoder caches: stale next to a changed image
 BACKUP_MARK = rb.BACKUP_MARK  # marks a folder the dataset tools made next to a dataset: never scanned
 
 # name -> (source, file). "hf" files come from Bingsu/adetailer on Hugging Face,
@@ -1448,9 +1451,22 @@ def write_bucket(src: Path, dst: Path, bplan: dict, png: bool) -> None:
     os.replace(tmp, dst)
 
 
-def caption_of(path: Path) -> Path | None:
-    cap = path.with_suffix(".txt")
-    return cap if cap.is_file() else None
+def sidecars_of(path: Path, listed: dict) -> list[Path]:
+    """The sidecars of an image: the files of its folder with its stem and an
+    extension that is not an image's (any image extension of the dataset tools,
+    not only the ones reframe reads), apart from the .part files of the
+    writers. listed caches the folder listings (folder -> stem -> files)."""
+    folder = path.parent
+    if folder not in listed:
+        by_stem: dict[str, list[Path]] = {}
+        with os.scandir(folder) as entries:
+            for e in sorted(entries, key=lambda e: e.name):
+                stem, ext = os.path.splitext(e.name)
+                if (e.is_file() and ext.lower() not in rb.IMAGE_EXTS and e.name != BACKUP_MARK
+                        and not ext.lower().startswith(".part")):
+                    by_stem.setdefault(stem.lower(), []).append(folder / e.name)
+        listed[folder] = by_stem
+    return listed[folder].get(path.stem.lower(), [])
 
 
 def file_sig(path: Path | None):
@@ -1462,7 +1478,7 @@ def file_sig(path: Path | None):
 
 def output_jobs(root: Path, files, plan: dict, args) -> dict:
     """rel -> job: what to write for each photo, and where (relative to the output folder)."""
-    jobs, taken = {}, set()
+    jobs, taken, listed = {}, set(), {}
     for path in files:
         rel = path.relative_to(root).as_posix()
         p = plan[rel]
@@ -1492,9 +1508,13 @@ def output_jobs(root: Path, files, plan: dict, args) -> dict:
             jobs[rel] = {"kind": mode, "out": rel, "box": c["box"], "stored_box": c.get("stored_box")}
         elif not args.skip_unchanged:
             jobs[rel] = {"kind": "copy", "out": rel}
-        cap = caption_of(path)
-        if rel in jobs and cap is not None:
-            jobs[rel]["caption"] = str(Path(jobs[rel]["out"]).with_suffix(".txt").as_posix())
+        if rel in jobs:
+            # [source, output] pairs, both relative; a written (changed) image leaves the caches behind
+            out = Path(jobs[rel]["out"])
+            jobs[rel]["sidecars"] = [
+                [sc.relative_to(root).as_posix(), out.with_name(out.stem + os.path.splitext(sc.name)[1]).as_posix()]
+                for sc in sidecars_of(path, listed)
+                if jobs[rel]["kind"] == "copy" or sc.suffix.lower() not in CACHE_EXTS]
     return jobs
 
 
@@ -1527,12 +1547,11 @@ def write_outputs(root: Path, out_dir: Path, files, plan: dict, args) -> None:
     by_rel = {p.relative_to(root).as_posix(): p for p in files}
 
     def remove(entry):
-        for key in ("out", "caption"):
-            f = entry.get(key)
+        for f in [entry.get("out"), entry.get("caption"), *entry.get("sidecars", [])]:   # "caption": older logs
             if f and (out_dir / f).is_file():
                 (out_dir / f).unlink()
 
-    todo = []                                         # (rel, job, src, caption source, signature)
+    todo = []                                         # (rel, job, src, signature)
     for rel, job in jobs.items():
         if job["kind"] == "too_small":
             counts["too small for 512 (skipped)"] = counts.get("too small for 512 (skipped)", 0) + 1
@@ -1540,18 +1559,18 @@ def write_outputs(root: Path, out_dir: Path, files, plan: dict, args) -> None:
                 remove(old[rel])
             continue
         src = by_rel[rel]
-        cap = caption_of(src)
-        sig = {"src": file_sig(src), "caption_src": file_sig(cap), **{k: v for k, v in job.items()}}
+        sig = {"src": file_sig(src), "sidecar_src": [file_sig(root / sc) for sc, _ in job["sidecars"]],
+               **{k: v for k, v in job.items()}}
         prev = old.get(rel)
         done = prev is not None and prev.get("sig") == sig and (out_dir / job["out"]).is_file() and \
-            ("caption" not in job or (out_dir / job["caption"]).is_file())
+            all((out_dir / sc).is_file() for _, sc in job["sidecars"])
         if done and not args.overwrite:
             new[rel] = prev
             counts["already done"] = counts.get("already done", 0) + 1
             continue
         if prev is not None:
             remove(prev)
-        todo.append((rel, job, src, cap, sig))
+        todo.append((rel, job, src, sig))
 
     # Worker processes, not threads: jpeglib crashes the whole process (heap
     # corruption) when another thread works with Pillow while it runs, even with
@@ -1587,16 +1606,17 @@ def write_outputs(root: Path, out_dir: Path, files, plan: dict, args) -> None:
             else:                                    # one bad file must not stop the run
                 print(f"  could not write {item[0]}: {type(ex).__name__}: {ex}")
                 counts["failed"] = counts.get("failed", 0) + 1
-    # Captions last and in order: two photos with one stem (a.jpg, a.png) share a.txt.
-    for rel, job, src, cap, sig in sorted(written, key=lambda t: t[0]):
+    # Sidecars last and in order: two photos with one stem (a.jpg, a.png) share a.txt.
+    for rel, job, src, sig in sorted(written, key=lambda t: t[0]):
         try:
-            if cap is not None:
-                shutil.copy2(cap, out_dir / job["caption"])
+            for sc, out in job["sidecars"]:
+                shutil.copy2(root / sc, out_dir / out)
         except OSError as ex:
-            print(f"  could not copy the caption of {rel}: {ex}")
+            print(f"  could not copy the sidecars of {rel}: {ex}")
             counts["failed"] = counts.get("failed", 0) + 1
             continue
-        new[rel] = {"sig": sig, "out": job["out"], **({"caption": job["caption"]} if "caption" in job else {})}
+        new[rel] = {"sig": sig, "out": job["out"], **({"sidecars": [out for _, out in job["sidecars"]]}
+                                                      if job["sidecars"] else {})}
         label = {"lossless": "cropped (lossless)", "reencode": "cropped (re-encoded)", "copy": "copied unchanged",
                  "bucket": f"resized to {job['bucket']['tier']}" if "bucket" in job else ""}[job["kind"]]
         counts[label] = counts.get(label, 0) + 1
