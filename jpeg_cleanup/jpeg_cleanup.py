@@ -48,6 +48,7 @@ import os
 import shutil
 import stat
 import sys
+import threading
 import time
 import urllib.request
 from collections import deque
@@ -1346,12 +1347,19 @@ def same_bytes(a: Path, b: Path) -> bool:
 
 def copy_keep(src: Path, dst: Path) -> str:
     """Copy src to dst unless dst exists. -> copied, same (dst has these bytes
-    already) or kept (dst holds other bytes, left alone)."""
+    already) or kept (dst holds other bytes, left alone). Two writers may back
+    up one file at once (a.jpg and a.png share a.txt): each writes its own
+    temporary file, and the first rename wins."""
     if dst.exists():
         return "same" if same_bytes(src, dst) else "kept"
-    tmp = part_path(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(f"{dst.name}.{os.getpid()}.{threading.get_ident()}.part")
     shutil.copy2(src, tmp)
-    os.replace(tmp, dst)
+    try:
+        os.rename(tmp, dst)                     # never over an existing file on Windows
+    except FileExistsError:
+        tmp.unlink(missing_ok=True)
+        return "same" if same_bytes(src, dst) else "kept"
     return "copied"
 
 

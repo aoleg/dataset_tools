@@ -33,6 +33,7 @@ import signal
 import stat
 import sys
 import tempfile
+import threading
 import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -1526,13 +1527,25 @@ def make_writable(path: Path) -> None:
 
 def copy_keep(src: Path, dst: Path) -> str:
     """Copy src to dst unless dst exists. -> copied, same (dst has these bytes
-    already) or kept (dst holds other bytes: an earlier original, left alone)."""
+    already) or kept (dst holds other bytes: an earlier original, left alone).
+    Two writers may back up one file at once (a.jpg and a.png share a.txt):
+    each writes its own temporary file, and the first rename wins."""
     if dst.exists():
         return "same" if same_bytes(src, dst) else "kept"
-    tmp = part_path(dst)
+    tmp = own_part_path(dst)
     shutil.copy2(src, tmp)
-    os.replace(tmp, dst)
+    try:
+        os.rename(tmp, dst)                     # never over an existing file on Windows
+    except FileExistsError:
+        tmp.unlink(missing_ok=True)
+        return "same" if same_bytes(src, dst) else "kept"
     return "copied"
+
+
+def own_part_path(dst: Path) -> Path:
+    """part_path for one writer of many: <name>.<process>.<thread>.part."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    return dst.with_name(f"{dst.name}.{os.getpid()}.{threading.get_ident()}.part")
 
 
 def free_name(dst: Path) -> Path:

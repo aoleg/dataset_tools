@@ -632,11 +632,26 @@ def write_job(job: dict) -> dict:
                 exif, icc = im.info.get("exif"), im.info.get("icc_profile")
             write_array(job["array"], dst, job["fmt"], exif, icc)
         for sc_src, sc_dst in job.get("sidecars", []):
-            Path(sc_dst).parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(sc_src, sc_dst)
+            copy_sidecar(Path(sc_src), Path(sc_dst))
         return {"out": str(dst)}
     except Exception as e:  # noqa: BLE001 - one bad file is reported, not fatal
         return {"error": f"{type(e).__name__}: {e}".strip()}
+
+
+def copy_sidecar(src: Path, dst: Path) -> None:
+    """Copy a sidecar next to an output. Two images of one stem (a.jpg, a.png)
+    copy their shared a.txt from two worker processes at once: each writes its
+    own temporary file, and a replace that loses to the other's identical
+    file is no error."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(f"{dst.name}.{os.getpid()}.part")
+    shutil.copy2(src, tmp)
+    try:
+        os.replace(tmp, dst)
+    except PermissionError:
+        tmp.unlink(missing_ok=True)
+        if not (dst.is_file() and filecmp.cmp(src, dst, shallow=False)):
+            raise
 
 
 def ignore_ctrl_c() -> None:
