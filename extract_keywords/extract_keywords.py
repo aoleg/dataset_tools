@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
 Extract part of a dataset by caption keywords: every image whose caption (.txt)
-contains the keywords moves, with its caption, out of the dataset into a new
-folder next to it, in the same subfolders.
+contains the keywords moves, with its sidecars, out of the dataset into a new
+folder next to it, in the same subfolders. The sidecars of an image are every
+other file of its name in its folder (captions, caches); only the .txt is
+searched.
 
     python extract_keywords.py 1940s "street scene" --dataset D:\\photos
     python extract_keywords.py soldier AND 1940s --dataset D:\\photos

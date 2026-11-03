@@ -1,6 +1,6 @@
 # Classify
 
-`classify.py` sorts a large image dataset into category folders. You define the categories by example: one folder per category, with a few dozen images you sorted by hand. The tool embeds every image once with a vision-language encoder, trains a small classifier on your examples, and copies each dataset image with its caption into the matching category folder. Images it cannot place with confidence go to an `_unsure` folder, so the category folders hold only images you can trust.
+`classify.py` sorts a large image dataset into category folders. You define the categories by example: one folder per category, with a few dozen images you sorted by hand. The tool embeds every image once with a vision-language encoder, trains a small classifier on your examples, and copies each dataset image with its sidecars (its captions and any other file of its name) into the matching category folder. Images it cannot place with confidence go to an `_unsure` folder, so the category folders hold only images you can trust.
 
 The tool is for datasets of tens of thousands of images where a category label per image is needed before training, and where losing the doubtful images is better than sorting them by hand.
 
@@ -58,11 +58,11 @@ A subfolder inside a category folder is a sub-category. The tool trains on it se
 
 A category named `outliers` (after the prefix) is counted as rejects in the report and is otherwise an ordinary category. Folders whose names start with `_` are ignored.
 
-The samples folder is training material only. Nothing in it is written to the output. Copy images into it, do not move them: the dataset copy is what reaches the output, with its caption.
+The samples folder is training material only. Nothing in it is written to the output. Copy images into it, do not move them: the dataset copy is what reaches the output, with its sidecars.
 
 ## What a run does
 
-1. Scans the dataset folders with all their subfolders. Images are `.jpg`, `.jpeg`, `.png`, `.webp`, `.bmp`, `.tif`, `.tiff`, `.gif` and `.avif`. A `.txt` file with the same name as an image is its caption and travels with it. Folders named `_embeddings`, `_classify`, `_duplicates`, `_unsure`, `_backup`, `_controls` and `masks` (face masks) are skipped, and so is a folder the dataset tools made next to a dataset (marked by `_dataset_tools.json`) and the output folder when it lies inside a dataset folder. Any other folder name is scanned, including names that start with `_`.
+1. Scans the dataset folders with all their subfolders. Images are `.jpg`, `.jpeg`, `.png`, `.webp`, `.bmp`, `.tif`, `.tiff`, `.gif` and `.avif`. Every other file with the same name as an image (`.txt`, `.short`, `.json`, `.npz`, ...) is a sidecar and travels with it; `--sidecars` narrows this to a list of extensions. Folders named `_embeddings`, `_classify`, `_duplicates`, `_unsure`, `_backup`, `_controls` and `masks` (face masks) are skipped, and so is a folder the dataset tools made next to a dataset (marked by `_dataset_tools.json`) and the output folder when it lies inside a dataset folder. Any other folder name is scanned, including names that start with `_`.
 2. Embeds every image that is not in the cache. The cache is `_embeddings\` inside each dataset folder and inside the samples folder. A second run embeds only new or changed files, so retraining after a change to the samples takes seconds.
 3. Cross-validates the examples and prints a table with precision and recall per category and a confusion matrix. This is the first check of your samples: a category with low recall is not consistent, or it overlaps another.
 4. Trains the classifier on all examples and predicts a category and a confidence for every dataset image.
@@ -109,7 +109,7 @@ When a classified folder exists and you want a new category, or want to re-sort 
 run.bat --extract 12_group_photo_children --extract 13_group_photo_adult --samples D:\photos\samples -o D:\photos\raw_classified
 ```
 
-There is no `--dataset`: the classified folder is read and changed in place. The classifier is trained on the whole samples folder, every image in the classified folder is scored, and only the images predicted as one of the extracted categories are acted on. Those that pass the usual gates move to `<category>\<origin>\`, where origin is the folder they came from, so `13_group_photo_adult\7_people_adult\` holds the group photos that were in people_adult. Captions move along. Everything predicted as anything else stays where it is, whatever the retrained classifier thinks about it. Images already inside an extracted category folder stay too.
+There is no `--dataset`: the classified folder is read and changed in place. The classifier is trained on the whole samples folder, every image in the classified folder is scored, and only the images predicted as one of the extracted categories are acted on. Those that pass the usual gates move to `<category>\<origin>\`, where origin is the folder they came from, so `13_group_photo_adult\7_people_adult\` holds the group photos that were in people_adult. Sidecars move along. Everything predicted as anything else stays where it is, whatever the retrained classifier thinks about it. Images already inside an extracted category folder stay too.
 
 `_unsure` is included by default, since the border cases live there; `--no-unsure` leaves it alone. Your examples for the new category are usually copies of files in the classified folder, and the hash match moves them for certain.
 
@@ -136,7 +136,7 @@ sorted\
     sheets\
 ```
 
-The category folders are flat. `_unsure` has one subfolder per predicted category, so you can sort the held-back images a category at a time, with the classifier's guess in front of you; images that could not be decoded go to `undecodable`. Copy the ones that belong somewhere into your samples folder, by your own judgement, not by the subfolder they are in. An image keeps its name with its path inside the dataset folder in front, separators replaced by two underscores: `album17\000304.jpg` becomes `album17__000304.jpg`. Datasets with many subfolders usually repeat the same names in each, and this keeps every image traceable to its source. A caption is renamed together with its image. A name that still collides, which happens only with two dataset folders, gets `-2`, `-3` and so on before the extension.
+The category folders are flat. `_unsure` has one subfolder per predicted category, so you can sort the held-back images a category at a time, with the classifier's guess in front of you; images that could not be decoded go to `undecodable`. Copy the ones that belong somewhere into your samples folder, by your own judgement, not by the subfolder they are in. An image keeps its name with its path inside the dataset folder in front, separators replaced by two underscores: `album17\000304.jpg` becomes `album17__000304.jpg`. Datasets with many subfolders usually repeat the same names in each, and this keeps every image traceable to its source. A sidecar is renamed together with its image. A name that still collides, which happens only with two dataset folders, gets `-2`, `-3` and so on before the extension.
 
 Point a trainer at the category folders, not at the output folder: `_classify\sheets\` holds JPEG files that are not training images.
 
@@ -161,7 +161,7 @@ The output is a function of the dataset, the samples and the threshold. To run a
 | `--extract CLASS` | off | move the images of this category out of the other folders of a classified output into `<category>\<origin>\`; repeat for several; needs `--samples` and `-o`, no `--dataset` |
 | `--no-unsure` | off | with `--extract`: leave the `_unsure` folder alone |
 | `--isolation-pct X` | 0 | also send the X percent of images that are farthest from all others to `_unsure` (reason `isolated`); off at 0 |
-| `--sidecars EXT,EXT` | `.txt` | the extensions that travel with an image |
+| `--sidecars EXT,EXT` | `all` | what travels with an image: `all` is every file of its name that is not an image; a list such as `.txt,.json` limits it to those extensions |
 | `--sheets` | off | write the contact sheets |
 | `--patches N` | 576 | the number of 16-pixel patches the encoder sees per image; more is slower and sharper |
 | `--threads N` | 8 | image decoding workers; 1 runs without worker processes |

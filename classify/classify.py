@@ -4,7 +4,8 @@
 The categories are given as folders of hand-sorted example images (the samples
 root). Every image is embedded once with SigLIP 2, a classifier is trained on
 the example embeddings, and every dataset image is copied (or moved) with its
-caption into the matching class folder under the output root. Images the
+sidecars (every other file of its name: captions, caches) into the matching
+class folder under the output root. Images the
 classifier cannot place with confidence go to _unsure.
 
 Usage:
@@ -49,7 +50,7 @@ PATCH_SIZE = 16
 EMBED_DIM = 1152
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".gif", ".avif"}
-DEFAULT_SIDECARS = ".txt"
+DEFAULT_SIDECARS = "all"    # every file of the image's name that is not an image; or a list of extensions
 
 EMBED_DIRNAME = "_embeddings"
 RUN_DIRNAME = "_classify"
@@ -85,9 +86,16 @@ class ImageItem:
         return self.root / self.rel
 
 
-def scan_root(root: Path, sidecar_exts: set[str], skip_abs: set[Path] = frozenset(),
+def is_sidecar(name: str, sidecar_exts: set[str] | None) -> bool:
+    ext = os.path.splitext(name)[1].lower()
+    return ext not in IMAGE_EXTS if sidecar_exts is None else ext in sidecar_exts
+
+
+def scan_root(root: Path, sidecar_exts: set[str] | None, skip_abs: set[Path] = frozenset(),
               skip_names: set[str] = SKIP_DIRNAMES) -> list[ImageItem]:
-    """Walk root recursively and return its images with their sidecars.
+    """Walk root recursively and return its images with their sidecars: the
+    files of the image's name in its folder that are not images, narrowed to
+    the extensions of sidecar_exts unless that is None (see sidecar_set).
 
     Folders are skipped by exact name (SKIP_DIRNAMES) or by absolute path
     (skip_abs, used for the output root). Any other folder name is scanned,
@@ -105,7 +113,7 @@ def scan_root(root: Path, sidecar_exts: set[str], skip_abs: set[Path] = frozense
         )
         by_stem: dict[str, list[str]] = {}
         for fn in filenames:
-            by_stem.setdefault(os.path.splitext(fn)[0], []).append(fn)
+            by_stem.setdefault(os.path.normcase(os.path.splitext(fn)[0]), []).append(fn)
         for fn in sorted(filenames):
             stem, ext = os.path.splitext(fn)
             if ext.lower() not in IMAGE_EXTS:
@@ -119,8 +127,8 @@ def scan_root(root: Path, sidecar_exts: set[str], skip_abs: set[Path] = frozense
             rel = fn if rel_dir == "." else f"{rel_dir}/{fn}"
             sidecars = [
                 (fn2 if rel_dir == "." else f"{rel_dir}/{fn2}")
-                for fn2 in by_stem.get(stem, [])
-                if os.path.splitext(fn2)[1].lower() in sidecar_exts
+                for fn2 in by_stem.get(os.path.normcase(stem), [])
+                if fn2 != BACKUP_MARK and is_sidecar(fn2, sidecar_exts)
             ]
             items.append(ImageItem(root, rel, st.st_size, st.st_mtime_ns, sorted(sidecars)))
     return items
@@ -150,7 +158,7 @@ def strip_prefix(name: str) -> str:
     return tail.lower() if sep and head.isdigit() and tail else name.lower()
 
 
-def discover_samples(samples_root: Path, sidecar_exts: set[str]) -> list[SampleClass]:
+def discover_samples(samples_root: Path, sidecar_exts: set[str] | None) -> list[SampleClass]:
     """Find the class folders and their sub-classes in the samples root."""
     samples_root = samples_root.resolve()
     items = scan_root(samples_root, sidecar_exts)
@@ -1224,7 +1232,9 @@ def parse_args(argv=None):
                     help="two passes: first at confidence X (default 0.9), then retrain on the confident placements "
                          "and re-score the unsure images at --min-confidence")
     ap.add_argument("--isolation-pct", type=float, default=0.0, metavar="X", help="the X%% most isolated images go to _unsure (default 0, off)")
-    ap.add_argument("--sidecars", default=DEFAULT_SIDECARS, metavar="EXT,EXT", help="sidecar extensions (default .txt)")
+    ap.add_argument("--sidecars", default=DEFAULT_SIDECARS, metavar="EXT,EXT",
+                    help="what travels with an image: 'all' (default), every file of its name that is not "
+                         "an image, or a list of extensions, such as .txt,.json")
     ap.add_argument("--sheets", action="store_true", help="write contact sheets per output folder")
     ap.add_argument("--patches", type=int, default=576, metavar="N", help="NaFlex patch budget per image (default 576)")
     ap.add_argument("--threads", type=int, default=8, metavar="N", help="image decoding workers (default 8)")
@@ -1235,7 +1245,10 @@ def parse_args(argv=None):
     return ap.parse_args(argv)
 
 
-def sidecar_set(spec: str) -> set[str]:
+def sidecar_set(spec: str) -> set[str] | None:
+    """The extensions of a --sidecars list; None for 'all', every non-image file of the image's name."""
+    if spec.strip().lower() == "all":
+        return None
     out = set()
     for s in spec.split(","):
         s = s.strip().lower()

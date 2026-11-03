@@ -1,6 +1,6 @@
 # Extract keywords
 
-`extract_keywords.py` moves the images whose captions contain one or more keywords, with their captions, out of a dataset into a new folder next to it. The subfolders of the dataset are kept in the new folder. Use it to take the images of one concept out of a large dataset for its own training, or to pull out every image whose caption mentions a text such as a watermark. `--undo` moves everything back.
+`extract_keywords.py` moves the images whose captions contain one or more keywords, with their sidecars, out of a dataset into a new folder next to it. The subfolders of the dataset are kept in the new folder. Use it to take the images of one concept out of a large dataset for its own training, or to pull out every image whose caption mentions a text such as a watermark. `--undo` moves everything back.
 
 ## Install
 
@@ -54,7 +54,7 @@ The run prints how many captions have each keyword, so you can see what each one
 3. Writes the list of files to move to `<new folder>\_extract_keywords\manifest.json`, then moves them. Each file keeps its subfolder path: `D:\photos\2024\beach\a.jpg` goes to `D:\photos_1940s\2024\beach\a.jpg`.
 4. Removes the subfolders of the dataset that are empty after the run. A subfolder that was empty before the run stays.
 
-With an image go all the files of the same name in its folder: its caption, other images of the same name (`a.jpg` and `a.png`) and other sidecars (`a.npz`). Every face mask of the image made by `face_masks` (`<subfolder>\_controls\<name>.<ext>`, with `<ext>` one of `.jpg`, `.jpeg`, `.png`, `.webp`) moves to the same place in the new folder. A mask in an old `masks` folder (before 2026-10-11) moves to `_controls` in the new folder, and `--undo` puts it back into `masks`.
+With an image go all the files of the same name in its folder, whatever their extension: its `.txt` caption, other captions (`.short`, `.caption`, `.json`), other images of the same name (`a.jpg` and `a.png`) and caches (`a.npz`, `a.safetensors`). Only the `.txt` is searched for keywords, and `--undo` moves all of these files back. Every face mask of the image made by `face_masks` (`<subfolder>\_controls\<name>.<ext>`, with `<ext>` one of `.jpg`, `.jpeg`, `.png`, `.webp`) moves to the same place in the new folder. A mask in an old `masks` folder (before 2026-10-11) moves to `_controls` in the new folder, and `--undo` puts it back into `masks`.
 
 A caption without an image is not searched and stays where it is; the run lists these captions.
 

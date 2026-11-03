@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-Flatten a dataset folder: move every image and its captions out of the
+Flatten a dataset folder: move every image and its sidecars out of the
 subfolders into the folder itself, under new normalised names.
 
 The new name of a file is made of the folder path and a running number:
 
     <folder>__<subfolder1>__<subfolder2>-datasetNNNNNN.<ext>
 
-An image and its captions (files with the same name and another extension, .txt
-by default) form a group and get the same new name, so they stay a pair. In the
+An image and its sidecars (every other file of its name that is not an image:
+captions, caches; --sidecars narrows this to a list of extensions) form a
+group and get the same new name, so they stay together. In the
 folder names, Cyrillic is transliterated, accents are dropped, and spaces and
 every other character that is not a Latin letter, a digit or "-" become "_".
 No new file name is longer than --max-length characters (80 by default): the
@@ -39,7 +40,8 @@ MANIFEST_NAME = "manifest.json"    # the plan of the last run; --undo reads it
 DRY_RUN_NAME = "dry_run.csv"
 MANIFEST_VERSION = 1
 DEFAULT_MAX_LENGTH = 80            # characters of a new file name, extension included
-DEFAULT_SIDECARS = ".txt"
+DEFAULT_SIDECARS = "all"           # every non-image file of the image's name; or a list of extensions
+CAPTION_EXTS = (".txt", ".short", ".caption", ".json")  # what "caption" means in the dataset tools
 NUMBER_PREFIX = "-dataset"
 MIN_DIGITS = 6
 SEPARATOR = "__"                   # between folder names; a name part never holds "__" itself
@@ -150,9 +152,10 @@ class Group:
 def scan(root: Path, excludes, sidecar_exts):
     """The groups under root in numbering order: the root's own files first, then
     each subfolder (natural order) before its own subfolders. Also returns the
-    files that stay: sidecars without an image, other files, and links."""
+    files that stay: captions without an image, other files, and links.
+    sidecar_exts is a list of extensions, or None for every non-image file."""
     excl = {e.casefold() for e in excludes}
-    exts = {e.casefold() for e in sidecar_exts}
+    exts = None if sidecar_exts is None else {e.casefold() for e in sidecar_exts}
     groups, orphans, others, links = [], [], [], []
 
     def walk(here: Path, dir_parts: tuple):
@@ -190,13 +193,15 @@ def scan(root: Path, excludes, sidecar_exts):
         for key in sorted(by_stem, key=natural_key):
             names = sorted(by_stem[key], key=natural_key)
             images = [n for n in names if os.path.splitext(n)[1].casefold() in IMAGE_EXTS]
-            sides = [n for n in names if os.path.splitext(n)[1].casefold() in exts]
-            rest = [n for n in names if n not in images and n not in sides]
-            others.extend("/".join(dir_parts + (n,)) for n in rest)
+            rest = [n for n in names if n not in images]
             if images:
+                sides = [n for n in rest if exts is None or os.path.splitext(n)[1].casefold() in exts]
+                others.extend("/".join(dir_parts + (n,)) for n in rest if n not in sides)
                 groups.append(Group(dir_parts, images + sides, sorted(masks.get(key, {}).values())))
             else:
-                orphans.extend("/".join(dir_parts + (n,)) for n in sides)
+                for n in rest:
+                    (orphans if os.path.splitext(n)[1].casefold() in CAPTION_EXTS else others).append(
+                        "/".join(dir_parts + (n,)))
         for d in sorted(subdirs, key=natural_key):
             walk(here / d, dir_parts + (d,))
 
@@ -265,7 +270,7 @@ def plan_root(root: Path, args) -> dict:
         and not (root / MASKS_DIRNAME).is_dir() else []
     return {"tool": "flatten_dataset", "version": MANIFEST_VERSION, "root": str(root),
             "time": time.strftime("%Y-%m-%d %H:%M:%S"), "max_length": args.max_length,
-            "sidecars": args.sidecars, "state": "planned", "phases_done": 0,
+            "sidecars": "all" if args.sidecars is None else args.sidecars, "state": "planned", "phases_done": 0,
             "groups": len(groups), "cut_groups": cut_groups,
             "files": files, "created_dirs": created, "removed_dirs": [],
             "_conflicts": conflicts, "_orphans": orphans, "_others": others, "_links": links}
@@ -479,7 +484,10 @@ def undo_root(root: Path) -> bool:
 
 # --- main ---------------------------------------------------------------------
 
-def sidecars_arg(value: str) -> list[str]:
+def sidecars_arg(value: str) -> list[str] | None:
+    """The extensions of a --sidecars list; None for 'all'."""
+    if value.strip().lower() == "all":
+        return None
     exts = []
     for e in value.split(","):
         e = e.strip()
@@ -500,8 +508,8 @@ def main(argv=None) -> int:
     ap.add_argument("--max-length", type=int, default=DEFAULT_MAX_LENGTH, metavar="N",
                     help=f"the longest new file name, extension included (default {DEFAULT_MAX_LENGTH})")
     ap.add_argument("--sidecars", type=sidecars_arg, default=sidecars_arg(DEFAULT_SIDECARS), metavar="LIST",
-                    help=f"extensions of the files that go with an image, comma-separated "
-                         f"(default {DEFAULT_SIDECARS})")
+                    help=f"the files that go with an image: 'all' (default), every file of its name that is "
+                         f"not an image, or extensions, comma-separated, such as .txt,.json")
     ap.add_argument("--exclude", action="append", default=[], metavar="NAME",
                     help="another folder name to leave alone, at any depth; may repeat")
     args = ap.parse_args(argv)
