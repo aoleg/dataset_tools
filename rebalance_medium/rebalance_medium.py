@@ -24,13 +24,21 @@ from the whole dataset. Each moves to the same subfolder of the destination,
 and its caption there loses the medium word ("A high-angle photograph"). The
 captions of the images that stay are not touched.
 
+Every file of the image's name moves with it (its sidecars: .short, .json,
+.caption, .npz, ...). The medium word is removed from the .txt caption, from
+the .short caption by the same rules, and from the "long" and "short" strings
+under the top-level "caption" object of a .json (its other keys stay; it is
+written back as UTF-8 with an indent of 2); a .caption (tag list), a .json of
+another shape and a file that is not UTF-8 move as they are.
+
 The caches of Ostris AI Toolkit go with the images. A latent cache file is
 named after the image and its crop, never its folder, so it moves with the
 image and stays valid. A text-embedding cache file is named after the caption
-text, so it is useless for the new caption. The original caption file and
-the text-embedding cache files go to <input>_rebalance_backup/<subfolder>
-next to the input folder, out of the dataset; --undo puts them back with the
-image, and they also allow a restore by hand.
+text, so it is useless for the new caption. The original of every file that
+was edited and the text-embedding cache files go to
+<input>_rebalance_backup/<subfolder> next to the input folder, out of the
+dataset; --undo puts them back with the image, and they also allow a restore
+by hand.
 
 Without --apply nothing moves: the plan is written to the manifest
 (<input>_rebalance.json next to the input folder) and summarised. An
@@ -54,9 +62,12 @@ import time
 from pathlib import Path
 
 TOOL = "rebalance_medium"
-MANIFEST_VERSION = 2                # 2: "selection" and "plan"; 1 had only color_pct and bw_pct
+MANIFEST_VERSION = 3                # 3: "sidecars"; 2: "selection" and "plan"; 1 had only color_pct and bw_pct
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
-CAPTION_EXT = ".txt"
+CAPTION_EXT = ".txt"                # the caption that is classified and edited first
+CAPTION_EXTS = (".txt", ".short", ".caption", ".json")  # what "caption" means in the dataset tools
+SHORT_EXT, JSON_EXT = ".short", ".json"  # sidecars whose text loses the medium word too
+JSON_FIELDS = ("long", "short")     # the strings of the "caption" object of a .json
 LATENT_DIRNAME = "_latent_cache"    # AI Toolkit: <stem>_<hash>.safetensors, keyed by file name and crop
 TE_DIRNAME = "_t_e_cache"           # AI Toolkit: <stem>_<hash>.safetensors, keyed by caption text
 BACKUP_DIRNAME = "_backup"          # the other dataset tools' old backup: never scanned, never moved
@@ -64,7 +75,7 @@ BACKUP_MARK = "_dataset_tools.json"  # marks <dataset>_backup, the backup folder
 SIZE_DB_NAME = ".aitk_size.json"    # AI Toolkit's image size cache in a dataset folder
 SKIP_DIRS = {d.casefold() for d in (LATENT_DIRNAME, TE_DIRNAME, BACKUP_DIRNAME)}
 DEST_SUFFIX = "media-rebalanced"
-BACKUP_SUFFIX = "_rebalance_backup"  # <input>_rebalance_backup: original captions and text-embedding caches
+BACKUP_SUFFIX = "_rebalance_backup"  # <input>_rebalance_backup: edited originals and text-embedding caches
 MANIFEST_SUFFIX = "_rebalance.json"
 SAVE_EVERY = 100                    # images between manifest writes
 LIST_LIMIT = 20                     # lines of any list printed
@@ -153,6 +164,35 @@ def new_caption(caption: str, m: re.Match, russian: bool) -> str:
     return strip_russian(new) if russian else new
 
 
+def edit_short(text: str, russian: bool) -> str | None:
+    """A .short caption without its medium word, by the rules of the .txt; None
+    when it names no medium."""
+    m = classify(text)[1]
+    return new_caption(text, m, russian) if m else None
+
+
+def edit_json(text: str, russian: bool) -> str | None:
+    """A .json whose "caption" object has "long" or "short" strings, without the
+    medium word in each, written as moss-caption.py writes it (UTF-8, indent 2,
+    a final line feed); the other keys stay. None when it is not such a file or
+    names no medium."""
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        return None
+    caption = doc.get("caption") if isinstance(doc, dict) else None
+    if not isinstance(caption, dict):
+        return None
+    changed = False
+    for key in JSON_FIELDS:
+        value = caption.get(key)
+        m = classify(value)[1] if isinstance(value, str) else None
+        if m:
+            caption[key] = new_caption(value, m, russian)
+            changed = True
+    return json.dumps(doc, ensure_ascii=False, indent=2) + "\n" if changed else None
+
+
 # --- scan ---------------------------------------------------------------------
 
 def is_link(entry: os.DirEntry) -> bool:
@@ -215,11 +255,13 @@ def scan(root: Path):
                     subdirs.append(e.name)
             elif e.is_file(follow_symlinks=False):
                 files.append(e.name)
-        captions = {}
+        captions, others = {}, {}           # the .txt of a stem; the other files of a stem that are not images
         for f in files:
             stem, ext = os.path.splitext(f)
             if ext.casefold() == CAPTION_EXT:
                 captions.setdefault(stem.casefold(), f)
+            if ext.casefold() not in IMAGE_EXTS:
+                others.setdefault(stem.casefold(), []).append(f)
         images = [f for f in files if os.path.splitext(f)[1].casefold() in IMAGE_EXTS]
         if any(os.path.splitext(f)[0].casefold() in captions for f in images):
             latents, tes = list_files(here / LATENT_DIRNAME), list_files(here / TE_DIRNAME)
@@ -231,8 +273,12 @@ def scan(root: Path):
                 stem = os.path.splitext(f)[0]
                 cap = captions.get(stem.casefold())
                 rx = cache_rx(stem)
+                sides = sorted(n for n in others.get(stem.casefold(), []) if n != cap)
                 it = {"rel": "/".join(parts + (f,)), "class": "no_caption", "selected": False,
                       "status": "planned", "caption_file": cap, "caption_old": None, "caption_new": None,
+                      "sidecars": sides, "sidecar_edits": {},
+                      "other_caption": cap is None and any(os.path.splitext(n)[1].casefold() in CAPTION_EXTS
+                                                           for n in sides),
                       "latent_cache": [n for n in latents if rx.match(n)],
                       "te_cache": [n for n in tes if rx.match(n)], "russian_medium": False}
                 if stems[stem.casefold()] > 1:
@@ -316,6 +362,28 @@ def select(items: list[dict], counts: dict, seed: int, russian: bool):
             it["caption_new"] = new_caption(it["caption_old"], classify(it["caption_old"])[1], russian)
 
 
+def edit_sidecars(items: list[dict], src: Path, russian: bool):
+    """For each selected image, the sidecars whose text loses the medium word:
+    the file name -> its text now and after the edit. A file that cannot be
+    read as UTF-8, or names no medium, moves as it is."""
+    for it in items:
+        if not it["selected"]:
+            continue
+        folder = src / Path(it["rel"]).parent
+        for name in it["sidecars"]:
+            ext = os.path.splitext(name)[1].casefold()
+            edit = edit_short if ext == SHORT_EXT else edit_json if ext == JSON_EXT else None
+            if edit is None:
+                continue
+            try:
+                text = read_text(folder / name)
+            except (OSError, UnicodeDecodeError):
+                continue
+            new = edit(text, russian)
+            if new is not None and new != text:
+                it["sidecar_edits"][name] = {"old": text, "new": new}
+
+
 def summarize(items: list[dict]) -> dict:
     cls = {c: sum(1 for it in items if it["class"] == c) for c in CLASSES}
     sel = {c: sum(1 for it in items if it["selected"] and it["class"] == c) for c in ("color", "bw")}
@@ -328,6 +396,9 @@ def summarize(items: list[dict]) -> dict:
         "dropped": sel["color"] + sel["bw"],
         "latent_cache_files": sum(len(it["latent_cache"]) for it in chosen),
         "te_cache_files": sum(len(it["te_cache"]) for it in chosen),
+        "sidecar_files": sum(len(it["sidecars"]) for it in chosen),
+        "sidecars_edited": sum(len(it["sidecar_edits"]) for it in chosen),
+        "other_caption": sum(1 for it in items if it["other_caption"]),
         "folders_touched": len({str(Path(it["rel"]).parent) for it in chosen}),
         "shared_name": sum(1 for it in items if it.get("shared_name")),
         "unreadable": sum(1 for it in items if it.get("unreadable")),
@@ -374,11 +445,16 @@ def print_summary(m: dict):
     print(f"  medium stated, in the input folder after the move: {s['stated_after']} "
           f"({pct(s['stated_after'], total)}): color {stated_color}, bw {c['bw'] - sel['bw']}, "
           f"{pct(stated_color, s['stated_after'])} colour")
-    print(f"  latent cache files to move: {s['latent_cache_files']}; to back up: {s['dropped']} original captions "
-          f"and {s['te_cache_files']} text-embedding cache files")
+    edited = s.get("sidecars_edited", 0)        # a summary of an older run has no sidecars
+    print(f"  sidecar files to move with the images: {s.get('sidecar_files', 0)}, of them {edited} "
+          f"with the medium word removed")
+    print(f"  latent cache files to move: {s['latent_cache_files']}; to back up: {s['dropped']} original captions, "
+          f"{edited} original sidecars and {s['te_cache_files']} text-embedding cache files")
     print(f"  folders touched: {s['folders_touched']}")
     if s["shared_name"]:
         print(f"  not moved, another image has the same name: {s['shared_name']}")
+    if s.get("other_caption"):
+        print(f"  not moved, no .txt caption to classify, but another caption file: {s['other_caption']}")
     print_list("not read as UTF-8, not moved", [it["rel"] for it in items if it.get("unreadable")])
     print_list("ambiguous captions (no medium, both, or tinted), not moved",
                [f"{it['rel']}: {one_line(it['caption_old'])}" for it in items
@@ -440,9 +516,26 @@ def move(src: Path, dst: Path):
 def paths(it: dict, src: Path, dst: Path, bk: Path) -> dict:
     rel = Path(it["rel"])
     sdir, ddir = src / rel.parent, dst / rel.parent
-    return {"sdir": sdir, "ddir": ddir, "simg": sdir / rel.name, "dimg": ddir / rel.name,
+    return {"sdir": sdir, "ddir": ddir, "bdir": bk / rel.parent, "simg": sdir / rel.name, "dimg": ddir / rel.name,
             "scap": sdir / it["caption_file"], "dcap": ddir / (rel.stem + CAPTION_EXT),
             "bcap": bk / rel.parent / it["caption_file"], "bte": bk / rel.parent / TE_DIRNAME}
+
+
+def text_edits(it: dict, p: dict) -> list[dict]:
+    """The files of one image whose text changes, each with its place in the
+    input folder, the destination and the backup folder, and its text before
+    and after: the .txt caption, then the edited sidecars."""
+    edits = [{"label": "caption", "src": p["scap"], "dst": p["dcap"], "bak": p["bcap"],
+              "old": it["caption_old"], "new": it["caption_new"]}]
+    for name, e in it.get("sidecar_edits", {}).items():
+        edits.append({"label": f"sidecar {name}", "src": p["sdir"] / name, "dst": p["ddir"] / name,
+                      "bak": p["bdir"] / name, "old": e["old"], "new": e["new"]})
+    return edits
+
+
+def plain_sidecars(it: dict) -> list[str]:
+    """The sidecars that move as they are. A manifest of an older run has none."""
+    return [n for n in it.get("sidecars", []) if n not in it.get("sidecar_edits", {})]
 
 
 def text_or_none(path: Path) -> str | None:
@@ -459,28 +552,40 @@ def apply_item(it: dict, src: Path, dst: Path, bk: Path, counts: dict):
         raise OSError(f"the image is in both folders: {p['dimg']}")
     if not p["simg"].exists() and not p["dimg"].exists():
         raise OSError("the image is missing")
-    scap = text_or_none(p["scap"])
-    if scap is not None and scap != it["caption_old"]:
-        raise OSError(f"the caption changed after the plan: {p['scap']}")
-    dcap = text_or_none(p["dcap"])
-    if dcap is not None and dcap != it["caption_new"]:
-        raise OSError(f"another caption is in the destination: {p['dcap']}")
-    bcap = text_or_none(p["bcap"])
-    if bcap is not None and bcap != it["caption_old"]:
-        raise OSError(f"another caption is in the backup folder: {p['bcap']}")
+    edits = text_edits(it, p)
+    for e in edits:
+        e["scur"] = text_or_none(e["src"])
+        if e["scur"] is not None and e["scur"] != e["old"]:
+            raise OSError(f"the {e['label']} changed after the plan: {e['src']}")
+        dcur = text_or_none(e["dst"])
+        if dcur is not None and dcur != e["new"]:
+            raise OSError(f"another {e['label']} is in the destination: {e['dst']}")
+        e["bcur"] = text_or_none(e["bak"])
+        if e["bcur"] is not None and e["bcur"] != e["old"]:
+            raise OSError(f"another {e['label']} is in the backup folder: {e['bak']}")
+    plain = plain_sidecars(it)
+    for name in plain:
+        if (p["sdir"] / name).exists() and (p["ddir"] / name).exists():
+            raise OSError(f"the sidecar is in both folders: {p['ddir'] / name}")
 
     if it["latent_cache"]:
         (p["ddir"] / LATENT_DIRNAME).mkdir(parents=True, exist_ok=True)
     if p["simg"].exists():
         move(p["simg"], p["dimg"])
-    write_text(p["dcap"], it["caption_new"])
-    if scap is not None:
-        if bcap is None:
-            move(p["scap"], p["bcap"])      # the original caption file itself, kept for a restore by hand
-        else:
-            p["scap"].unlink()              # its backup is there already, the same text
-    elif bcap is None:
-        write_text(p["bcap"], it["caption_old"])
+    for e in edits:
+        write_text(e["dst"], e["new"])
+        if e["scur"] is not None:
+            if e["bcur"] is None:
+                move(e["src"], e["bak"])    # the original file itself, kept for a restore by hand
+            else:
+                e["src"].unlink()           # its backup is there already, the same text
+        elif e["bcur"] is None:
+            write_text(e["bak"], e["old"])
+    for name in plain:
+        if (p["sdir"] / name).exists():
+            move(p["sdir"] / name, p["ddir"] / name)
+            counts["sidecars"] += 1
+    counts["edited"] += len(edits) - 1
     for name in it["latent_cache"]:
         s, d = p["sdir"] / LATENT_DIRNAME / name, p["ddir"] / LATENT_DIRNAME / name
         if s.exists():
@@ -498,8 +603,8 @@ def apply_item(it: dict, src: Path, dst: Path, bk: Path, counts: dict):
 
 
 def undo_item(it: dict, src: Path, dst: Path, bk: Path, counts: dict, notes: list[str]):
-    """Put one image back with its original caption (the backed-up file, or the
-    manifest's text when that file is gone), its latent caches and its
+    """Put one image back with its original captions and sidecars (the backed-up
+    files, or the manifest's text when a file is gone), its latent caches and its
     text-embedding caches; delete the text-embedding caches made for the new
     caption."""
     p = paths(it, src, dst, bk)
@@ -507,30 +612,41 @@ def undo_item(it: dict, src: Path, dst: Path, bk: Path, counts: dict, notes: lis
         raise OSError(f"the image is in both folders: {p['simg']}")
     if not p["simg"].exists() and not p["dimg"].exists():
         raise OSError("the image is missing from both folders")
-    scap = text_or_none(p["scap"])
-    if scap is not None and scap != it["caption_old"]:
-        raise OSError(f"another caption is in the input folder: {p['scap']}")
+    edits = text_edits(it, p)
+    for e in edits:
+        e["scur"] = text_or_none(e["src"])
+        if e["scur"] is not None and e["scur"] != e["old"]:
+            raise OSError(f"another {e['label']} is in the input folder: {e['src']}")
+    plain = plain_sidecars(it)
+    for name in plain:
+        if (p["sdir"] / name).exists() and (p["ddir"] / name).exists():
+            raise OSError(f"the sidecar is in both folders: {p['sdir'] / name}")
 
     if p["dimg"].exists():
         move(p["dimg"], p["simg"])
-    bcap = text_or_none(p["bcap"])
-    if scap is None and bcap is not None:
-        move(p["bcap"], p["scap"])
-        if bcap != it["caption_old"]:
-            notes.append(f"{it['rel']}: the backed-up caption was edited; the edited one is back in the input folder")
-    elif scap is None:
-        write_text(p["scap"], it["caption_old"])
-    elif bcap is not None:
-        if bcap == it["caption_old"]:
-            p["bcap"].unlink()              # the same text is in place already
-        else:
-            notes.append(f"{it['rel']}: the backed-up caption was edited; it stays in the backup folder")
-    dcap = text_or_none(p["dcap"])
-    if dcap is not None:
-        if dcap == it["caption_new"]:
-            p["dcap"].unlink()
-        else:
-            notes.append(f"{it['rel']}: the caption in the destination was edited; it stays there")
+    for e in edits:
+        scap, bcap = e["scur"], text_or_none(e["bak"])
+        if scap is None and bcap is not None:
+            move(e["bak"], e["src"])
+            if bcap != e["old"]:
+                notes.append(f"{it['rel']}: the backed-up {e['label']} was edited; the edited one is back in the input folder")
+        elif scap is None:
+            write_text(e["src"], e["old"])
+        elif bcap is not None:
+            if bcap == e["old"]:
+                e["bak"].unlink()           # the same text is in place already
+            else:
+                notes.append(f"{it['rel']}: the backed-up {e['label']} was edited; it stays in the backup folder")
+        dcap = text_or_none(e["dst"])
+        if dcap is not None:
+            if dcap == e["new"]:
+                e["dst"].unlink()
+            else:
+                notes.append(f"{it['rel']}: the {e['label']} in the destination was edited; it stays there")
+    for name in plain:
+        if (p["ddir"] / name).exists():
+            move(p["ddir"] / name, p["sdir"] / name)
+            counts["sidecars"] += 1
     rx = cache_rx(Path(it["rel"]).stem)
     for name in list_files(p["ddir"] / LATENT_DIRNAME):
         if rx.match(name):
@@ -608,6 +724,7 @@ def plan_run(src: Path, settings: dict) -> dict:
     n = class_counts(items)
     plan = plan_counts(n, settings["selection"])
     select(items, plan, settings["seed"], settings["strip_russian"])
+    edit_sidecars(items, src, settings["strip_russian"])
     summary = summarize(items)
     c = summary["classes"]          # the percent of each whole class, as the summary prints it
     m = {"tool": TOOL, "version": MANIFEST_VERSION, **settings,
@@ -619,16 +736,16 @@ def plan_run(src: Path, settings: dict) -> dict:
 
 
 def backfill_captions(m: dict, src: Path, dst: Path, bk: Path) -> int:
-    """Write the original caption of every moved image whose backup file is
-    missing, from the manifest: a run made before the captions were backed up
+    """Write the original of every edited file of a moved image whose backup file
+    is missing, from the manifest: a run made before the captions were backed up
     gets them on its next --apply."""
     n = 0
     for it in m["items"]:
         if it["status"] == "moved":
-            p = paths(it, src, dst, bk)
-            if not p["bcap"].exists() and not p["scap"].exists():
-                write_text(p["bcap"], it["caption_old"])
-                n += 1
+            for e in text_edits(it, paths(it, src, dst, bk)):
+                if not e["bak"].exists() and not e["src"].exists():
+                    write_text(e["bak"], e["old"])
+                    n += 1
     return n
 
 
@@ -665,7 +782,7 @@ def run_apply(src: Path, dst: Path, mpath: Path, settings: dict, chosen: bool) -
     backfilled = backfill_captions(m, src, dst, bk)
     if backfilled:
         print(f"  original captions written to the backup folder from the manifest: {backfilled}")
-    counts = {"latent": 0, "te": 0}
+    counts = {"latent": 0, "te": 0, "sidecars": 0, "edited": 0}
     errors, done = [], 0
     try:
         for it in todo:
@@ -679,11 +796,13 @@ def run_apply(src: Path, dst: Path, mpath: Path, settings: dict, chosen: bool) -
                 print(f"  {done + len(errors)}/{len(todo)}")
     finally:
         m["applied"] = {"time": time.strftime("%Y-%m-%dT%H:%M:%S"), "images": done,
-                        "latent_cache_moved": counts["latent"], "te_cache_backed_up": counts["te"]}
+                        "latent_cache_moved": counts["latent"], "te_cache_backed_up": counts["te"],
+                        "sidecars_moved": counts["sidecars"], "sidecars_edited": counts["edited"]}
         write_manifest(mpath, m)
     print_summary(m)
-    print(f"  moved now: {done} images, {counts['latent']} latent cache files; "
-          f"original captions and {counts['te']} text-embedding cache files backed up to {bk}")
+    print(f"  moved now: {done} images, {counts['sidecars']} sidecar files as they are, {counts['edited']} sidecar "
+          f"files edited, {counts['latent']} latent cache files; original captions, original edited sidecars and "
+          f"{counts['te']} text-embedding cache files backed up to {bk}")
     moved = sum(1 for it in m["items"] if it["status"] == "moved")
     print(f"  moved in all: {moved} images into {dst}")
     if errors:
@@ -703,7 +822,7 @@ def run_undo(src: Path, mpath: Path) -> bool:
     todo = [it for it in m["items"] if it["status"] == "moved"
             or (it["selected"] and it["status"] == "planned" and (dst / it["rel"]).exists())]
     print(f"  undoing the run of {m['created']}: {len(todo)} images back from {dst}")
-    counts = {"latent": 0, "te": 0, "te_deleted": 0}
+    counts = {"latent": 0, "te": 0, "te_deleted": 0, "sidecars": 0}
     errors, notes, done = [], [], 0
     try:
         for it in todo:
@@ -718,7 +837,7 @@ def run_undo(src: Path, mpath: Path) -> bool:
     finally:
         m["undone"] = {"time": time.strftime("%Y-%m-%dT%H:%M:%S"), "images": done,
                        "latent_cache_moved": counts["latent"], "te_cache_restored": counts["te"],
-                       "te_cache_deleted": counts["te_deleted"]}
+                       "te_cache_deleted": counts["te_deleted"], "sidecars_moved": counts["sidecars"]}
         write_manifest(mpath, m)
     dirs = set()
     for it in todo:
@@ -729,8 +848,8 @@ def run_undo(src: Path, mpath: Path) -> bool:
     left = clear_folder(dst)
     left_bk = clear_folder(bk)
     print_summary(m)
-    print(f"  moved back: {done} images with their original captions, {counts['latent']} latent cache files, "
-          f"{counts['te']} text-embedding cache files from {bk.name}; "
+    print(f"  moved back: {done} images with their original captions, {counts['sidecars']} sidecar files as they "
+          f"were, {counts['latent']} latent cache files, {counts['te']} text-embedding cache files from {bk.name}; "
           f"{counts['te_deleted']} text-embedding cache files of the new captions deleted")
     print_list("notes", notes)
     for folder, files in ((dst, left), (bk, left_bk)):
