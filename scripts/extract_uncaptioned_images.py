@@ -1,9 +1,11 @@
-"""Move images that have no .txt caption sidecar into "<root>_uncaptioned", recursively.
+"""Move images that have no caption sidecar into "<root>_uncaptioned", recursively.
 
 An image "name.png" counts as captioned when the same folder holds
-"name.txt" (case-insensitive). Every uncaptioned png/jpg/jpeg/gif/webp is
-moved to "<root>_uncaptioned/<same relative path>", next to the root, so the
-original directory tree is kept. The folder is next to the root, not inside
+"name.txt", "name.short", "name.caption" or a "name.json" with a "caption"
+key (case-insensitive). Every uncaptioned png/jpg/jpeg/gif/webp is moved to
+"<root>_uncaptioned/<same relative path>", next to the root, so the original
+directory tree is kept, with every other file of its name (a cache, a
+metadata .json). The folder is next to the root, not inside
 it, because a trainer that reads all subfolders (Ostris AI Toolkit trains
 every subfolder whose name does not start with a dot) would train the
 uncaptioned images. Until 2026-10-11 it was "<root>/_uncaptioned"; such a
@@ -15,7 +17,7 @@ which have no captions by design), and any folder the dataset tools marked
 with MARK.
 
 After captioning, --restore moves every file in "<root>_uncaptioned" (images
-and their new .txt files) back to the same place in the tree and removes the
+and their new captions) back to the same place in the tree and removes the
 emptied folders.
 
 Usage:
@@ -24,11 +26,14 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import sys
 import time
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+CAPTION_EXTS = {".txt", ".short", ".caption", ".json"}
+JSON_EXT = ".json"
 OUT_SUFFIX = "_uncaptioned"     # <root>_uncaptioned next to the root
 OLD_OUT_NAME = "_uncaptioned"   # the same folder inside the root until 2026-10-11
 # The output folders of the dataset tools, at any depth: _controls holds the
@@ -37,6 +42,18 @@ OLD_OUT_NAME = "_uncaptioned"   # the same folder inside the root until 2026-10-
 EXCLUDES = {OLD_OUT_NAME, "_controls", "masks", "faces", "_backup", "_duplicates", "_prep",
             "_classify", "_embeddings", "_reframed"}
 MARK = "_dataset_tools.json"    # marks a folder the dataset tools made next to a dataset
+
+
+def is_caption(path):
+    """True for every caption file but a .json that is not a JSON caption."""
+    if os.path.splitext(path)[1].lower() != JSON_EXT:
+        return True
+    try:
+        with open(path, "rb") as f:
+            doc = json.loads(f.read().decode("utf-8-sig"))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return False
+    return isinstance(doc, dict) and "caption" in doc
 
 
 def skipped(entry):
@@ -74,7 +91,7 @@ def extract(root, out, dry_run, quiet):
 
         # One directory listing per folder; no per-file existence checks.
         images = []
-        texts = set()
+        others = {}     # stem -> the files of that name that are not images
         subdirs = []
         try:
             with os.scandir(folder) as it:
@@ -91,19 +108,27 @@ def extract(root, out, dry_run, quiet):
                     ext = ext.lower()
                     if ext in IMAGE_EXTS:
                         images.append(entry)
-                    elif ext == ".txt":
-                        texts.add(stem.lower())
+                    else:
+                        others.setdefault(stem.lower(), []).append(entry)
         except OSError as e:
             print(f"  Cannot read folder: {e}", file=sys.stderr)
             continue
 
+        uncaptioned = {}
+        for stem, files in others.items():
+            uncaptioned[stem] = not any(os.path.splitext(f.name)[1].lower() in CAPTION_EXTS and is_caption(f.path)
+                                        for f in files)
         for entry in sorted(images, key=lambda e: e.name.lower()):
-            if os.path.splitext(entry.name)[0].lower() in texts:
+            stem = os.path.splitext(entry.name)[0].lower()
+            if not uncaptioned.get(stem, True):
                 captioned += 1
                 continue
             dst = os.path.join(out, os.path.relpath(entry.path, root))
             if move(entry.path, dst, dry_run, "uncaptioned image"):
                 moved += 1
+                # the other files of its name go with it (once, when two images share the name)
+                for f in sorted(others.pop(stem, []), key=lambda e: e.name.lower()):
+                    move(f.path, os.path.join(out, os.path.relpath(f.path, root)), dry_run, "its file")
             else:
                 failed += 1
 
@@ -153,8 +178,9 @@ def move_old_out(root, out, dry_run):
 
 def main():
     ap = argparse.ArgumentParser(
-        description=f"Recursively move png/jpg/jpeg/gif/webp images with no "
-                    f".txt sidecar into <folder>{OUT_SUFFIX} next to the folder, keeping the folder tree.")
+        description=f"Recursively move png/jpg/jpeg/gif/webp images with no caption sidecar "
+                    f"(.txt, .short, .caption, or a .json with a \"caption\" key), with the other files of "
+                    f"their name, into <folder>{OUT_SUFFIX} next to the folder, keeping the folder tree.")
     ap.add_argument("folder", nargs="?", default=".",
                     help="root folder (default: current folder)")
     ap.add_argument("-r", "--restore", action="store_true",
