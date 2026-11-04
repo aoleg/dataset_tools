@@ -1,0 +1,21 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+# The partner's hand-off, journal, agent context and the plan stay local;
+# the tool's own README.md is the one tracked document in the root
+/*.md
+!/README.md
+# The partner's OpenCode deployment, written for his machine (PLAN.md, D3)
+docs/
+examples/
+.opencode/
+opencode.jsonc
+# Code removed from the tool but kept for the record (PLAN.md, section 8)
+_removed/
+# secrets and local state
+vk_token.txt
+vkds.conf
+_vkds/
+tmp/
+datasets/
+tests/_smoke_out/
