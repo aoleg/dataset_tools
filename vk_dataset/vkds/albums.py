@@ -1,11 +1,16 @@
 """Этап 1: сканирование и скачивание фотоальбомов сообщества ВК.
 
-Структура датасета (с версии 0.3):
-  <out>/<папка группы — по НАЗВАНИЮ группы>/<папка альбома — по НАЗВАНИЮ>/photo_<id>.jpg
+Структура датасета (с версии 0.3, имена файлов с 0.5):
+  <out>/<папка группы — по НАЗВАНИЮ группы>/<папка альбома — по НАЗВАНИЮ>/photo<owner>_<id>.jpg
+
+Имя файла — форма ВК photo<owner_id>_<photo_id> с владельцем со знаком
+(photo-9642436_457239017 у фото группы, photo123_456 у фото пользователя):
+уникально между группами. Старые photo_<id>.jpg (до 0.5) при докачке
+считаются существующими; переименование — глагол migrate.
 
 Рядом с фото и альбомами:
-  photo_<id>.txt  — подпись фото (если есть), имя файла как у фото —
-                    готовые пары «картинка-текст» для датасета;
+  photo<owner>_<id>.txt — очищенная подпись фото (без ссылок, хэштегов и
+                    упоминаний), имя как у фото — пары «картинка-текст»;
   album.txt       — название, описание, даты и статистика выгрузки альбома;
   metadata.json   — машинные данные всех фото (тексты, даты, гео, лайки).
 
@@ -18,9 +23,15 @@
   _albums.json      — индекс альбомов; _group.json — данные группы.
 
 Мёртвые фото (файл удалён с CDN ВК, но API по-прежнему отдаёт метаданные) —
-частая проблема ВК: 404 не повторяется ни разу, фото попадает в реестр,
-и при следующих запусках CDN вообще не дёргается (TTL 30 дней;
---recheck-dead принудительно перепроверяет — ВК иногда восстанавливает файлы).
+частая проблема ВК: 404 на лучшей копии -> пробуются все остальные размеры
+(бесплатно); только если все ответили 404, фото попадает в реестр, и при
+следующих запусках CDN вообще не дёргается (TTL 30 дней; --recheck-dead и
+глагол recheck-dead перепроверяют — ВК иногда восстанавливает файлы).
+
+Списки при скачивании (D7): настоящий прогон берёт photos.getAlbums и
+photos.get только живыми (и пишет кэш); кэш читают лишь scan и --dry-run.
+Альбом, у которого по манифесту и диску ничего не недостаёт, пропускается
+без единого вызова photos.get.
 
 Совпадающие названия разных альбомов получают суффикс "__<id>"; раннее
 назначенные папки при докачке не меняются. Датасеты vkds 0.2 (папка группы
@@ -43,6 +54,7 @@ from pathlib import Path
 
 from .api import VkApiError, VkClient
 from .budget import now_iso
+from .captions import clean_caption
 from .fs import download_file, read_json, sanitize_dirname, write_json
 from .models import AlbumInfo, GroupInfo
 
@@ -87,7 +99,36 @@ class AlbumsOptions:
 # Вспомогательные функции
 # ----------------------------------------------------------------------------
 
-def size_candidates(photo: dict, limit: int = 4) -> list:
+def photo_stem(owner_id, photo_id) -> str:
+    """VK's own id form: photo-9642436_457239017 (group), photo123_456 (user)."""
+    return "photo{}_{}".format(int(owner_id), photo_id)
+
+
+def old_stem(photo_id) -> str:
+    """The file stem before 0.5."""
+    return "photo_{}".format(photo_id)
+
+
+def write_caption(dest_dir: Path, stem: str, text: str) -> str:
+    """Write <stem>.txt with the cleaned caption; return its name or "".
+
+    An empty cleaned caption writes nothing and removes a stale .txt of the
+    same stem (an older version wrote the raw text).
+    """
+    path = Path(dest_dir) / (stem + ".txt")
+    cap = clean_caption(text)
+    try:
+        if cap:
+            path.write_text(cap, encoding="utf-8")
+            return path.name
+        if path.is_file():
+            path.unlink()
+    except OSError:
+        pass
+    return ""
+
+
+def size_candidates(photo: dict, limit: int = 64) -> list:
     """Копии фото, отсортированные по убыванию размера (первая — лучшая).
 
     У фото, загруженных до 2012 года, width/height бывают нулевыми — тогда
@@ -160,7 +201,9 @@ def resolve_groups(client: VkClient, targets) -> list[GroupInfo]:
         resp = client.call("groups.getById", group_id=",".join(refs),
                            fields="description,members_count")
         groups = _to_groups(resp.get("groups") or resp.get("items"))
-    except VkApiError:
+    except VkApiError as e0:
+        if e0.limit:
+            raise
         # одна из ссылок битая — определяем по одной, плохие пропускаем
         groups, last = [], None
         for r in refs:
@@ -169,6 +212,8 @@ def resolve_groups(client: VkClient, targets) -> list[GroupInfo]:
                                    fields="description,members_count")
                 groups.extend(_to_groups(resp.get("groups") or resp.get("items")))
             except VkApiError as e:
+                if e.limit:
+                    raise
                 last = e
                 print("[!] Сообщество «{}» не найдено: {}".format(r, e))
         if not groups and last is not None:
@@ -181,11 +226,15 @@ def resolve_groups(client: VkClient, targets) -> list[GroupInfo]:
     return uniq
 
 
-def fetch_albums(client: VkClient, group: GroupInfo) -> list[AlbumInfo]:
-    """Полный список обычных альбомов сообщества (постранично, 100/вызов)."""
+def fetch_albums(client: VkClient, group: GroupInfo,
+                 live: bool = False) -> list[AlbumInfo]:
+    """Полный список обычных альбомов сообщества (постранично, 100/вызов).
+
+    live=True (настоящий прогон, D7) — мимо кэша, ответ пишется в кэш.
+    """
     albums, offset = [], 0
     while True:
-        resp = client.call("photos.getAlbums", owner_id=group.owner_id,
+        resp = client.call("photos.getAlbums", _live=live, owner_id=group.owner_id,
                            offset=offset, count=ALBUMS_PER_PAGE,
                            need_system=0, need_covers=0)
         items = resp.get("items", [])
@@ -207,11 +256,16 @@ def fetch_albums(client: VkClient, group: GroupInfo) -> list[AlbumInfo]:
     return out
 
 
-def fetch_photos(client: VkClient, group: GroupInfo, album_id: str) -> list[dict]:
-    """Все фотографии одного альбома (постранично, до 1000/вызов)."""
+def fetch_photos(client: VkClient, group: GroupInfo, album_id: str,
+                 live: bool = True) -> list[dict]:
+    """Все фотографии одного альбома (постранично, до 1000/вызов).
+
+    Для скачивания список всегда живой (D7): URL копий подписаны и могут
+    устаревать.
+    """
     photos, offset = [], 0
     while True:
-        resp = client.call("photos.get", owner_id=group.owner_id,
+        resp = client.call("photos.get", _live=live, owner_id=group.owner_id,
                            album_id=str(album_id), photo_sizes=1, extended=1,
                            rev=0, offset=offset, count=PHOTOS_PER_PAGE)
         items = resp.get("items", [])
@@ -225,7 +279,7 @@ def fetch_photos(client: VkClient, group: GroupInfo, album_id: str) -> list[dict
 
 def make_record(photo: dict) -> dict:
     """Фото из ответа API -> плоская запись для metadata.json / пайплайна."""
-    cands = size_candidates(photo, 4)
+    cands = size_candidates(photo)
     best = cands[0] if cands else None
     return {
         "id": photo.get("id"),
@@ -238,7 +292,9 @@ def make_record(photo: dict) -> dict:
         "likes": (photo.get("likes") or {}).get("count"),
         "comments": (photo.get("comments") or {}).get("count"),
         "url": best.get("url") if best else None,
-        "alt_urls": [s["url"] for s in cands[1:]],   # фолбэк-копии меньшего размера
+        "alt_urls": [s["url"] for s in cands[1:]],   # все копии меньшего размера
+        "alt_sizes": [{k: s.get(k) for k in ("type", "width", "height")}
+                      for s in cands[1:]],
         "width": best.get("width") if best else None,
         "height": best.get("height") if best else None,
         "size_type": best.get("type") if best else None,
@@ -279,7 +335,7 @@ def save_dead(gdir: Path, dead: dict) -> None:
 
 
 def make_dead_entry(group: GroupInfo, album: AlbumInfo, photo: dict,
-                    http_code: int = 404) -> dict:
+                    http_code: int = 404, urls_live: bool = True) -> dict:
     """Полная карточка мёртвого фото: всё, что осталось кроме самого файла.
 
     Сохраняются подпись, дата, лайки, ссылки на ВСЕ размеры (пригодятся для
@@ -304,6 +360,7 @@ def make_dead_entry(group: GroupInfo, album: AlbumInfo, photo: dict,
                   for s in (photo.get("sizes") or []) if s.get("url")],
         "link": "https://vk.com/photo{}_{}".format(owner, pid),
         "http_status": http_code,
+        "urls_live": urls_live,   # every size answered 404 on URLs of a live listing
         "first_seen_dead": now_iso(),
         "last_checked": now_iso(),
     }
@@ -321,12 +378,15 @@ def register_dead(dead: dict, entry: dict) -> None:
 
 
 def _dead_is_fresh(entry: dict, ttl_days: int) -> bool:
-    """Свежесть проверки: верим реестру TTL дней (по умолчанию 30)."""
+    """Свежесть проверки: верим реестру TTL дней (по умолчанию 30).
+
+    Отметка, которая не разбирается (или без часового пояса), — устаревшая.
+    """
     try:
         t = datetime.fromisoformat(str(entry.get("last_checked")))
         return (datetime.now(timezone.utc) - t).days < max(1, ttl_days)
     except Exception:
-        return True
+        return False
 
 
 # ----------------------------------------------------------------------------
@@ -467,12 +527,14 @@ def download_photos(session, records: list[dict], dest_dir: Path,
 
     Мёртвые фото: известные по реестру _dead_photos.json (проверка свежее
     dead_ttl_days) вообще не дёргают CDN — повторные запуски бесплатны.
-    При недоступности лучшей копии (403/сбой) пробуются меньшие копии
-    (alt_urls); при 404 фолбэка нет — все размеры одного фото это один
-    физический файл на CDN.
+    При неудаче лучшей копии (404, 403, сбой) пробуются ВСЕ меньшие копии
+    (alt_urls; меньше min_area — пропускаются), без вызовов API. dead — только
+    если каждая опробованная копия ответила 404; использованная меньшая копия
+    отмечается в записи (fallback_from, url_used, её размеры).
 
-    Для скачанных/существующих фото с подписью пишется photo_<id>.txt
-    рядом с файлом (чистый текст — пары «картинка-текст» для датасета).
+    Имя файла — photo<owner>_<id>.jpg; файл старой формы photo_<id>.jpg
+    считается существующим. Для скачанных/существующих фото с подписью
+    пишется <имя файла>.txt с очищенной подписью (clean_caption).
     """
     dead = dead if dead is not None else {}
     dest_dir = Path(dest_dir)
@@ -485,10 +547,15 @@ def download_photos(session, records: list[dict], dest_dir: Path,
         if min_area and w and h and w * h < min_area:
             rec["status"] = "small"
             continue
-        fname = "photo_{}.jpg".format(rec["id"])
+        fname = photo_stem(rec["owner_id"], rec["id"]) + ".jpg"
         dest = dest_dir / fname
+        old = dest_dir / (old_stem(rec["id"]) + ".jpg")
         rec["file"] = fname
         if dest.exists() and dest.stat().st_size > 0:
+            rec["status"] = "exists"
+            continue
+        if old.exists() and old.stat().st_size > 0:
+            rec["file"] = old.name        # датасет до 0.5, ещё не migrate
             rec["status"] = "exists"
             continue
         ent = dead.get("{}_{}".format(rec.get("owner_id"), rec["id"]))
@@ -499,16 +566,32 @@ def download_photos(session, records: list[dict], dest_dir: Path,
         jobs.append((rec, dest))
 
     def _fetch(rec, dest):
-        """Лучшая копия -> при 403/сбое пробуем меньшие; 404 = конец."""
-        urls = [rec["url"]] + [u for u in (rec.get("alt_urls") or []) if u]
-        res = None
-        for u in urls[:4]:
+        """Лучшая копия, затем все меньшие; dead — только если все 404."""
+        best = {"type": rec.get("size_type"), "width": rec.get("width"),
+                "height": rec.get("height")}
+        alts = list(rec.get("alt_urls") or [])
+        alt_sizes = list(rec.get("alt_sizes") or [])
+        alt_sizes += [{}] * (len(alts) - len(alt_sizes))
+        tries = [(rec["url"], best)] + [(u, s or {}) for u, s in zip(alts, alt_sizes) if u]
+        statuses = []
+        for i, (u, sz) in enumerate(tries):
+            w, h = sz.get("width") or 0, sz.get("height") or 0
+            if i and min_area and w and h and w * h < min_area:
+                continue                 # копия мельче фильтра — не годится
             res = download_file(session, u, dest, retry_sleep=retry_sleep)
-            if res["status"] in ("ok", "dead"):
-                if res["status"] == "ok":
-                    rec["url_used"] = u
+            statuses.append(res["status"])
+            if res["status"] == "ok":
+                rec["url_used"] = u
+                if i:
+                    rec["fallback_from"] = rec.get("size_type")
+                    rec.update(size_type=sz.get("type"), width=sz.get("width"),
+                               height=sz.get("height"))
                 return res
-        return res or {"status": "failed"}
+        if statuses and all(x == "dead" for x in statuses):
+            return {"status": "dead"}
+        if "forbidden" in statuses:
+            return {"status": "forbidden"}
+        return {"status": "failed"}
 
     if jobs:
         with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
@@ -529,13 +612,9 @@ def download_photos(session, records: list[dict], dest_dir: Path,
                 rec["bytes"] = (dest_dir / rec["file"]).stat().st_size
             except OSError:
                 rec["bytes"] = 0
-        if write_txt and rec.get("status") in ("ok", "exists") \
-                and (rec.get("text") or "").strip():
-            try:
-                (dest_dir / "photo_{}.txt".format(rec["id"])).write_text(
-                    rec["text"].strip(), encoding="utf-8")
-            except OSError:
-                pass
+        if write_txt and rec.get("file") and rec.get("status") in ("ok", "exists"):
+            rec["txt"] = write_caption(dest_dir, Path(rec["file"]).stem,
+                                       rec.get("text") or "")
     return records
 
 
@@ -577,18 +656,9 @@ def write_album_txt(album_dir: Path, group: GroupInfo, album: AlbumInfo,
         pass
 
 
-def update_manifest(gdir: Path, out_root: Path, group: GroupInfo,
-                    album: AlbumInfo, records: list[dict],
-                    rel_dir: str) -> Path:
-    """Обновляет _manifest.csv группы: по строке на КАЖДОЕ фото альбома.
-
-    Манифест — основа для сборки датасета: пути к файлам, подписи (дублируют
-    photo_<id>.txt), статусы, размеры. Мёртвые фото тоже входят (status=dead)
-    — их подписи и метаданные сохраняются для восстановления. Строки других
-    альбомов не трогаются; строки обрабатываемого альбома заменяются.
-    """
-    gdir, out_root = Path(gdir), Path(out_root)
-    path = gdir / MANIFEST_NAME
+def read_manifest(gdir: Path) -> dict:
+    """_manifest.csv группы: {(album_id, photo_id): row} в порядке файла."""
+    path = Path(gdir) / MANIFEST_NAME
     rows = {}
     if path.is_file():
         try:
@@ -597,15 +667,39 @@ def update_manifest(gdir: Path, out_root: Path, group: GroupInfo,
                     rows[(str(r.get("album_id")), str(r.get("photo_id")))] = r
         except Exception:
             rows = {}
+    return rows
+
+
+def write_manifest(gdir: Path, rows: dict) -> Path:
+    path = Path(gdir) / MANIFEST_NAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=MANIFEST_COLS, extrasaction="ignore")
+        w.writeheader()
+        for r in rows.values():
+            w.writerow(r)
+    return path
+
+
+def update_manifest(gdir: Path, out_root: Path, group: GroupInfo,
+                    album: AlbumInfo, records: list[dict],
+                    rel_dir: str) -> Path:
+    """Обновляет _manifest.csv группы: по строке на КАЖДОЕ фото альбома.
+
+    Манифест — основа для сборки датасета: пути к файлам, имя .txt с
+    очищенной подписью, статусы, размеры; колонка text — подпись как есть.
+    Мёртвые фото тоже входят (status=dead) — их подписи и метаданные
+    сохраняются для восстановления. Строки других альбомов не трогаются;
+    строки обрабатываемого альбома заменяются.
+    """
+    gdir, out_root = Path(gdir), Path(out_root)
+    rows = read_manifest(gdir)
     for rec in records:
         fname = rec.get("file") or ""
         if rec.get("status") not in ("ok", "exists"):
             fname = ""                # файла нет (dead/failed/small) — не указываем
         rel = (Path(rel_dir) / fname).as_posix() if fname else ""
-        txt = ""
-        if fname and rec.get("status") in ("ok", "exists") \
-                and (rec.get("text") or "").strip():
-            txt = "photo_{}.txt".format(rec["id"])
+        txt = (rec.get("txt") or "") if fname else ""
         rows[(str(album.id), str(rec["id"]))] = {
             "photo_id": rec.get("id"), "owner_id": rec.get("owner_id"),
             "group_id": group.id, "group_name": group.name,
@@ -618,13 +712,50 @@ def update_manifest(gdir: Path, out_root: Path, group: GroupInfo,
             "likes": rec.get("likes"), "comments": rec.get("comments"),
             "text": rec.get("text") or "",
         }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", newline="", encoding="utf-8-sig") as f:
-        w = csv.DictWriter(f, fieldnames=MANIFEST_COLS)
-        w.writeheader()
-        for r in rows.values():
-            w.writerow(r)
-    return path
+    return write_manifest(gdir, rows)
+
+
+def reconcile_album(rows: list[dict], album: AlbumInfo, entry: dict,
+                    out_root: Path, dead: dict, opts: AlbumsOptions) -> dict | None:
+    """Сверка альбома с манифестом и диском без вызовов API (D7).
+
+    Возвращает счётчики, если у альбома ничего не недостаёт: число строк
+    равно размеру альбома из живого photos.getAlbums (или размер и дата
+    обновления те же, что при последнем живом списке), каждый файл ok/exists
+    на диске, каждое мёртвое фото свежо в реестре, каждое small мельче
+    текущего --min-area. Иначе None — альбом надо листать живым.
+    """
+    if album.is_special or album.size is None or not rows:
+        return None
+    same_listing = (entry.get("listed_size") == album.size
+                    and entry.get("listed_updated") == album.updated
+                    and entry.get("listed_count") == len(rows))
+    if len(rows) != album.size and not same_listing:
+        return None
+    st = {"ok": 0, "exists": 0, "small": 0, "failed": 0, "no_url": 0,
+          "dead": 0, "forbidden": 0}
+    for r in rows:
+        status = r.get("status")
+        if status in ("ok", "exists"):
+            if not r.get("path") or not (Path(out_root) / r["path"]).is_file():
+                return None
+            st["exists"] += 1
+        elif status == "dead":
+            ent = dead.get("{}_{}".format(r.get("owner_id"), r.get("photo_id")))
+            if opts.recheck_dead or not ent or not _dead_is_fresh(ent, opts.dead_ttl_days):
+                return None
+            st["dead"] += 1
+        elif status == "small":
+            try:
+                area = int(float(r.get("width") or 0)) * int(float(r.get("height") or 0))
+            except ValueError:
+                return None
+            if not (opts.min_area and area and area < opts.min_area):
+                return None
+            st["small"] += 1
+        else:
+            return None
+    return st
 
 
 # ----------------------------------------------------------------------------
@@ -647,8 +778,10 @@ def _process_group(client: VkClient, group: GroupInfo, out_root: Path,
                    opts: AlbumsOptions) -> dict:
     print("\n=== {} (id={}) ===".format(group.name, group.id))
     try:
-        albums = fetch_albums(client, group)
+        albums = fetch_albums(client, group, live=not opts.dry_run)
     except VkApiError as e:
+        if e.limit:
+            raise
         print("  [!] Не удалось получить список альбомов: {}".format(e))
         return {"group": group.as_dict(), "error": str(e), "albums": []}
 
@@ -685,13 +818,19 @@ def _process_group(client: VkClient, group: GroupInfo, out_root: Path,
     write_json(gdir / "_group.json", group.as_dict())
 
     dead = load_dead(gdir)
+    manifest = {}
+    for (aid, _pid), row in read_manifest(gdir).items():
+        manifest.setdefault(aid, []).append(row)
+    entries_by_id = {str(e.get("id")): dict(e) for e in idx["albums"]}
     gsum = {"group": group.as_dict(), "albums": [], "photos": 0,
             "downloaded": 0, "exists": 0, "small": 0, "failed": 0,
             "no_url": 0, "dead": 0, "forbidden": 0}
     for i, al in enumerate(selected, 1):
         arep = _process_album(client, group, al, out_root / dirs[str(al.id)],
                               opts, i, len(selected), rel_dir=dirs[str(al.id)],
-                              out_root=out_root, gdir=gdir, dead=dead)
+                              out_root=out_root, gdir=gdir, dead=dead,
+                              rows=manifest.get(str(al.id), []),
+                              entry=entries_by_id.get(str(al.id), {}))
         for e in idx["albums"]:
             if str(e.get("id")) == str(al.id):
                 e.update(arep.pop("index"))
@@ -717,7 +856,8 @@ def _process_album(client: VkClient, group: GroupInfo, album: AlbumInfo,
                    album_dir: Path, opts: AlbumsOptions,
                    num: int, total: int, rel_dir: str = "",
                    out_root: Path | None = None,
-                   gdir: Path | None = None, dead: dict | None = None) -> dict:
+                   gdir: Path | None = None, dead: dict | None = None,
+                   rows: list | None = None, entry: dict | None = None) -> dict:
     print("[{}/{}] Альбом «{}» (id={}), фото по данным API: {}".format(
         num, total, album.title, album.id,
         album.size if album.size is not None else "?"))
@@ -727,9 +867,27 @@ def _process_album(client: VkClient, group: GroupInfo, album: AlbumInfo,
             "exists": 0, "small": 0, "failed": 0, "no_url": 0,
             "dead": 0, "forbidden": 0,
             "index": {"status": "started", "last_run": now_iso()}}
+    if out_root is not None and rows:
+        done = reconcile_album(rows, album, entry or {}, out_root,
+                               dead if dead is not None else {}, opts)
+        if done is not None:
+            arep.update({"photos": len(rows), "exists": done["exists"],
+                         "dead": done["dead"], "small": done["small"]})
+            arep["index"].update({"status": "done", "reconciled": now_iso(),
+                                  "stats": {"photos": len(rows), "downloaded": 0,
+                                            "exists": done["exists"],
+                                            "small": done["small"], "failed": 0,
+                                            "no_url": 0, "dead": done["dead"],
+                                            "forbidden": 0}})
+            print("      сверка с манифестом: всё на месте (есть {}, мёртвых {}, "
+                  "отфильтровано {}), вызовов API: 0".format(
+                      done["exists"], done["dead"], done["small"]))
+            return arep
     try:
         photos = fetch_photos(client, group, album.id)
     except VkApiError as e:
+        if e.limit:
+            raise
         print("      [!] Пропуск альбома: {}".format(e))
         arep["index"]["status"] = "error"
         arep["index"]["error"] = str(e)
@@ -752,6 +910,9 @@ def _process_album(client: VkClient, group: GroupInfo, album: AlbumInfo,
         print("      [i] Дублей фото в ответе API: {} — пропущены".format(
             len(photos) - len(uniq)))
     records = [make_record(p) for p in uniq]
+    for rec in records:
+        if rec.get("owner_id") in (None, ""):
+            rec["owner_id"] = group.owner_id
     album_dir.mkdir(parents=True, exist_ok=True)
     records = download_photos(client.session, records, album_dir,
                               workers=opts.workers, min_area=opts.min_area,
@@ -772,7 +933,7 @@ def _process_album(client: VkClient, group: GroupInfo, album: AlbumInfo,
         for rec in records:
             if rec.get("status") == "dead" and not rec.get("dead_cached"):
                 register_dead(dead, make_dead_entry(
-                    group, album, photos_by_id.get(rec["id"], {})))
+                    group, album, photos_by_id.get(rec["id"], {}), urls_live=True))
                 new_dead += 1
         if new_dead and gdir is not None:
             save_dead(gdir, dead)
@@ -800,6 +961,8 @@ def _process_album(client: VkClient, group: GroupInfo, album: AlbumInfo,
 
     arep["index"].update({
         "status": "done",
+        "listed_size": album.size, "listed_updated": album.updated,
+        "listed_count": len(records),
         "stats": {"photos": len(records), "downloaded": st["ok"],
                   "exists": st["exists"], "small": st["small"],
                   "failed": st["failed"], "no_url": st["no_url"],
@@ -880,7 +1043,7 @@ def run_peek(client: VkClient, target, album_id, limit: int, offset: int,
     """
     out_root = Path(out_root)
     group = resolve_groups(client, [target])[0]
-    resp = client.call("photos.get", owner_id=group.owner_id,
+    resp = client.call("photos.get", _live=True, owner_id=group.owner_id,
                        album_id=str(album_id), photo_sizes=1, extended=1,
                        offset=int(offset), count=int(limit))
     photos = resp.get("items", [])
@@ -889,7 +1052,9 @@ def run_peek(client: VkClient, target, album_id, limit: int, offset: int,
     records = []
     for p in photos:
         rec = make_record(p)
-        fname = "photo_{}.jpg".format(rec["id"])
+        if rec.get("owner_id") in (None, ""):
+            rec["owner_id"] = group.owner_id
+        fname = photo_stem(rec["owner_id"], rec["id"]) + ".jpg"
         if rec.get("url"):
             res = download_file(client.session, rec["url"], dest / fname)
             rec["http_status"] = res.get("http_code")
@@ -898,12 +1063,8 @@ def run_peek(client: VkClient, target, album_id, limit: int, offset: int,
             rec["status"] = "no_url"
         ok = rec["status"] == "ok"
         rec["file"] = fname if ok else None
-        if ok and (rec.get("text") or "").strip():
-            try:
-                (dest / "photo_{}.txt".format(rec["id"])).write_text(
-                    rec["text"].strip(), encoding="utf-8")
-            except OSError:
-                pass
+        if ok:
+            rec["txt"] = write_caption(dest, Path(fname).stem, rec.get("text") or "")
         records.append(rec)
     write_json(dest / "_meta.json", {
         "group": group.as_dict(), "album_id": str(album_id),

@@ -30,7 +30,7 @@ class Conf:
     loaded: bool = False               # True when the file existed
     token_file: Path = TOOL_DIR / "vk_token.txt"
     base: Path | None = None           # the datasets root; None: not set
-    ledger: Path = TOOL_DIR / "_vkds" / "ledger.json"   # used from phase 2
+    ledger: Path = TOOL_DIR / "_vkds" / "ledger.json"   # the ledger of this checkout
     monthly: int = 10000
     delay: float = 0.35
 

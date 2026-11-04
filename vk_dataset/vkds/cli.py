@@ -3,11 +3,13 @@
 Этап 1 (текущий) — альбомы сообществ. Глаголы:
 
   albums        скачать альбомы группы в <название группы>/<название
-                альбома>/ (полный размер, описания, photo_<id>.txt)
+                альбома>/ (полный размер, описания, photo<owner>_<id>.txt)
   scan albums   разведка: список альбомов без скачивания (для ИИ-агента)
   peek          пробные фото альбома для визуальной оценки агентом
   whoami        проверить токен (1 вызов API)
-  budget        показать расход вызовов API (0 вызовов)
+  budget        журнал вызовов этой копии и датасета (0 вызовов)
+  recheck-dead  перепроверить мёртвые фото по реестру (0 вызовов, только CDN)
+  migrate       переименовать photo_<id> в photo<owner>_<id> (0 вызовов)
 
 Запуск: run.bat <глагол> ... из папки инструмента или откуда угодно, например
   run.bat scan albums examplegroup
@@ -16,8 +18,10 @@
 токен, папка датасетов base, пауза между вызовами.
 
 Кэш: photos.getAlbums/photos.get кэшируются в <out>/_vkds/cache (TTL 7
-дней) — повторные и контрольные прогоны почти бесплатны. --refresh читает
-мимо кэша, --no-cache отключает его.
+дней). Читают кэш только scan и --dry-run; настоящее скачивание листает
+живым и пишет кэш, а альбом, где по манифесту ничего не недостаёт, не
+стоит ни одного вызова photos.get. --refresh читает мимо кэша, --no-cache
+отключает его.
 Руководство — README.md.
 """
 from __future__ import annotations
@@ -25,12 +29,16 @@ from __future__ import annotations
 import argparse
 import sys
 
+import requests
+
 from . import __version__
 from . import conf as vconf
 from .albums import AlbumsOptions, run_albums, run_peek, run_scan_albums
 from .api import VkApiError, VkClient
-from .budget import Budget, BudgetExceeded
+from .budget import Budget, BudgetExceeded, Ledger, today_utc
 from .cache import ApiCache
+from .migrate import MigrateError, run_migrate
+from .recheck import RecheckError, run_recheck_dead
 
 
 def _read_token(explicit: str, conf: vconf.Conf) -> str:
@@ -105,7 +113,7 @@ def build_parser(conf: vconf.Conf | None = None) -> argparse.ArgumentParser:
     a.add_argument("--dry-run", action="store_true",
                    help="Показать план скачивания, не тратя вызовы на фото")
     a.add_argument("--no-meta", action="store_true",
-                   help="Не писать metadata.json, album.txt и photo_<id>.txt")
+                   help="Не писать metadata.json, album.txt и photo<owner>_<id>.txt")
     a.add_argument("--recheck-dead", action="store_true",
                    help="Перепроверить мёртвые фото (404) из _dead_photos.json "
                         "— ВК иногда восстанавливает файлы")
@@ -136,8 +144,57 @@ def build_parser(conf: vconf.Conf | None = None) -> argparse.ArgumentParser:
                    help="Любое сообщество для проверки токена")
 
     sub.add_parser("budget", parents=[common],
-                   help="Показать журнал расхода вызовов API (0 вызовов)")
+                   help="Журнал вызовов API этой копии и датасета (0 вызовов)")
+
+    r = sub.add_parser("recheck-dead", parents=[common],
+                       help="Перепроверить мёртвые фото по _dead_photos.json "
+                            "(0 вызовов API, только CDN)")
+    r.add_argument("group", help="Папка группы, её id или короткое имя "
+                                 "(из _groups.json датасета)")
+    r.add_argument("--limit", type=int, default=None, metavar="N",
+                   help="Проверить не больше N записей реестра")
+    r.add_argument("--sizes", action="store_true",
+                   help="Пробовать все сохранённые размеры, а не только лучший")
+
+    m = sub.add_parser("migrate", parents=[common],
+                       help="Переименовать photo_<id>.* в photo<owner>_<id>.* "
+                            "(0 вызовов API)")
+    m.add_argument("dataset", help="Папка датасета или группы (относительная — "
+                                   "внутри base из vkds.conf)")
+    m.add_argument("--dry-run", action="store_true",
+                   help="Только показать, что будет переименовано")
     return p
+
+
+def _fmt(n: int) -> str:
+    return "{:,}".format(int(n)).replace(",", " ")
+
+
+def _print_ledger(ledger: Ledger) -> None:
+    tot = ledger.period_total()
+    rd = tot["reset_day"]
+    print("Журнал вызовов этой копии инструмента: {}{}".format(
+        ledger.path, "" if ledger.path and ledger.path.is_file() else " (пока пуст)"))
+    print("Период с {} ({}): попыток {}, успешных {} из {} в месяц".format(
+        tot["start"], "день сброса {}".format(rd) if rd else "начало месяца",
+        _fmt(tot["attempts"]), _fmt(tot["ok"]), _fmt(ledger.monthly)))
+    for name, m in sorted(tot["by_method"].items(), key=lambda x: -x[1]["attempts"]):
+        print("   {:<28} попыток {}, успешных {}".format(name, m["attempts"], m["ok"]))
+    hits = ledger.data.get("limit_hits") or []
+    cleared = ledger.data.get("limit_cleared") or []
+    if hits:
+        print("Отметки лимита (limit_hit):")
+        for h in hits[-10:]:
+            print("   {} [{}] {}".format(h.get("ts", ""), h.get("code", ""),
+                                        h.get("message", "")))
+        if cleared:
+            print("Первый успех после отметки (limit_cleared): {}".format(
+                ", ".join(str(c) for c in cleared[-5:])))
+    else:
+        print("Отметок лимита нет.")
+    if not rd:
+        print("День сброса лимита не задан (поле reset_day в журнале; "
+              "узнаётся по limit_hit и limit_cleared).")
 
 
 def _print_totals(rep: dict) -> None:
@@ -169,27 +226,56 @@ def main(argv=None, conf: vconf.Conf | None = None) -> int:
         print("[!] {}".format(e), file=sys.stderr)
         return 2
     ns = build_parser(conf).parse_args(argv)
-    try:
-        out_root = vconf.resolve_out(ns.out, conf)
-    except vconf.ConfError as e:
-        print("[!] {}".format(e), file=sys.stderr)
-        return 2
+    ledger = Ledger(conf.ledger, monthly=conf.monthly)
 
-    # budget не требует токена и не делает вызовов
+    # budget не требует токена и не делает вызовов; без --out и base —
+    # только журнал этой копии
     if ns.cmd == "budget":
+        _print_ledger(ledger)
+        try:
+            out_root = vconf.resolve_out(ns.out, conf)
+        except vconf.ConfError:
+            return 0
         b = Budget(out_root / "_vkds" / "budget.json")
-        print("Файл журнала: {}".format(b.path))
-        print("Всего вызовов API записано: {} "
-              "(месячный лимит без верификации — {})".format(
-                  b.total, "{:,}".format(conf.monthly).replace(",", " ")))
+        print("\nЖурнал датасета: {}".format(b.path))
+        print("Успешных вызовов API записано: {} (попыток: {}; "
+              "месячный лимит без верификации — {})".format(
+                  b.total, b.data.get("total_attempts", b.total), _fmt(conf.monthly)))
         for m, n in sorted(b.data.get("by_method", {}).items(), key=lambda x: -x[1]):
             print("   {:<28} {}".format(m, n))
         runs = b.data.get("runs", [])[-10:]
         if runs:
             print("Последние запуски:")
             for r in runs:
-                print("   {} {:<10} вызовов: {}".format(
-                    r.get("ts", ""), r.get("label", ""), r.get("calls", 0)))
+                print("   {} {:<12} вызовов: {}, попыток: {}".format(
+                    r.get("ts", ""), r.get("label", ""), r.get("calls", 0),
+                    r.get("attempts", r.get("calls", 0))))
+        return 0
+
+    try:
+        out_root = vconf.resolve_out(
+            ns.dataset if ns.cmd == "migrate" else ns.out, conf)
+    except vconf.ConfError as e:
+        print("[!] {}".format(e), file=sys.stderr)
+        return 2
+
+    # recheck-dead и migrate тоже без токена и без вызовов API
+    if ns.cmd == "migrate":
+        try:
+            run_migrate(out_root, dry_run=ns.dry_run)
+        except MigrateError as e:
+            print("[!] {}".format(e), file=sys.stderr)
+            return 2
+        return 0
+    if ns.cmd == "recheck-dead":
+        session = requests.Session()
+        session.headers["User-Agent"] = "vkds/{} (dataset harvester)".format(__version__)
+        try:
+            run_recheck_dead(session, out_root, ns.group, limit=ns.limit,
+                             all_sizes=ns.sizes)
+        except RecheckError as e:
+            print("[!] {}".format(e), file=sys.stderr)
+            return 2
         return 0
 
     token = _read_token(ns.token, conf)
@@ -204,7 +290,7 @@ def main(argv=None, conf: vconf.Conf | None = None) -> int:
                     run_limit=ns.budget, label=ns.cmd)
     cache = None if ns.no_cache else ApiCache(out_root / "_vkds" / "cache")
     client = VkClient(token, delay=ns.delay, budget=budget, cache=cache,
-                      refresh=ns.refresh)
+                      refresh=ns.refresh, ledger=ledger)
     rc = 0
     try:
         if ns.cmd == "albums":
@@ -237,8 +323,16 @@ def main(argv=None, conf: vconf.Conf | None = None) -> int:
         print("Выполненное до остановки сохранено; повторный запуск докачает.")
         rc = 2
     except VkApiError as e:
-        print("\n[!] Ошибка VK API: {}".format(e), file=sys.stderr)
-        rc = 1
+        if e.limit:
+            print("\n[!] Достигнут лимит VK API: [{}] {}. Отметка limit_hit "
+                  "записана в журнал {} ({} UTC). Повторите после сброса "
+                  "лимита; расход — run.bat budget.".format(
+                      e.code, e.message, ledger.path, today_utc().isoformat()),
+                  file=sys.stderr)
+            rc = 2
+        else:
+            print("\n[!] Ошибка VK API: {}".format(e), file=sys.stderr)
+            rc = 1
     except KeyboardInterrupt:
         print("\n[!] Прервано. Скачанное сохранено; повторный запуск докачает.")
         rc = 130
@@ -247,9 +341,10 @@ def main(argv=None, conf: vconf.Conf | None = None) -> int:
         rc = 1
     finally:
         budget.finish_run(ok=(rc == 0))
-    print("\nВызовов API за запуск: {}; из кэша бесплатно: {}; всего в журнале: "
-          "{} (файлы с CDN и кэш — бесплатно, в лимит не входят)".format(
-              client.api_calls, client.cache_hits, budget.total))
+    print("\nВызовов API за запуск: {} (попыток {}); из кэша бесплатно: {}; "
+          "всего в журнале датасета: {} (файлы с CDN и кэш — бесплатно, в "
+          "лимит не входят)".format(client.api_calls, client.attempts,
+                                    client.cache_hits, budget.total))
     return rc
 
 

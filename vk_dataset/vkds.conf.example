@@ -6,7 +6,7 @@
 token = vk_token.txt
 ; The datasets root: no --out writes here, a relative --out resolves under it, an absolute --out is used as it is.
 base =
-; The machine-wide journal of API calls (used from the ledger of the next version on).
+; The ledger of API calls of this checkout: daily attempts and successes, the limit hits, an optional reset_day.
 ledger = _vkds\ledger.json
 
 [limits]
