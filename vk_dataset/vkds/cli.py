@@ -114,6 +114,9 @@ def build_parser(conf: vconf.Conf | None = None) -> argparse.ArgumentParser:
     a.add_argument("--min-side", type=int, default=0, metavar="N",
                    help="Пропускать фото, у которых любая сторона меньше N пикселей "
                         "(512 — порог импорта pastvu)")
+    a.add_argument("--redownload-missing", action="store_true",
+                   help="Скачать заново фото, чьи файлы перемещены из датасета "
+                        "(по умолчанию они считаются обработанными)")
     a.add_argument("--workers", type=int, default=4,
                    help="Параллельных потоков загрузки файлов")
     a.add_argument("--dry-run", action="store_true",
@@ -165,6 +168,9 @@ def build_parser(conf: vconf.Conf | None = None) -> argparse.ArgumentParser:
     wl.add_argument("--min-side", type=int, default=0, metavar="N",
                     help="Пропускать фото, у которых любая сторона меньше N пикселей "
                          "(512 — порог импорта pastvu)")
+    wl.add_argument("--redownload-missing", action="store_true",
+                    help="Скачать заново фото, чьи файлы перемещены из датасета "
+                         "(по умолчанию они считаются обработанными)")
     wl.add_argument("--workers", type=int, default=4,
                     help="Параллельных потоков загрузки файлов")
     wl.add_argument("--recheck-dead", action="store_true",
@@ -215,6 +221,7 @@ def _wall_options(ns) -> WallOptions:
     return WallOptions(since=ns.since, until=ns.until, text_regex=ns.text_regex or "",
                        photos_min=ns.photos_min, post_ids=[str(x) for x in (ns.post_ids or [])],
                        min_area=ns.min_area, min_side=ns.min_side,
+                       redownload_missing=ns.redownload_missing,
                        workers=ns.workers, dry_run=ns.dry_run,
                        recheck_dead=ns.recheck_dead)
 
@@ -255,16 +262,16 @@ def _print_totals(rep: dict) -> None:
     if not groups or any(g.get("dry_run") for g in groups):
         return
     t = {"photos": 0, "downloaded": 0, "exists": 0, "small": 0,
-         "failed": 0, "no_url": 0, "dead": 0, "forbidden": 0}
+         "failed": 0, "no_url": 0, "dead": 0, "forbidden": 0, "moved": 0}
     for g in groups:
         for k in t:
             t[k] += g.get(k, 0)
     print("\n==== ИТОГ ====")
     print("Групп: {} | альбомов: {} | фото: {} | скачано: {} | уже было: {} | "
-          "мёртвых (404): {} | отфильтровано: {} | ошибок: {}".format(
+          "мёртвых (404): {} | отфильтровано: {} | перемещено: {} | ошибок: {}".format(
               len(groups), sum(len(g.get("albums", [])) for g in groups),
               t["photos"], t["downloaded"], t["exists"], t["dead"],
-              t["small"], t["failed"] + t["no_url"] + t["forbidden"]))
+              t["small"], t["moved"], t["failed"] + t["no_url"] + t["forbidden"]))
 
 
 def main(argv=None, conf: vconf.Conf | None = None) -> int:
@@ -360,6 +367,7 @@ def main(argv=None, conf: vconf.Conf | None = None) -> int:
                 include_wall=ns.include_wall,
                 min_area=ns.min_area,
                 min_side=ns.min_side,
+                redownload_missing=ns.redownload_missing,
                 workers=ns.workers,
                 dry_run=ns.dry_run,
                 no_meta=ns.no_meta,

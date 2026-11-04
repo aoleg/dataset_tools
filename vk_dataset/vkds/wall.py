@@ -43,7 +43,7 @@ from pathlib import Path
 
 from .albums import (DEAD_TTL_DAYS, DEFAULT_DIR_PATTERN, assign_group_dir,
                      download_photos, load_dead, make_dead_entry, make_record,
-                     read_manifest, register_dead, resolve_groups,
+                     note_moved, photo_key, read_manifest, register_dead, resolve_groups,
                      row_done, save_dead, update_manifest, write_caption)
 from .api import VkClient
 from .budget import now_iso
@@ -289,6 +289,7 @@ class WallOptions:
     post_ids: list = field(default_factory=list)
     min_area: int = 0
     min_side: int = 0
+    redownload_missing: bool = False
     workers: int = 4
     dry_run: bool = False
     recheck_dead: bool = False
@@ -334,7 +335,7 @@ def _existing_files(rows: dict, out_root: Path) -> dict:
 
 
 def _post_settled(post: dict, rows_by_album: dict, out_root: Path, dead: dict,
-                  opts: WallOptions, have: dict) -> bool:
+                  opts: WallOptions, have: dict, moved: dict) -> bool:
     """True when every photo of the post needs no call: its wall row is
     settled (file, fresh dead entry, filtered), or it is a dup of a file
     elsewhere in the group."""
@@ -346,6 +347,8 @@ def _post_settled(post: dict, rows_by_album: dict, out_root: Path, dead: dict,
             continue
         hit = have.get((int(ph.get("owner_id") or 0), str(ph.get("id"))))
         if hit and hit[0] != aid:
+            continue
+        if photo_key(ph.get("owner_id"), ph.get("id")) in moved:
             continue
         return False
     return True
@@ -375,12 +378,14 @@ def run_wall(client: VkClient | None, target, out_root, opts: WallOptions) -> di
                       screen_name=str(g.get("screen_name") or ""))
     sel = select_posts(idx, opts)
     dead = load_dead(gdir)
+    moved = {} if opts.redownload_missing else note_moved(gdir, out_root)
     rows = read_manifest(gdir)
     rows_by_album: dict = {}
     for (aid, _pid), r in rows.items():
         rows_by_album.setdefault(aid, []).append(r)
     have = _existing_files(rows, out_root)
-    todo = [p for p in sel if not _post_settled(p, rows_by_album, out_root, dead, opts, have)]
+    todo = [p for p in sel
+            if not _post_settled(p, rows_by_album, out_root, dead, opts, have, moved)]
     est = math.ceil(len(todo) / GETBYID_PAGE)
     n_photos = sum(len(p["photos"]) for p in sel)
     months = Counter(month_of(p["date"]) for p in sel)
@@ -406,12 +411,12 @@ def run_wall(client: VkClient | None, target, out_root, opts: WallOptions) -> di
 
     gsum = {"group": group.as_dict(), "posts": len(sel), "photos": 0, "downloaded": 0,
             "exists": 0, "dup": 0, "small": 0, "failed": 0, "no_url": 0, "dead": 0,
-            "forbidden": 0, "gone": 0}
+            "forbidden": 0, "gone": 0, "moved": 0}
     todo_ids = {str(p["id"]) for p in todo}
     for post in sel:
         _wall_post(client, group, gdir, out_root, post, live.get(str(post["id"])),
                    opts, dead, rows_by_album, have, gsum,
-                   fetched=str(post["id"]) in todo_ids)
+                   fetched=str(post["id"]) in todo_ids, moved=moved)
     save_dead(gdir, dead)
     for k, v in live.items():
         new = normalize_post(v)
@@ -419,9 +424,10 @@ def run_wall(client: VkClient | None, target, out_root, opts: WallOptions) -> di
         idx["posts"][k] = new
     write_json(gdir / WALL_NAME, idx)
     print("  Итого по стене «{}»: постов {}, фото {}, скачано {}, уже было {}, "
-          "дубли {}, мёртвых (404) {}, отфильтровано {}, ошибок {}, постов удалено "
-          "{}".format(gkey, len(sel), gsum["photos"], gsum["downloaded"],
-                      gsum["exists"], gsum["dup"], gsum["dead"], gsum["small"],
+          "дубли {}, мёртвых (404) {}, отфильтровано {}, перемещено {}, ошибок {}, "
+          "постов удалено {}".format(gkey, len(sel), gsum["photos"], gsum["downloaded"],
+                                     gsum["exists"], gsum["dup"], gsum["dead"],
+                                     gsum["small"], gsum["moved"],
                       gsum["failed"] + gsum["no_url"] + gsum["forbidden"], gsum["gone"]))
     print("  Вызовов wall.getById: {} | манифест: {}".format(est, gdir / "_manifest.csv"))
     return gsum
@@ -429,7 +435,8 @@ def run_wall(client: VkClient | None, target, out_root, opts: WallOptions) -> di
 
 def _wall_post(client, group: GroupInfo, gdir: Path, out_root: Path, post: dict,
                live_item: dict | None, opts: WallOptions, dead: dict,
-               rows_by_album: dict, have: dict, gsum: dict, fetched: bool) -> None:
+               rows_by_album: dict, have: dict, gsum: dict, fetched: bool,
+               moved: dict | None = None) -> None:
     aid = "post_{}".format(post["id"])
     rel_dir = "{}/wall/{}".format(gkey_of(gdir), month_of(post["date"]))
     dest_dir = out_root / rel_dir
@@ -459,14 +466,19 @@ def _wall_post(client, group: GroupInfo, gdir: Path, out_root: Path, post: dict,
         rec["photo_text"] = rec.get("text") or ""
         rec["text"] = raw
         r = old.get(str(rec["id"]))
+        verdict = row_done(r, out_root, dead, opts) if r is not None else None
         hit = have.get((int(rec["owner_id"]), str(rec["id"])))
-        if hit and hit[0] != aid:
+        gone = (moved or {}).get(photo_key(rec["owner_id"], rec["id"]))
+        if verdict == "moved" or (gone is not None and not hit):
+            rec["status"] = "moved"     # its file was moved away: settled
+            rec["moved_row"] = gone if gone is not None else r
+        elif hit and hit[0] != aid:
             rec["status"] = "dup"
             rec["dup_path"] = hit[1]
             existing = out_root / hit[1]
             rec["txt"] = write_caption(existing.parent, existing.stem, raw)
             rec["file"] = existing.name
-        elif not fetched and r is not None and row_done(r, out_root, dead, opts):
+        elif not fetched and verdict:
             rec.update(status=r.get("status") if r.get("status") != "ok" else "exists",
                        file=r.get("file") or "", txt=r.get("txt") or "",
                        bytes=r.get("bytes"))

@@ -77,6 +77,8 @@ MANIFEST_COLS = [
     "likes", "comments", "text",
     # wall rows (phase 3); album rows leave them empty
     "post_id", "post_date", "repost_from", "reposts",
+    # the first date a row's file was seen gone from its path (moved away)
+    "moved",
 ]
 
 
@@ -89,6 +91,7 @@ class AlbumsOptions:
     include_wall: bool = False       # системный альбом «фото со стены»
     min_area: int = 0                # пропускать фото мельче N пикселей
     min_side: int = 0                # пропускать фото, у которых сторона меньше N
+    redownload_missing: bool = False  # fetch again the photos whose file was moved away
     workers: int = 4                 # параллельных потоков загрузки CDN
     dry_run: bool = False            # только показать план
     no_meta: bool = False            # не писать metadata.json / album.txt / .txt
@@ -525,9 +528,43 @@ def assign_dirs(group: GroupInfo, albums: list[AlbumInfo], pattern: str,
     return dirs
 
 
+def photo_key(owner_id, photo_id) -> tuple | None:
+    """(owner, photo id) as (int, str), the identity of a photo in a group."""
+    try:
+        return int(float(str(owner_id))), str(photo_id)
+    except (TypeError, ValueError):
+        return None
+
+
+def note_moved(gdir: Path, out_root: Path) -> dict:
+    """Photos whose file is gone from the path its manifest row names.
+
+    A row with status ok, exists or dup whose file is no longer at its path
+    was moved away (by deduplicate, unrelated.py, another tool or by hand):
+    it is settled, never listed or downloaded again (the rule the pastvu
+    import applies to a file gone from an import). Its row keeps its status
+    and gets the first date it was seen gone in the column `moved`; the
+    manifest is written when a date is added. Returns (owner, id) -> row.
+    """
+    rows = read_manifest(gdir)
+    moved, changed = {}, False
+    for r in rows.values():
+        if r.get("status") in ("ok", "exists", "dup") and r.get("path") \
+                and not (Path(out_root) / r["path"]).is_file():
+            if not r.get("moved"):
+                r["moved"] = now_iso()[:10]
+                changed = True
+            key = photo_key(r.get("owner_id"), r.get("photo_id"))
+            if key:
+                moved.setdefault(key, r)
+    if changed:
+        write_manifest(gdir, rows)
+    return moved
+
+
 def count_statuses(records: list[dict]) -> dict:
     st = {"ok": 0, "exists": 0, "small": 0, "failed": 0, "no_url": 0,
-          "dead": 0, "forbidden": 0}
+          "dead": 0, "forbidden": 0, "moved": 0}
     for r in records:
         s = r.get("status", "no_url")
         st[s] = st.get(s, 0) + 1
@@ -539,7 +576,7 @@ def download_photos(session, records: list[dict], dest_dir: Path,
                     retry_sleep: float = 1.5, dead: dict | None = None,
                     recheck_dead: bool = False,
                     dead_ttl_days: int = DEAD_TTL_DAYS,
-                    write_txt: bool = True) -> list[dict]:
+                    write_txt: bool = True, moved: dict | None = None) -> list[dict]:
     """Скачивает фото параллельно с CDN; в записи добавляются file/status.
 
     Статусы: ok (скачано), exists (уже было), small (отфильтровано по площади),
@@ -578,6 +615,11 @@ def download_photos(session, records: list[dict], dest_dir: Path,
         if old.exists() and old.stat().st_size > 0:
             rec["file"] = old.name        # датасет до 0.5, ещё не migrate
             rec["status"] = "exists"
+            continue
+        gone = (moved or {}).get(photo_key(rec.get("owner_id"), rec["id"]))
+        if gone is not None:              # its file was moved away: settled
+            rec["status"] = "moved"
+            rec["moved_row"] = gone
             continue
         ent = dead.get("{}_{}".format(rec.get("owner_id"), rec["id"]))
         if ent and not recheck_dead and _dead_is_fresh(ent, dead_ttl_days):
@@ -720,6 +762,17 @@ def update_manifest(gdir: Path, out_root: Path, group: GroupInfo,
     gdir, out_root = Path(gdir), Path(out_root)
     rows = read_manifest(gdir)
     for rec in records:
+        key = (str(album.id), str(rec["id"]))
+        if rec.get("status") == "moved":
+            own = rows.get(key)
+            if own is not None and own.get("path"):
+                own["moved"] = own.get("moved") or now_iso()[:10]
+                if extra:
+                    own.update({k: v for k, v in extra.items() if not own.get(k)})
+                continue
+            gone = rec.get("moved_row") or {}
+            rec = dict(rec, status="dup", dup_path=gone.get("path") or "",
+                       txt=gone.get("txt") or "", moved=gone.get("moved") or now_iso()[:10])
         fname = rec.get("file") or ""
         if rec.get("status") not in ("ok", "exists"):
             fname = ""                # файла нет (dead/failed/small) — не указываем
@@ -739,6 +792,7 @@ def update_manifest(gdir: Path, out_root: Path, group: GroupInfo,
             "bytes": rec.get("bytes", ""), "date": rec.get("date"),
             "likes": rec.get("likes"), "comments": rec.get("comments"),
             "text": rec.get("text") or "",
+            "moved": rec.get("moved") or "",
         }
         if extra:
             rows[(str(album.id), str(rec["id"]))].update(extra)
@@ -758,6 +812,8 @@ def row_done(r: dict, out_root: Path, dead: dict, opts) -> str | None:
     if status in ("ok", "exists", "dup"):
         if r.get("path") and (Path(out_root) / r["path"]).is_file():
             return "exists"
+        if r.get("path") and not getattr(opts, "redownload_missing", False):
+            return "moved"            # the file was moved away: settled
         return None
     if status == "dead":
         ent = dead.get("{}_{}".format(r.get("owner_id"), r.get("photo_id")))
@@ -789,7 +845,7 @@ def reconcile_album(rows: list[dict], album: AlbumInfo, entry: dict,
     if len(rows) != album.size and not same_listing:
         return None
     st = {"ok": 0, "exists": 0, "small": 0, "failed": 0, "no_url": 0,
-          "dead": 0, "forbidden": 0}
+          "dead": 0, "forbidden": 0, "moved": 0}
     for r in rows:
         verdict = row_done(r, out_root, dead, opts)
         if verdict is None:
@@ -858,19 +914,20 @@ def _process_group(client: VkClient, group: GroupInfo, out_root: Path,
     write_json(gdir / "_group.json", group.as_dict())
 
     dead = load_dead(gdir)
+    moved = {} if opts.redownload_missing else note_moved(gdir, out_root)
     manifest = {}
     for (aid, _pid), row in read_manifest(gdir).items():
         manifest.setdefault(aid, []).append(row)
     entries_by_id = {str(e.get("id")): dict(e) for e in idx["albums"]}
     gsum = {"group": group.as_dict(), "albums": [], "photos": 0,
             "downloaded": 0, "exists": 0, "small": 0, "failed": 0,
-            "no_url": 0, "dead": 0, "forbidden": 0}
+            "no_url": 0, "dead": 0, "forbidden": 0, "moved": 0}
     for i, al in enumerate(selected, 1):
         arep = _process_album(client, group, al, out_root / dirs[str(al.id)],
                               opts, i, len(selected), rel_dir=dirs[str(al.id)],
                               out_root=out_root, gdir=gdir, dead=dead,
                               rows=manifest.get(str(al.id), []),
-                              entry=entries_by_id.get(str(al.id), {}))
+                              entry=entries_by_id.get(str(al.id), {}), moved=moved)
         for e in idx["albums"]:
             if str(e.get("id")) == str(al.id):
                 e.update(arep.pop("index"))
@@ -878,14 +935,14 @@ def _process_group(client: VkClient, group: GroupInfo, out_root: Path,
         write_json(gdir / "_albums.json", idx)
         gsum["albums"].append(arep)
         for k in ("photos", "downloaded", "exists", "small", "failed",
-                  "no_url", "dead", "forbidden"):
+                  "no_url", "dead", "forbidden", "moved"):
             gsum[k] += arep.get(k, 0)
     save_dead(gdir, dead)
 
     print("  Итого по «{}»: альбомов {}, фото {}, скачано {}, уже было {}, "
-          "мёртвых (404) {}, отфильтровано {}, ошибок {}".format(
+          "мёртвых (404) {}, отфильтровано {}, перемещено {}, ошибок {}".format(
               gkey, len(selected), gsum["photos"], gsum["downloaded"],
-              gsum["exists"], gsum["dead"], gsum["small"],
+              gsum["exists"], gsum["dead"], gsum["small"], gsum["moved"],
               gsum["failed"] + gsum["no_url"] + gsum["forbidden"]))
     print("  Манифест: {} | реестр мёртвых: {}".format(
         gdir / MANIFEST_NAME, gdir / "_dead_photos.json"))
@@ -897,7 +954,8 @@ def _process_album(client: VkClient, group: GroupInfo, album: AlbumInfo,
                    num: int, total: int, rel_dir: str = "",
                    out_root: Path | None = None,
                    gdir: Path | None = None, dead: dict | None = None,
-                   rows: list | None = None, entry: dict | None = None) -> dict:
+                   rows: list | None = None, entry: dict | None = None,
+                   moved: dict | None = None) -> dict:
     print("[{}/{}] Альбом «{}» (id={}), фото по данным API: {}".format(
         num, total, album.title, album.id,
         album.size if album.size is not None else "?"))
@@ -905,23 +963,24 @@ def _process_album(client: VkClient, group: GroupInfo, album: AlbumInfo,
     arep = {"id": album.id, "title": album.title, "dir": rel_dir,
             "photos": 0, "downloaded": 0,
             "exists": 0, "small": 0, "failed": 0, "no_url": 0,
-            "dead": 0, "forbidden": 0,
+            "dead": 0, "forbidden": 0, "moved": 0,
             "index": {"status": "started", "last_run": now_iso()}}
     if out_root is not None and rows:
         done = reconcile_album(rows, album, entry or {}, out_root,
                                dead if dead is not None else {}, opts)
         if done is not None:
             arep.update({"photos": len(rows), "exists": done["exists"],
-                         "dead": done["dead"], "small": done["small"]})
+                         "dead": done["dead"], "small": done["small"],
+                         "moved": done["moved"]})
             arep["index"].update({"status": "done", "reconciled": now_iso(),
                                   "stats": {"photos": len(rows), "downloaded": 0,
                                             "exists": done["exists"],
                                             "small": done["small"], "failed": 0,
                                             "no_url": 0, "dead": done["dead"],
-                                            "forbidden": 0}})
+                                            "forbidden": 0, "moved": done["moved"]}})
             print("      сверка с манифестом: всё на месте (есть {}, мёртвых {}, "
-                  "отфильтровано {}), вызовов API: 0".format(
-                      done["exists"], done["dead"], done["small"]))
+                  "отфильтровано {}, перемещено {}), вызовов API: 0".format(
+                      done["exists"], done["dead"], done["small"], done["moved"]))
             return arep
     try:
         photos = fetch_photos(client, group, album.id)
@@ -960,12 +1019,13 @@ def _process_album(client: VkClient, group: GroupInfo, album: AlbumInfo,
                               retry_sleep=opts.dl_retry_sleep,
                               dead=dead, recheck_dead=opts.recheck_dead,
                               dead_ttl_days=opts.dead_ttl_days,
-                              write_txt=not opts.no_meta)
+                              write_txt=not opts.no_meta, moved=moved)
     st = count_statuses(records)
     arep.update({"photos": len(records), "downloaded": st["ok"],
                  "exists": st["exists"], "small": st["small"],
                  "failed": st["failed"], "no_url": st["no_url"],
-                 "dead": st["dead"], "forbidden": st["forbidden"]})
+                 "dead": st["dead"], "forbidden": st["forbidden"],
+                 "moved": st["moved"]})
 
     # Новые мёртвые фото -> реестр группы (сохраняем всё, что осталось)
     if dead is not None:
@@ -1007,14 +1067,15 @@ def _process_album(client: VkClient, group: GroupInfo, album: AlbumInfo,
         "stats": {"photos": len(records), "downloaded": st["ok"],
                   "exists": st["exists"], "small": st["small"],
                   "failed": st["failed"], "no_url": st["no_url"],
-                  "dead": st["dead"], "forbidden": st["forbidden"]},
+                  "dead": st["dead"], "forbidden": st["forbidden"],
+                  "moved": st["moved"]},
     })
     print("      итог: скачано {}, уже было {}, мёртвых (404) {}, "
           "отфильтровано (мельче {} px^2 или стороной меньше {} px) {}, "
-          "ошибок {}".format(
+          "перемещено {}, ошибок {}".format(
               st["ok"], st["exists"], st["dead"], opts.min_area or "-",
-              opts.min_side or "-",
-              st["small"], st["failed"] + st["no_url"] + st["forbidden"]))
+              opts.min_side or "-", st["small"], st["moved"],
+              st["failed"] + st["no_url"] + st["forbidden"]))
     return arep
 
 
