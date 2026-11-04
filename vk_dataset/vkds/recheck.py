@@ -56,8 +56,15 @@ def _urls(entry: dict, all_sizes: bool) -> list[dict]:
     return sizes
 
 
-def _album_dir(gdir: Path, out_root: Path, entry: dict) -> tuple[Path, str]:
-    """(absolute folder, folder relative to the dataset root) of the album."""
+def _album_dir(gdir: Path, out_root: Path, entry: dict,
+               row: dict | None = None) -> tuple[Path, str]:
+    """(absolute folder, folder relative to the dataset root) of the album.
+
+    The manifest row's album_dir first (a wall post's month folder), then
+    the album index, then a folder named after the album title.
+    """
+    if row and row.get("album_dir"):
+        return out_root / row["album_dir"], str(row["album_dir"])
     aid = str(entry.get("album_id"))
     for e in load_index(gdir)["albums"]:
         if str(e.get("id")) == aid and e.get("dir"):
@@ -97,7 +104,8 @@ def run_recheck_dead(session, out_root, target, limit: int | None = None,
     for key in keys:
         entry = dead[key]
         counts["checked"] += 1
-        album_dir, rel_dir = _album_dir(gdir, out_root, entry)
+        rk = (str(entry.get("album_id")), str(entry.get("photo_id")))
+        album_dir, rel_dir = _album_dir(gdir, out_root, entry, rows.get(rk))
         owner = entry.get("owner_id") or -int(entry.get("group_id") or 0)
         fname = photo_stem(owner, entry.get("photo_id")) + ".jpg"
         statuses, got = [], None
@@ -114,7 +122,6 @@ def run_recheck_dead(session, out_root, target, limit: int | None = None,
             counts["recovered"] += 1
             txt = write_caption(album_dir, Path(fname).stem, entry.get("text") or "")
             nbytes = res.get("bytes") or (album_dir / fname).stat().st_size
-            rk = (str(entry.get("album_id")), str(entry.get("photo_id")))
             row = rows.get(rk) or {
                 "photo_id": entry.get("photo_id"), "owner_id": owner,
                 "group_id": entry.get("group_id"), "album_id": entry.get("album_id"),

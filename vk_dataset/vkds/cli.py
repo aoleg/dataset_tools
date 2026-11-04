@@ -5,6 +5,8 @@
   albums        скачать альбомы группы в <название группы>/<название
                 альбома>/ (полный размер, описания, photo<owner>_<id>.txt)
   scan albums   разведка: список альбомов без скачивания (для ИИ-агента)
+  scan wall     индекс стены в _wall.json: посты, тексты, фото (1 вызов на 100 постов)
+  wall          скачать фото отобранных постов стены (wall.getById, 1 вызов на 100 постов)
   peek          пробные фото альбома для визуальной оценки агентом
   whoami        проверить токен (1 вызов API)
   budget        журнал вызовов этой копии и датасета (0 вызовов)
@@ -39,6 +41,7 @@ from .budget import Budget, BudgetExceeded, Ledger, today_utc
 from .cache import ApiCache
 from .migrate import MigrateError, run_migrate
 from .recheck import RecheckError, run_recheck_dead
+from .wall import ScanWallOptions, WallError, WallOptions, run_scan_wall, run_wall
 
 
 def _read_token(explicit: str, conf: vconf.Conf) -> str:
@@ -128,6 +131,40 @@ def build_parser(conf: vconf.Conf | None = None) -> argparse.ArgumentParser:
     sa = ssub.add_parser("albums", parents=[common],
                          help="Список альбомов группы с размерами")
     sa.add_argument("group", help="Короткое имя / id / ссылка сообщества")
+    sw = ssub.add_parser("wall", parents=[common],
+                         help="Индекс стены группы в _wall.json (wall.get, 1 вызов на 100 постов)")
+    sw.add_argument("group", help="Короткое имя / id / ссылка сообщества")
+    sw.add_argument("--since", metavar="ГГГГ-ММ-ДД",
+                    help="Листать до постов этой даты включительно (UTC)")
+    sw.add_argument("--until", metavar="ГГГГ-ММ-ДД",
+                    help="Считать в сводке посты не позже этой даты (UTC)")
+    sw.add_argument("--limit", type=int, default=None, metavar="N",
+                    help="Остановиться после N постов")
+    sw.add_argument("--all", action="store_true",
+                    help="Все записи стены (filter=all), а не только от имени группы")
+
+    wl = sub.add_parser("wall", parents=[common],
+                        help="Скачать фото отобранных постов стены (по _wall.json; "
+                             "wall.getById, 1 вызов на 100 постов)")
+    wl.add_argument("group", help="Короткое имя / id сообщества или папка группы "
+                                  "(из _groups.json датасета)")
+    wl.add_argument("--since", metavar="ГГГГ-ММ-ДД", help="Посты с этой даты (UTC, включительно)")
+    wl.add_argument("--until", metavar="ГГГГ-ММ-ДД", help="Посты по эту дату (UTC, включительно)")
+    wl.add_argument("--text-regex", default="",
+                    help="Только посты, чей текст (или текст оригинала репоста) "
+                         "подходит под регулярное выражение")
+    wl.add_argument("--photos-min", type=int, default=1, metavar="N",
+                    help="Только посты, где не меньше N фото")
+    wl.add_argument("--post-id", dest="post_ids", action="append",
+                    help="Только этот пост (можно несколько раз)")
+    wl.add_argument("--min-area", type=int, default=0, metavar="N",
+                    help="Пропускать фото мельче N пикселей (262144 = 512x512)")
+    wl.add_argument("--workers", type=int, default=4,
+                    help="Параллельных потоков загрузки файлов")
+    wl.add_argument("--recheck-dead", action="store_true",
+                    help="Перепроверить мёртвые фото (404) из _dead_photos.json")
+    wl.add_argument("--dry-run", action="store_true",
+                    help="Показать план по _wall.json, без вызовов API и без токена")
 
     k = sub.add_parser("peek", parents=[common],
                        help="Пробные фото альбома (визуальная оценка агентом)")
@@ -164,6 +201,13 @@ def build_parser(conf: vconf.Conf | None = None) -> argparse.ArgumentParser:
     m.add_argument("--dry-run", action="store_true",
                    help="Только показать, что будет переименовано")
     return p
+
+
+def _wall_options(ns) -> WallOptions:
+    return WallOptions(since=ns.since, until=ns.until, text_regex=ns.text_regex or "",
+                       photos_min=ns.photos_min, post_ids=[str(x) for x in (ns.post_ids or [])],
+                       min_area=ns.min_area, workers=ns.workers, dry_run=ns.dry_run,
+                       recheck_dead=ns.recheck_dead)
 
 
 def _fmt(n: int) -> str:
@@ -267,6 +311,13 @@ def main(argv=None, conf: vconf.Conf | None = None) -> int:
             print("[!] {}".format(e), file=sys.stderr)
             return 2
         return 0
+    if ns.cmd == "wall" and ns.dry_run:
+        try:
+            run_wall(None, ns.group, out_root, _wall_options(ns))
+        except WallError as e:
+            print("[!] {}".format(e), file=sys.stderr)
+            return 2
+        return 0
     if ns.cmd == "recheck-dead":
         session = requests.Session()
         session.headers["User-Agent"] = "vkds/{} (dataset harvester)".format(__version__)
@@ -308,6 +359,12 @@ def main(argv=None, conf: vconf.Conf | None = None) -> int:
             _print_totals(rep)
         elif ns.cmd == "scan" and getattr(ns, "what", None) == "albums":
             run_scan_albums(client, ns.group, out_root)
+        elif ns.cmd == "scan" and getattr(ns, "what", None) == "wall":
+            run_scan_wall(client, ns.group, out_root, ScanWallOptions(
+                since=ns.since, until=ns.until, limit=ns.limit,
+                include_all=ns.all, refresh=ns.refresh))
+        elif ns.cmd == "wall":
+            run_wall(client, ns.group, out_root, _wall_options(ns))
         elif ns.cmd == "peek":
             run_peek(client, ns.group, ns.album_id, ns.limit, ns.offset, out_root)
         elif ns.cmd == "whoami":
@@ -318,6 +375,9 @@ def main(argv=None, conf: vconf.Conf | None = None) -> int:
         else:
             print("Неизвестная команда", file=sys.stderr)
             rc = 1
+    except WallError as e:
+        print("\n[!] {}".format(e), file=sys.stderr)
+        rc = 2
     except BudgetExceeded as e:
         print("\n[!] {}".format(e))
         print("Выполненное до остановки сохранено; повторный запуск докачает.")

@@ -67,7 +67,7 @@ class VkClient:
         self.refresh = refresh
         self.session = session if session is not None else requests.Session()
         if session is None:
-            self.session.headers["User-Agent"] = "vkds/0.5 (dataset harvester)"
+            self.session.headers["User-Agent"] = "vkds/0.6 (dataset harvester)"
         self.api_calls = 0          # живых вызовов за этот запуск (для отчёта)
         self.attempts = 0           # HTTP-попыток за запуск (с повторами и сбоями)
         self.cache_hits = 0         # ответов отдано из кэша (бесплатно)

@@ -75,6 +75,8 @@ MANIFEST_COLS = [
     "album_id", "album_title", "album_dir", "file", "path", "txt",
     "status", "size_type", "width", "height", "bytes", "date",
     "likes", "comments", "text",
+    # wall rows (phase 3); album rows leave them empty
+    "post_id", "post_date", "repost_from", "reposts",
 ]
 
 
@@ -689,7 +691,7 @@ def write_manifest(gdir: Path, rows: dict) -> Path:
 
 def update_manifest(gdir: Path, out_root: Path, group: GroupInfo,
                     album: AlbumInfo, records: list[dict],
-                    rel_dir: str) -> Path:
+                    rel_dir: str, extra: dict | None = None) -> Path:
     """Обновляет _manifest.csv группы: по строке на КАЖДОЕ фото альбома.
 
     Манифест — основа для сборки датасета: пути к файлам, имя .txt с
@@ -697,6 +699,11 @@ def update_manifest(gdir: Path, out_root: Path, group: GroupInfo,
     Мёртвые фото тоже входят (status=dead) — их подписи и метаданные
     сохраняются для восстановления. Строки других альбомов не трогаются;
     строки обрабатываемого альбома заменяются.
+
+    extra — поля, общие для всех строк (у постов стены: post_id, post_date,
+    repost_from, reposts, likes и comments поста). Запись со статусом dup
+    (фото уже есть в другом месте группы) получает путь существующего файла
+    из dup_path.
     """
     gdir, out_root = Path(gdir), Path(out_root)
     rows = read_manifest(gdir)
@@ -705,6 +712,9 @@ def update_manifest(gdir: Path, out_root: Path, group: GroupInfo,
         if rec.get("status") not in ("ok", "exists"):
             fname = ""                # файла нет (dead/failed/small) — не указываем
         rel = (Path(rel_dir) / fname).as_posix() if fname else ""
+        if rec.get("status") == "dup" and rec.get("dup_path"):
+            rel = rec["dup_path"]
+            fname = Path(rel).name
         txt = (rec.get("txt") or "") if fname else ""
         rows[(str(album.id), str(rec["id"]))] = {
             "photo_id": rec.get("id"), "owner_id": rec.get("owner_id"),
@@ -718,7 +728,36 @@ def update_manifest(gdir: Path, out_root: Path, group: GroupInfo,
             "likes": rec.get("likes"), "comments": rec.get("comments"),
             "text": rec.get("text") or "",
         }
+        if extra:
+            rows[(str(album.id), str(rec["id"]))].update(extra)
     return write_manifest(gdir, rows)
+
+
+def row_done(r: dict, out_root: Path, dead: dict, opts) -> str | None:
+    """The reconcile verdict of one manifest row, without any API call.
+
+    "exists" when its file (ok, exists, dup) is on disk, "dead" when the dead
+    registry has a fresh entry and no recheck is asked, "small" when it is
+    still under the current min_area; None when the photo is not settled.
+    `opts` needs min_area, recheck_dead and dead_ttl_days.
+    """
+    status = r.get("status")
+    if status in ("ok", "exists", "dup"):
+        if r.get("path") and (Path(out_root) / r["path"]).is_file():
+            return "exists"
+        return None
+    if status == "dead":
+        ent = dead.get("{}_{}".format(r.get("owner_id"), r.get("photo_id")))
+        if opts.recheck_dead or not ent or not _dead_is_fresh(ent, opts.dead_ttl_days):
+            return None
+        return "dead"
+    if status == "small":
+        try:
+            area = int(float(r.get("width") or 0)) * int(float(r.get("height") or 0))
+        except ValueError:
+            return None
+        return "small" if (opts.min_area and area and area < opts.min_area) else None
+    return None
 
 
 def reconcile_album(rows: list[dict], album: AlbumInfo, entry: dict,
@@ -741,26 +780,10 @@ def reconcile_album(rows: list[dict], album: AlbumInfo, entry: dict,
     st = {"ok": 0, "exists": 0, "small": 0, "failed": 0, "no_url": 0,
           "dead": 0, "forbidden": 0}
     for r in rows:
-        status = r.get("status")
-        if status in ("ok", "exists"):
-            if not r.get("path") or not (Path(out_root) / r["path"]).is_file():
-                return None
-            st["exists"] += 1
-        elif status == "dead":
-            ent = dead.get("{}_{}".format(r.get("owner_id"), r.get("photo_id")))
-            if opts.recheck_dead or not ent or not _dead_is_fresh(ent, opts.dead_ttl_days):
-                return None
-            st["dead"] += 1
-        elif status == "small":
-            try:
-                area = int(float(r.get("width") or 0)) * int(float(r.get("height") or 0))
-            except ValueError:
-                return None
-            if not (opts.min_area and area and area < opts.min_area):
-                return None
-            st["small"] += 1
-        else:
+        verdict = row_done(r, out_root, dead, opts)
+        if verdict is None:
             return None
+        st[verdict] += 1
     return st
 
 
