@@ -107,7 +107,7 @@ class Budget:
 
 def _empty_ledger() -> dict:
     return {"version": 1, "days": {}, "limit_hits": [], "limit_cleared": [],
-            "reset_day": None}
+            "reset_day": None, "seeded": []}
 
 
 def _norm_ledger(data) -> dict:
@@ -117,7 +117,7 @@ def _norm_ledger(data) -> dict:
     base.update(data)
     if not isinstance(base.get("days"), dict):
         base["days"] = {}
-    for key in ("limit_hits", "limit_cleared"):
+    for key in ("limit_hits", "limit_cleared", "seeded"):
         if not isinstance(base.get(key), list):
             base[key] = []
     return base
@@ -204,6 +204,38 @@ class Ledger:
         del d["limit_hits"][:max(0, len(d["limit_hits"]) - HITS_CAP)]
         self._save()
         return hit
+
+    def seed(self, log: list) -> int:
+        """Import the calls of a dataset journal (budget.json `log`: ts and
+        method of each successful call) as one attempt and one success on
+        their UTC day. Each entry is keyed by ts and method in `seeded`, so a
+        second seed adds nothing. Returns how many were added."""
+        d = self._reload()
+        done = set(d["seeded"])
+        added = 0
+        for e in log or []:
+            ts, method = str((e or {}).get("ts") or ""), str((e or {}).get("method") or "")
+            key = "{}|{}".format(ts, method)
+            if not ts or not method or key in done:
+                continue
+            try:
+                t = datetime.fromisoformat(ts)
+            except ValueError:
+                continue
+            if t.tzinfo is None:
+                t = t.replace(tzinfo=UTC)
+            day = d["days"].setdefault(t.astimezone(UTC).date().isoformat(),
+                                       {"attempts": 0, "ok": 0, "by_method": {}})
+            m = day.setdefault("by_method", {}).setdefault(method, {"attempts": 0, "ok": 0})
+            for bucket in (day, m):
+                bucket["attempts"] = int(bucket.get("attempts", 0)) + 1
+                bucket["ok"] = int(bucket.get("ok", 0)) + 1
+            d["seeded"].append(key)
+            done.add(key)
+            added += 1
+        if added:
+            self._save()
+        return added
 
     @property
     def reset_day(self) -> int | None:

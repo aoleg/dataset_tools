@@ -19,7 +19,7 @@ Groups of old photographs ("old Moscow", Soviet buses, a factory's history) keep
 
 Run `install.bat` in the repository root, or `install.bat` in this folder after the root one has created the shared venv. It installs `requests` into `..\venv` and makes `vkds.conf` from `vkds.conf.example` when there is none.
 
-Put your token into a file `vk_token.txt` next to `vkds.conf`, or set `VK_TOKEN`, or pass `--token`. Use the token of an application you registered yourself in VK's developer cabinet (a service key is enough for public groups); tokens of other people's applications get accounts blocked. The token never leaves your machine except in the requests to `api.vk.com`, and the tool never prints it.
+Put your token into a file `vk_token.txt` next to `vkds.conf`, or set `VK_TOKEN`, or pass `--token`. Use the token of an application you registered yourself in VK's developer cabinet (in the partner's tests a service key was enough for public groups); the partner who uses the tool observed that VK has restricted accounts seen using tokens of other people's applications. The token never leaves your machine except in the requests to `api.vk.com`, and the tool never prints it.
 
 ## The conf file
 
@@ -53,7 +53,7 @@ run.bat albums <group> [<group> ...] [--album-id ID ...] [--title-regex RX] [--i
 run.bat wall <group> [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--text-regex RX] [--photos-min N] [--post-id ID ...] [--min-area N] [--min-side N] [--dry-run] [--recheck-dead] [--redownload-missing] [--workers N]
 run.bat peek <group> --album-id ID [--limit 6] [--offset N] [--min-side N]
 run.bat whoami [--group <group>]
-run.bat budget
+run.bat budget [--seed-ledger]
 run.bat recheck-dead <group> [--limit N] [--sizes]
 run.bat migrate <dataset> [--dry-run]
 ```
@@ -70,7 +70,7 @@ What each verb costs in API calls (the files themselves come from the CDN for fr
 | `wall` | downloads the photos of the selected posts, listing only the posts that still miss photos | 1 per 100 such posts |
 | `peek` | downloads a few sample photos of an album into `_peek\` for a look | 2 |
 | `whoami` | checks the token | 1 |
-| `budget` | prints the ledger and the dataset's journal | 0 |
+| `budget` | prints the ledger and the dataset's journal; `--seed-ledger` imports the journal's calls into the ledger | 0 |
 | `recheck-dead` | tries the dead photos of a group again, from the stored URLs | 0 |
 | `migrate` | renames a dataset made before version 0.5 | 0 |
 
@@ -140,11 +140,18 @@ VK allows an application 10,000 API calls per month without a verified business 
 - **The ledger** (`[paths] ledger`, one per checkout of the tool) keeps daily buckets by UTC date: the attempts and the successes of every method. Every HTTP attempt counts, retried and failed ones included, because it is not known which of them VK counts. `--budget N` caps the attempts of one run.
 - **The month** that `budget` prints starts on the first of the calendar month. Once you know the day your quota resets, write it into the ledger by hand as `"reset_day": 14` (a day of the month); the period then starts on the last such day.
 - **The limit error.** VK error 29 ("Rate limit reached"), and any other non-retried error whose message mentions a limit, stops the run at once, without retries, and is written to the ledger with its code, message, method and time; the first success afterwards is written too. VK documents error 29 as the limit of one method, so a hit on one method is not proof that the month is spent. The two dates tell when the limit was lifted.
-- **The dataset journal** `<base>\_vkds\budget.json` keeps the runs of that dataset root with their calls and attempts.
+- **The dataset journal** `<base>\_vkds\budget.json` keeps the runs of that dataset root with their calls and attempts. Calls made before the ledger existed are only there: `run.bat budget --seed-ledger --out <dataset>` adds the journal's recorded calls to the ledger, each as one attempt and one success on its UTC day, and remembers them, so a second run adds nothing.
 
 ## Migrate
 
-Versions before 0.5 named the files `photo_<id>.jpg`. A rerun still recognises them, so an old dataset resumes as it is. `run.bat migrate <dataset> --dry-run` lists the renames to `photo<owner>_<id>`, every sidecar (`.txt`, `.json` and any other file of the same name) with its image; `run.bat migrate <dataset>` renames them and rewrites the manifest and every `metadata.json`. A name that already exists is skipped and reported. `<dataset>` is a group folder or a dataset root.
+Versions before 0.5 named the files `photo_<id>.jpg`. A rerun still recognises them, so an old dataset resumes as it is. `run.bat migrate <dataset> --dry-run` lists the renames to `photo<owner>_<id>`, every sidecar (`.txt`, `.json` and any other file of the same name) with its image; `run.bat migrate <dataset>` renames them and rewrites the manifest and every `metadata.json`. A name that already exists is skipped and reported. Those versions also wrote the raw caption into the `.txt`: a `.txt` whose content is still exactly the raw text of its manifest row is rewritten with the cleaned caption, or removed when nothing is left, and every other `.txt` (edited by hand or by a model) is left alone; `--dry-run` lists these too. `<dataset>` is a group folder or a dataset root.
+
+## Exit codes
+
+- `0` done;
+- `1` an error: a VK API error other than the limit, or an unexpected failure;
+- `2` a refusal: no token, no `base` and no `--out`, no wall index, the run cap of `--budget`, or the limit error;
+- `130` interrupted with Ctrl+C; what was downloaded stays, and the same command resumes.
 
 ## Fixtures for the offline tests
 

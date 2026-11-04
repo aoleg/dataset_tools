@@ -192,8 +192,11 @@ def build_parser(conf: vconf.Conf | None = None) -> argparse.ArgumentParser:
     w.add_argument("--group", default="1",
                    help="Любое сообщество для проверки токена")
 
-    sub.add_parser("budget", parents=[common],
-                   help="Журнал вызовов API этой копии и датасета (0 вызовов)")
+    bp = sub.add_parser("budget", parents=[common],
+                        help="Журнал вызовов API этой копии и датасета (0 вызовов)")
+    bp.add_argument("--seed-ledger", action="store_true",
+                    help="Перенести вызовы из журнала датасета (--out) в журнал этой "
+                         "копии; повторный перенос ничего не добавляет")
 
     r = sub.add_parser("recheck-dead", parents=[common],
                        help="Перепроверить мёртвые фото по _dead_photos.json "
@@ -289,6 +292,16 @@ def main(argv=None, conf: vconf.Conf | None = None) -> int:
     # budget needs no token and makes no call; without --out and base it
     # prints the ledger of this checkout alone
     if ns.cmd == "budget":
+        if ns.seed_ledger:
+            try:
+                out_root = vconf.resolve_out(ns.out, conf)
+            except vconf.ConfError as e:
+                print("[!] {}".format(e), file=sys.stderr)
+                return 2
+            src = Budget(out_root / "_vkds" / "budget.json")
+            added = ledger.seed(src.data.get("log") or [])
+            print("Перенесено в журнал этой копии из {}: {} вызовов (уже перенесённые "
+                  "не повторяются)".format(src.path, added))
         _print_ledger(ledger)
         try:
             out_root = vconf.resolve_out(ns.out, conf)

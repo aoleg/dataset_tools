@@ -6,6 +6,11 @@ photo<owner>_<id>.*, every sidecar (.txt, .json, ...) with its image, and both
 files are rewritten. A target name that already exists is skipped and
 reported, the old file stays. --dry-run lists what would move and changes
 nothing. No API call. The dead registry keeps its keys (<owner>_<photo_id>).
+
+Captions: versions before 0.5 wrote the raw caption into the .txt. A .txt
+whose content equals the row's raw `text` (both stripped) is rewritten with
+the cleaned caption, or removed when nothing is left after cleaning; every
+other .txt (a hand edit, a model's caption) is left alone.
 """
 from __future__ import annotations
 
@@ -13,6 +18,7 @@ import re
 from pathlib import Path
 
 from .albums import MANIFEST_NAME, old_stem, photo_stem, read_manifest, write_manifest
+from .captions import clean_caption
 from .fs import read_json, write_json
 
 _OLD = re.compile(r"^photo_(\d+)$")
@@ -62,7 +68,8 @@ def migrate_group(gdir: Path, dry_run: bool = False) -> dict:
     gdir = Path(gdir)
     out_root = gdir.parent
     rows = read_manifest(gdir)
-    counts = {"photos": 0, "files": 0, "skipped": 0, "already": 0}
+    counts = {"photos": 0, "files": 0, "skipped": 0, "already": 0,
+              "captions_cleaned": 0, "captions_removed": 0}
     moved = {}        # (album_dir, old file name) -> new file name
     plan = []         # (src, dst)
     seen = set()
@@ -106,17 +113,20 @@ def migrate_group(gdir: Path, dry_run: bool = False) -> dict:
         counts["files"] += 1
         if not dry_run:
             src.rename(dst)
-    if dry_run or not plan:
+    if not dry_run and plan:
+        for row in rows.values():
+            album_dir = str(out_root / (row.get("album_dir") or ""))
+            for col in ("file", "txt"):
+                new = moved.get((album_dir, row.get(col) or ""))
+                if new:
+                    row[col] = new
+            if row.get("file") and row.get("album_dir"):
+                row["path"] = "{}/{}".format(row["album_dir"], row["file"])
+    changed = _clean_raw_captions(rows, out_root, counts, dry_run)
+    if dry_run:
         return counts
-    for row in rows.values():
-        album_dir = str(out_root / (row.get("album_dir") or ""))
-        for col in ("file", "txt"):
-            new = moved.get((album_dir, row.get(col) or ""))
-            if new:
-                row[col] = new
-        if row.get("file") and row.get("album_dir"):
-            row["path"] = "{}/{}".format(row["album_dir"], row["file"])
-    write_manifest(gdir, rows)
+    if plan or changed:
+        write_manifest(gdir, rows)
     for album_dir in sorted({a for a, _ in moved}):
         path = Path(album_dir) / "metadata.json"
         meta = read_json(path, None)
@@ -134,8 +144,43 @@ def migrate_group(gdir: Path, dry_run: bool = False) -> dict:
     return counts
 
 
+def _clean_raw_captions(rows: dict, out_root: Path, counts: dict, dry_run: bool) -> bool:
+    """Rewrite or remove the .txt that still hold the raw caption; True when a
+    manifest row changed. In a dry run only list them."""
+    changed = False
+    for row in rows.values():
+        if row.get("status") not in ("ok", "exists") or not row.get("txt"):
+            continue
+        path = out_root / (row.get("album_dir") or "") / row["txt"]
+        try:
+            content = path.read_text(encoding="utf-8-sig").strip()
+        except (OSError, UnicodeDecodeError):
+            continue
+        raw = (row.get("text") or "").strip()
+        if not raw or content != raw:
+            continue                       # edited by hand or by a model: keep
+        cap = clean_caption(raw)
+        if cap == content:
+            continue
+        rel = path.relative_to(out_root).as_posix()
+        if cap:
+            counts["captions_cleaned"] += 1
+            print("   подпись {}: очищена".format(rel))
+            if not dry_run:
+                path.write_text(cap, encoding="utf-8")
+        else:
+            counts["captions_removed"] += 1
+            print("   подпись {}: после очистки пуста, файл удаляется".format(rel))
+            if not dry_run:
+                path.unlink()
+                row["txt"] = ""
+                changed = True
+    return changed
+
+
 def run_migrate(dataset, dry_run: bool = False) -> dict:
-    total = {"photos": 0, "files": 0, "skipped": 0, "already": 0}
+    total = {"photos": 0, "files": 0, "skipped": 0, "already": 0,
+             "captions_cleaned": 0, "captions_removed": 0}
     for gdir in group_dirs(Path(dataset)):
         print("Группа «{}»{}:".format(gdir.name, " (dry-run, ничего не меняется)"
                                       if dry_run else ""))
@@ -146,4 +191,7 @@ def run_migrate(dataset, dry_run: bool = False) -> dict:
         total["photos"], total["files"],
         "будет переименовано" if dry_run else "переименовано",
         total["skipped"], total["already"]))
+    print("Подписи .txt с сырым текстом: {} {}, {} {} (остальные .txt не трогаются)".format(
+        total["captions_cleaned"], "будет очищено" if dry_run else "очищено",
+        total["captions_removed"], "будет удалено" if dry_run else "удалено"))
     return total
