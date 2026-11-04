@@ -73,7 +73,7 @@ IMPORT_TOPS = ("color", "category", "none")
 # The options of the processing: a raw run (run --raw) refuses them, since it processes nothing.
 RAW_REFUSES = ("samples", "no_classify", "min_confidence", "priority_margin", "patches", "png", "no_watermark",
                "wm_conf", "wm_paint_conf", "wm_mode", "no_borders", "no_dark", "txt_fields", "json_sidecar", "depth",
-               "writers", "keep_rejects")
+               "writers", "keep_rejects", "storage_threads")
 
 
 def no_open_review(store: Store, base: Path, command: str) -> None:
@@ -584,6 +584,7 @@ def run_locked(args, conf, client, base: Path, store: Store, sm) -> int:
                       writers=args.writers, report_every=args.report_every, limit=args.limit, retries=args.retries,
                       txt_fields=fields, json_files=conf.json_files, json_sidecar=args.json_sidecar,
                       comments=args.comments, raw=args.raw, keep_rejects=args.keep_rejects,
+                      storage_threads=args.storage_threads,
                       display="json" if args.json_progress else "quiet" if args.quiet else "live")
 
     total = sum(store.scope_counts(name)["total"] for name in names)
@@ -695,6 +696,7 @@ def cmd_pull(args, conf, client) -> int:
                           writers=args.writers, report_every=args.report_every, limit=args.limit,
                           retries=args.retries, txt_fields=parse_fields(args.txt_fields), json_files=conf.json_files,
                           json_sidecar=args.json_sidecar, keep_rejects=args.keep_rejects,
+                          storage_threads=args.storage_threads,
                           display="json" if args.json_progress else "quiet" if args.quiet else "live")
         print(f"Processing {len(stored):,} photos ({store.stored_bytes(names) / 2**30:.1f} GB) of the storage "
               f"{base / layout.STORAGE_DIR}, {len(mine)} scope{'s' if len(mine) > 1 else ''} ...", flush=True)
@@ -1656,6 +1658,8 @@ def parse_args(argv=None):
         p.add_argument("--keep-rejects", action="store_true",
                        help="a stored photo the processing rejects keeps its raw files in the storage (default: "
                             "deleted, since nothing fetches it again)")
+        p.add_argument("--storage-threads", type=int, default=4, metavar="N",
+                       help="threads that read and decode stored photos ahead of the GPU (default 4)")
         p.add_argument("--export", action="store_true",
                        help="hard-link every saved photo into <base parent>/pastvu_export/<category>/<bw|color>/<NNN> "
                             "as it is written (photos saved before are linked at the start)")

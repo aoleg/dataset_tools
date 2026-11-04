@@ -16,9 +16,10 @@ and skips the copies of a base's photos after the embedding.
 A raw run (run --raw, Options.raw) stops after the fetch's gates: the original
 bytes go into <base>/_storage with the record as <cid>.json and the facts caption
 as <cid>.txt, the store marks the photo stored, and no model is loaded. The
-processing of the storage is a second source of the same stream: one thread
-reads stored photos, checks them against the store and prepares them (decode,
-band, borders) a few ahead, and the GPU stage takes one whenever no download
+processing of the storage is a second source of the same stream: storage
+threads (as many as the fetch threads by default: a 3 MB scan takes 0.36 s to
+read, decode and plan) check stored photos against the store and prepare them
+(decode, band, borders) a few ahead, and the GPU stage takes one whenever no download
 is ready (run --pull: downloads first, the storage fills the gaps; pull: the
 storage alone). After a stored photo is committed, or rejected, its raw files
 are deleted (--keep-rejects keeps a reject's). --limit counts the photos taken
@@ -90,7 +91,8 @@ class Options:
     display: str = "live"
     raw: bool = False                 # run --raw: download into the storage, no processing
     keep_rejects: bool = False        # a stored photo rejected by the processing keeps its raw files
-    storage_depth: int = 4            # stored photos prepared ahead of the GPU
+    storage_threads: int = 4          # threads that read and prepare stored photos
+    storage_depth: int = 4            # stored photos prepared ahead of the GPU (at least the threads)
 
     @property
     def scope_dir(self) -> Path:
@@ -695,7 +697,7 @@ class Stream:
         it, sit = iter(pairs), iter(stored)
         cid_lock = threading.Lock()
         out_q: queue.Queue = queue.Queue(maxsize=max(1, o.depth))
-        sq: queue.Queue = queue.Queue(maxsize=max(1, o.storage_depth))
+        sq: queue.Queue = queue.Queue(maxsize=max(1, o.storage_depth, o.storage_threads))
         wq: queue.Queue = queue.Queue(maxsize=max(2, o.writers * 2))
         run_id = self.store.start_run(self.scope, {"cids": len(pairs), "stored": len(stored),
                                                    "scopes": sorted(self.scopes),
@@ -719,14 +721,15 @@ class Stream:
             d.print(f"{text}; {completed:,} of {scope_total:,} done, skipped or saved under another scope before.")
             fetchers = [threading.Thread(target=self.fetch_worker, args=(it, cid_lock, out_q), daemon=True,
                                          name=f"fetch-{i}") for i in range(o.fetchers)] if pairs else []
-            storage = threading.Thread(target=self.storage_worker, args=(sit, cid_lock, sq), daemon=True,
-                                       name="storage") if stored else None
+            storages = [threading.Thread(target=self.storage_worker, args=(sit, cid_lock, sq), daemon=True,
+                                         name=f"storage-{i}") for i in range(max(1, o.storage_threads))] \
+                if stored else []
             writers = [threading.Thread(target=self.writer_worker, args=(wq,), daemon=True, name=f"write-{i}")
                        for i in range(o.writers)]
-            for t in fetchers + writers + ([storage] if storage else []):
+            for t in fetchers + writers + storages:
                 t.start()
-            ended, interrupts = 0, 0
-            remote_ended, storage_ended = not fetchers, storage is None
+            ended, sended, interrupts = 0, 0, 0
+            remote_ended, storage_ended = not fetchers, not storages
             try:
                 while not (remote_ended and storage_ended):
                     try:
@@ -755,7 +758,8 @@ class Stream:
                                 ended += 1
                                 remote_ended = ended >= len(fetchers)
                             else:
-                                storage_ended = True
+                                sended += 1
+                                storage_ended = sended >= len(storages)
                             continue
                         if isinstance(item, pr.Rejected):
                             self.reject(item.cid, item, item.scope)
@@ -800,7 +804,7 @@ class Stream:
                 if self.captioner is not None:
                     d.set("finishing the captions")
                     self.captioner.close()
-                if storage is not None:
+                if storages:
                     folders.prune_empty(o.base / layout.STORAGE_DIR)
                 d.set("done")
                 d.print(self.report(t_start, final=True))
