@@ -7,7 +7,10 @@ scope in it.
   scopes list a photo.
 - status: one row per photo, global, so a photo saved under one scope is not
   downloaded again for another. A photo is pending, writing (its path is
-  claimed and its files are being written), done, skipped or failed.
+  claimed and its files are being written), stored (downloaded raw into
+  <base>/_storage by run --raw, waiting for the processing; path and raw
+  both name the raw file, and raw stays set while the photo is written so an
+  interrupted write goes back to stored), done, skipped or failed.
 - records, embeddings: the PastVu record with what was done, and the
   classifier's embedding of the saved pixels, per photo.
 - counters: per-scope totals for the reports.
@@ -93,10 +96,11 @@ CREATE TABLE IF NOT EXISTS caption_runs (
 """
 
 PENDING, WRITING, DONE, SKIPPED, FAILED = "pending", "writing", "done", "skipped", "failed"
+STORED = "stored"          # downloaded raw by run --raw, in <base>/_storage, not processed yet
 REVIEW = "review"          # moved by cleanup into the review folder, waiting for cleanup --done or --undo
 REGION_COLS = "cid, parent, parents, title_en, title_local, phc, pac, child_len"
 STATUS_COLS = ("cid", "state", "reason", "attempts", "scope", "category", "path", "sha256", "bytes", "width", "height",
-               "changed", "mode")
+               "changed", "mode", "raw")
 
 
 class Store:
@@ -125,6 +129,8 @@ class Store:
             self.db.execute("ALTER TABLE status ADD COLUMN mode TEXT")
         if "export" not in status_cols:
             self.db.execute("ALTER TABLE status ADD COLUMN export TEXT")
+        if "raw" not in status_cols:
+            self.db.execute("ALTER TABLE status ADD COLUMN raw TEXT")
         self.set_meta("schema", SCHEMA_VERSION)
         if self.get_meta("kind") == "import":
             import layout as lay
@@ -474,7 +480,7 @@ class Store:
             total = self.db.execute("SELECT COUNT(*) FROM members WHERE scope=?", (scope,)).fetchone()[0]
             rows = self.db.execute("SELECT s.state, s.scope = ?, COUNT(*) FROM members m JOIN status s ON s.cid=m.cid "
                                    "WHERE m.scope=? GROUP BY s.state, s.scope = ?", (scope, scope, scope)).fetchall()
-        out = {"total": total, PENDING: 0, WRITING: 0, DONE: 0, SKIPPED: 0, FAILED: 0, "elsewhere": 0}
+        out = {"total": total, PENDING: 0, WRITING: 0, STORED: 0, DONE: 0, SKIPPED: 0, FAILED: 0, "elsewhere": 0}
         for state, mine, n in rows:
             if state == DONE and not mine:
                 out["elsewhere"] += n
@@ -534,8 +540,8 @@ class Store:
         def work(db):
             for cid in cids:
                 db.execute("UPDATE status SET state=?, reason='', attempts=0, scope=NULL, category=NULL, path=NULL, "
-                           "sha256=NULL, bytes=NULL, width=NULL, height=NULL, changed=NULL, mode=NULL, updated=? "
-                           "WHERE cid=?",
+                           "sha256=NULL, bytes=NULL, width=NULL, height=NULL, changed=NULL, mode=NULL, raw=NULL, "
+                           "updated=? WHERE cid=?",
                            (PENDING, time.time(), cid))
                 for t in ("records", "embeddings", "captions", "caption_fails", "caption_log"):
                     db.execute(f"DELETE FROM {t} WHERE cid=?", (cid,))
@@ -571,8 +577,48 @@ class Store:
                             (WRITING, scope, path, time.time(), cid))
 
     def unclaim(self, cid: int) -> None:
+        """A claimed photo whose write did not finish: back to stored (its raw file is still
+        there) when it came from the storage, else back to pending."""
         with self.lock:
-            self.db.execute("UPDATE status SET state=?, path=NULL, updated=? WHERE cid=?", (PENDING, time.time(), cid))
+            self.db.execute("UPDATE status SET state=CASE WHEN raw IS NULL THEN ? ELSE ? END, path=raw, updated=? "
+                            "WHERE cid=?", (PENDING, STORED, time.time(), cid))
+
+    # --- the storage (run --raw) ---------------------------------------------------
+
+    def store_raw(self, cid: int, scope: str, path: str, sha256: str, size: int) -> None:
+        """Downloaded raw into <base>/path: state stored, the raw file named twice (path and raw)."""
+        with self.lock:
+            self.db.execute("UPDATE status SET state=?, reason='', scope=?, path=?, raw=?, sha256=?, bytes=?, "
+                            "updated=? WHERE cid=?", (STORED, scope, path, path, sha256, size, time.time(), cid))
+
+    def stored_pairs(self, scopes: list[str] | None = None) -> list[tuple[int, str]]:
+        """(cid, scope) of the photos in the storage, in cid order; scopes None: the whole base."""
+        with self.lock:
+            if scopes is None:
+                rows = self.db.execute("SELECT cid, scope FROM status WHERE state=? ORDER BY cid", (STORED,)).fetchall()
+            elif not scopes:
+                return []
+            else:
+                q = ",".join("?" * len(scopes))
+                rows = self.db.execute(f"SELECT cid, scope FROM status WHERE state=? AND scope IN ({q}) ORDER BY cid",
+                                       (STORED, *scopes)).fetchall()
+        return [(r[0], r[1]) for r in rows]
+
+    def stored_count(self, scopes: list[str] | None = None) -> int:
+        return len(self.stored_pairs(scopes))
+
+    def stored_bytes(self, scopes: list[str] | None = None) -> int:
+        """The size of the raw files in the storage, from the store."""
+        with self.lock:
+            if scopes is None:
+                row = self.db.execute("SELECT COALESCE(SUM(bytes), 0) FROM status WHERE state=?", (STORED,)).fetchone()
+            elif not scopes:
+                return 0
+            else:
+                q = ",".join("?" * len(scopes))
+                row = self.db.execute(f"SELECT COALESCE(SUM(bytes), 0) FROM status WHERE state=? AND scope IN ({q})",
+                                      (STORED, *scopes)).fetchone()
+        return int(row[0])
 
     def finish(self, cid: int, scope: str, facts: dict, record: str, emb: tuple | None, counters: dict) -> None:
         """Done: status, record, embedding and counters in one transaction.
@@ -581,7 +627,7 @@ class Store:
 
         def work(db):
             db.execute("UPDATE status SET state=?, reason='', scope=?, category=?, path=?, sha256=?, bytes=?, width=?, "
-                       "height=?, changed=?, mode=?, updated=? WHERE cid=?",
+                       "height=?, changed=?, mode=?, raw=NULL, updated=? WHERE cid=?",
                        (DONE, scope, facts.get("category", ""), facts["path"], facts.get("sha256"), facts.get("bytes"),
                         facts.get("width"), facts.get("height"), json.dumps(facts.get("changed") or []),
                         facts.get("mode"), now, cid))
@@ -598,8 +644,8 @@ class Store:
         now = time.time()
 
         def work(db):
-            db.execute("UPDATE status SET state=?, reason=?, scope=?, path=NULL, attempts=attempts+?, updated=? "
-                       "WHERE cid=?", (state, reason, scope, 1 if state == FAILED else 0, now, cid))
+            db.execute("UPDATE status SET state=?, reason=?, scope=?, path=NULL, raw=NULL, attempts=attempts+?, "
+                       "updated=? WHERE cid=?", (state, reason, scope, 1 if state == FAILED else 0, now, cid))
             self._add_counters(db, scope, counters)
 
         self.tx(work)

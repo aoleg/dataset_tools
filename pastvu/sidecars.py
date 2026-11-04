@@ -7,6 +7,7 @@ from __future__ import annotations
 import html
 import json
 import re
+import time
 
 TXT_FIELDS = ["title", "years", "regions", "address", "desc"]
 ALL_TXT_FIELDS = TXT_FIELDS + ["direction"]
@@ -131,4 +132,13 @@ def record_json(cid: int, page: str, result: dict, download: dict, processing: d
                 tool: dict) -> str:
     doc = {"cid": cid, "page": page, "record": result.get("photo"), "can": result.get("can"), "download": download,
            "processing": processing, "classification": classification, "tool": tool}
+    return json.dumps(doc, ensure_ascii=False, indent=1, default=str)
+
+
+def raw_json(cid: int, page: str, result: dict, download: dict, scope: str, tool: dict) -> str:
+    """The record of a photo in the storage (run --raw): the API result as returned (the
+    comment tree under result.comments with --comments), the download facts, the scope the
+    processing writes into. The processing reads it back instead of asking PastVu again."""
+    doc = {"cid": cid, "page": page, "result": result, "download": download, "scope": scope,
+           "stored": time.time(), "tool": tool}
     return json.dumps(doc, ensure_ascii=False, indent=1, default=str)

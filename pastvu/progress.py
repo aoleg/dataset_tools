@@ -18,7 +18,7 @@ from rich.progress import BarColumn, MofNCompleteColumn, Progress, TaskProgressC
     TimeRemainingColumn
 from rich.text import Text
 
-STAGES = ["fetch", "detect", "paint", "colour", "classify", "encode", "write", "caption"]
+STAGES = ["fetch", "pull", "detect", "paint", "colour", "classify", "encode", "write", "caption"]
 
 
 def hms(seconds: float) -> str:
@@ -53,22 +53,47 @@ class Stats:
             self.calls[stage] += 1
 
 
+def _reason_lines(c: dict) -> list[str]:
+    """The skipped and failed lines of a report, by reason."""
+    skipped = {k[8:]: int(v) for k, v in c.items() if k.startswith("skipped.") and v}
+    failed = {k[7:]: int(v) for k, v in c.items() if k.startswith("failed.") and v}
+    lines = []
+    if skipped:
+        lines.append("  skipped: " + ", ".join(f"{v:,} {k}" for k, v in sorted(skipped.items(), key=lambda x: -x[1])))
+    if failed:
+        lines.append("  failed: " + ", ".join(f"{v:,} {k}" for k, v in sorted(failed.items(), key=lambda x: -x[1])))
+    return lines
+
+
+def raw_report_block(totals: dict, session: Stats, counts: dict, elapsed: float, final: bool = False) -> str:
+    """The report of a raw run (run --raw): photos put into the storage, nothing processed."""
+    c = {k[2:]: v for k, v in totals.items() if k.startswith("c.")}
+    rate = session.c["stored"] / elapsed if elapsed > 0 else 0.0
+    mb = session.c["raw_bytes"] / 2**20
+    lines = [f"{'Finished: ' if final else ''}{counts.get('stored', 0):,} photos in the storage, {counts['done']:,} saved "
+             f"out of {counts['total']:,} ({session.c['stored']:,} stored in {hms(elapsed)} this run, {rate:.2f}/s, "
+             f"{mb:,.0f} MB)"]
+    if counts.get("elsewhere"):
+        lines.append(f"  already saved under another scope: {counts['elsewhere']:,} (not downloaded again)")
+    lines.extend(_reason_lines(c))
+    with session.lock:
+        pace = [f"{s} {session.seconds[s] / session.calls[s]:.2f} s" for s in ("fetch", "write") if session.calls[s]]
+    if pace:
+        lines.append("  pace per photo: " + ", ".join(pace))
+    return "\n".join(lines)
+
+
 def report_block(totals: dict, session: Stats, counts: dict, elapsed: float, final: bool = False) -> str:
     """The report printed every N images: totals of the scope from the store,
     rate and pace from this process."""
     c = {k[2:]: v for k, v in totals.items() if k.startswith("c.")}
     cats = {k[4:]: int(v) for k, v in totals.items() if k.startswith("cat.") and v}
-    skipped = {k[8:]: int(v) for k, v in c.items() if k.startswith("skipped.") and v}
-    failed = {k[7:]: int(v) for k, v in c.items() if k.startswith("failed.") and v}
     rate = session.c["done"] / elapsed if elapsed > 0 else 0.0
     lines = [f"{'Finished: ' if final else ''}{counts['done']:,} images saved out of {counts['total']:,} "
              f"({session.c['done']:,} in {hms(elapsed)} this run, {rate:.2f}/s)"]
     if counts.get("elsewhere"):
         lines.append(f"  already saved under another scope: {counts['elsewhere']:,} (not downloaded again)")
-    if skipped:
-        lines.append("  skipped: " + ", ".join(f"{v:,} {k}" for k, v in sorted(skipped.items(), key=lambda x: -x[1])))
-    if failed:
-        lines.append("  failed: " + ", ".join(f"{v:,} {k}" for k, v in sorted(failed.items(), key=lambda x: -x[1])))
+    lines.extend(_reason_lines(c))
     lines.append(f"  band cut: {int(c.get('band', 0)):,}; band colour unverified: {int(c.get('band_unverified', 0)):,}; "
                  f"borders cut: {int(c.get('borders', 0)):,} images (frames {int(c.get('cut.frame', 0)):,}, "
                  f"sides {int(c.get('cut.border', 0)):,}, lines {int(c.get('cut.line', 0)):,}, "

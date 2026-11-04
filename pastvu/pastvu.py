@@ -10,6 +10,9 @@ samples folder, the defaults and the region aliases come from pastvu.conf.
     run.bat run --scope belarus_1917-1991             resume
     run.bat run --region estonia --by decade          estonia_1910s ... estonia_1990s in one download
     run.bat run --region estonia --regroup            pull saved Estonia photos from other scopes, then download
+    run.bat run --region belarus --raw                download only, into <base>/_storage, no model and no GPU
+    run.bat run --region belarus --pull               download and process; the storage fills the GPU's idle time
+    run.bat pull                                      process the storage, no downloads
     run.bat regroup --by decade estonia_1917-1991     split a scope into decades, no downloads (--undo)
     run.bat drop estonia_1950s --yes                  delete a scope's files and forget it
     run.bat reclassify belarus_1917-1991 --dry-run    sort again with the current samples
@@ -67,6 +70,10 @@ UKRAINE_PRESETS = [          # name, regions, comment
 
 IMPORT_COMMANDS = ("reclassify", "cleanup", "cherrypick", "autocaption", "scopes")
 IMPORT_TOPS = ("color", "category", "none")
+# The options of the processing: a raw run (run --raw) refuses them, since it processes nothing.
+RAW_REFUSES = ("samples", "no_classify", "min_confidence", "priority_margin", "patches", "png", "no_watermark",
+               "wm_conf", "wm_paint_conf", "wm_mode", "no_borders", "no_dark", "txt_fields", "json_sidecar", "depth",
+               "writers", "keep_rejects")
 
 
 def no_open_review(store: Store, base: Path, command: str) -> None:
@@ -498,8 +505,13 @@ def cmd_scopes(args, conf, client) -> int:
         where = f"  {sc['folder']}" if sc["folder"] != sc["name"] else ""
         modes = f"  bw {int(k.get('c.mode.bw', 0)):,} / colour {int(k.get('c.mode.color', 0)):,}" \
             if k.get("c.mode.bw") or k.get("c.mode.color") else ""
-        print(f"{sc['name']:36} {c['total']:>9,} listed  {c['done']:>9,} saved  {c['skipped']:>7,} skipped  "
+        stored = f"  {c['stored']:>7,} stored" if c["stored"] else ""
+        print(f"{sc['name']:36} {c['total']:>9,} listed  {c['done']:>9,} saved{stored}  {c['skipped']:>7,} skipped  "
               f"{c['failed']:>5,} failed  {c['elsewhere']:>7,} in other scopes  {c['pending']:>9,} left{modes}{where}")
+    n = store.stored_count()
+    if n:
+        print(f"storage: {n:,} photos, {store.stored_bytes() / 2**30:.1f} GB in {base / layout.STORAGE_DIR}; "
+              f"pull, or run --pull, processes them")
     return 0
 
 
@@ -571,13 +583,8 @@ def run_locked(args, conf, client, base: Path, store: Store, sm) -> int:
                       dark_borders=not args.no_dark, fetchers=args.fetchers or conf.fetchers, depth=args.depth,
                       writers=args.writers, report_every=args.report_every, limit=args.limit, retries=args.retries,
                       txt_fields=fields, json_files=conf.json_files, json_sidecar=args.json_sidecar,
-                      comments=args.comments,
+                      comments=args.comments, raw=args.raw, keep_rejects=args.keep_rejects,
                       display="json" if args.json_progress else "quiet" if args.quiet else "live")
-
-    caption_client = None
-    if args.autocaption:
-        caption_client = vlm_client(conf)
-    vram, detector, lama, classifier, mode_probe = load_models(args, conf)
 
     total = sum(store.scope_counts(name)["total"] for name in names)
     pairs = store.pending_pairs(names, args.retries)
@@ -587,6 +594,38 @@ def run_locked(args, conf, client, base: Path, store: Store, sm) -> int:
         pairs = skip_pairs(store, names, pairs, args.skip)
         print(f"  --skip {args.skip:,}: starting at photo {args.skip + 1:,} of {total:,}; {n - len(pairs):,} photos "
               f"before it that are not done are left for later", flush=True)
+    where = sc["name"] if len(names) == 1 else f"its {len(names)} scopes"
+    if args.raw:
+        s = sm.Stream(client, store, opts)
+        res = s.run(pairs, total, completed)
+        left = len(store.pending_pairs(names, args.retries))
+        print(f"This run: {res['stored']:,} photos stored, {res['skipped']:,} skipped, {res['failed']:,} failed in "
+              f"{res['seconds'] / 60:.1f} min. Left to download in {where}: {left:,}. In the storage: "
+              f"{store.stored_count():,} photos, {store.stored_bytes() / 2**30:.1f} GB; pull, or run --pull, processes them.")
+        return 0
+    stored = []
+    if args.pull:
+        # a stored photo of any scope may have been cut short while written: back to the storage
+        n = sum(sm.cleanup_interrupted(store, base, s["name"]) for s in store.scopes() if s["name"] not in names)
+        if n:
+            print(f"  {n} stored photos were being written when an earlier run stopped; they are in the storage again")
+        stored = store.stored_pairs()
+    elif store.stored_count():
+        print(f"  {store.stored_count():,} photos wait in the storage {base / layout.STORAGE_DIR}; add --pull, or run "
+              f"pull, to process them", flush=True)
+    in_scope = sum(1 for _, s in stored if s in names)      # listed by the run's scopes: in total already
+    return process_stream(args, conf, client, base, store, sm, opts, names, pairs, total + len(stored) - in_scope,
+                          completed - in_scope, stored, where)
+
+
+def process_stream(args, conf, client, base: Path, store: Store, sm, opts, names: list[str], pairs: list,
+                   total: int, completed: int, stored: list, where: str) -> int:
+    """Load the models, run the stream over the downloads (pairs) and the storage (stored),
+    then caption what has no VLM caption yet. names: the scopes to report and caption."""
+    caption_client = None
+    if args.autocaption:
+        caption_client = vlm_client(conf)
+    vram, detector, lama, classifier, mode_probe = load_models(args, conf)
     if vram.ok:
         print(f"  {vram.text()}", flush=True)
     exporter = None
@@ -598,11 +637,16 @@ def run_locked(args, conf, client, base: Path, store: Store, sm) -> int:
         if lx.Exporter.exists_for(store):
             print(f"  This base has an export ({lx.root_of(base)}); add --export to link the new photos into it too")
     s = sm.Stream(client, store, opts, classifier, detector, lama, caption_client, vram, mode_probe, exporter)
-    res = s.run(pairs, total, completed)
+    res = s.run(pairs, total, completed, stored=stored)
     left = len(store.pending_pairs(names, args.retries))
-    where = sc["name"] if len(names) == 1 else f"its {len(names)} scopes"
-    print(f"This run: {res['done']:,} saved, {res['skipped']:,} skipped, {res['failed']:,} failed in "
-          f"{res['seconds'] / 60:.1f} min. Left to do in {where}: {left:,}.")
+    text = f"This run: {res['done']:,} saved"
+    if stored:
+        text += f" ({res['pulled']:,} of them from the storage)"
+    text += (f", {res['skipped']:,} skipped, {res['failed']:,} failed in {res['seconds'] / 60:.1f} min. "
+             f"Left to do in {where}: {left:,}")
+    if stored:
+        text += f"; in the storage: {store.stored_count():,}"
+    print(text + ".")
     if caption_client is not None and not s.stop_requested_by_captioner():
         # photos saved earlier or left behind: caption them now
         import autocaption as ac
@@ -621,6 +665,41 @@ def run_locked(args, conf, client, base: Path, store: Store, sm) -> int:
                 break
     vram.stop()
     return 0
+
+
+def cmd_pull(args, conf, client) -> int:
+    """The processing of the storage alone: every stored photo (or those of the given scopes)
+    through the complete pipeline into its scope, no downloads."""
+    import stream as sm
+    base, store = open_base(args, conf)
+    with locked(store, "pull", "run"):
+        names = [sc["name"] for sc in scopes_arg(base, store, args.scope)] if args.scope else None
+        n = sum(sm.cleanup_interrupted(store, base, sc["name"]) for sc in store.scopes())
+        if n:
+            print(f"  {n} photos were being written when an earlier run stopped; the stored ones are in the storage "
+                  f"again, the others are downloaded again")
+        stored = store.stored_pairs(names)
+        if not stored:
+            print(f"Nothing to do: the storage {base / layout.STORAGE_DIR} holds no photos"
+                  + (" of these scopes." if names else "."))
+            return 0
+        mine = sorted({s for _, s in stored})
+        scopes = {name: store.scope(name) for name in mine}
+        if any(sc is None for sc in scopes.values()):
+            gone = ", ".join(n for n, sc in scopes.items() if sc is None)
+            raise SystemExit(f"stored photos of a scope that no longer exists: {gone}")
+        opts = sm.Options(base=base, scope=scopes[mine[0]], scopes=scopes, min_side=args.min_side,
+                          max_aspect=aspect_of(conf), png=args.png, wm_conf=args.wm_conf,
+                          wm_paint_conf=args.wm_paint_conf, wm_mode=args.wm_mode, borders=not args.no_borders,
+                          dark_borders=not args.no_dark, fetchers=conf.fetchers, depth=args.depth,
+                          writers=args.writers, report_every=args.report_every, limit=args.limit,
+                          retries=args.retries, txt_fields=parse_fields(args.txt_fields), json_files=conf.json_files,
+                          json_sidecar=args.json_sidecar, keep_rejects=args.keep_rejects,
+                          display="json" if args.json_progress else "quiet" if args.quiet else "live")
+        print(f"Processing {len(stored):,} photos ({store.stored_bytes(names) / 2**30:.1f} GB) of the storage "
+              f"{base / layout.STORAGE_DIR}, {len(mine)} scope{'s' if len(mine) > 1 else ''} ...", flush=True)
+        where = mine[0] if len(mine) == 1 else f"its {len(mine)} scopes"
+        return process_stream(args, conf, client, base, store, sm, opts, mine, [], len(stored), 0, stored, where)
 
 
 def load_models(args, conf: cf.Conf, quality: float | None = None, colour_probe: bool = True) -> tuple:
@@ -1230,6 +1309,9 @@ def cmd_drop(args, conf, client) -> int:
             res = rg.drop_scope(store, base, sc, exporter=exporter)
             print(f"Dropped {sc['name']}: {res['files']:,} images deleted, {res['photos']:,} photos marked not "
                   f"downloaded")
+        if (base / layout.STORAGE_DIR).is_dir():            # the scope's raw files went with its paths
+            import folders
+            folders.prune_empty(base / layout.STORAGE_DIR)
     return 0
 
 
@@ -1542,55 +1624,84 @@ def parse_args(argv=None):
     p = sub.add_parser("index", help="list the photos of a scope into the store, no downloads")
     scope_opts(p, True)
 
-    p = sub.add_parser("run", help="index (with --region) and download, process, sort and write a scope")
+    def processing_opts(p):
+        """The processing (the models, the crop, the writer) and what follows it: run, run --pull and pull."""
+        p.add_argument("--samples", metavar="DIR", help="classify samples folder (default: [paths] samples of the conf)")
+        p.add_argument("--no-classify", action="store_true",
+                       help="no categories: images go into numbered folders of the scope")
+        p.add_argument("--min-confidence", type=float, default=0.7, metavar="X",
+                       help="below this the record marks the photo as doubtful; it still goes to its best-guess category")
+        p.add_argument("--priority-margin", type=float, metavar="X",
+                       help="a category within X of the top score wins when its number is lower (default: [defaults] "
+                            "priority_margin of the conf, 0.15; 0: the top score always wins)")
+        p.add_argument("--patches", type=int, default=576, metavar="N", help="encoder patch budget (default 576)")
+        p.add_argument("--png", action="store_true",
+                       help="write images with painted watermarks as PNG instead of JPEG q97")
+        p.add_argument("--no-watermark", action="store_true", help="no watermark detection or painting")
+        p.add_argument("--wm-conf", type=float, default=0.1, metavar="X",
+                       help="watermark detections from this confidence go into the record (default 0.1)")
+        p.add_argument("--wm-paint-conf", type=float, default=0.4, metavar="X",
+                       help="only detections from this confidence are painted out (default 0.4)")
+        p.add_argument("--wm-mode", choices=["inpaint", "trim"], default="inpaint",
+                       help="paint watermarks out (default) or cut the largest clear rectangle when it keeps half "
+                            "the image")
+        p.add_argument("--no-borders", action="store_true", help="no border analysis (the PastVu band is still cut)")
+        p.add_argument("--no-dark", action="store_true", help="leave dark borders alone")
+        p.add_argument("--txt-fields", metavar="LIST",
+                       help=f"caption parts in order, from {','.join(sidecars.ALL_TXT_FIELDS)} "
+                            f"(default {','.join(sidecars.TXT_FIELDS)})")
+        p.add_argument("--json-sidecar", action="store_true", help="also write the record next to the image")
+        p.add_argument("--depth", type=int, default=16, metavar="N", help="images fetched ahead of the GPU (default 16)")
+        p.add_argument("--writers", type=int, default=2, metavar="N", help="encoder and writer threads (default 2)")
+        p.add_argument("--keep-rejects", action="store_true",
+                       help="a stored photo the processing rejects keeps its raw files in the storage (default: "
+                            "deleted, since nothing fetches it again)")
+        p.add_argument("--export", action="store_true",
+                       help="hard-link every saved photo into <base parent>/pastvu_export/<category>/<bw|color>/<NNN> "
+                            "as it is written (photos saved before are linked at the start)")
+        p.add_argument("--export-reset", action="store_true",
+                       help="with --export: forget the images you deleted from the export and link them again")
+        p.add_argument("--autocaption", action="store_true",
+                       help="caption each saved photo with the VLM of [caption] in the conf (the run slows to its pace)")
+
+    def pace_opts(p):
+        p.add_argument("--limit", type=int, metavar="N", help="do at most N photos in this run")
+        p.add_argument("--retries", type=int, default=3, metavar="N", help="attempts for a photo that failed (default 3)")
+        p.add_argument("--report-every", type=int, default=500, metavar="N", help="a report block every N photos")
+        p.add_argument("--quiet", action="store_true", help="report blocks only, no live display")
+        p.add_argument("--json-progress", action="store_true", help="one JSON line per photo on stdout")
+
+    p = run_p = sub.add_parser("run", help="index (with --region) and download, process, sort and write a scope; "
+                                           "--raw downloads only, --pull also processes the storage")
     scope_opts(p, False)
     p.add_argument("--scope", metavar="NAME", help="resume a scope by its name or folder")
     p.add_argument("--resume", action="store_true",
                    help="skip the index (no requests to plan or page it) and download what is listed already")
-    p.add_argument("--export", action="store_true",
-                   help="hard-link every saved photo into <base parent>/pastvu_export/<category>/<bw|color>/<NNN> "
-                        "as it is written (photos saved before are linked at the start)")
-    p.add_argument("--export-reset", action="store_true",
-                   help="with --export: forget the images you deleted from the export and link them again")
+    p.add_argument("--raw", action="store_true",
+                   help="download the originals into <base>/_storage with their records and nothing else: no model "
+                        "is loaded, no GPU is used; pull, or run --pull, processes them later")
+    p.add_argument("--pull", action="store_true",
+                   help="also process the photos in the storage: one whenever no download is ready for the GPU, "
+                        "the rest at full speed when the downloads are finished (the whole storage, every scope)")
     p.add_argument("--regroup", action="store_true",
                    help="first move the saved photos the run's scopes list into them, from whatever scope holds them")
-    p.add_argument("--samples", metavar="DIR", help="classify samples folder (default: [paths] samples of the conf)")
-    p.add_argument("--no-classify", action="store_true", help="no categories: images go into numbered folders of the scope")
-    p.add_argument("--min-confidence", type=float, default=0.7, metavar="X",
-                   help="below this the record marks the photo as doubtful; it still goes to its best-guess category")
-    p.add_argument("--priority-margin", type=float, metavar="X",
-                   help="a category within X of the top score wins when its number is lower (default: [defaults] priority_margin of the conf, 0.15; 0: the top score always wins)")
-    p.add_argument("--patches", type=int, default=576, metavar="N", help="encoder patch budget (default 576)")
     p.add_argument("--min-side", type=int, default=512, metavar="PX",
                    help="skip images whose picture is smaller than this on either side (default 512)")
-    p.add_argument("--png", action="store_true", help="write images with painted watermarks as PNG instead of JPEG q97")
-    p.add_argument("--no-watermark", action="store_true", help="no watermark detection or painting")
-    p.add_argument("--wm-conf", type=float, default=0.1, metavar="X",
-                   help="watermark detections from this confidence go into the record (default 0.1)")
-    p.add_argument("--wm-paint-conf", type=float, default=0.4, metavar="X",
-                   help="only detections from this confidence are painted out (default 0.4)")
-    p.add_argument("--wm-mode", choices=["inpaint", "trim"], default="inpaint",
-                   help="paint watermarks out (default) or cut the largest clear rectangle when it keeps half the image")
-    p.add_argument("--no-borders", action="store_true", help="no border analysis (the PastVu band is still cut)")
-    p.add_argument("--no-dark", action="store_true", help="leave dark borders alone")
-    p.add_argument("--txt-fields", metavar="LIST",
-                   help=f"caption parts in order, from {','.join(sidecars.ALL_TXT_FIELDS)} "
-                        f"(default {','.join(sidecars.TXT_FIELDS)})")
-    p.add_argument("--json-sidecar", action="store_true", help="also write the record next to the image")
     p.add_argument("--comments", action="store_true", help="add the comment tree to the record (one more request)")
     p.add_argument("--fetchers", type=int, metavar="N", help="download threads (default: [defaults] fetchers of the conf)")
-    p.add_argument("--depth", type=int, default=16, metavar="N", help="images fetched ahead of the GPU (default 16)")
-    p.add_argument("--writers", type=int, default=2, metavar="N", help="encoder and writer threads (default 2)")
-    p.add_argument("--limit", type=int, metavar="N", help="do at most N photos in this run")
     p.add_argument("--skip", type=int, default=0, metavar="N",
                    help="start at photo N+1 in PastVu number order: the first N are left out, not downloaded, and "
                         "stay to do for a run without --skip")
-    p.add_argument("--retries", type=int, default=3, metavar="N", help="attempts for a photo that failed (default 3)")
-    p.add_argument("--report-every", type=int, default=500, metavar="N", help="a report block every N photos")
-    p.add_argument("--quiet", action="store_true", help="report blocks only, no live display")
-    p.add_argument("--json-progress", action="store_true", help="one JSON line per photo on stdout")
-    p.add_argument("--autocaption", action="store_true",
-                   help="caption each saved photo with the VLM of [caption] in the conf (downloads slow to its pace)")
+    processing_opts(p)
+    pace_opts(p)
+
+    p = sub.add_parser("pull", help="process the photos in <base>/_storage (run --raw) into their scopes, no downloads")
+    p.add_argument("scope", nargs="*", metavar="SCOPE",
+                   help="only the stored photos of these scopes (names, folders or patterns; default: the whole storage)")
+    p.add_argument("--min-side", type=int, default=512, metavar="PX",
+                   help="skip images whose picture is smaller than this on either side after the crop (default 512)")
+    processing_opts(p)
+    pace_opts(p)
 
     p = sub.add_parser("import", help="process a local dataset (not from PastVu) like a download, into a folder of "
                                       "its own; the source is only read")
@@ -1758,7 +1869,19 @@ def parse_args(argv=None):
     p = sub.add_parser("drop", help="delete the files of a scope and forget it; its photos count as not downloaded")
     p.add_argument("scope", nargs="+", metavar="SCOPE", help="a scope's name, folder or name pattern")
     p.add_argument("--yes", action="store_true", help="delete; without it, only show what would be deleted")
-    return ap.parse_args(argv)
+    args = ap.parse_args(argv)
+    if args.cmd == "run" and args.raw:
+        if args.pull:
+            ap.error("--raw downloads without processing and --pull processes the storage: give one of them")
+        for dest in ("regroup", "export", "export_reset", "autocaption"):
+            if getattr(args, dest):
+                ap.error(f"--raw downloads into the storage without processing; --{dest.replace('_', '-')} belongs to "
+                         f"run --pull or pull")
+        for dest in RAW_REFUSES:
+            if getattr(args, dest) != run_p.get_default(dest):
+                ap.error(f"--raw downloads into the storage without processing; --{dest.replace('_', '-')} belongs to "
+                         f"run --pull or pull")
+    return args
 
 
 def main(argv=None) -> int:
@@ -1773,7 +1896,8 @@ def main(argv=None) -> int:
     client = Client(max_per_second=args.max_per_second, connections=max(8, fetchers * 2))
     try:
         cmds = {"regions": cmd_regions, "aliases": cmd_aliases, "count": cmd_count, "scopes": cmd_scopes,
-                "index": cmd_index, "run": cmd_run, "captions": cmd_captions, "reclassify": cmd_reclassify,
+                "index": cmd_index, "run": cmd_run, "pull": cmd_pull, "captions": cmd_captions,
+                "reclassify": cmd_reclassify,
                 "export": cmd_export, "autocaption": cmd_autocaption, "regroup": cmd_regroup, "drop": cmd_drop,
                 "extract": cmd_extract, "import": cmd_import, "cleanup": cmd_cleanup,
                 "cherrypick": cmd_cherrypick}

@@ -377,3 +377,14 @@ def category_of(rel: str, width: int) -> str:
 def record_file(base, cid: int):
     """Where the optional JSON file of a record goes: <base>/_records/<cid // 10000>/<cid>.json."""
     return base / "_records" / f"{cid // 10000:03d}" / f"{cid}.json"
+
+
+# The storage of run --raw: the originals waiting for the processing, with the record
+# as <cid>.json and the facts caption as <cid>.txt next to each. Bucketed by number
+# like _records (at most 10,000 photos per folder), so no chunker and no journal.
+STORAGE_DIR = "_storage"
+
+
+def storage_rel(cid: int, ext: str) -> str:
+    """The storage path of a photo's original, relative to the base: _storage/<cid // 10000>/<cid><ext>."""
+    return f"{STORAGE_DIR}/{cid // 10000:03d}/{cid}{ext}"

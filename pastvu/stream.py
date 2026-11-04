@@ -13,6 +13,17 @@ An import (importer.py) reads each photo from its source folder instead of
 PastVu (no band), writes it under its source name with its cleaned caption,
 and skips the copies of a base's photos after the embedding.
 
+A raw run (run --raw, Options.raw) stops after the fetch's gates: the original
+bytes go into <base>/_storage with the record as <cid>.json and the facts caption
+as <cid>.txt, the store marks the photo stored, and no model is loaded. The
+processing of the storage is a second source of the same stream: one thread
+reads stored photos, checks them against the store and prepares them (decode,
+band, borders) a few ahead, and the GPU stage takes one whenever no download
+is ready (run --pull: downloads first, the storage fills the gaps; pull: the
+storage alone). After a stored photo is committed, or rejected, its raw files
+are deleted (--keep-rejects keeps a reject's). --limit counts the photos taken
+from both sources together.
+
 A photo whose long side is more than max_aspect (21:9) times its short side is
 skipped before the download (by the record's size) or after the crop.
 A photo the quality probe scores at or above its threshold is skipped after
@@ -27,6 +38,7 @@ command continues with the rest.
 from __future__ import annotations
 
 import hashlib
+import json
 import queue
 import threading
 import time
@@ -43,8 +55,8 @@ import layout
 import process as pr
 import sidecars
 from client import IMG, Client, PastvuError, TransportError, page_url
-from progress import Display, Stats, report_block
-from store import DONE, FAILED, SKIPPED, Store
+from progress import Display, Stats, raw_report_block, report_block
+from store import DONE, FAILED, SKIPPED, STORED, Store
 
 TOOL_VERSION = "0.2"
 
@@ -76,6 +88,9 @@ class Options:
     comments: bool = False
     colour: bool = True               # tell black-and-white from colour (an import with --top none does not)
     display: str = "live"
+    raw: bool = False                 # run --raw: download into the storage, no processing
+    keep_rejects: bool = False        # a stored photo rejected by the processing keeps its raw files
+    storage_depth: int = 4            # stored photos prepared ahead of the GPU
 
     @property
     def scope_dir(self) -> Path:
@@ -100,6 +115,7 @@ class Job:
     caption: str | None = None        # an import: the source's caption (raw)
     sidecars: dict = None             # an import: the source's other sidecars, copied as they are
     written: list = None              # an import: the sidecars written next to the image
+    raw: str | None = None            # from the storage: the raw image's path relative to the base
     t_fetch: float = 0.0
 
 
@@ -137,6 +153,9 @@ class Stream:
         self.source = Path(source) if source else None      # an import: the folder the photos are read from
         self.against = against             # an import: importer.Against, the base whose copies are skipped
         self.captioner = None
+        self.budget: int | None = None     # photos still to take under --limit, over both sources
+        self.storage_source = False        # this run reads the storage too
+        self.records_refetched = 0         # stored photos whose JSON was missing
         enc_model = getattr(getattr(classifier, "encoder", None), "model_id", None)
         self.emb_key = (enc_model, getattr(classifier, "patches", None))
         self.tool = {"name": "dataset_tools/pastvu", "version": TOOL_VERSION, "detector": self.det_name,
@@ -190,9 +209,9 @@ class Stream:
         job.t_fetch = time.perf_counter() - t0
         return job
 
-    def fetch(self, cid: int, scope: str) -> Job:
-        if self.source is not None:
-            return self.fetch_local(cid, scope)
+    def fetch_remote(self, cid: int, scope: str) -> Job:
+        """The record and the bytes from PastVu, with every gate that needs no
+        pixels: what a raw run does for a photo. A full fetch goes on with prepare."""
         o = self.opts
         t0 = time.perf_counter()
         job = Job(cid, scope)
@@ -223,12 +242,6 @@ class Stream:
         if job.head["frames"] > 1:
             raise pr.Rejected("animated")
         job.rows = pr.band_rows(job.head, p)
-        job.array = pr.decode(job.data, job.head)
-        job.band = pr.verify_band(job.array, job.head, job.rows)
-        job.pic_box = pr.picture_box(job.head, job.rows)
-        if o.borders:
-            picture = pr.crop_array(job.array, job.pic_box)
-            job.borders = pr.borders_plan(picture, {"dark": o.dark_borders})
         if o.comments:
             try:
                 job.comments = self.client.comments(cid)
@@ -237,17 +250,93 @@ class Stream:
         job.t_fetch = time.perf_counter() - t0
         return job
 
+    def prepare(self, job: Job) -> Job:
+        """The pixels: decode upright, verify the band, the picture box, the border plan."""
+        o = self.opts
+        t0 = time.perf_counter()
+        job.array = pr.decode(job.data, job.head)
+        job.band = pr.verify_band(job.array, job.head, job.rows)
+        job.pic_box = pr.picture_box(job.head, job.rows)
+        if o.borders:
+            picture = pr.crop_array(job.array, job.pic_box)
+            job.borders = pr.borders_plan(picture, {"dark": o.dark_borders})
+        job.t_fetch += time.perf_counter() - t0
+        return job
+
+    def fetch(self, cid: int, scope: str) -> Job:
+        if self.source is not None:
+            return self.fetch_local(cid, scope)
+        return self.prepare(self.fetch_remote(cid, scope))
+
+    def fetch_stored(self, cid: int, scope: str) -> Job:
+        """A photo of the storage: its bytes and its record from <base>/_storage, checked
+        against the store (a missing or changed file is failed, its raw path cleared, so a
+        later run downloads it again); the record is asked from PastVu again when the JSON
+        is missing or unreadable."""
+        o = self.opts
+        t0 = time.perf_counter()
+        job = Job(cid, scope)
+        row = self.store.status(cid) or {}
+        rel = row.get("raw") or row.get("path")
+        if not rel:
+            raise pr.Rejected("stored file unknown", failed=True)
+        job.raw = rel
+        img = o.base / rel
+        try:
+            job.data = img.read_bytes()
+        except OSError as e:
+            raise pr.Rejected(f"stored file missing: {e.strerror or e}", failed=True)
+        if row.get("sha256") and hashlib.sha256(job.data).hexdigest() != row["sha256"]:
+            raise pr.Rejected("stored file changed", failed=True)
+        doc = None
+        try:
+            doc = json.loads(img.with_suffix(".json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            pass
+        if isinstance(doc, dict) and isinstance(doc.get("result"), dict) and doc["result"].get("photo"):
+            job.result = doc["result"]
+            job.ctype = str((doc.get("download") or {}).get("content_type") or "")
+        else:
+            with self.lock:
+                self.records_refetched += 1
+                first = self.records_refetched == 1
+            if first:
+                self.log(f"  {cid}: no record in the storage; asking PastVu for it (said once)")
+            try:
+                job.result = self.client.give_for_page(cid)
+            except PastvuError as e:
+                raise pr.Rejected(f"stored record: {e.kind} {e.code}", failed=True)
+        p = job.photo = job.result.get("photo") or {}
+        try:
+            job.head = pr.head_of(job.data)
+        except Exception as e:  # noqa: BLE001
+            raise pr.Rejected(f"stored file unreadable ({type(e).__name__})", failed=True)
+        if not job.ctype:
+            job.ctype = "image/" + str(job.head.get("format") or "").lower()
+        job.rows = pr.band_rows(job.head, p)
+        job.t_fetch = time.perf_counter() - t0
+        return self.prepare(job)
+
+    def take(self, it, lock) -> tuple[int, str] | None:
+        """The next (cid, scope) of a source, within --limit counted over both sources."""
+        with lock:
+            if self.budget is not None and self.budget <= 0:
+                return None
+            pair = next(it, None)
+            if pair is not None and self.budget is not None:
+                self.budget -= 1
+            return pair
+
     def fetch_worker(self, cids, cid_lock, out_q: queue.Queue) -> None:
         while not self.stop.is_set():
-            with cid_lock:
-                pair = next(cids, None)
+            pair = self.take(cids, cid_lock)
             if pair is None:
                 break
             cid, scope = pair
             with self.lock:
                 self.in_flight += 1
             try:
-                item = self.fetch(cid, scope)
+                item = self.fetch_remote(cid, scope) if self.opts.raw else self.fetch(cid, scope)
             except pr.Rejected as r:
                 item = r
             except TransportError as e:
@@ -262,12 +351,41 @@ class Stream:
             out_q.put(item)
         out_q.put(None)
 
+    def storage_worker(self, pairs, lock, sq: queue.Queue) -> None:
+        """The storage source: stored photos read and prepared a few ahead of the GPU."""
+        while not self.stop.is_set():
+            pair = self.take(pairs, lock)
+            if pair is None:
+                break
+            cid, scope = pair
+            try:
+                item = self.fetch_stored(cid, scope)
+            except pr.Rejected as r:
+                item = r
+            except TransportError as e:
+                item = pr.Rejected(f"stored record: {e}", failed=True)
+            except Exception as e:  # noqa: BLE001
+                item = pr.Rejected(f"stored: {type(e).__name__}: {e}", failed=True)
+            if isinstance(item, pr.Rejected):
+                item.cid, item.scope = cid, scope
+            sq.put(item)
+        sq.put(None)
+
     # --- outcomes ------------------------------------------------------------------
+
+    def remove_raw(self, rel: str) -> None:
+        """Delete a photo's raw files in the storage: the image and every file of its name."""
+        img = self.opts.base / rel
+        for f in (img, *layout.sidecars(img)):
+            f.unlink(missing_ok=True)
 
     def reject(self, cid: int, r: pr.Rejected, scope: str) -> None:
         key = r.reason.split(":")[0].split(" (")[0]
         state = FAILED if r.failed else SKIPPED
+        raw = (self.store.status(cid) or {}).get("raw")
         self.store.reject(cid, scope, state, r.reason, {f"c.{state}.{key}": 1})
+        if raw and (r.failed or not self.opts.keep_rejects):
+            self.remove_raw(raw)             # nothing fetches a reject again; a failed one is downloaded afresh
         self.stats.add(**{f"{state}.{key}": 1})
         self.display.advance(saved=False)
         self.display.line({"cid": cid, "state": state, "reason": r.reason})
@@ -326,6 +444,55 @@ class Stream:
 
     # --- writer threads ------------------------------------------------------------
 
+    def chunker_for(self, scope: str):
+        """The scope's chunker; a scope the run did not open (a stored photo of another
+        scope) gets one on first use."""
+        with self.lock:
+            c = self.chunkers.get(scope)
+            if c is None:
+                sc = self.store.scope(scope)
+                if sc is None:
+                    raise pr.Rejected(f"scope {scope} is gone", failed=True)
+                c = self.chunkers[scope] = folders.ScopeChunks(self.store, self.opts.base, sc, log=self.log)
+                self.scopes[scope] = sc
+            return c
+
+    def write_raw(self, job: Job) -> None:
+        """A raw run: the original bytes, the record and the facts caption into the storage,
+        then the store row, in that order (a crash before the row leaves files the next
+        raw write overwrites under the same names)."""
+        o, s, d = self.opts, self.stats, self.display
+        ext = enc.EXTENSIONS.get(job.head["format"], ".bin")
+        rel = layout.storage_rel(job.cid, ext)
+        path = o.base / rel
+        d.set(f"{job.cid}: storing {rel}")
+        t = time.perf_counter()
+        sha = hashlib.sha256(job.data).hexdigest()
+        p = job.photo
+        result = dict(job.result)
+        if job.comments is not None:
+            result["comments"] = job.comments
+        download = {"url": f"{IMG}/a/{p['file']}", "bytes": len(job.data), "sha256": sha, "content_type": job.ctype,
+                    "format": job.head["format"], "stored_size": job.head["stored"],
+                    "orientation": job.head["orientation"], "mcu": job.head["mcu"]}
+        doc = sidecars.raw_json(job.cid, page_url(job.cid), result, download, job.scope,
+                                {"name": self.tool["name"], "version": self.tool["version"]})
+        files = (path, path.with_suffix(".json"), path.with_suffix(".txt"))
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(job.data)
+            files[1].write_text(doc, encoding="utf-8")
+            files[2].write_text(sidecars.caption(p, o.txt_fields), encoding="utf-8")
+            self.store.store_raw(job.cid, job.scope, rel, sha, len(job.data))
+        except BaseException:
+            for f in files:
+                f.unlink(missing_ok=True)
+            raise
+        s.time("write", time.perf_counter() - t)
+        s.add(stored=1, raw_bytes=len(job.data))
+        d.advance(saved=True)
+        d.line({"cid": job.cid, "state": STORED, "path": rel, "bytes": len(job.data)})
+
     def write(self, job: Job, plan: dict, boxes: list, painted, vec, verdict, fw: int, fh: int, final=None,
               tone=None) -> None:
         o, s, d = self.opts, self.stats, self.display
@@ -337,7 +504,7 @@ class Stream:
             verdict = self.classifier.example_override(data, verdict)
         folder = verdict.folder if verdict else ""
         scope = job.scope
-        chunker = self.chunkers[scope]
+        chunker = self.chunker_for(scope)
         if o.colour:
             tone = tone or colour.decide({"off_hue": 0.0, "strong": 0.0, "tone": 0.0})
         tone_mode = tone["mode"] if tone else None
@@ -378,6 +545,9 @@ class Stream:
             self.store.unclaim(job.cid)
             raise
         chunker.done(rel_scope)          # may move the category's images into 001 now that it passed the split
+        if job.raw:
+            self.remove_raw(job.raw)     # committed: the storage copy has served
+            s.add(pulled=1)
         if self.exporter is not None:
             self.exporter.add(job.cid, self.store.status(job.cid)["path"], tone_mode, folder)
         s.time("write", time.perf_counter() - t)
@@ -463,7 +633,10 @@ class Stream:
                 break
             job = item[0]
             try:
-                self.write(*item)
+                if self.opts.raw:
+                    self.write_raw(job)
+                else:
+                    self.write(*item)
             except Exception as e:  # noqa: BLE001
                 self.reject(job.cid, pr.Rejected(f"write: {type(e).__name__}: {e}", failed=True), job.scope)
                 self.display.print(f"[write error] {job.cid}: {''.join(traceback.format_exception_only(e)).strip()}")
@@ -486,7 +659,13 @@ class Stream:
 
     def report(self, t_start: float, final: bool = False) -> str:
         counters, counts = self.totals()
-        text = report_block(counters, self.stats, counts, time.time() - t_start, final)
+        if self.opts.raw:
+            text = raw_report_block(counters, self.stats, counts, time.time() - t_start, final)
+        else:
+            text = report_block(counters, self.stats, counts, time.time() - t_start, final)
+        if self.storage_source:
+            text += (f"\n  from the storage: {int(self.stats.c['pulled']):,} processed this run, "
+                     f"{self.store.stored_count():,} left in it")
         if self.caption_client is not None:
             text += f"\n  captioned by the VLM in this run: {int(self.stats.c['captioned']):,}"
         if self.vram is not None and self.vram.ok:
@@ -500,17 +679,23 @@ class Stream:
                          f"bw {int(k.get('c.mode.bw', 0)):,} / colour {int(k.get('c.mode.color', 0)):,}")
         return text
 
-    def run(self, pairs: list[tuple[int, str]], scope_total: int, completed: int) -> dict:
-        """pairs: (cid, scope) to do."""
+    def run(self, pairs: list[tuple[int, str]], scope_total: int, completed: int,
+            stored: list[tuple[int, str]] = ()) -> dict:
+        """pairs: (cid, scope) to download; stored: (cid, scope) to take from the storage
+        whenever no download is ready. scope_total and completed size the progress bar."""
         o = self.opts
-        if o.limit is not None:
-            pairs = pairs[:max(0, o.limit)]
-        cids = pairs
-        it = iter(pairs)
+        stored = list(stored)
+        if o.raw and stored:
+            raise ValueError("a raw run does not read the storage")
+        self.budget = max(0, o.limit) if o.limit is not None else None
+        self.storage_source = bool(stored)
+        it, sit = iter(pairs), iter(stored)
         cid_lock = threading.Lock()
         out_q: queue.Queue = queue.Queue(maxsize=max(1, o.depth))
+        sq: queue.Queue = queue.Queue(maxsize=max(1, o.storage_depth))
         wq: queue.Queue = queue.Queue(maxsize=max(2, o.writers * 2))
-        run_id = self.store.start_run(self.scope, {"cids": len(cids), "scopes": sorted(self.scopes),
+        run_id = self.store.start_run(self.scope, {"cids": len(pairs), "stored": len(stored),
+                                                   "scopes": sorted(self.scopes),
                                                    **{k: str(v) for k, v in vars(o).items()
                                                       if k not in ("scope", "scopes")}})
         t_start = time.time()
@@ -522,33 +707,60 @@ class Stream:
                 self.captioner = ac.StreamCaptioner(self.store, self.caption_client, self.stats,
                                                     lambda: self.display, self.stop)
             where = self.scope if len(self.scopes) == 1 else f"{self.scope} ({len(self.scopes)} scopes)"
-            d.print(f"{where}: {len(cids):,} photos to do in this run; {completed:,} of {scope_total:,} done, "
-                    f"skipped or saved under another scope before.")
+            what = ("to download into the storage" if o.raw else "to download") if pairs or not stored else ""
+            text = f"{where}: {len(pairs):,} photos {what}" if what else f"{where}:"
+            if stored:
+                text += f"{' and' if what else ''} {len(stored):,} photos in the storage to process"
+            if o.limit is not None:
+                text += f", at most {o.limit:,} in this run"
+            d.print(f"{text}; {completed:,} of {scope_total:,} done, skipped or saved under another scope before.")
             fetchers = [threading.Thread(target=self.fetch_worker, args=(it, cid_lock, out_q), daemon=True,
-                                         name=f"fetch-{i}") for i in range(o.fetchers)]
+                                         name=f"fetch-{i}") for i in range(o.fetchers)] if pairs else []
+            storage = threading.Thread(target=self.storage_worker, args=(sit, cid_lock, sq), daemon=True,
+                                       name="storage") if stored else None
             writers = [threading.Thread(target=self.writer_worker, args=(wq,), daemon=True, name=f"write-{i}")
                        for i in range(o.writers)]
-            for t in fetchers + writers:
+            for t in fetchers + writers + ([storage] if storage else []):
                 t.start()
             ended, interrupts = 0, 0
+            remote_ended, storage_ended = not fetchers, storage is None
             try:
-                while ended < len(fetchers):
+                while not (remote_ended and storage_ended):
                     try:
-                        try:
-                            item = out_q.get(timeout=0.5)
-                        except queue.Empty:
+                        # downloads first; a stored photo only when no download is ready
+                        item, source = None, None
+                        if not remote_ended:
+                            try:
+                                item = out_q.get_nowait() if not storage_ended else out_q.get(timeout=0.5)
+                                source = "download"
+                            except queue.Empty:
+                                pass
+                        if source is None and not storage_ended:
+                            try:
+                                item = sq.get(timeout=0.5)
+                                source = "storage"
+                            except queue.Empty:
+                                pass
+                        if source is None:
                             with self.lock:
                                 n = self.in_flight
                             d.set(f"waiting for downloads ({n} in flight)" if not self.stop.is_set()
                                   else "stopping: finishing the images in flight")
                             continue
                         if item is None:
-                            ended += 1
+                            if source == "download":
+                                ended += 1
+                                remote_ended = ended >= len(fetchers)
+                            else:
+                                storage_ended = True
                             continue
                         if isinstance(item, pr.Rejected):
                             self.reject(item.cid, item, item.scope)
-                        else:
+                        elif o.raw:
                             self.stats.time("fetch", item.t_fetch)
+                            wq.put((item,))
+                        else:
+                            self.stats.time("pull" if source == "storage" else "fetch", item.t_fetch)
                             try:
                                 res = self.process(item)
                                 item.array = None
@@ -585,11 +797,13 @@ class Stream:
                 if self.captioner is not None:
                     d.set("finishing the captions")
                     self.captioner.close()
+                if storage is not None:
+                    folders.prune_empty(o.base / layout.STORAGE_DIR)
                 d.set("done")
                 d.print(self.report(t_start, final=True))
         c = self.stats.c
         failed = sum(v for k, v in c.items() if k.startswith("failed."))
         skipped = sum(v for k, v in c.items() if k.startswith("skipped."))
-        self.store.end_run(run_id, int(c["done"]), int(skipped), int(failed))
-        return {"done": int(c["done"]), "skipped": int(skipped), "failed": int(failed),
-                "seconds": time.time() - t_start}
+        self.store.end_run(run_id, int(c["done"] + c["stored"]), int(skipped), int(failed))
+        return {"done": int(c["done"]), "stored": int(c["stored"]), "pulled": int(c["pulled"]),
+                "skipped": int(skipped), "failed": int(failed), "seconds": time.time() - t_start}

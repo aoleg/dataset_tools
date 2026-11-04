@@ -162,6 +162,8 @@ Other folders whose names start with `_`, such as a folder of photos that you di
 run.bat run --region <alias> [--region ...] [--years FROM TO | --decade YEAR] [options]
 run.bat run --region <alias> --by decade|country|region|country,decade|region,decade [--regroup]
 run.bat run --scope <name>
+run.bat run --region <alias> ... --raw | --pull
+run.bat pull [<scope> ...] [--limit N] [--keep-rejects]
 run.bat regroup --by RULE [<scope> ...] [--dry-run] [--undo]
 run.bat drop <scope> [...] [--yes]
 run.bat reclassify [<scope> ...] [--dry-run] [--undo] [--yes]
@@ -227,13 +229,27 @@ run.bat run --scope ukraine_1970s
 
 Without `--limit`, the same command runs until every photo is done. Running it again first goes over the index: finished shards are not paged again, but planning the shards asks PastVu for the photo count of every large region and its children, which takes a while for a big country. `--resume` skips the index altogether and downloads what the store lists already; it says how much of the index is done ("189 of 189 shards finished, 0 partly paged, 0 not started"), and when the index is not finished, a run without `--resume` lists the rest. Ctrl+C finishes the photos in progress and stops; a second Ctrl+C stops at once. `--scope` continues one scope only, here the 1970s. A photo that failed is tried again on the next run, up to `--retries` (3) times; a photo skipped as too small is not. `--reindex` pages the index again to find photos published since the first run.
 
+**Download without the GPU, process later:**
+
+```
+run.bat run --region ukraine --raw
+run.bat pull
+run.bat run --region belarus --pull
+```
+
+`--raw` downloads the originals into `<base>\_storage`, each with its PastVu record (`<cid>.json`) and its facts caption (`<cid>.txt`), and applies only the checks that need no pixels: photograph, public, size and aspect ratio from the record, a readable image file. No model is loaded and the GPU is not touched, so the download runs while the GPU does something else. The originals average about 370 KB, so 1,000 photos take about 0.4 GB; the run says how much the storage holds, and so does `scopes`.
+
+`pull` processes the storage through the complete pipeline (band, borders, watermarks, quality, colour, category) into the scope folders, as a download would, and deletes each raw file once the photo is saved. It takes the processing options of `run`. `run --pull` does both: it downloads as usual and, whenever no download is ready for the GPU, processes a stored photo instead, so the storage drains in the gaps and at full speed once the downloads are finished. Both take the whole storage, whatever scope a photo was listed for. A plain `run` leaves the storage alone and says how many photos wait in it.
+
+A stored photo the processing rejects (too small after the crop, low quality) is marked skipped as in a download and its raw files are deleted, since nothing fetches it again; `--keep-rejects` keeps them for a look. A raw file that went missing or changed is marked failed and downloaded again by the next run. `--limit` counts the photos taken from the downloads and the storage together. Ctrl+C and resume work as for a download: a stored photo whose write was cut short goes back to the storage.
+
 A run downloads a **scope**: regions and years. Its name is the aliases (or region names) joined by `+`, an underscore, and the years: `belarus_1917-1991`, `ukraine_1970s`, `minsk+brest_oblast_1945-1960`. More than three regions need `--name` or an alias of their own. Running the same command again continues it, as does `run --scope <name>`. The scope's folder follows `layout` in the conf (see [Folder layouts](#folder-layouts)): `<base>\1970s\ukraine\` by default.
 
 `--years` takes the photos whose dating overlaps the years, as PastVu's own filter does: a photo dated 1910-1925 is in 1917-1991. `--decade 1970` takes the photos whose dating starts in 1970-1979, so a photo dated 1965-1975 belongs to the 1960s only, and decade runs never download a photo twice. Only photographs are taken, not paintings.
 
 **A photo is downloaded once per base folder.** The store at `<base>\pastvu.db` is shared by every scope, so a photo already saved under one scope (Minsk) is not downloaded again for another (Belarus); the report counts it as already saved under another scope, and `scopes` shows how many there are.
 
-**One command at a time changes a base folder.** The store holds a lock. A second download into the same base folder stops at the start with the name of the command that holds the lock, and so does a `regroup`, `drop` or `reclassify` while anything else runs. `autocaption` and `captions` can run beside a download. A lock left by a process that no longer runs is taken over.
+**One command at a time changes a base folder.** The store holds a lock. A second download into the same base folder stops at the start with the name of the command that holds the lock (`run --raw`, `run --pull` and `pull` are downloads to the lock), and so does a `regroup`, `drop` or `reclassify` while anything else runs. `autocaption` and `captions` can run beside a download. A lock left by a process that no longer runs is taken over.
 
 ## Splitting and regrouping
 
