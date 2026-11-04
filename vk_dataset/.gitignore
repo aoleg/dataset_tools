@@ -5,12 +5,12 @@ __pycache__/
 # the tool's own README.md is the one tracked document in the root
 /*.md
 !/README.md
-# The partner's OpenCode deployment, written for his machine (PLAN.md, D3)
+# The partner's OpenCode deployment, written for his machine (the local PLAN.md, D3)
 docs/
 examples/
 .opencode/
 opencode.jsonc
-# Code removed from the tool but kept for the record (PLAN.md, section 8)
+# Code removed from the tool but kept for the record (the local PLAN.md, section 8)
 _removed/
 # secrets and local state
 vk_token.txt

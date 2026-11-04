@@ -1,0 +1,16 @@
+; vkds configuration. install.bat copies this file to vkds.conf (next to vkds.py), which is yours to edit.
+; Relative paths are resolved against the folder of this file.
+
+[paths]
+; The file with the VK access token. VK_TOKEN and --token take precedence over it.
+token = vk_token.txt
+; The datasets root: no --out writes here, a relative --out resolves under it, an absolute --out is used as it is.
+base =
+; The machine-wide journal of API calls (used from the ledger of the next version on).
+ledger = _vkds\ledger.json
+
+[limits]
+; VK API calls per month of the application (CDN downloads do not count).
+monthly = 10000
+; Seconds between API calls (about 3 requests per second).
+delay = 0.35
