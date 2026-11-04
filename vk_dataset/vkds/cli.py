@@ -111,6 +111,9 @@ def build_parser(conf: vconf.Conf | None = None) -> argparse.ArgumentParser:
                    help="Дополнительно скачать фото со стены сообщества")
     a.add_argument("--min-area", type=int, default=0, metavar="N",
                    help="Пропускать фото мельче N пикселей (307200 = 640x480)")
+    a.add_argument("--min-side", type=int, default=0, metavar="N",
+                   help="Пропускать фото, у которых любая сторона меньше N пикселей "
+                        "(512 — порог импорта pastvu)")
     a.add_argument("--workers", type=int, default=4,
                    help="Параллельных потоков загрузки файлов")
     a.add_argument("--dry-run", action="store_true",
@@ -159,6 +162,9 @@ def build_parser(conf: vconf.Conf | None = None) -> argparse.ArgumentParser:
                     help="Только этот пост (можно несколько раз)")
     wl.add_argument("--min-area", type=int, default=0, metavar="N",
                     help="Пропускать фото мельче N пикселей (262144 = 512x512)")
+    wl.add_argument("--min-side", type=int, default=0, metavar="N",
+                    help="Пропускать фото, у которых любая сторона меньше N пикселей "
+                         "(512 — порог импорта pastvu)")
     wl.add_argument("--workers", type=int, default=4,
                     help="Параллельных потоков загрузки файлов")
     wl.add_argument("--recheck-dead", action="store_true",
@@ -174,6 +180,8 @@ def build_parser(conf: vconf.Conf | None = None) -> argparse.ArgumentParser:
                    help="Сколько фото скачать как пробы")
     k.add_argument("--offset", type=int, default=0,
                    help="Смещение внутри альбома (начало/середина/конец)")
+    k.add_argument("--min-side", type=int, default=0, metavar="N",
+                   help="Не качать пробы, у которых любая сторона меньше N пикселей")
 
     w = sub.add_parser("whoami", parents=[common],
                        help="Проверить токен (1 вызов API)")
@@ -206,7 +214,8 @@ def build_parser(conf: vconf.Conf | None = None) -> argparse.ArgumentParser:
 def _wall_options(ns) -> WallOptions:
     return WallOptions(since=ns.since, until=ns.until, text_regex=ns.text_regex or "",
                        photos_min=ns.photos_min, post_ids=[str(x) for x in (ns.post_ids or [])],
-                       min_area=ns.min_area, workers=ns.workers, dry_run=ns.dry_run,
+                       min_area=ns.min_area, min_side=ns.min_side,
+                       workers=ns.workers, dry_run=ns.dry_run,
                        recheck_dead=ns.recheck_dead)
 
 
@@ -350,6 +359,7 @@ def main(argv=None, conf: vconf.Conf | None = None) -> int:
                 title_regex=ns.title_regex or "",
                 include_wall=ns.include_wall,
                 min_area=ns.min_area,
+                min_side=ns.min_side,
                 workers=ns.workers,
                 dry_run=ns.dry_run,
                 no_meta=ns.no_meta,
@@ -366,7 +376,8 @@ def main(argv=None, conf: vconf.Conf | None = None) -> int:
         elif ns.cmd == "wall":
             run_wall(client, ns.group, out_root, _wall_options(ns))
         elif ns.cmd == "peek":
-            run_peek(client, ns.group, ns.album_id, ns.limit, ns.offset, out_root)
+            run_peek(client, ns.group, ns.album_id, ns.limit, ns.offset, out_root,
+                     min_side=ns.min_side)
         elif ns.cmd == "whoami":
             resp = client.call("groups.getById", group_id=ns.group)
             g = (resp.get("groups") or [{}])[0]

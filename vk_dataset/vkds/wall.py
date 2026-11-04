@@ -288,6 +288,7 @@ class WallOptions:
     photos_min: int = 1
     post_ids: list = field(default_factory=list)
     min_area: int = 0
+    min_side: int = 0
     workers: int = 4
     dry_run: bool = False
     recheck_dead: bool = False
@@ -477,7 +478,8 @@ def _wall_post(client, group: GroupInfo, gdir: Path, out_root: Path, post: dict,
     if to_download:
         dest_dir.mkdir(parents=True, exist_ok=True)
         download_photos(client.session, to_download, dest_dir, workers=opts.workers,
-                        min_area=opts.min_area, retry_sleep=opts.dl_retry_sleep,
+                        min_area=opts.min_area, min_side=opts.min_side,
+                        retry_sleep=opts.dl_retry_sleep,
                         dead=dead, recheck_dead=opts.recheck_dead,
                         dead_ttl_days=opts.dead_ttl_days, write_txt=True)
     by_id = {(p.get("owner_id"), p.get("id")): p for p in photos}

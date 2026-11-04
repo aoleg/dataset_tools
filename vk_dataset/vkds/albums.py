@@ -88,6 +88,7 @@ class AlbumsOptions:
     title_regex: str = ""            # фильтр по названию/описанию альбома
     include_wall: bool = False       # системный альбом «фото со стены»
     min_area: int = 0                # пропускать фото мельче N пикселей
+    min_side: int = 0                # пропускать фото, у которых сторона меньше N
     workers: int = 4                 # параллельных потоков загрузки CDN
     dry_run: bool = False            # только показать план
     no_meta: bool = False            # не писать metadata.json / album.txt / .txt
@@ -153,6 +154,18 @@ def size_candidates(photo: dict, limit: int = 64) -> list:
     """
     sizes = [s for s in (photo.get("sizes") or []) if s.get("url")]
     return sorted(sizes, key=size_score, reverse=True)[:max(1, limit)]
+
+
+def too_small(w, h, min_area: int = 0, min_side: int = 0) -> bool:
+    """True when a copy of known size is under --min-area or has a side under
+    --min-side (the import's gate is a side of 512). Unknown sizes pass."""
+    try:
+        w, h = int(float(w or 0)), int(float(h or 0))
+    except (TypeError, ValueError):
+        return False
+    if not (w > 0 and h > 0):
+        return False
+    return bool((min_area and w * h < min_area) or (min_side and min(w, h) < min_side))
 
 
 def pick_best_size(photo: dict) -> dict | None:
@@ -522,7 +535,7 @@ def count_statuses(records: list[dict]) -> dict:
 
 
 def download_photos(session, records: list[dict], dest_dir: Path,
-                    workers: int = 4, min_area: int = 0,
+                    workers: int = 4, min_area: int = 0, min_side: int = 0,
                     retry_sleep: float = 1.5, dead: dict | None = None,
                     recheck_dead: bool = False,
                     dead_ttl_days: int = DEAD_TTL_DAYS,
@@ -536,7 +549,8 @@ def download_photos(session, records: list[dict], dest_dir: Path,
     Мёртвые фото: известные по реестру _dead_photos.json (проверка свежее
     dead_ttl_days) вообще не дёргают CDN — повторные запуски бесплатны.
     При неудаче лучшей копии (404, 403, сбой) пробуются ВСЕ меньшие копии
-    (alt_urls; меньше min_area — пропускаются), без вызовов API. dead — только
+    (alt_urls; меньше min_area или со стороной меньше min_side — пропускаются),
+    без вызовов API. dead — только
     если каждая опробованная копия ответила 404; использованная меньшая копия
     отмечается в записи (fallback_from, url_used, её размеры).
 
@@ -551,8 +565,7 @@ def download_photos(session, records: list[dict], dest_dir: Path,
         if not rec.get("url"):
             rec["status"] = "no_url"
             continue
-        w, h = rec.get("width") or 0, rec.get("height") or 0
-        if min_area and w and h and w * h < min_area:
+        if too_small(rec.get("width"), rec.get("height"), min_area, min_side):
             rec["status"] = "small"
             continue
         fname = photo_stem(rec["owner_id"], rec["id"]) + ".jpg"
@@ -583,8 +596,7 @@ def download_photos(session, records: list[dict], dest_dir: Path,
         tries = [(rec["url"], best)] + [(u, s or {}) for u, s in zip(alts, alt_sizes) if u]
         statuses = []
         for i, (u, sz) in enumerate(tries):
-            w, h = sz.get("width") or 0, sz.get("height") or 0
-            if i and min_area and w and h and w * h < min_area:
+            if i and too_small(sz.get("width"), sz.get("height"), min_area, min_side):
                 continue                 # копия мельче фильтра — не годится
             res = download_file(session, u, dest, retry_sleep=retry_sleep)
             statuses.append(res["status"])
@@ -738,8 +750,9 @@ def row_done(r: dict, out_root: Path, dead: dict, opts) -> str | None:
 
     "exists" when its file (ok, exists, dup) is on disk, "dead" when the dead
     registry has a fresh entry and no recheck is asked, "small" when it is
-    still under the current min_area; None when the photo is not settled.
-    `opts` needs min_area, recheck_dead and dead_ttl_days.
+    still under the current min_area or min_side; None when the photo is not
+    settled. `opts` needs min_area, recheck_dead and dead_ttl_days (min_side
+    is optional).
     """
     status = r.get("status")
     if status in ("ok", "exists", "dup"):
@@ -752,11 +765,9 @@ def row_done(r: dict, out_root: Path, dead: dict, opts) -> str | None:
             return None
         return "dead"
     if status == "small":
-        try:
-            area = int(float(r.get("width") or 0)) * int(float(r.get("height") or 0))
-        except ValueError:
-            return None
-        return "small" if (opts.min_area and area and area < opts.min_area) else None
+        small = too_small(r.get("width"), r.get("height"), opts.min_area,
+                          getattr(opts, "min_side", 0))
+        return "small" if small else None
     return None
 
 
@@ -945,6 +956,7 @@ def _process_album(client: VkClient, group: GroupInfo, album: AlbumInfo,
     album_dir.mkdir(parents=True, exist_ok=True)
     records = download_photos(client.session, records, album_dir,
                               workers=opts.workers, min_area=opts.min_area,
+                              min_side=opts.min_side,
                               retry_sleep=opts.dl_retry_sleep,
                               dead=dead, recheck_dead=opts.recheck_dead,
                               dead_ttl_days=opts.dead_ttl_days,
@@ -998,8 +1010,10 @@ def _process_album(client: VkClient, group: GroupInfo, album: AlbumInfo,
                   "dead": st["dead"], "forbidden": st["forbidden"]},
     })
     print("      итог: скачано {}, уже было {}, мёртвых (404) {}, "
-          "отфильтровано (мельче {} px^2) {}, ошибок {}".format(
+          "отфильтровано (мельче {} px^2 или стороной меньше {} px) {}, "
+          "ошибок {}".format(
               st["ok"], st["exists"], st["dead"], opts.min_area or "-",
+              opts.min_side or "-",
               st["small"], st["failed"] + st["no_url"] + st["forbidden"]))
     return arep
 
@@ -1062,7 +1076,7 @@ def run_scan_albums(client: VkClient, target, out_root) -> dict:
 
 
 def run_peek(client: VkClient, target, album_id, limit: int, offset: int,
-             out_root) -> dict:
+             out_root, min_side: int = 0) -> dict:
     """Пробная выборка фото альбома — «глаза» агента перед решением.
 
     Стоимость: 1 вызов photos.get (+1 groups.getById, если группа ещё не
@@ -1084,7 +1098,9 @@ def run_peek(client: VkClient, target, album_id, limit: int, offset: int,
         if rec.get("owner_id") in (None, ""):
             rec["owner_id"] = group.owner_id
         fname = photo_stem(rec["owner_id"], rec["id"]) + ".jpg"
-        if rec.get("url"):
+        if too_small(rec.get("width"), rec.get("height"), 0, min_side):
+            rec["status"] = "small"
+        elif rec.get("url"):
             res = download_file(client.session, rec["url"], dest / fname)
             rec["http_status"] = res.get("http_code")
             rec["status"] = res["status"]
