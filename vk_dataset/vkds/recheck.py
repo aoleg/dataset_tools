@@ -15,7 +15,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from .albums import (load_dead, load_index, parse_group_ref, photo_stem,
-                     read_manifest, save_dead, write_caption, write_manifest)
+                     read_manifest, save_dead, size_score, write_caption,
+                     write_manifest)
 from .budget import now_iso
 from .fs import download_file, read_json, sanitize_dirname, write_json
 
@@ -49,8 +50,7 @@ def _urls(entry: dict, all_sizes: bool) -> list[dict]:
     if not all_sizes:
         return [best] if best.get("url") else []
     sizes = [s for s in (entry.get("sizes") or []) if s.get("url")]
-    sizes.sort(key=lambda s: (s.get("width") or 0) * (s.get("height") or 0),
-               reverse=True)
+    sizes.sort(key=size_score, reverse=True)   # dimensionless (pre-2012): by type
     if best.get("url") and all(s["url"] != best["url"] for s in sizes):
         sizes.insert(0, best)
     return sizes

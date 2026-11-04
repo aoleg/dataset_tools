@@ -110,22 +110,37 @@ def old_stem(photo_id) -> str:
 
 
 def write_caption(dest_dir: Path, stem: str, text: str) -> str:
-    """Write <stem>.txt with the cleaned caption; return its name or "".
+    """Write <stem>.txt with the cleaned caption unless one exists; return the
+    name of the .txt that exists afterwards, or "".
 
-    An empty cleaned caption writes nothing and removes a stale .txt of the
-    same stem (an older version wrote the raw text).
+    An existing .txt is never rewritten or deleted: a sidecar may have been
+    edited by hand or replaced by autocaption, and a resume must not clobber
+    it (the rule of the pastvu import). An empty cleaned caption writes
+    nothing. Callers pass only images that were downloaded in this run or
+    exist on disk.
     """
     path = Path(dest_dir) / (stem + ".txt")
+    if path.is_file():
+        return path.name
     cap = clean_caption(text)
+    if not cap:
+        return ""
     try:
-        if cap:
-            path.write_text(cap, encoding="utf-8")
-            return path.name
-        if path.is_file():
-            path.unlink()
+        path.write_text(cap, encoding="utf-8")
+        return path.name
     except OSError:
-        pass
-    return ""
+        return ""
+
+
+def size_score(s: dict) -> tuple:
+    """Sort key of a copy: area when both dimensions are known, else the
+    letter of its type (s < m < x < ... < w). Larger is better."""
+    w = s.get("width") or 0
+    h = s.get("height") or 0
+    if w > 0 and h > 0:
+        return (2, w * h)
+    t = SIZE_TYPE_ORDER.find(str(s.get("type", "")))
+    return (1, t if t >= 0 else -1)
 
 
 def size_candidates(photo: dict, limit: int = 64) -> list:
@@ -135,16 +150,7 @@ def size_candidates(photo: dict, limit: int = 64) -> list:
     размер сравнивается по типу копии (s < m < x < ... < w, w до 2560x2048).
     """
     sizes = [s for s in (photo.get("sizes") or []) if s.get("url")]
-
-    def score(s: dict):
-        w = s.get("width") or 0
-        h = s.get("height") or 0
-        if w > 0 and h > 0:
-            return (2, w * h)
-        t = SIZE_TYPE_ORDER.find(str(s.get("type", "")))
-        return (1, t if t >= 0 else -1)
-
-    return sorted(sizes, key=score, reverse=True)[:max(1, limit)]
+    return sorted(sizes, key=size_score, reverse=True)[:max(1, limit)]
 
 
 def pick_best_size(photo: dict) -> dict | None:
