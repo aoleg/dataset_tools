@@ -644,8 +644,9 @@ class Store:
         now = time.time()
 
         def work(db):
-            db.execute("UPDATE status SET state=?, reason=?, scope=?, path=NULL, raw=NULL, attempts=attempts+?, "
-                       "updated=? WHERE cid=?", (state, reason, scope, 1 if state == FAILED else 0, now, cid))
+            db.execute("UPDATE status SET state=?, reason=?, scope=?, path=NULL, raw=NULL, sha256=NULL, bytes=NULL, "
+                       "attempts=attempts+?, updated=? WHERE cid=?",
+                       (state, reason, scope, 1 if state == FAILED else 0, now, cid))
             self._add_counters(db, scope, counters)
 
         self.tx(work)

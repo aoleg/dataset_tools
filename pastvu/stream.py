@@ -674,9 +674,12 @@ class Stream:
             for n in sorted(self.scopes):
                 c = self.store.scope_counts(n)
                 k = self.store.counters(n)
-                text += (f"\n    {n:32} {c['done']:>7,} saved  {c['skipped']:>6,} skipped  {c['failed']:>4,} failed  "
-                         f"{c['elsewhere']:>6,} in other scopes  {c['pending']:>7,} left  "
-                         f"bw {int(k.get('c.mode.bw', 0)):,} / colour {int(k.get('c.mode.color', 0)):,}")
+                stored = f"  {c['stored']:>6,} stored" if self.opts.raw or c["stored"] else ""
+                modes = "" if self.opts.raw else \
+                    f"  bw {int(k.get('c.mode.bw', 0)):,} / colour {int(k.get('c.mode.color', 0)):,}"
+                text += (f"\n    {n:32} {c['done']:>7,} saved{stored}  {c['skipped']:>6,} skipped  "
+                         f"{c['failed']:>4,} failed  {c['elsewhere']:>6,} in other scopes  {c['pending']:>7,} left"
+                         f"{modes}")
         return text
 
     def run(self, pairs: list[tuple[int, str]], scope_total: int, completed: int,
