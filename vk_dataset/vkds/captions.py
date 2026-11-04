@@ -34,7 +34,7 @@ def clean_caption(text: str) -> str:
     s = _RE_HASHTAG.sub(" ", s)
     s = _RE_AT.sub(" ", s)
     s = _RE_SPACE.sub(" ", s).strip()
-    # punctuation left behind by a removed link: "Фото: ." -> "Фото:"
+    # punctuation left behind by a removed link: "Photo: ." -> "Photo:"
     s = re.sub(r"\s+([,.;:!?)])", r"\1", s)
     s = re.sub(r"\(\s*\)", "", s).strip()
     return s if re.search(r"\w", s) else ""

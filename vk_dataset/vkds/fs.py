@@ -1,5 +1,5 @@
-"""Файловые утилиты: безопасные имена папок, атомарная запись JSON,
-скачивание файлов с CDN ВК (не входит в лимиты API).
+"""File helpers: safe folder names, atomic JSON writes, and downloads from
+VK's CDN (which cost no API quota).
 """
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ _WIN_RESERVED = ({"CON", "PRN", "AUX", "NUL"}
 
 
 def sanitize_dirname(name: str, max_len: int = 100) -> str:
-    """Безопасное имя папки/файла для Windows и Linux (кириллица сохраняется)."""
+    """A folder or file name safe on Windows and Linux (Cyrillic is kept)."""
     s = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", str(name or ""))
     s = re.sub(r"\s+", " ", s).strip(" .")
     if len(s) > max_len:
@@ -26,7 +26,7 @@ def sanitize_dirname(name: str, max_len: int = 100) -> str:
 
 
 def read_json(path: Path, default: Any = None) -> Any:
-    """Читает JSON; при любой проблеме возвращает default."""
+    """Read JSON; return `default` on any problem."""
     try:
         return json.loads(Path(path).read_text(encoding="utf-8"))
     except Exception:
@@ -34,7 +34,7 @@ def read_json(path: Path, default: Any = None) -> Any:
 
 
 def write_json(path: Path, data: Any) -> None:
-    """Атомарная запись JSON (сначала .tmp, затем замена)."""
+    """Write JSON atomically (a .tmp first, then a replace)."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
@@ -46,23 +46,23 @@ def write_json(path: Path, data: Any) -> None:
 def download_file(session, url: str, dest: Path, retries: int = 4,
                   timeout: float = 90.0, min_bytes: int = 1024,
                   retry_sleep: float = 1.5) -> dict:
-    """Скачивает файл с CDN ВК (в лимиты API НЕ входит) с классификацией ошибок.
+    """Download one file from VK's CDN (no API quota) and classify the outcome.
 
-    Пишет во временный *.part и переименовывает только после полной загрузки —
-    недокачанных файлов в датасете не остаётся.
+    The file is written to a *.part and renamed only when complete, so no
+    partial file is left in a dataset.
 
-    Возвращает словарь:
-      status    — "ok" | "dead" | "forbidden" | "failed";
-      http_code — код ответа (None при сетевой ошибке);
-      bytes     — размер скачанного файла;
-      error     — текст ошибки (для dead/forbidden/failed).
+    Returns a dict:
+      status    "ok", "dead", "forbidden" or "failed";
+      http_code the response code (None on a network error);
+      bytes     the size of the file;
+      error     the error text (for dead, forbidden and failed).
 
-    ВАЖНО (частая проблема ВК): 404 — файл удалён с CDN, при этом API
-    продолжает отдавать метаданные фото. 404 НЕ повторяется; вызывающий код
-    (albums.download_photos, recheck-dead) пробует другие размеры — это
-    бесплатно, и «мёртвым» фото считается, только если 404 у всех. 403
-    (доступ запрещён) тоже не повторяется.
-    Повторяются только 429/5xx и сетевые сбои (с нарастающей паузой).
+    A 404 means the file is gone from the CDN while the API still returns the
+    photo's metadata, a common VK case. A 404 is not retried; the callers
+    (albums.download_photos, recheck-dead) try the other sizes, which is free,
+    and a photo counts as dead only when every size answers 404. A 403 is not
+    retried either. Only 429, 5xx and network failures are retried, with a
+    growing pause.
     """
     dest = Path(dest)
     result = {"status": "failed", "http_code": None, "bytes": 0, "error": None}
@@ -74,22 +74,22 @@ def download_file(session, url: str, dest: Path, retries: int = 4,
         try:
             with session.get(url, stream=True, timeout=timeout) as r:
                 code = r.status_code
-                if code == 404:            # файл удалён с CDN — навсегда
+                if code == 404:            # gone from the CDN for good
                     result.update(status="dead", http_code=404,
                                   error="файл удалён с CDN ВК (404)")
                     return result
-                if code == 403:            # доступ запрещён — не повторяем
+                if code == 403:            # forbidden: no retry
                     result.update(status="forbidden", http_code=403,
                                   error="доступ запрещён (403)")
                     return result
                 if code != 200:
-                    raise IOError("HTTP {}".format(code))
+                    raise OSError("HTTP {}".format(code))
                 with open(tmp, "wb") as f:
                     for chunk in r.iter_content(65536):
                         if chunk:
                             f.write(chunk)
             if tmp.stat().st_size < min_bytes:
-                raise IOError("файл подозрительно мал")
+                raise OSError("файл подозрительно мал")
             tmp.replace(dest)
             result.update(status="ok", http_code=200, bytes=dest.stat().st_size)
             return result
@@ -104,7 +104,7 @@ def download_file(session, url: str, dest: Path, retries: int = 4,
                 code = int(m.group(1))
                 result["http_code"] = code
                 if code != 429 and code < 500:
-                    break              # прочие 4xx бессмысленно повторять
+                    break              # other 4xx: no point retrying
             if attempt == retries - 1:
                 break
             time.sleep(retry_sleep * (attempt + 1))

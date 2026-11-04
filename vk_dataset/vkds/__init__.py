@@ -1,7 +1,6 @@
-"""vkds — сборщик фото-датасетов из ВКонтакте.
+"""vkds: builds photo datasets from VK (VKontakte) groups, albums and walls.
 
-Этап 1 (полностью): альбомы сообществ в полном размере + кэш ответов.
-Руководство — README.md.
+See README.md.
 """
 
 __version__ = "0.6.0"

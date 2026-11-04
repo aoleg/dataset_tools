@@ -1,15 +1,14 @@
-"""Клиент VK API v5.199: лимит частоты, повторы ошибок, execute, бюджет вызовов,
-кэш списочных методов.
+"""VK API v5.199 client: rate limit, retries, execute, call accounting, the
+cache of the listing methods.
 
-Важно: в месячный лимит ВК (10 000 вызовов без верифицированного бизнес-профиля)
-входят ТОЛЬКО запросы к api.vk.com. Скачивание самих файлов с CDN ВК —
-бесплатно и не ограничено (см. fs.download_file). Ответы из кэша (cache.py)
-тоже бесплатны — это и делает повторные/контрольные прогоны бесплатными.
+Only requests to api.vk.com count against VK's monthly quota (10,000 calls
+without a verified business profile). Downloading the files from VK's CDN is
+free and unlimited (see fs.download_file), and so are cache hits (cache.py).
 """
 from __future__ import annotations
 
 import time
-from typing import Any, Optional
+from typing import Any
 
 import requests
 
@@ -18,8 +17,8 @@ from .cache import ApiCache
 
 API_URL = "https://api.vk.com/method/"
 API_VERSION = "5.199"
-# Повторяемые коды: 1 — неизвестная, 6 — слишком много запросов/сек,
-# 9 — flood control, 10 — внутренняя ошибка сервера.
+# Retried codes: 1 unknown error, 6 too many requests per second,
+# 9 flood control, 10 internal server error.
 RETRY_CODES = {1, 6, 9, 10}
 # 29: "Rate limit reached", the limit error (never retried); any other
 # non-retryable error whose message says "limit" is treated the same way.
@@ -32,7 +31,7 @@ def is_limit_error(code: int, message: str) -> bool:
 
 
 class VkApiError(RuntimeError):
-    """Ошибка VK API с кодом и именем метода."""
+    """A VK API error with its code and the method name."""
 
     def __init__(self, code: int, message: str, method: str = "",
                  limit: bool = False):
@@ -44,19 +43,20 @@ class VkApiError(RuntimeError):
 
 
 class VkClient:
-    """Однопоточный клиент API с троттлингом (~3 запроса/сек) и ретраями.
+    """A single-threaded API client with throttling (about 3 requests per
+    second) and retries.
 
-    Файлы с CDN качаются отдельно (fs.download_file) — они лимит не расходуют,
-    поэтому экономить нужно только вызовы call()/execute(). Тяжёлые списочные
-    методы (photos.getAlbums, photos.get) при наличии cache отдаются из кэша
-    без вызова API и без расхода бюджета.
+    CDN files are fetched separately (fs.download_file) and cost no quota, so
+    only call() and execute() need saving. With a cache, the heavy listing
+    methods (photos.getAlbums, photos.get) of scan and --dry-run come from it
+    without a call.
     """
 
     def __init__(self, token: str, delay: float = 0.35, timeout: float = 30.0,
-                 session=None, budget: Optional[Budget] = None,
+                 session=None, budget: Budget | None = None,
                  retry_sleep: float = 1.5,
-                 cache: Optional[ApiCache] = None, refresh: bool = False,
-                 ledger: Optional[Ledger] = None):
+                 cache: ApiCache | None = None, refresh: bool = False,
+                 ledger: Ledger | None = None):
         self.token = token
         self.delay = max(0.0, delay)
         self.timeout = timeout
@@ -68,9 +68,9 @@ class VkClient:
         self.session = session if session is not None else requests.Session()
         if session is None:
             self.session.headers["User-Agent"] = "vkds/0.6 (dataset harvester)"
-        self.api_calls = 0          # живых вызовов за этот запуск (для отчёта)
-        self.attempts = 0           # HTTP-попыток за запуск (с повторами и сбоями)
-        self.cache_hits = 0         # ответов отдано из кэша (бесплатно)
+        self.api_calls = 0          # successful live calls of this run (for the report)
+        self.attempts = 0           # HTTP attempts of this run (retries and failures included)
+        self.cache_hits = 0         # responses served from the cache (free)
         self._last_call = 0.0
 
     def call(self, method: str, _live: bool = False, **params: Any) -> dict:
@@ -132,11 +132,7 @@ class VkClient:
         raise VkApiError(-1, "сеть недоступна: {}".format(last_err), method)
 
     def execute(self, code: str) -> Any:
-        """execute: до 25 методов API за один вызов.
-
-        Основной способ экономии месячного лимита на больших объёмах
-        (стены, комментарии); пока не используется.
-        """
+        """execute: up to 25 API methods in one call. Not used by the verbs."""
         return self.call("execute", code=code)
 
     def _record(self, method: str, ok: bool) -> None:

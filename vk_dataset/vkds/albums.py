@@ -1,46 +1,48 @@
-"""Этап 1: сканирование и скачивание фотоальбомов сообщества ВК.
+"""Albums of a VK group: scan, peek and download.
 
-Структура датасета (с версии 0.3, имена файлов с 0.5):
-  <out>/<папка группы — по НАЗВАНИЮ группы>/<папка альбома — по НАЗВАНИЮ>/photo<owner>_<id>.jpg
+Dataset layout (since 0.3, file names since 0.5):
+  <out>/<group folder, named after the group's title>/<album folder, after its title>/photo<owner>_<id>.jpg
 
-Имя файла — форма ВК photo<owner_id>_<photo_id> с владельцем со знаком
-(photo-9642436_457239017 у фото группы, photo123_456 у фото пользователя):
-уникально между группами. Старые photo_<id>.jpg (до 0.5) при докачке
-считаются существующими; переименование — глагол migrate.
+The file name is VK's own id form photo<owner_id>_<photo_id> with the signed
+owner (photo-12345_456239017 for a group photo, photo123_456 for a user's),
+unique across groups. An old photo_<id>.jpg (before 0.5) counts as existing on
+a resume; the verb migrate renames it.
 
-Рядом с фото и альбомами:
-  photo<owner>_<id>.txt — очищенная подпись фото (без ссылок, хэштегов и
-                    упоминаний), имя как у фото — пары «картинка-текст»;
-  album.txt       — название, описание, даты и статистика выгрузки альбома;
-  metadata.json   — машинные данные всех фото (тексты, даты, гео, лайки).
+Next to the photos and albums:
+  photo<owner>_<id>.txt  the cleaned caption (no links, hashtags or mentions),
+                         named like the photo: image and text pairs; never
+                         rewritten once it exists;
+  album.txt              title, description, dates and the run statistics;
+  metadata.json          the machine data of every photo (texts, dates,
+                         coordinates, likes).
 
-На уровне папки группы:
-  _manifest.csv     — таблица ВСЕХ фото (включая мёртвые) со статусами —
-                      основа для сборки датасета;
-  _dead_photos.json — реестр мёртвых фото (404 на CDN ВК) с полными
-                      метаданными и ссылками на все размеры (для попыток
-                      восстановления);
-  _albums.json      — индекс альбомов; _group.json — данные группы.
+In the group folder:
+  _manifest.csv     every photo (dead ones included) with its status, the base
+                    for building a dataset;
+  _dead_photos.json the registry of dead photos (404 on VK's CDN) with their
+                    full metadata and the URLs of every size;
+  _albums.json      the album index; _group.json the group data.
 
-Мёртвые фото (файл удалён с CDN ВК, но API по-прежнему отдаёт метаданные) —
-частая проблема ВК: 404 на лучшей копии -> пробуются все остальные размеры
-(бесплатно); только если все ответили 404, фото попадает в реестр, и при
-следующих запусках CDN вообще не дёргается (TTL 30 дней; --recheck-dead и
-глагол recheck-dead перепроверяют — ВК иногда восстанавливает файлы).
+Dead photos (the file is gone from VK's CDN while the API still returns its
+metadata) are common: a 404 on the best copy tries every other size (free);
+only when every size answers 404 does the photo enter the registry, and later
+runs do not touch the CDN for it (30 days; --recheck-dead and the verb
+recheck-dead check again, VK sometimes restores files).
 
-Списки при скачивании (D7): настоящий прогон берёт photos.getAlbums и
-photos.get только живыми (и пишет кэш); кэш читают лишь scan и --dry-run.
-Альбом, у которого по манифесту и диску ничего не недостаёт, пропускается
-без единого вызова photos.get.
+Listing (D7): a real run reads photos.getAlbums and photos.get live and writes
+the cache; only scan and --dry-run read it. An album with nothing missing
+according to the manifest and the disk costs no photos.get. A file moved away
+from its path (by deduplicate, unrelated.py or by hand) counts as settled
+(`moved`) and is not fetched again unless --redownload-missing.
 
-Совпадающие названия разных альбомов получают суффикс "__<id>"; раннее
-назначенные папки при докачке не меняются. Датасеты vkds 0.2 (папка группы
-по screen_name) автоматически мигрируются: докачка идёт в прежние папки.
+Equal titles of different albums get the suffix "__<id>"; folders assigned
+once never change on a resume. Datasets of vkds 0.2 (group folder named after
+screen_name) resume into their old folders.
 
-Команды для ИИ-агента (дешёвая разведка -> решение -> скачивание):
-  run_scan_albums() — список альбомов с размерами, без скачивания;
-  run_peek()        — пробные фото альбома для визуальной оценки;
-  run_albums()      — скачивание отобранных альбомов.
+Steps for the agent (cheap reconnaissance, decision, download):
+  run_scan_albums()  the albums with their sizes, no download;
+  run_peek()         sample photos of an album for a look;
+  run_albums()       download the selected albums.
 """
 from __future__ import annotations
 
@@ -49,7 +51,7 @@ import math
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from .api import VkApiError, VkClient
@@ -58,16 +60,16 @@ from .captions import clean_caption
 from .fs import download_file, read_json, sanitize_dirname, write_json
 from .models import AlbumInfo, GroupInfo
 
-ALBUMS_PER_PAGE = 100            # максимум photos.getAlbums
-PHOTOS_PER_PAGE = 1000           # максимум photos.get
-SIZE_TYPE_ORDER = "smxopqryzw"   # возрастание размера копий (w — максимальный)
+ALBUMS_PER_PAGE = 100            # the maximum of photos.getAlbums
+PHOTOS_PER_PAGE = 1000           # the maximum of photos.get
+SIZE_TYPE_ORDER = "smxopqryzw"   # copy types by growing size (w is the largest)
 SPECIAL_ALBUMS = {
     "wall": "Фотографии со стены",
     "saved": "Сохранённые фотографии",
     "profile": "Фотографии профиля",
 }
 DEFAULT_DIR_PATTERN = "{group_name}/{album}"
-DEAD_TTL_DAYS = 30               # сколько дней верим реестру мёртвых фото
+DEAD_TTL_DAYS = 30               # days the dead registry is trusted
 
 MANIFEST_NAME = "_manifest.csv"
 MANIFEST_COLS = [
@@ -84,29 +86,29 @@ MANIFEST_COLS = [
 
 @dataclass
 class AlbumsOptions:
-    """Параметры скачивания альбомов."""
+    """Options of an albums download."""
 
-    album_ids: list = field(default_factory=list)  # только эти альбомы (id строками)
-    title_regex: str = ""            # фильтр по названию/описанию альбома
-    include_wall: bool = False       # системный альбом «фото со стены»
-    min_area: int = 0                # пропускать фото мельче N пикселей
-    min_side: int = 0                # пропускать фото, у которых сторона меньше N
+    album_ids: list = field(default_factory=list)  # only these albums (ids as strings)
+    title_regex: str = ""            # filter on the album title or description
+    include_wall: bool = False       # the system album of wall photos
+    min_area: int = 0                # skip photos under N pixels
+    min_side: int = 0                # skip photos with a side under N
     redownload_missing: bool = False  # fetch again the photos whose file was moved away
-    workers: int = 4                 # параллельных потоков загрузки CDN
-    dry_run: bool = False            # только показать план
-    no_meta: bool = False            # не писать metadata.json / album.txt / .txt
+    workers: int = 4                 # parallel CDN download threads
+    dry_run: bool = False            # only print the plan
+    no_meta: bool = False            # write no metadata.json, album.txt or .txt
     dir_pattern: str = DEFAULT_DIR_PATTERN
-    dl_retry_sleep: float = 1.5      # пауза между повторами загрузки файла
-    recheck_dead: bool = False       # перепроверять известные мёртвые фото
+    dl_retry_sleep: float = 1.5      # pause between retries of a file download
+    recheck_dead: bool = False       # check the known dead photos again
     dead_ttl_days: int = DEAD_TTL_DAYS
 
 
 # ----------------------------------------------------------------------------
-# Вспомогательные функции
+# Helpers
 # ----------------------------------------------------------------------------
 
 def photo_stem(owner_id, photo_id) -> str:
-    """VK's own id form: photo-9642436_457239017 (group), photo123_456 (user)."""
+    """VK's own id form: photo-12345_456239017 (group), photo123_456 (user)."""
     return "photo{}_{}".format(int(owner_id), photo_id)
 
 
@@ -150,10 +152,10 @@ def size_score(s: dict) -> tuple:
 
 
 def size_candidates(photo: dict, limit: int = 64) -> list:
-    """Копии фото, отсортированные по убыванию размера (первая — лучшая).
+    """The copies of a photo, largest first (the first is the best).
 
-    У фото, загруженных до 2012 года, width/height бывают нулевыми — тогда
-    размер сравнивается по типу копии (s < m < x < ... < w, w до 2560x2048).
+    Photos uploaded before 2012 may have zero width and height; then the type
+    letter decides (s < m < x < ... < w, w up to 2560x2048), see size_score.
     """
     sizes = [s for s in (photo.get("sizes") or []) if s.get("url")]
     return sorted(sizes, key=size_score, reverse=True)[:max(1, limit)]
@@ -172,7 +174,7 @@ def too_small(w, h, min_area: int = 0, min_side: int = 0) -> bool:
 
 
 def pick_best_size(photo: dict) -> dict | None:
-    """Выбирает копию фото максимального размера из массива sizes."""
+    """The largest copy of a photo from its sizes."""
     cands = size_candidates(photo, 1)
     return cands[0] if cands else None
 
@@ -180,17 +182,17 @@ def pick_best_size(photo: dict) -> dict | None:
 def iso_date(unix) -> str | None:
     if not unix:
         return None
-    return datetime.fromtimestamp(int(unix), tz=timezone.utc).isoformat()
+    return datetime.fromtimestamp(int(unix), tz=UTC).isoformat()
 
 
 def parse_group_ref(value: str) -> str:
-    """Короткое имя / id / ссылка сообщества -> ref для groups.getById."""
+    """A short name, id or link of a group -> the ref for groups.getById."""
     g = str(value or "").strip()
     for dom in ("vk.com/", "vk.ru/", "m.vk.com/", "new.vk.com/"):
         if dom in g:
             g = g.split(dom, 1)[1].split("?", 1)[0].strip("/")
             break
-    if "/" in g:  # напр. vk.ru/examplegroup/photos или /album… — берём первый сегмент
+    if "/" in g:  # e.g. vk.ru/examplegroup/photos or /album...: take the first segment
         g = g.split("/", 1)[0]
     g = g.lstrip("-")
     for prefix in ("public", "club", "event", "group"):
@@ -200,7 +202,7 @@ def parse_group_ref(value: str) -> str:
 
 
 def resolve_groups(client: VkClient, targets) -> list[GroupInfo]:
-    """Определяет сообщества по именам/ссылкам. Все группы — одним вызовом API."""
+    """Resolve groups by name or link, all of them in one API call."""
     refs = []
     for t in targets:
         r = parse_group_ref(t)
@@ -228,7 +230,7 @@ def resolve_groups(client: VkClient, targets) -> list[GroupInfo]:
     except VkApiError as e0:
         if e0.limit:
             raise
-        # одна из ссылок битая — определяем по одной, плохие пропускаем
+        # one of the refs is broken: resolve one by one, skip the bad ones
         groups, last = [], None
         for r in refs:
             try:
@@ -241,7 +243,7 @@ def resolve_groups(client: VkClient, targets) -> list[GroupInfo]:
                 last = e
                 print("[!] Сообщество «{}» не найдено: {}".format(r, e))
         if not groups and last is not None:
-            raise last
+            raise last from e0
     seen, uniq = set(), []
     for g in groups:
         if g.id not in seen:
@@ -252,9 +254,9 @@ def resolve_groups(client: VkClient, targets) -> list[GroupInfo]:
 
 def fetch_albums(client: VkClient, group: GroupInfo,
                  live: bool = False) -> list[AlbumInfo]:
-    """Полный список обычных альбомов сообщества (постранично, 100/вызов).
+    """Every regular album of a group (paged, 100 per call).
 
-    live=True (настоящий прогон, D7) — мимо кэша, ответ пишется в кэш.
+    live=True (a real run, D7) reads past the cache and writes the response.
     """
     albums, offset = [], 0
     while True:
@@ -282,10 +284,9 @@ def fetch_albums(client: VkClient, group: GroupInfo,
 
 def fetch_photos(client: VkClient, group: GroupInfo, album_id: str,
                  live: bool = True) -> list[dict]:
-    """Все фотографии одного альбома (постранично, до 1000/вызов).
+    """Every photo of one album (paged, up to 1000 per call).
 
-    Для скачивания список всегда живой (D7): URL копий подписаны и могут
-    устаревать.
+    Listed live for a download (D7): the copy URLs are signed and may expire.
     """
     photos, offset = [], 0
     while True:
@@ -302,7 +303,7 @@ def fetch_photos(client: VkClient, group: GroupInfo, album_id: str,
 
 
 def make_record(photo: dict) -> dict:
-    """Фото из ответа API -> плоская запись для metadata.json / пайплайна."""
+    """A photo of the API response -> the flat record of metadata.json."""
     cands = size_candidates(photo)
     best = cands[0] if cands else None
     return {
@@ -316,7 +317,7 @@ def make_record(photo: dict) -> dict:
         "likes": (photo.get("likes") or {}).get("count"),
         "comments": (photo.get("comments") or {}).get("count"),
         "url": best.get("url") if best else None,
-        "alt_urls": [s["url"] for s in cands[1:]],   # все копии меньшего размера
+        "alt_urls": [s["url"] for s in cands[1:]],   # every smaller copy
         "alt_sizes": [{k: s.get(k) for k in ("type", "width", "height")}
                       for s in cands[1:]],
         "width": best.get("width") if best else None,
@@ -326,7 +327,7 @@ def make_record(photo: dict) -> dict:
 
 
 def select_albums(albums: list[AlbumInfo], opts: AlbumsOptions) -> list[AlbumInfo]:
-    """Фильтрует альбомы по --album-id / --title-regex, добавляет системные."""
+    """Filter the albums by --album-id and --title-regex, add the system albums."""
     wanted = {str(a) for a in (opts.album_ids or [])}
     rx = re.compile(opts.title_regex, re.IGNORECASE) if opts.title_regex else None
     sel = []
@@ -336,7 +337,7 @@ def select_albums(albums: list[AlbumInfo], opts: AlbumsOptions) -> list[AlbumInf
         if rx and not (rx.search(a.title) or rx.search(a.description)):
             continue
         sel.append(a)
-    # Системные альбомы (wall и др.) отсутствуют в обычном списке
+    # System albums (wall and others) are not in the regular list
     for key, title in SPECIAL_ALBUMS.items():
         if (wanted and key in wanted) or \
            (key == "wall" and opts.include_wall and not wanted):
@@ -345,11 +346,11 @@ def select_albums(albums: list[AlbumInfo], opts: AlbumsOptions) -> list[AlbumInf
 
 
 # ----------------------------------------------------------------------------
-# Реестр мёртвых фото (404 на CDN ВК)
+# The dead photo registry (404 on VK's CDN)
 # ----------------------------------------------------------------------------
 
 def load_dead(gdir: Path) -> dict:
-    """Читает _dead_photos.json группы: {"<owner>_<photo_id>": entry, ...}."""
+    """The group's _dead_photos.json: {"<owner>_<photo_id>": entry, ...}."""
     data = read_json(Path(gdir) / "_dead_photos.json", None)
     return data if isinstance(data, dict) else {}
 
@@ -360,10 +361,10 @@ def save_dead(gdir: Path, dead: dict) -> None:
 
 def make_dead_entry(group: GroupInfo, album: AlbumInfo, photo: dict,
                     http_code: int = 404, urls_live: bool = True) -> dict:
-    """Полная карточка мёртвого фото: всё, что осталось кроме самого файла.
+    """The full card of a dead photo: everything that is left but the file.
 
-    Сохраняются подпись, дата, лайки, ссылки на ВСЕ размеры (пригодятся для
-    попыток восстановления через web.archive.org или повторной проверки).
+    The caption, date, likes and the URLs of every size are kept (for a later
+    check or a recovery attempt).
     """
     best = pick_best_size(photo)
     owner = photo.get("owner_id", group.owner_id)
@@ -391,7 +392,7 @@ def make_dead_entry(group: GroupInfo, album: AlbumInfo, photo: dict,
 
 
 def register_dead(dead: dict, entry: dict) -> None:
-    """Добавляет/обновляет запись в реестре (ключ — owner_photo_id)."""
+    """Add or update a registry entry (key <owner>_<photo_id>)."""
     key = "{}_{}".format(entry.get("owner_id"), entry.get("photo_id"))
     old = dead.get(key)
     if old:
@@ -402,19 +403,19 @@ def register_dead(dead: dict, entry: dict) -> None:
 
 
 def _dead_is_fresh(entry: dict, ttl_days: int) -> bool:
-    """Свежесть проверки: верим реестру TTL дней (по умолчанию 30).
+    """Whether the registry's last check is recent (TTL days, 30 by default).
 
-    Отметка, которая не разбирается (или без часового пояса), — устаревшая.
+    A timestamp that does not parse, or has no time zone, counts as stale.
     """
     try:
         t = datetime.fromisoformat(str(entry.get("last_checked")))
-        return (datetime.now(timezone.utc) - t).days < max(1, ttl_days)
+        return (datetime.now(UTC) - t).days < max(1, ttl_days)
     except Exception:
         return False
 
 
 # ----------------------------------------------------------------------------
-# Индекс альбомов и назначение папок
+# The album index and the folder assignment
 # ----------------------------------------------------------------------------
 
 def load_index(gdir: Path) -> dict:
@@ -427,7 +428,7 @@ def load_index(gdir: Path) -> dict:
 
 
 def merge_index(idx: dict, group: GroupInfo, entries: list[dict]) -> dict:
-    """Вливает записи альбомов в индекс группы, сохраняя порядок и историю."""
+    """Merge album entries into the group's index, keeping order and history."""
     by_id = {str(e.get("id")): e for e in idx["albums"]}
     order = [str(e.get("id")) for e in idx["albums"]]
     for e in entries:
@@ -444,24 +445,24 @@ def merge_index(idx: dict, group: GroupInfo, entries: list[dict]) -> dict:
 
 
 def group_dir_segment(pattern: str, group: GroupInfo) -> str:
-    """Уровень папки группы из шаблона (первый сегмент пути)."""
+    """The group level of the folder pattern (its first path segment)."""
     head = pattern.split("/", 1)[0]
     cand = head.format(group=group.dir_key, group_id=group.id,
                        group_name=group.name_key, album="", album_id="")
     if "{album" in cand or not cand.strip():
-        cand = group.name_key       # шаблон без уровня группы
+        cand = group.name_key       # a pattern without a group level
     return sanitize_dirname(cand) or group.dir_key
 
 
 def assign_group_dir(out_root: Path, group: GroupInfo, pattern: str,
                      register: bool = True) -> str:
-    """Папка группы в датасете — по НАЗВАНИЮ группы (по умолчанию с 0.3).
+    """The group folder of the dataset, named after the group's title (since 0.3).
 
-    Порядок разрешения:
-      1. прежняя папка из реестра <out>/_groups.json (докачка не переезжает);
-      2. миграция датасетов vkds 0.2: если есть <out>/<screen_name>/_group.json;
-      3. название группы (name_key), при совпадении названий разных групп —
-         суффикс "__<screen_name|id>".
+    Resolution order:
+      1. the folder recorded in <out>/_groups.json (a resume never moves);
+      2. a dataset of vkds 0.2: <out>/<screen_name>/_group.json exists;
+      3. the group's title (name_key); equal titles of different groups get
+         the suffix "__<screen_name|id>".
     """
     out_root = Path(out_root)
     reg_path = out_root / "_groups.json"
@@ -473,7 +474,7 @@ def assign_group_dir(out_root: Path, group: GroupInfo, pattern: str,
     if prev_dir:
         return str(prev_dir)
     if (out_root / group.dir_key / "_group.json").is_file():
-        cand = group.dir_key                       # миграция датасета 0.2.x
+        cand = group.dir_key                       # a dataset of vkds 0.2.x
     else:
         cand = group_dir_segment(pattern, group)
     used = {str((v or {}).get("dir")) for v in reg["groups"].values()}
@@ -493,19 +494,19 @@ def assign_group_dir(out_root: Path, group: GroupInfo, pattern: str,
 
 def assign_dirs(group: GroupInfo, albums: list[AlbumInfo], pattern: str,
                 prev: dict, group_dir: str | None = None) -> dict:
-    """id альбома -> относительный путь папки (от корня датасета).
+    """Album id -> the folder path relative to the dataset root.
 
-    Ранее назначенные пути (prev, из _albums.json) не меняются — докачка
-    всегда попадает в те же папки. При совпадении названий разных альбомов
-    к имени второго добавляется "__<id>" (если в шаблоне нет {album_id}).
+    Paths assigned before (prev, from _albums.json) never change, so a resume
+    lands in the same folders. Equal album titles give the second one the
+    suffix "__<id>" (unless the pattern has {album_id}).
 
-    group_dir — уже разрешённая папка группы (с учётом коллизий названий
-    и миграции датасетов 0.2): первый сегмент шаблона заменяется ею, чтобы
-    альбомы легли в ту же папку, что и служебные файлы группы.
+    group_dir is the group folder already resolved (title collisions, 0.2
+    datasets): it replaces the pattern's first segment, so the albums land in
+    the folder that holds the group's service files.
     """
     if group_dir and "/" in pattern:
         head, tail = pattern.split("/", 1)
-        if "{album" in tail:          # шаблон вида <группа>/<альбом...>
+        if "{album" in tail:          # a pattern of the form <group>/<album...>
             pattern = "{}/{}".format(group_dir, tail)
     has_id = "{album_id}" in pattern
     dirs, used = {}, set(prev.values())
@@ -577,23 +578,23 @@ def download_photos(session, records: list[dict], dest_dir: Path,
                     recheck_dead: bool = False,
                     dead_ttl_days: int = DEAD_TTL_DAYS,
                     write_txt: bool = True, moved: dict | None = None) -> list[dict]:
-    """Скачивает фото параллельно с CDN; в записи добавляются file/status.
+    """Download photos from the CDN in parallel; file and status go into each record.
 
-    Статусы: ok (скачано), exists (уже было), small (отфильтровано по площади),
-    dead (404 — файл удалён с CDN ВК), forbidden (403), failed (не скачалось),
-    no_url (нет копий в ответе API).
+    Statuses: ok (downloaded), exists (already there), small (under
+    --min-area or --min-side), dead (404, gone from VK's CDN), forbidden (403),
+    failed (not downloaded), no_url (no copy in the API response), moved (the
+    file was moved away from its manifest path: settled, not fetched again).
 
-    Мёртвые фото: известные по реестру _dead_photos.json (проверка свежее
-    dead_ttl_days) вообще не дёргают CDN — повторные запуски бесплатны.
-    При неудаче лучшей копии (404, 403, сбой) пробуются ВСЕ меньшие копии
-    (alt_urls; меньше min_area или со стороной меньше min_side — пропускаются),
-    без вызовов API. dead — только
-    если каждая опробованная копия ответила 404; использованная меньшая копия
-    отмечается в записи (fallback_from, url_used, её размеры).
+    Dead photos known to _dead_photos.json (checked within dead_ttl_days) do
+    not touch the CDN, so reruns are free. When the best copy fails (404, 403,
+    an error) every smaller copy is tried (alt_urls; copies under min_area or
+    with a side under min_side are skipped), without any API call. dead only
+    when every tried copy answered 404; a smaller copy that was used is
+    recorded (fallback_from, url_used, its size).
 
-    Имя файла — photo<owner>_<id>.jpg; файл старой формы photo_<id>.jpg
-    считается существующим. Для скачанных/существующих фото с подписью
-    пишется <имя файла>.txt с очищенной подписью (clean_caption).
+    The file name is photo<owner>_<id>.jpg; an old photo_<id>.jpg counts as
+    existing. Downloaded or existing photos with a caption get a
+    <file name>.txt with the cleaned caption, unless one exists.
     """
     dead = dead if dead is not None else {}
     dest_dir = Path(dest_dir)
@@ -613,7 +614,7 @@ def download_photos(session, records: list[dict], dest_dir: Path,
             rec["status"] = "exists"
             continue
         if old.exists() and old.stat().st_size > 0:
-            rec["file"] = old.name        # датасет до 0.5, ещё не migrate
+            rec["file"] = old.name        # a dataset before 0.5, not migrated yet
             rec["status"] = "exists"
             continue
         gone = (moved or {}).get(photo_key(rec.get("owner_id"), rec["id"]))
@@ -629,17 +630,17 @@ def download_photos(session, records: list[dict], dest_dir: Path,
         jobs.append((rec, dest))
 
     def _fetch(rec, dest):
-        """Лучшая копия, затем все меньшие; dead — только если все 404."""
+        """The best copy, then every smaller one; dead only when all are 404."""
         best = {"type": rec.get("size_type"), "width": rec.get("width"),
                 "height": rec.get("height")}
         alts = list(rec.get("alt_urls") or [])
         alt_sizes = list(rec.get("alt_sizes") or [])
-        alt_sizes += [{}] * (len(alts) - len(alt_sizes))
-        tries = [(rec["url"], best)] + [(u, s or {}) for u, s in zip(alts, alt_sizes) if u]
+        alt_sizes = (alt_sizes + [{}] * len(alts))[:len(alts)]
+        tries = [(rec["url"], best)] + [(u, s or {}) for u, s in zip(alts, alt_sizes, strict=True) if u]
         statuses = []
         for i, (u, sz) in enumerate(tries):
             if i and too_small(sz.get("width"), sz.get("height"), min_area, min_side):
-                continue                 # копия мельче фильтра — не годится
+                continue                 # a copy under the gates does not qualify
             res = download_file(session, u, dest, retry_sleep=retry_sleep)
             statuses.append(res["status"])
             if res["status"] == "ok":
@@ -681,12 +682,12 @@ def download_photos(session, records: list[dict], dest_dir: Path,
 
 
 # ----------------------------------------------------------------------------
-# Описание альбома и манифест датасета
+# The album description and the dataset manifest
 # ----------------------------------------------------------------------------
 
 def write_album_txt(album_dir: Path, group: GroupInfo, album: AlbumInfo,
                     stats: dict) -> None:
-    """Человекочитаемое описание альбома — album.txt рядом с фото."""
+    """A readable description of the album: album.txt next to its photos."""
     link = ("https://vk.com/album{}_{}".format(group.owner_id, album.id)
             if str(album.id).isdigit() else "-")
     lines = [
@@ -719,7 +720,7 @@ def write_album_txt(album_dir: Path, group: GroupInfo, album: AlbumInfo,
 
 
 def read_manifest(gdir: Path) -> dict:
-    """_manifest.csv группы: {(album_id, photo_id): row} в порядке файла."""
+    """The group's _manifest.csv: {(album_id, photo_id): row} in file order."""
     path = Path(gdir) / MANIFEST_NAME
     rows = {}
     if path.is_file():
@@ -746,18 +747,19 @@ def write_manifest(gdir: Path, rows: dict) -> Path:
 def update_manifest(gdir: Path, out_root: Path, group: GroupInfo,
                     album: AlbumInfo, records: list[dict],
                     rel_dir: str, extra: dict | None = None) -> Path:
-    """Обновляет _manifest.csv группы: по строке на КАЖДОЕ фото альбома.
+    """Update the group's _manifest.csv: one row for EVERY photo of the album.
 
-    Манифест — основа для сборки датасета: пути к файлам, имя .txt с
-    очищенной подписью, статусы, размеры; колонка text — подпись как есть.
-    Мёртвые фото тоже входят (status=dead) — их подписи и метаданные
-    сохраняются для восстановления. Строки других альбомов не трогаются;
-    строки обрабатываемого альбома заменяются.
+    The manifest is the base for building a dataset: the file paths, the name
+    of the .txt with the cleaned caption, statuses, sizes; the text column
+    holds the caption as it is. Dead photos are in it too (status dead), with
+    their captions and metadata. Rows of other albums are kept; the rows of
+    this album are replaced.
 
-    extra — поля, общие для всех строк (у постов стены: post_id, post_date,
-    repost_from, reposts, likes и comments поста). Запись со статусом dup
-    (фото уже есть в другом месте группы) получает путь существующего файла
-    из dup_path.
+    extra holds the fields shared by every row (for wall posts: post_id,
+    post_date, repost_from, reposts, likes and comments of the post). A
+    record with status dup (the photo already has a file elsewhere in the
+    group) gets the path of that file from dup_path. A record with status
+    moved keeps its old row and gets the date in the moved column.
     """
     gdir, out_root = Path(gdir), Path(out_root)
     rows = read_manifest(gdir)
@@ -775,7 +777,7 @@ def update_manifest(gdir: Path, out_root: Path, group: GroupInfo,
                        txt=gone.get("txt") or "", moved=gone.get("moved") or now_iso()[:10])
         fname = rec.get("file") or ""
         if rec.get("status") not in ("ok", "exists"):
-            fname = ""                # файла нет (dead/failed/small) — не указываем
+            fname = ""                # no file (dead, failed, small): no path
         rel = (Path(rel_dir) / fname).as_posix() if fname else ""
         if rec.get("status") == "dup" and rec.get("dup_path"):
             rel = rec["dup_path"]
@@ -829,13 +831,13 @@ def row_done(r: dict, out_root: Path, dead: dict, opts) -> str | None:
 
 def reconcile_album(rows: list[dict], album: AlbumInfo, entry: dict,
                     out_root: Path, dead: dict, opts: AlbumsOptions) -> dict | None:
-    """Сверка альбома с манифестом и диском без вызовов API (D7).
+    """Reconcile an album with the manifest and the disk, without any API call (D7).
 
-    Возвращает счётчики, если у альбома ничего не недостаёт: число строк
-    равно размеру альбома из живого photos.getAlbums (или размер и дата
-    обновления те же, что при последнем живом списке), каждый файл ok/exists
-    на диске, каждое мёртвое фото свежо в реестре, каждое small мельче
-    текущего --min-area. Иначе None — альбом надо листать живым.
+    Returns the counters when nothing is missing: the row count equals the
+    album size of the live photos.getAlbums (or size and update date equal
+    those of the last live listing), every ok or exists file is on disk or was
+    moved away, every dead photo is fresh in the registry, every small one is
+    still under the current gates. Otherwise None: the album is listed live.
     """
     if album.is_special or album.size is None or not rows:
         return None
@@ -855,12 +857,12 @@ def reconcile_album(rows: list[dict], album: AlbumInfo, entry: dict,
 
 
 # ----------------------------------------------------------------------------
-# Основные сценарии
+# The verbs
 # ----------------------------------------------------------------------------
 
 def run_albums(client: VkClient, targets, out_root, opts: AlbumsOptions) -> dict:
-    """Скачивает альбомы сообществ (может быть несколько) в структуру
-    <out>/<название группы>/<название альбома>/. Возвращает сводку."""
+    """Download the albums of one or more groups into
+    <out>/<group title>/<album title>/. Returns a summary."""
     out_root = Path(out_root)
     groups = resolve_groups(client, targets)
     report = {"groups": [], "api_calls": client.api_calls}
@@ -900,8 +902,8 @@ def _process_group(client: VkClient, group: GroupInfo, out_root: Path,
                 "albums": [dict(id=a.id, title=a.title, size=a.size,
                                 dir=dirs[str(a.id)]) for a in selected]}
 
-    # Фиксируем индекс и инфо о группе ДО скачивания: назначение папок
-    # сохранится даже при обрыве в середине.
+    # Write the index and the group data BEFORE the download, so the folder
+    # assignment survives an interruption.
     entries = []
     for al in selected:
         e = al.as_dict()
@@ -996,8 +998,8 @@ def _process_album(client: VkClient, group: GroupInfo, album: AlbumInfo,
         arep["index"]["status"] = "empty"
         return arep
 
-    # защита от дублей одного фото в ответе API (сбой пагинации, повторные
-    # записи): иначе параллельные потоки пишут один и тот же файл
+    # guard against the same photo twice in the API response (a paging slip):
+    # otherwise two threads write one file
     uniq, seen = [], set()
     for p in photos:
         pid = p.get("id")
@@ -1027,7 +1029,7 @@ def _process_album(client: VkClient, group: GroupInfo, album: AlbumInfo,
                  "dead": st["dead"], "forbidden": st["forbidden"],
                  "moved": st["moved"]})
 
-    # Новые мёртвые фото -> реестр группы (сохраняем всё, что осталось)
+    # New dead photos go to the group's registry (with everything that is left)
     if dead is not None:
         photos_by_id = {p.get("id"): p for p in photos}
         new_dead = 0
@@ -1095,10 +1097,10 @@ def _print_dry_run(group, albums, selected, dirs):
 
 
 def run_scan_albums(client: VkClient, target, out_root) -> dict:
-    """Разведка для агента: список альбомов группы с размерами и датами.
+    """Reconnaissance for the agent: the albums of a group with sizes and dates.
 
-    Стоимость: 1 вызов groups.getById + 1 на каждые 100 альбомов.
-    Результат сохраняется в <out>/<группа>/_albums.json (статус «scanned»).
+    Cost: 1 groups.getById + 1 call per 100 albums. The result goes to
+    <out>/<group>/_albums.json (status "scanned").
     """
     out_root = Path(out_root)
     group = resolve_groups(client, [target])[0]
@@ -1138,12 +1140,11 @@ def run_scan_albums(client: VkClient, target, out_root) -> dict:
 
 def run_peek(client: VkClient, target, album_id, limit: int, offset: int,
              out_root, min_side: int = 0) -> dict:
-    """Пробная выборка фото альбома — «глаза» агента перед решением.
+    """Sample photos of an album, the agent's eyes before a decision.
 
-    Стоимость: 1 вызов photos.get (+1 groups.getById, если группа ещё не
-    известна). Файлы скачиваются с CDN в полном размере — бесплатно.
-    Складываются в <out>/_peek/<группа>/album_<id>/ вместе с _meta.json;
-    мёртвые (404) помечаются статусом dead.
+    Cost: 1 photos.get (+1 groups.getById). The files come from the CDN at
+    full size, for free, into <out>/_peek/<group>/album_<id>/ with _meta.json;
+    dead ones (404) get status dead, and copies under --min-side status small.
     """
     out_root = Path(out_root)
     group = resolve_groups(client, [target])[0]

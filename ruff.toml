@@ -1,0 +1,13 @@
+# ruff, check only (no ruff format), for every tool of the repository.
+# Installed by hand into the shared venv, never by an install.bat:
+#   venv\Scripts\python.exe -m pip install ruff==0.17.3
+# Run from the repository root: venv\Scripts\python.exe -m ruff check <tool folder>
+target-version = "py313"
+line-length = 120
+extend-exclude = ["venv", ".claude", "datasorterv1.3"]
+
+[lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+# The .format calls stay: in vk_dataset they are the partner-facing Russian
+# output and keep their shape.
+ignore = ["UP031", "UP032"]

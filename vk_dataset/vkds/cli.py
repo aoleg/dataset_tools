@@ -1,30 +1,28 @@
-"""CLI vkds: сборщик фото-датасетов из ВКонтакте.
+"""The vkds command line: photo datasets from VK groups.
 
-Этап 1 (текущий) — альбомы сообществ. Глаголы:
+Verbs (the cost in API calls in brackets):
 
-  albums        скачать альбомы группы в <название группы>/<название
-                альбома>/ (полный размер, описания, photo<owner>_<id>.txt)
-  scan albums   разведка: список альбомов без скачивания (для ИИ-агента)
-  scan wall     индекс стены в _wall.json: посты, тексты, фото (1 вызов на 100 постов)
-  wall          скачать фото отобранных постов стены (wall.getById, 1 вызов на 100 постов)
-  peek          пробные фото альбома для визуальной оценки агентом
-  whoami        проверить токен (1 вызов API)
-  budget        журнал вызовов этой копии и датасета (0 вызовов)
-  recheck-dead  перепроверить мёртвые фото по реестру (0 вызовов, только CDN)
-  migrate       переименовать photo_<id> в photo<owner>_<id> (0 вызовов)
+  scan albums   the album index of a group (1 + 1 per 100 albums)
+  scan wall     the wall index _wall.json: posts, texts, photos (1 per 100 posts)
+  albums        download albums into <group title>/<album title>/ (full size,
+                captions in photo<owner>_<id>.txt; 1 per 1000 photos listed)
+  wall          download the photos of selected posts (wall.getById, 1 per 100 posts)
+  peek          sample photos of an album for a look (1 or 2)
+  whoami        check the token (1)
+  budget        the ledger of this checkout and the dataset journal (0)
+  recheck-dead  re-try the dead photos from the registry (0, CDN only)
+  migrate       rename photo_<id> to photo<owner>_<id> (0)
 
-Запуск: run.bat <глагол> ... из папки инструмента или откуда угодно, например
+Run as run.bat <verb> ... from anywhere, for example
   run.bat scan albums examplegroup
   run.bat albums examplegroup --album-id 123 --dry-run
-Пути и лимиты — vkds.conf рядом с vkds.py (образец — vkds.conf.example):
-токен, папка датасетов base, пауза между вызовами.
+Paths and limits come from vkds.conf next to vkds.py (vkds.conf.example is the
+template): the token file, the datasets root base, the pause between calls.
 
-Кэш: photos.getAlbums/photos.get кэшируются в <out>/_vkds/cache (TTL 7
-дней). Читают кэш только scan и --dry-run; настоящее скачивание листает
-живым и пишет кэш, а альбом, где по манифесту ничего не недостаёт, не
-стоит ни одного вызова photos.get. --refresh читает мимо кэша, --no-cache
-отключает его.
-Руководство — README.md.
+The cache (<out>/_vkds/cache, 7 days) is read only by scan and --dry-run; a
+real download lists live and writes it, and an album with nothing missing in
+the manifest costs no photos.get. --refresh reads past the cache, --no-cache
+turns it off. Everything the tool prints is Russian (D2). See README.md.
 """
 from __future__ import annotations
 
@@ -45,7 +43,7 @@ from .wall import ScanWallOptions, WallError, WallOptions, run_scan_wall, run_wa
 
 
 def _read_token(explicit: str, conf: vconf.Conf) -> str:
-    """Приоритет: --token > переменная VK_TOKEN > файл [paths] token из vkds.conf."""
+    """Precedence: --token, then VK_TOKEN, then the file [paths] token of vkds.conf."""
     token, source = vconf.read_token(explicit, conf)
     if token and source not in ("--token", "VK_TOKEN"):
         print("Токен взят из файла {}".format(source))
@@ -54,8 +52,8 @@ def _read_token(explicit: str, conf: vconf.Conf) -> str:
 
 def build_parser(conf: vconf.Conf | None = None) -> argparse.ArgumentParser:
     conf = conf or vconf.Conf()
-    # Общие флаги разрешены и ДО, и ПОСЛЕ глагола:
-    #   run.bat --out D scan albums grp   или   run.bat scan albums grp --out D
+    # The common flags work before and after the verb:
+    #   run.bat --out D scan albums grp   or   run.bat scan albums grp --out D
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--token", default=argparse.SUPPRESS,
                         help="Ключ доступа VK API "
@@ -288,8 +286,8 @@ def main(argv=None, conf: vconf.Conf | None = None) -> int:
     ns = build_parser(conf).parse_args(argv)
     ledger = Ledger(conf.ledger, monthly=conf.monthly)
 
-    # budget не требует токена и не делает вызовов; без --out и base —
-    # только журнал этой копии
+    # budget needs no token and makes no call; without --out and base it
+    # prints the ledger of this checkout alone
     if ns.cmd == "budget":
         _print_ledger(ledger)
         try:
@@ -319,7 +317,7 @@ def main(argv=None, conf: vconf.Conf | None = None) -> int:
         print("[!] {}".format(e), file=sys.stderr)
         return 2
 
-    # recheck-dead и migrate тоже без токена и без вызовов API
+    # recheck-dead, migrate and wall --dry-run need no token and make no call
     if ns.cmd == "migrate":
         try:
             run_migrate(out_root, dry_run=ns.dry_run)
@@ -415,7 +413,7 @@ def main(argv=None, conf: vconf.Conf | None = None) -> int:
     except KeyboardInterrupt:
         print("\n[!] Прервано. Скачанное сохранено; повторный запуск докачает.")
         rc = 130
-    except Exception as e:  # непредвиденное — агенту нужен читаемый отказ
+    except Exception as e:  # unexpected: the agent needs a readable refusal
         print("\n[!] Непредвиденная ошибка: {}".format(e), file=sys.stderr)
         rc = 1
     finally:

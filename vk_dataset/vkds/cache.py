@@ -1,30 +1,28 @@
-"""Кэш ответов VK API: повторные прогоны и контрольные сверки бесплатны.
+"""Cache of VK API responses for scan and --dry-run.
 
-Кэшируются только «тяжёлые» списочные методы (photos.getAlbums, photos.get) —
-именно они дают основную массу вызовов при полном скачивании группы.
-groups.getById НЕ кэшируется: один вызов на прогон — дешёвая живая проверка,
-что группа всё ещё существует и доступна (поэтому whoami остаётся честной
-проверкой токена, а повторный прогон замечает переименование группы).
+Only the heavy listing methods are cached (photos.getAlbums, photos.get).
+groups.getById is never cached: one live call per run checks that the group
+still exists (so whoami stays an honest token check and a rerun notices a
+renamed group).
 
-Файлы: <датасет>/_vkds/cache/<метод>/<sha1(метод+параметры)>.json с полями
-ts, ts_epoch, params, response. TTL по умолчанию 7 дней (состав альбомов
-меняется редко; докачка после обрыва попадает в свежий кэш того же дня).
+Files: <dataset>/_vkds/cache/<method>/<sha1(method + parameters)>.json with
+ts, ts_epoch, params and response. The default TTL is 7 days.
 
-Кэш-хиты НЕ расходуют месячный лимит и не пишутся в budget.json. Читают
-кэш только scan и --dry-run (D7): настоящее скачивание листает живым (URL
-копий подписаны и могут устаревать) и пишет кэш; контрольный повторный
-прогон стоит groups.getById + photos.getAlbums, а альбом без недостающих
-файлов сверяется с манифестом без photos.get.
+Cache hits cost no quota and are not written to budget.json. Only scan and
+--dry-run read the cache (D7): a real download lists live (the copy URLs are
+signed and may expire) and writes the cache; a control rerun costs
+groups.getById plus photos.getAlbums, and an album with nothing missing is
+reconciled from the manifest without photos.get.
 
-Управление: --refresh — читать мимо кэша (записи обновляются),
---no-cache — полностью отключить (файлы не создаются и не читаются).
+--refresh reads past the cache (and rewrites its entries), --no-cache turns it
+off (no file is read or written).
 """
 from __future__ import annotations
 
 import hashlib
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from .budget import now_iso
 from .fs import read_json, write_json
@@ -34,17 +32,17 @@ DEFAULT_TTL_DAYS = 7.0
 
 
 class ApiCache:
-    """Простейший дисковый кэш ответов списочных методов VK API."""
+    """A plain disk cache of the responses of the listing methods."""
 
     def __init__(self, root: Path, ttl_days: float = DEFAULT_TTL_DAYS):
         self.root = Path(root)
         self.ttl = max(0.0, float(ttl_days)) * 86400.0
-        self.hits = 0      # сколько ответов отдано из кэша (для отчёта)
+        self.hits = 0      # responses served from the cache (for the report)
         self.writes = 0
 
     @staticmethod
     def _key(method: str, params: dict) -> str:
-        """Ключ = sha1(метод + отсортированные параметры)."""
+        """The key: sha1 of the method and the sorted parameters."""
         norm = "&".join("{}={}".format(k, params[k]) for k in sorted(params))
         return hashlib.sha1("{}|{}".format(method, norm)
                             .encode("utf-8")).hexdigest()
@@ -52,8 +50,8 @@ class ApiCache:
     def _path(self, method: str, key: str) -> Path:
         return self.root / method.replace(".", "_") / (key + ".json")
 
-    def get(self, method: str, params: dict) -> Optional[Any]:
-        """Ответ из кэша или None (нет файла / истёк TTL / не кэшируем)."""
+    def get(self, method: str, params: dict) -> Any | None:
+        """The cached response, or None (no file, TTL passed, not cacheable)."""
         if method not in CACHEABLE:
             return None
         data = read_json(self._path(method, self._key(method, params)), None)
@@ -66,7 +64,7 @@ class ApiCache:
         return data["response"]
 
     def put(self, method: str, params: dict, response: Any) -> None:
-        """Сохранить успешный ответ (только кэшируемые методы)."""
+        """Store a successful response (cacheable methods only)."""
         if method not in CACHEABLE:
             return
         p = self._path(method, self._key(method, params))

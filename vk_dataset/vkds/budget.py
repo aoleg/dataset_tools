@@ -18,9 +18,8 @@ separately. Cache hits and CDN downloads are free and count nowhere.
 from __future__ import annotations
 
 import calendar
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Optional
 
 from .fs import read_json, write_json
 
@@ -34,17 +33,17 @@ class BudgetExceeded(RuntimeError):
 
 
 def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(UTC).isoformat(timespec="seconds")
 
 
 def today_utc() -> date:
-    return datetime.now(timezone.utc).date()
+    return datetime.now(UTC).date()
 
 
 class Budget:
     """The per-dataset journal of successful calls plus the cap of one run."""
 
-    def __init__(self, path: Optional[Path] = None, run_limit: Optional[int] = None,
+    def __init__(self, path: Path | None = None, run_limit: int | None = None,
                  label: str = ""):
         self.path = Path(path) if path else None
         self.run_limit = run_limit
@@ -164,7 +163,7 @@ class Ledger:
     write. A ledger without a path keeps everything in memory (tests).
     """
 
-    def __init__(self, path: Optional[Path] = None, monthly: int = 10000):
+    def __init__(self, path: Path | None = None, monthly: int = 10000):
         self.path = Path(path) if path else None
         self.monthly = int(monthly)
         self.data = _norm_ledger(read_json(self.path, None) if self.path else None)

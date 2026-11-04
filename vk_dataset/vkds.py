@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Точка входа:  run.bat <глагол> ...   (run.bat --help — список глаголов)"""
+"""Entry point: run.bat <verb> ...   (run.bat --help lists the verbs)"""
 from vkds.cli import main
 
 if __name__ == "__main__":

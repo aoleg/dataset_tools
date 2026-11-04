@@ -14,9 +14,17 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .albums import (load_dead, load_index, parse_group_ref, photo_stem,
-                     read_manifest, save_dead, size_score, write_caption,
-                     write_manifest)
+from .albums import (
+    load_dead,
+    load_index,
+    parse_group_ref,
+    photo_stem,
+    read_manifest,
+    save_dead,
+    size_score,
+    write_caption,
+    write_manifest,
+)
 from .budget import now_iso
 from .fs import download_file, read_json, sanitize_dirname, write_json
 

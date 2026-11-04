@@ -1,4 +1,4 @@
-"""Модели данных: сообщество и альбом."""
+"""Data models: a group and an album."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -8,7 +8,7 @@ from .fs import sanitize_dirname
 
 @dataclass
 class GroupInfo:
-    """Сообщество ВК (id положительный; owner_id для API — отрицательный)."""
+    """A VK group (id positive; the API owner_id is negative)."""
 
     id: int
     name: str
@@ -22,10 +22,10 @@ class GroupInfo:
 
     @property
     def dir_key(self) -> str:
-        """Папка группы по короткому имени (examplegroup) или club<id>.
+        """The group folder by short name (examplegroup) or club<id>.
 
-        Историческое имя (vkds 0.2); используется для миграции старых
-        датасетов и служебных папок (_peek).
+        The folder name of vkds 0.2; used to migrate old datasets and for
+        service folders (_peek).
         """
         sn = (self.screen_name or "").strip()
         if sn and sn not in ("club{}".format(self.id), "public{}".format(self.id)):
@@ -34,11 +34,9 @@ class GroupInfo:
 
     @property
     def name_key(self) -> str:
-        """Папка группы по её НАЗВАНИЮ («Автомобили и Техника СССР…»).
-
-        Основной способ папок с версии 0.3: читаемый датасет. При пустом
-        или бесполезном названии — откат на короткое имя (dir_key).
-        """
+        """The group folder by the group's title, the default since 0.3 (a
+        readable dataset). An empty or useless title falls back to the short
+        name (dir_key)."""
         return sanitize_dirname(self.name, max_len=80) or self.dir_key
 
     def as_dict(self) -> dict:
@@ -49,15 +47,15 @@ class GroupInfo:
 
 @dataclass
 class AlbumInfo:
-    """Альбом сообщества. id — строка: числовой id либо wall/saved/profile."""
+    """An album of a group. id is a string: a number, or wall, saved or profile."""
 
     id: str
     title: str
     description: str = ""
-    size: int | None = None   # число фото по данным API (у wall — None)
+    size: int | None = None   # photos according to the API (None for wall)
     created: int | None = None
     updated: int | None = None
-    special: bool = False     # системный альбом (wall, saved, profile)
+    special: bool = False     # a system album (wall, saved, profile)
 
     @property
     def is_special(self) -> bool:

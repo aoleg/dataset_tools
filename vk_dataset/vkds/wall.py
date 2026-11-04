@@ -38,13 +38,27 @@ import math
 import re
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
-from .albums import (DEAD_TTL_DAYS, DEFAULT_DIR_PATTERN, assign_group_dir,
-                     download_photos, load_dead, make_dead_entry, make_record,
-                     note_moved, photo_key, read_manifest, register_dead, resolve_groups,
-                     row_done, save_dead, update_manifest, write_caption)
+from .albums import (
+    DEAD_TTL_DAYS,
+    DEFAULT_DIR_PATTERN,
+    assign_group_dir,
+    download_photos,
+    load_dead,
+    make_dead_entry,
+    make_record,
+    note_moved,
+    photo_key,
+    read_manifest,
+    register_dead,
+    resolve_groups,
+    row_done,
+    save_dead,
+    update_manifest,
+    write_caption,
+)
 from .api import VkClient
 from .budget import now_iso
 from .captions import clean_caption
@@ -75,14 +89,14 @@ def parse_day(value: str | None, end: bool = False) -> int | None:
         d = date.fromisoformat(str(value).strip())
     except ValueError as e:
         raise WallError("Дата «{}»: нужен формат ГГГГ-ММ-ДД.".format(value)) from e
-    t = datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
+    t = datetime(d.year, d.month, d.day, tzinfo=UTC)
     if end:
         t += timedelta(days=1, seconds=-1)
     return int(t.timestamp())
 
 
 def month_of(unix) -> str:
-    return datetime.fromtimestamp(int(unix or 0), tz=timezone.utc).strftime("%Y-%m")
+    return datetime.fromtimestamp(int(unix or 0), tz=UTC).strftime("%Y-%m")
 
 
 def _photos_of(attachments) -> list[dict]:
@@ -515,7 +529,7 @@ def gkey_of(gdir: Path) -> str:
 
 
 def _iso(unix) -> str:
-    return datetime.fromtimestamp(int(unix or 0), tz=timezone.utc).isoformat()
+    return datetime.fromtimestamp(int(unix or 0), tz=UTC).isoformat()
 
 
 def _print_wall_dry_run(sel: list, todo: list, months: Counter, est: int, gkey: str) -> None:
