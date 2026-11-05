@@ -184,6 +184,10 @@ Most photographs of the Soviet era are still protected somewhere. In Russia a ph
 
 The manifest keeps what attribution and a takedown need: the group, the album or post, the photo's id (which opens it on VK), its date and its caption.
 
+## For the partner
+
+The folder `partner\` holds the handover for the partner who runs the tool through his local agent, in Russian: what changed and the steps of the move (`ПЕРЕХОД.md`), the two OpenCode skills, and the checklist of edits to his agent files.
+
 ## Lint
 
 The code is checked with ruff from the repository root's `ruff.toml` (check only, no formatting). ruff is installed by hand, never by an `install.bat`: `venv\Scripts\python.exe -m pip install ruff==0.17.3`, then `venv\Scripts\python.exe -m ruff check vk_dataset` from the repository root.
@@ -206,3 +210,4 @@ The code is checked with ruff from the repository root's `ruff.toml` (check only
 | `vkds\fs.py`, `vkds\models.py` | file helpers and the CDN download, the group and album models |
 | `tools\capture_fixtures.py` | the capture of raw VK answers for the offline tests |
 | `vkds.conf.example` | the template of `vkds.conf` |
+| `partner\` | the Russian handover for the partner |
