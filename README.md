@@ -210,7 +210,7 @@ All tools share one virtual environment: the `venv` folder in the repository roo
 | `vk_dataset` | `requests`; runs on the CPU. Its `install.bat` needs the shared `venv` that another tool's `install.bat` creates, and makes `vkds.conf` |
 | `judge` | what classify installs (torch, transformers) and classify's SigLIP 2 model, which its `install.bat` checks; a CUDA GPU for `--images`; the captions and the vision model need a local OpenAI-compatible model server such as Ollama |
 
-The `install.bat` in the repository root runs the `install.bat` of every tool in this table that has one, one after the other: remove_borders, reframe, jpeg_cleanup, face_masks and watermark first, then deduplicate, k2prep, ddg_images, classify, duck, pastvu, normalize and vk_dataset. Use it to set up everything at once, or run the `install.bat` of single tools.
+The `install.bat` in the repository root runs the `install.bat` of every tool in this table that has one, one after the other: remove_borders, reframe, jpeg_cleanup, face_masks and watermark first, then deduplicate, k2prep, ddg_images, classify, duck, pastvu, normalize, vk_dataset and judge. Use it to set up everything at once, or run the `install.bat` of single tools.
 
 When a tool's installation fails, the root `install.bat` runs it once more without the Hugging Face Xet transfer, because some networks block its download servers, and keeps the Xet transfer off for the tools after it. reframe and face_masks finish without the face model `face_yolov8m.pt` when it cannot be downloaded; the root `install.bat` then ends with a warning that tells you where to put it by hand.
 

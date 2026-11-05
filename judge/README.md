@@ -8,7 +8,7 @@ It generalises `scripts\unrelated.py`, whose topic is fixed (the Soviet Union), 
 
 Run `install.bat`. Judge installs nothing of its own: it needs what [classify](../classify/README.md) installs (torch with CUDA, transformers, numpy, Pillow) and classify's SigLIP 2 model, so run `classify\install.bat` first, or the `install.bat` in the repository root. `install.bat` checks that classify's snapshot in `classify\models\siglip2-so400m-patch16-naflex` holds both halves of the model, the image tower that classify uses and the text tower that judge needs, and downloads the snapshot through classify into that same folder when it is missing. There is one copy of the model on disk.
 
-The LLM and the vision model run on any OpenAI-compatible server: KoboldCpp at `http://localhost:5001/v1/` is the default, as for `unrelated.py`; Ollama is `http://127.0.0.1:11434/v1/`. Without `--model` the first model the server lists is used. One model that reads both text and images, such as a Qwen vision model, serves all three layers.
+The LLM and the vision model run on any OpenAI-compatible server: KoboldCpp at `http://localhost:5001/v1/` is the default, as for `unrelated.py`; Ollama is `http://127.0.0.1:11434/v1/`. The environment variable `JUDGE_ENDPOINT`, when set, replaces the default, so `set JUDGE_ENDPOINT=http://127.0.0.1:11434/v1/` spares `--endpoint` on a machine that runs Ollama. Without `--model` the first model the server lists is used. One model that reads both text and images, such as a Qwen vision model, serves all three layers.
 
 ## Usage
 
@@ -69,6 +69,7 @@ The layers never share the card. The captions run first; then the SigLIP pass ov
     verdicts.csv                 one row per image
     prompts.json                 the condition, the prompts and where they came from, the band, the cap
     moves.jsonl                  the undo log
+    report.txt                   the report of the last run
     accepted.jpg, rejected.jpg   contact sheets of up to 24 accepted and rejected images (--sheets)
     band.jpg                     the images the VLM saw or the cap left out, nearest to 0.5 first (--sheets)
 ```
@@ -77,7 +78,7 @@ The layers never share the card. The captions run first; then the SigLIP pass ov
 
 The contact sheets come from vk_dataset's sheet module (`vk_dataset\vkds\sheet.py`, next to this folder); each tile is captioned with its score, its letter and the start of its caption.
 
-The report at the end counts each layer's verdicts and the final ones, gives the band size, how many images the VLM saw and how many the cap left, the rates (images per second for SigLIP, seconds per image for the VLM), and the folders written.
+The report at the end counts each layer's verdicts and the final ones, gives the band size, how many images the VLM saw and how many the cap left, the rates (images per second for SigLIP, seconds per image for the VLM), and the folders written. The same lines go to `_judge\report.txt`, overwritten by every run, so whoever did not watch the run (a person, or an agent after a person ran it in a terminal) can read its outcome.
 
 ## Running again
 
@@ -103,7 +104,7 @@ Judge is agnostic about the condition. The era of a photograph for a historic co
 | `--vlm-band LO HI` | 0.35 0.65 | at or above HI accepts, at or below LO rejects, between goes to the VLM |
 | `--vlm-max N` | 300 | how many images of the band the VLM sees |
 | `--positives`, `--negatives` | written by the LLM | SigLIP prompts, one per flag |
-| `--endpoint` | `http://localhost:5001/v1/` | the OpenAI-compatible server |
+| `--endpoint` | `JUDGE_ENDPOINT`, else `http://localhost:5001/v1/` | the OpenAI-compatible server |
 | `--model` | the first one listed | the model on the server |
 | `--batch` | 10 | captions per request |
 | `--timeout` | 600 | seconds to wait for one reply |

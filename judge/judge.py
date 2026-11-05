@@ -87,10 +87,12 @@ MARK = "_dataset_tools.json"    # marks a folder the dataset tools made next to 
 VERDICTS_NAME = "verdicts.csv"
 PROMPTS_NAME = "prompts.json"
 MOVES_NAME = "moves.jsonl"
+REPORT_NAME = "report.txt"
 SHEET_NAMES = {"YES": "accepted.jpg", "NO": "rejected.jpg", "BAND": "band.jpg"}
 SHEET_MAX = 24
 
-DEFAULT_ENDPOINT = "http://localhost:5001/v1/"
+DEFAULT_ENDPOINT = "http://localhost:5001/v1/"     # KoboldCpp, as unrelated.py
+ENDPOINT_ENV = "JUDGE_ENDPOINT"                     # overrides the default when set
 DEFAULT_BATCH = 10
 DEFAULT_TIMEOUT = 600
 DEFAULT_BAND = (0.35, 0.65)
@@ -895,9 +897,28 @@ def run(ns, client=None, scorer_factory=SiglipScorer) -> int:
                                  key=lambda it: (abs((_score(it.row) or 0.5) - 0.5), it.rel))}
         sheets = render_sheets(root, dst_root, run_dir, rows, groups)
 
-    report(ns, items, todo, settled, stats, moved_n, files_n, failed_n, root, dst_root, run_dir,
-           sheets, time.time() - t_start)
+    # the report goes to the screen and to report.txt, for an agent that did not start the run
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(_Tee(sys.stdout, buf)):
+        report(ns, items, todo, settled, stats, moved_n, files_n, failed_n, root, dst_root, run_dir,
+               sheets, time.time() - t_start, rc)
+    with open(os.path.join(run_dir, REPORT_NAME), "w", encoding="utf-8") as f:
+        f.write(buf.getvalue().lstrip("\n"))
     return rc
+
+
+class _Tee(io.TextIOBase):
+    def __init__(self, *outs):
+        self.outs = outs
+
+    def write(self, s):
+        for o in self.outs:
+            o.write(s)
+        return len(s)
+
+    def flush(self):
+        for o in self.outs:
+            o.flush()
 
 
 def _vlm_final(letter):
@@ -909,7 +930,7 @@ def _vlm_final(letter):
 
 
 def report(ns, items, todo, settled, stats, moved_n, files_n, failed_n, root, dst_root, run_dir,
-           sheets, seconds):
+           sheets, seconds, rc=0):
     cur = [it.row for it in todo + settled]
     cap = {v: sum(1 for r in cur if (r.get("caption_verdict") or "") == v)
            for v in ("YES", "NO", "INDETERMINATE", "UNANSWERED")}
@@ -919,6 +940,10 @@ def report(ns, items, todo, settled, stats, moved_n, files_n, failed_n, root, ds
     for r in cur:
         reasons[r.get("reason") or "-"] = reasons.get(r.get("reason") or "-", 0) + 1
     print("\n==== ИТОГ ====")
+    print("{}{}".format(time.strftime("%Y-%m-%d %H:%M"), {0: "", 1: " — ОСТАНОВЛЕНО: сервер модели не ответил",
+                                                       130: " — ОСТАНОВЛЕНО пользователем"}.get(rc, "")))
+    print("Папка: {}".format(root))
+    print("Условие: {}".format(ns.condition))
     print("Изображений: {} (решено раньше: {})".format(len(items), len(settled)))
     if ns.captions:
         print("Подписи: ДА {}, НЕТ {}, НЕ ЯСНО {}{}; без подписи {}{}".format(
@@ -950,6 +975,7 @@ def report(ns, items, todo, settled, stats, moved_n, files_n, failed_n, root, ds
             if failed_n else ""))
     print("Отбраковка: {}".format(dst_root))
     print("Вердикты: {}".format(os.path.join(run_dir, VERDICTS_NAME)))
+    print("Этот итог: {}".format(os.path.join(run_dir, REPORT_NAME)))
     if ns.images:
         print("Подсказки: {}".format(os.path.join(run_dir, PROMPTS_NAME)))
     for s in sheets:
@@ -1035,8 +1061,10 @@ def build_parser():
                     help="Своя положительная подсказка SigLIP (английский; можно несколько раз)")
     ap.add_argument("--negatives", action="append", metavar="ТЕКСТ",
                     help="Своя отрицательная подсказка SigLIP (английский; можно несколько раз)")
-    ap.add_argument("--endpoint", default=DEFAULT_ENDPOINT,
-                    help="OpenAI-совместимый адрес модели (Ollama: http://127.0.0.1:11434/v1/)")
+    ap.add_argument("--endpoint", default=os.environ.get(ENDPOINT_ENV) or DEFAULT_ENDPOINT,
+                    help="OpenAI-совместимый адрес модели (Ollama: http://127.0.0.1:11434/v1/); "
+                         "по умолчанию переменная окружения JUDGE_ENDPOINT, если задана, иначе адрес "
+                         "KoboldCpp")
     ap.add_argument("--model", default=None,
                     help="Имя модели на сервере (по умолчанию первая из списка сервера)")
     ap.add_argument("--batch", type=int, default=DEFAULT_BATCH, help="Подписей в одном запросе")
