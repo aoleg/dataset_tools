@@ -74,6 +74,10 @@ class Conf:
     aspect_in_file: bool = False
     max_pixels: int = 2048             # a picture over this^2 pixels is downscaled to that area; 0: never
     pixels_in_file: bool = False
+    jpeg_quality: int = 97             # a JPEG re-encoded at its own size (a painted watermark)
+    jpeg_quality_in_file: bool = False
+    jpeg_quality_downscaled: int = 95  # a JPEG re-encoded while it is downscaled to max_pixels
+    jpeg_quality_downscaled_in_file: bool = False
     export_layout: str = "categories_first"   # the live export and an import: categories_first or color_first
     export_layout_in_file: bool = False
     layout: str | None = None          # the folder tree of a new base; None: not in the file (written on first use)
@@ -128,9 +132,14 @@ QUALITY_COMMENT = ["; Photos the quality probe (trained on _quality_good and _qu
                    "; and reclassify deletes the saved ones. 0 turns it off."]
 
 
+JPEG_COMMENT = ["; The JPEG quality (1 to 100, saved without chroma subsampling) of a photo",
+                "; re-encoded at its own size (a painted watermark), and of a photo re-encoded",
+                "; while it is downscaled to max_pixels (run, pull, import, reprocess). A",
+                "; downscaled photo is still larger than training needs, so it can take a little",
+                "; less. Untouched photos and lossless crops keep the downloaded bytes."]
 PIXELS_COMMENT = ["; A photo whose picture (without the PastVu band) has more pixels than this",
                   "; number squared is downscaled to that area before it is processed and is saved",
-                  "; from the downscaled pixels (JPEG q97, or PNG with --png). Training needs no",
+                  "; from the downscaled pixels (JPEG at jpeg_quality_downscaled, or PNG with --png). Training needs no",
                   "; more than 2048 x 2048. 0: never downscale. reprocess --downscale does the same",
                   "; to photos saved before."]
 ASPECT_COMMENT = ["; Photos whose long side is more than this times the short side (panoramas,",
@@ -234,6 +243,13 @@ def load(path: Path | None = None) -> Conf:
                 if conf.max_pixels < 0:
                     raise ValueError(f"max_pixels {conf.max_pixels}: give the side of the square (2048), or 0")
                 conf.pixels_in_file = True
+            for key in ("jpeg_quality", "jpeg_quality_downscaled"):
+                if d.get(key, "").strip():
+                    v = d.getint(key)
+                    if not 1 <= v <= 100:
+                        raise ValueError(f"{key} {v}: give a JPEG quality from 1 to 100")
+                    setattr(conf, key, v)
+                    setattr(conf, key + "_in_file", True)
             if d.get("export_layout", "").strip():
                 v = d.get("export_layout").strip().lower()
                 if v not in ("categories_first", "color_first"):

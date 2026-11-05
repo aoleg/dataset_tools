@@ -18,7 +18,7 @@ You give a place and years, for example “Belarus, 1917 to 1991” or “Ukrain
    - It trims scanned frames and white borders.
    - It paints out printed captions, photographer credits and watermarks. It paints only marks it is confident about, so real shop signs and buildings are left alone.
    - Cropping never lowers JPEG quality; only painting re-saves an image.
-   - A picture with more than 2048 x 2048 pixels (4 MP, `max_pixels` in the conf) is downscaled to that area right after the band is cut, before anything else looks at it, and is saved from the downscaled pixels (JPEG q97). Training needs no more; a 65 MP scan would only cost time at every step.
+   - A picture with more than 2048 x 2048 pixels (4 MP, `max_pixels` in the conf) is downscaled to that area right after the band is cut, before anything else looks at it, and is saved from the downscaled pixels (JPEG at quality 95, `jpeg_quality_downscaled`). Training needs no more; a 65 MP scan would only cost time at every step.
 3. **Black-and-white or colour:** a fast pixel test tells colour photos from black-and-white ones, and counts sepia, toned prints and yellowed paper as black-and-white.
 4. **Sort:** it first leaves out low-quality photos, such as film and TV frame grabs and blurry or washed-out scans, learned from two folders of examples. Then it puts the photo into your categories, such as transport, people or monuments, learned from example images you put in a samples folder. When two categories fit about equally, the one with the lower folder number wins. Every photo goes into a category, a doubtful one into its best guess.
 5. **Caption:** it writes a short facts line from PastVu’s record: title, years, place and description.
@@ -73,6 +73,8 @@ priority_margin = 0.15                within this of the top score, the lower-nu
 quality_threshold = 0.88              skip photos the quality probe scores at or above this; 0: off
 max_aspect = 21:9                     skip photos whose long side is more than this times the short side; 0: off
 max_pixels = 2048                     downscale a picture over this^2 pixels to that area before processing; 0: never
+jpeg_quality = 97                     JPEG quality of a photo re-encoded at its own size (a painted watermark)
+jpeg_quality_downscaled = 95          JPEG quality of a photo re-encoded while it is downscaled to max_pixels
 export_layout = categories_first      folder order of the live export and of an import: categories_first or color_first
 
 [caption]                             the VLM of autocaption; see Autocaption
@@ -253,7 +255,7 @@ run.bat reprocess --downscale
 run.bat reprocess --downscale 1536 estonia_* --dry-run
 ```
 
-The photos whose saved size is over the limit (the store knows every photo's size, so no file is opened to decide) are rewritten at that area in place, by the same rule as a download: JPEG q97, a PNG stays PNG, `--png` makes every one PNG; EXIF and ICC kept, captions kept. The number is the side of the square whose area is the limit, 2048 when left out. The latent caches of the old pixels (.npz, .safetensors) are deleted, the live export's links are made again, the records say what happened, and the classifier's embeddings stay. It cannot be undone, so it asks first; `--yes` skips the question, `--dry-run` lists the photos in `<base>\_reports`. Reading, resizing and encoding run in worker processes (`--workers`, half the CPUs by default): 143 scans of up to 65 MP took 13 seconds.
+The photos whose saved size is over the limit (the store knows every photo's size, so no file is opened to decide) are rewritten at that area in place, by the same rule as a download: JPEG at `jpeg_quality_downscaled` (95), a PNG stays PNG, `--png` makes every one PNG; EXIF and ICC kept, captions kept. The number is the side of the square whose area is the limit, 2048 when left out. The latent caches of the old pixels (.npz, .safetensors) are deleted, the live export's links are made again, the records say what happened, and the classifier's embeddings stay. It cannot be undone, so it asks first; `--yes` skips the question, `--dry-run` lists the photos in `<base>\_reports`. Reading, resizing and encoding run in worker processes (`--workers`, half the CPUs by default): 143 scans of up to 65 MP took 13 seconds. Ctrl+C finishes the photos in hand and stops; the same command continues. A photo whose file was rewritten by a run that was killed before its row is found by the next run and its row, record, caches and export link brought up to date, and the temporary files such a run left are deleted.
 
 A run downloads a **scope**: regions and years. Its name is the aliases (or region names) joined by `+`, an underscore, and the years: `belarus_1917-1991`, `ukraine_1970s`, `minsk+brest_oblast_1945-1960`. More than three regions need `--name` or an alias of their own. Running the same command again continues it, as does `run --scope <name>`. The scope's folder follows `layout` in the conf (see [Folder layouts](#folder-layouts)): `<base>\1970s\ukraine\` by default.
 
@@ -315,7 +317,8 @@ Pixels stay in memory from the download to the write; no temporary file is made.
 |---|---|
 | nothing | the downloaded bytes, unchanged |
 | only cuts (band, borders, trim) | JPEG: cropped in the DCT domain with libjpeg-turbo, every coefficient kept, EXIF kept with the new size. PNG: the exact pixels in the same format and mode. |
-| a watermark painted | JPEG at quality 97 without chroma subsampling, or PNG with `--png` |
+| a watermark painted | JPEG at `jpeg_quality` (97) without chroma subsampling, or PNG with `--png` |
+| a picture over `max_pixels` squared | downscaled first, then JPEG at `jpeg_quality_downscaled` (95) without chroma subsampling, or PNG with `--png` |
 
 A JPEG crop keeps every coefficient of the kept blocks; the decoded pixels can still differ in the last row or column at a cut, where the decoder's chroma upsampling no longer sees the cut-off neighbours. An image that is smaller than `--min-side` after its crop, or more than `max_aspect` times as long as it is wide, is skipped.
 

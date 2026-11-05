@@ -40,6 +40,19 @@ quality_threshold = 0.88
 ; strips) are skipped like the ones under 512 pixels, and reclassify deletes
 ; the saved ones. W:H or a number; 0 turns it off.
 max_aspect = 21:9
+; A photo whose picture (without the PastVu band) has more pixels than this
+; number squared is downscaled to that area before it is processed and is saved
+; from the downscaled pixels (JPEG at jpeg_quality_downscaled, or PNG with --png). Training needs no
+; more than 2048 x 2048. 0: never downscale. reprocess --downscale does the same
+; to photos saved before.
+max_pixels = 2048
+; The JPEG quality (1 to 100, saved without chroma subsampling) of a photo
+; re-encoded at its own size (a painted watermark), and of a photo re-encoded
+; while it is downscaled to max_pixels (run, pull, import, reprocess). A
+; downscaled photo is still larger than training needs, so it can take a little
+; less. Untouched photos and lossless crops keep the downloaded bytes.
+jpeg_quality = 97
+jpeg_quality_downscaled = 95
 ; The folder order of the live export (run --export) and of an import:
 ; categories_first (<category>\bw, <category>\color) or color_first
 ; (bw\<category>, color\<category>). A change reorders an existing export

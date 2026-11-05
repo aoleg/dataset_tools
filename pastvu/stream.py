@@ -70,6 +70,8 @@ class Options:
     min_side: int = 512
     max_aspect: float = 21 / 9        # long side over short side; 0: no limit
     max_pixels: int = pr.DEFAULT_MAX_PIXELS   # a picture over this^2 pixels is downscaled to that area; 0: never
+    jpeg_quality: int = enc.JPEG_QUALITY      # a JPEG re-encoded at its own size (painted)
+    jpeg_quality_downscaled: int = enc.JPEG_QUALITY_DOWNSCALED   # a JPEG re-encoded while downscaled
     png: bool = False
     wm_conf: float = 0.1
     wm_paint_conf: float = 0.4
@@ -120,6 +122,7 @@ class Job:
     written: list = None              # an import: the sidecars written next to the image
     raw: str | None = None            # from the storage: the raw image's path relative to the base
     head_orig: dict = None            # a downscaled photo: the original file's head, for the record
+    quality: int | None = None        # the JPEG quality it was re-encoded at (None: not re-encoded, or PNG)
     downscale: dict = None            # a downscaled photo: {"from", "to", "limit", "band_rows"}
     det_input: np.ndarray = None      # the detector's input, made by the worker (watermark.detector_input)
     det_scale: float = 1.0
@@ -602,7 +605,10 @@ class Stream:
             final = pr.crop_array(job.array, plan["box"])       # the writer's copy, not the main thread's
         d.set(f"{job.cid}: encoding")
         t = time.perf_counter()
-        data, ext, mode = enc.encode(job.data, job.head, plan, painted, o.png, pixels=final if job.downscale else None)
+        data, ext, mode = enc.encode(job.data, job.head, plan, painted, o.png, pixels=final if job.downscale else None,
+                                     quality=o.jpeg_quality, quality_downscaled=o.jpeg_quality_downscaled)
+        if mode in ("array", "downscaled") and ext == ".jpg":
+            job.quality = o.jpeg_quality_downscaled if job.downscale else o.jpeg_quality
         s.time("encode", time.perf_counter() - t)
         if self.classifier is not None:
             verdict = self.classifier.example_override(data, verdict)
@@ -688,7 +694,7 @@ class Stream:
                           "box": plan["box"], "stored_box": plan["stored_box"], "changed": plan["changed"],
                           "write": mode, "colour": tone,
                           "output": {"path": rel, "bytes": len(data), "sha256": sha, "size": [fw, fh],
-                                     "stored_size": list(enc.size_of(data)),
+                                     "stored_size": list(enc.size_of(data)), "quality": job.quality,
                                      "orientation": job.head["orientation"] if mode != "array" else 1}}
             return importer.record_json(job.cid, p["name"], p["src"], job.data, job.caption, processing,
                                         verdict.as_dict() if verdict else None, {**self.tool, "scope": job.scope},
@@ -706,7 +712,7 @@ class Stream:
                       "write": mode,
                       "colour": tone,
                       "output": {"path": rel, "bytes": len(data), "sha256": sha, "size": [fw, fh],
-                                 "stored_size": list(enc.size_of(data)),
+                                 "stored_size": list(enc.size_of(data)), "quality": job.quality,
                                  "orientation": job.head["orientation"] if mode != "array" else 1}}
         classification = verdict.as_dict() if verdict else None
         result = dict(job.result)

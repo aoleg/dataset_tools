@@ -6,9 +6,11 @@
   kept with the new size and without its thumbnail; PNG and other lossless
   formats cropped to the exact pixels in the same format and mode; a lossy
   non-JPEG format becomes PNG.
-- A destructive change (painted watermark): JPEG at quality 97 without chroma
-  subsampling, or PNG with --png, from the upright array, EXIF orientation
-  reset.
+- A destructive change (painted watermark): JPEG at jpeg_quality (97) without
+  chroma subsampling, or PNG with --png, from the upright array, EXIF
+  orientation reset.
+- A picture downscaled to max_pixels: the same, at jpeg_quality_downscaled (95):
+  it is still larger than training needs.
 """
 
 from __future__ import annotations
@@ -24,7 +26,8 @@ from process import rb
 
 HERE = Path(__file__).resolve().parent
 TURBOJPEG_DLL = HERE / "bin" / "turbojpeg.dll"
-JPEG_QUALITY = 97
+JPEG_QUALITY = 97                # a re-encode at the photo's own size (conf jpeg_quality)
+JPEG_QUALITY_DOWNSCALED = 95     # a re-encode while downscaling to max_pixels (conf jpeg_quality_downscaled)
 PNG_LEVEL = 6
 EXTENSIONS = {"JPEG": ".jpg", "MPO": ".jpg", "PNG": ".png", "GIF": ".gif", "BMP": ".bmp", "TIFF": ".tif",
               "WEBP": ".webp"}
@@ -101,8 +104,9 @@ def exact_crop(data: bytes, head: dict, stored_box) -> tuple[bytes, str]:
     return buf.getvalue(), fmt
 
 
-def array_bytes(array: np.ndarray, head: dict, png: bool) -> tuple[bytes, str]:
-    """A destructively changed upright array as JPEG q97 (or PNG). -> (bytes, format)."""
+def array_bytes(array: np.ndarray, head: dict, png: bool, quality: int = JPEG_QUALITY) -> tuple[bytes, str]:
+    """A destructively changed upright array as JPEG at `quality` without chroma
+    subsampling (or PNG). -> (bytes, format)."""
     im = Image.fromarray(np.ascontiguousarray(array))
     kw = {}
     exif = exif_for(head.get("exif"), im.width, im.height, reset_orientation=True)
@@ -115,7 +119,7 @@ def array_bytes(array: np.ndarray, head: dict, png: bool) -> tuple[bytes, str]:
         im.save(buf, "PNG", compress_level=PNG_LEVEL, **kw)
         return buf.getvalue(), "PNG"
     try:
-        im.save(buf, "JPEG", quality=JPEG_QUALITY, subsampling=0, optimize=True, **kw)
+        im.save(buf, "JPEG", quality=quality, subsampling=0, optimize=True, **kw)
     except OSError as e:
         # Pillow gives the optimize pass a buffer of 2 bytes per pixel at this quality, and a
         # grainy scan at q97 without chroma subsampling can need more: libjpeg then says
@@ -124,21 +128,22 @@ def array_bytes(array: np.ndarray, head: dict, png: bool) -> tuple[bytes, str]:
         if "writing image file" not in str(e):
             raise
         buf = io.BytesIO()
-        im.save(buf, "JPEG", quality=JPEG_QUALITY, subsampling=0, **kw)
+        im.save(buf, "JPEG", quality=quality, subsampling=0, **kw)
     return buf.getvalue(), "JPEG"
 
 
 def encode(data: bytes, head: dict, plan: dict, painted: np.ndarray | None, png: bool,
-           pixels: np.ndarray | None = None) -> tuple[bytes, str, str]:
+           pixels: np.ndarray | None = None, quality: int = JPEG_QUALITY,
+           quality_downscaled: int = JPEG_QUALITY_DOWNSCALED) -> tuple[bytes, str, str]:
     """The output bytes of one image. -> (bytes, extension, write mode:
     verbatim, lossless, exact, png, array or downscaled). pixels: the final
-    pixels of a downscaled photo, which has no original bytes to crop."""
-    if painted is not None:
-        out, fmt = array_bytes(painted, head, png)
-        return out, EXTENSIONS[fmt], "array"
-    if pixels is not None:
-        out, fmt = array_bytes(pixels, head, png)
-        return out, EXTENSIONS[fmt], "downscaled"
+    pixels of a downscaled photo, which has no original bytes to crop. A
+    re-encode is at `quality`, or at `quality_downscaled` for a downscaled photo
+    (painted or not)."""
+    if painted is not None or pixels is not None:
+        q = quality_downscaled if pixels is not None else quality
+        out, fmt = array_bytes(painted if painted is not None else pixels, head, png, q)
+        return out, EXTENSIONS[fmt], "array" if painted is not None else "downscaled"
     if not plan.get("stored_box"):
         return data, EXTENSIONS.get(head["format"], ".bin"), "verbatim"
     if head["kind"] == rb.KIND_JPEG:
@@ -149,8 +154,8 @@ def encode(data: bytes, head: dict, plan: dict, painted: np.ndarray | None, png:
                 raise
             # libjpeg-turbo cannot name this file's chroma subsampling (an odd sampling
             # factor), so there is no DCT-domain crop: the pixels are cropped and
-            # re-encoded at q97 (or PNG), as a painted image is saved.
-            out, fmt = array_bytes(pr.crop_array(pr.decode(data, head), plan["box"]), head, png)
+            # re-encoded at `quality` (or PNG), as a painted image is saved.
+            out, fmt = array_bytes(pr.crop_array(pr.decode(data, head), plan["box"]), head, png, quality)
             return out, EXTENSIONS[fmt], "array"
     out, fmt = exact_crop(data, head, plan["stored_box"])
     return out, EXTENSIONS.get(fmt, ".png"), "exact" if fmt == head["format"] else "png"

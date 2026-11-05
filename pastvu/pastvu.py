@@ -579,6 +579,7 @@ def run_locked(args, conf, client, base: Path, store: Store, sm) -> int:
             sc = store.scope(sc["name"])
     opts = sm.Options(base=base, scope=sc, scopes=scopes, min_side=args.min_side, max_aspect=aspect_of(conf),
                       max_pixels=0 if args.raw else pixels_of(conf, args.max_pixels), png=args.png, wm_conf=args.wm_conf,
+                      **({} if args.raw else qualities_of(conf)),
                       wm_paint_conf=args.wm_paint_conf, wm_mode=args.wm_mode, borders=not args.no_borders,
                       dark_borders=not args.no_dark, fetchers=args.fetchers or conf.fetchers, depth=args.depth,
                       writers=args.writers, report_every=args.report_every, limit=args.limit, retries=args.retries,
@@ -684,8 +685,9 @@ def cmd_reprocess(args, conf, client) -> int:
         items = rp.candidates(store, scopes, side)
         total_mb = sum(it["bytes"] for it in items) / 2**20
         where = f"{len(scopes)} scope{'s' if len(scopes) != 1 else ''}" if scopes else "the whole base"
+        quality = qualities_of(conf)["jpeg_quality_downscaled"]
         print(f"{len(items):,} saved photos of {where} have more than {side} x {side} = {side * side:,} pixels "
-              f"({total_mb:,.0f} MB now); they are downscaled to that area in place, as JPEG q97"
+              f"({total_mb:,.0f} MB now); they are downscaled to that area in place, as JPEG at quality {quality}"
               + (" or PNG" if not args.png else ", every one as PNG") + ".")
         if not items:
             return 0
@@ -705,6 +707,9 @@ def cmd_reprocess(args, conf, client) -> int:
         if lx.Exporter.exists_for(store):
             exporter = lx.Exporter(store, base, conf.split, order=export_layout_of(conf))
             print(f"  the export {exporter.root} is relinked as the photos are rewritten")
+        swept = rp.sweep_temp(base, items)
+        if swept:
+            print(f"  {swept} temporary files of a stopped run deleted")
         mode = "json" if args.json_progress else "quiet" if args.quiet else "live"
         t0 = time.time()
         with Display(len(items), 0, mode) as d:
@@ -712,9 +717,12 @@ def cmd_reprocess(args, conf, client) -> int:
                 d.advance(saved=True)
                 d.set(f"downscaled {n:,} of {total:,}")
             res = rp.apply(store, base, items, side, png=args.png, workers=args.workers, exporter=exporter, log=d.print,
-                           progress=progress)
+                           progress=progress, quality=quality)
+        if res["stopped"]:
+            print(f"Stopped. {len(rp.candidates(store, scopes, side)):,} photos are left; the same command continues.")
         print(f"Downscaled {res['done']:,} photos in {(time.time() - t0) / 60:.1f} min: {res['before'] / 2**20:,.0f} MB "
-              f"to {res['after'] / 2**20:,.0f} MB; {res['failed']} failed, {res['fits']} fitted already, "
+              f"to {res['after'] / 2**20:,.0f} MB; {res['failed']} failed, {res['repaired']} repaired (rewritten by a "
+              f"run that stopped before their rows), "
               f"{res['caches']} caches of the old pixels deleted"
               + (f", {res['relinked']:,} export links made again" if exporter is not None else "") + ".")
     return 0
@@ -743,7 +751,7 @@ def cmd_pull(args, conf, client) -> int:
             raise SystemExit(f"stored photos of a scope that no longer exists: {gone}")
         opts = sm.Options(base=base, scope=scopes[mine[0]], scopes=scopes, min_side=args.min_side,
                           max_aspect=aspect_of(conf), max_pixels=pixels_of(conf, args.max_pixels), png=args.png,
-                          wm_conf=args.wm_conf,
+                          wm_conf=args.wm_conf, **qualities_of(conf),
                           wm_paint_conf=args.wm_paint_conf, wm_mode=args.wm_mode, borders=not args.no_borders,
                           dark_borders=not args.no_dark, fetchers=conf.fetchers, depth=args.depth,
                           writers=args.writers, report_every=args.report_every, limit=args.limit,
@@ -880,6 +888,7 @@ def cmd_import(args, conf, client) -> int:
             against = importer.Against(Path(against_base), classifier.model_id, classifier.patches)
         opts = sm.Options(base=out, scope=sc, min_side=args.min_side, max_aspect=aspect_of(conf),
                           max_pixels=pixels_of(conf, getattr(args, "max_pixels", None)), png=args.png,
+                          **qualities_of(conf),
                           wm_conf=args.wm_conf, wm_paint_conf=args.wm_paint_conf, wm_mode=args.wm_mode,
                           borders=not args.no_borders, dark_borders=not args.no_dark, fetchers=args.threads,
                           depth=args.depth, writers=args.writers, report_every=args.report_every, limit=args.limit,
@@ -1406,6 +1415,20 @@ def pixels_of(conf: cf.Conf, given: int | None = None) -> int:
     return conf.max_pixels
 
 
+def qualities_of(conf: cf.Conf) -> dict:
+    """[defaults] jpeg_quality and jpeg_quality_downscaled of the conf, as Options keywords;
+    a key the file lacks is written into it with its default."""
+    keys = ("jpeg_quality", "jpeg_quality_downscaled")
+    missing = [k for k in keys if not getattr(conf, k + "_in_file")]
+    if missing and conf.path and Path(conf.path).is_file():
+        for i, key in enumerate(missing):
+            value = getattr(cf.Conf, key)
+            cf.save_default(conf.path, key, str(value), cf.JPEG_COMMENT if i == 0 else [])
+            setattr(conf, key + "_in_file", True)
+            print(f"  {key} = {value} written into [defaults] of {conf.path}")
+    return {k: getattr(conf, k) for k in keys}
+
+
 def export_layout_of(conf: cf.Conf) -> str:
     """[defaults] export_layout of the conf; written into the file with its default when it is not there."""
     if not conf.export_layout_in_file and conf.path and Path(conf.path).is_file():
@@ -1580,10 +1603,17 @@ quality_threshold = 0.88
 max_aspect = 21:9
 ; A photo whose picture (without the PastVu band) has more pixels than this
 ; number squared is downscaled to that area before it is processed and is saved
-; from the downscaled pixels (JPEG q97, or PNG with --png). Training needs no
+; from the downscaled pixels (JPEG at jpeg_quality_downscaled, or PNG with --png). Training needs no
 ; more than 2048 x 2048. 0: never downscale. reprocess --downscale does the same
 ; to photos saved before.
 max_pixels = 2048
+; The JPEG quality (1 to 100, saved without chroma subsampling) of a photo
+; re-encoded at its own size (a painted watermark), and of a photo re-encoded
+; while it is downscaled to max_pixels (run, pull, import, reprocess). A
+; downscaled photo is still larger than training needs, so it can take a little
+; less. Untouched photos and lossless crops keep the downloaded bytes.
+jpeg_quality = 97
+jpeg_quality_downscaled = 95
 ; The folder order of the live export (run --export) and of an import:
 ; categories_first (<category>\\bw, <category>\\color) or color_first
 ; (bw\\<category>, color\\<category>). A change reorders an existing export
@@ -1715,7 +1745,7 @@ def parse_args(argv=None):
                        help="downscale a picture over N x N pixels to that area before processing it and save it "
                             "from the pixels; 0: never (default: [defaults] max_pixels of the conf, 2048)")
         p.add_argument("--png", action="store_true",
-                       help="write images with painted watermarks or downscaled as PNG instead of JPEG q97")
+                       help="write painted and downscaled images as PNG instead of JPEG (jpeg_quality, jpeg_quality_downscaled)")
         p.add_argument("--no-watermark", action="store_true", help="no watermark detection or painting")
         p.add_argument("--wm-conf", type=float, default=0.1, metavar="X",
                        help="watermark detections from this confidence go into the record (default 0.1)")
@@ -1816,7 +1846,7 @@ def parse_args(argv=None):
     p.add_argument("--patches", type=int, default=576, metavar="N", help="encoder patch budget (default 576)")
     p.add_argument("--min-side", type=int, default=512, metavar="PX",
                    help="skip images whose picture is smaller than this on either side (default 512)")
-    p.add_argument("--png", action="store_true", help="write images with painted watermarks as PNG instead of JPEG q97")
+    p.add_argument("--png", action="store_true", help="write images with painted watermarks as PNG instead of JPEG at jpeg_quality")
     p.add_argument("--no-watermark", action="store_true", help="no watermark detection or painting")
     p.add_argument("--wm-conf", type=float, default=0.1, metavar="X",
                    help="watermark detections from this confidence go into the record (default 0.1)")
@@ -1842,7 +1872,7 @@ def parse_args(argv=None):
     p.add_argument("--downscale", type=int, nargs="?", const=2048, metavar="N",
                    help="downscale the saved photos over N x N pixels to that area, in place (N: the side of the "
                         "square, 2048 when given alone)")
-    p.add_argument("--png", action="store_true", help="write the downscaled photos as PNG (default: JPEG q97, a PNG stays PNG)")
+    p.add_argument("--png", action="store_true", help="write the downscaled photos as PNG (default: JPEG at jpeg_quality_downscaled; a PNG stays PNG)")
     p.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 4) // 2), metavar="N",
                    help="worker processes that read, resize and encode (default: half the CPUs)")
     p.add_argument("--dry-run", action="store_true", help="count and list the photos in <base>/_reports, change nothing")
