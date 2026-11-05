@@ -2,6 +2,11 @@
 
 Verbs (the cost in API calls in brackets):
 
+  search groups find groups by name and description into _candidates.json
+                (1 per query, plus 1 per 500 groups found for their details)
+  sample        a few photos of a group from its wall or an album, with an
+                optional contact sheet (1 wall.get, or photos.getAlbums plus
+                one photos.get; +1 groups.getById for a group not yet known)
   scan albums   the album index of a group (1 + 1 per 100 albums)
   scan wall     the wall index _wall.json: posts, texts, photos (1 per 100 posts)
   albums        download albums into <group title>/<album title>/ (full size,
@@ -14,6 +19,8 @@ Verbs (the cost in API calls in brackets):
   migrate       rename photo_<id> to photo<owner>_<id> (0)
 
 Run as run.bat <verb> ... from anywhere, for example
+  run.bat search groups --q "старые автобусы" --q "советский транспорт"
+  run.bat sample examplegroup --sheet
   run.bat scan albums examplegroup
   run.bat albums examplegroup --album-id 123 --dry-run
 Paths and limits come from vkds.conf next to vkds.py (vkds.conf.example is the
@@ -37,8 +44,10 @@ from .albums import AlbumsOptions, run_albums, run_peek, run_scan_albums
 from .api import VkApiError, VkClient
 from .budget import Budget, BudgetExceeded, Ledger, today_utc
 from .cache import ApiCache
+from .discover import SampleError, SampleOptions, SearchError, run_sample, run_search_groups
 from .migrate import MigrateError, run_migrate
 from .recheck import RecheckError, run_recheck_dead
+from .sheet import SheetError
 from .wall import ScanWallOptions, WallError, WallOptions, run_scan_wall, run_wall
 
 
@@ -75,8 +84,8 @@ def build_parser(conf: vconf.Conf | None = None) -> argparse.ArgumentParser:
 
     p = argparse.ArgumentParser(
         prog="vkds",
-        description="Сборщик фото-датасетов из ВКонтакте. Этап 1: альбомы "
-                    "сообществ. Руководство: README.md.",
+        description="Сборщик фото-датасетов из ВКонтакте: поиск сообществ, пробные "
+                    "выборки с листами, альбомы и стена. Руководство: README.md.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("-V", "--version", action="version",
                    version="vkds " + __version__)
@@ -128,6 +137,37 @@ def build_parser(conf: vconf.Conf | None = None) -> argparse.ArgumentParser:
                    help="Шаблон папок: {group} {group_name} {group_id} "
                         "{album} {album_id}; по умолчанию папка группы — "
                         "НАЗВАНИЕ группы, альбома — название альбома")
+
+    se = sub.add_parser("search", parents=[common],
+                        help="Поиск сообществ по названию и описанию (для ИИ-агента)")
+    sesub = se.add_subparsers(dest="what", required=True)
+    sg = sesub.add_parser("groups", parents=[common],
+                          help="groups.search: 1 вызов на запрос, плюс 1 вызов на 500 "
+                               "найденных групп (участники, описание); итог в _candidates.json")
+    sg.add_argument("--q", dest="queries", action="append", required=True, metavar="ЗАПРОС",
+                    help="Поисковый запрос (можно несколько раз: синонимы, сокращения, "
+                         "транслит); результаты сводятся по id группы")
+    sg.add_argument("--count", type=int, default=20, metavar="N",
+                    help="Сколько групп брать на каждый запрос (не больше 1000)")
+    sg.add_argument("--type", dest="group_type", choices=["group", "page", "all"],
+                    default="all",
+                    help="Тип сообщества: group — группа, page — публичная страница, all — все")
+
+    sm = sub.add_parser("sample", parents=[common],
+                        help="Пробная выборка фото группы в _samples\\<папка группы> "
+                             "(1–2 вызова; --sheet — лист для просмотра)")
+    sm.add_argument("group", help="Короткое имя / id / ссылка сообщества")
+    sm.add_argument("--n", type=int, default=12, help="Сколько фото взять")
+    sm.add_argument("--from", dest="source", choices=["wall", "albums"], default="wall",
+                    help="Откуда: wall — первая страница стены (100 постов, 1 вызов), "
+                         "albums — самый большой альбом или --album-id (2 вызова)")
+    sm.add_argument("--album-id", default=None,
+                    help="Альбом для --from albums (по умолчанию самый большой)")
+    sm.add_argument("--sheet", action="store_true",
+                    help="Сделать sheet.jpg: сетка миниатюр с началом подписей и "
+                         "названием группы")
+    sm.add_argument("--min-side", type=int, default=0, metavar="N",
+                    help="Не брать фото, у которых любая сторона меньше N пикселей")
 
     s = sub.add_parser("scan", parents=[common],
                        help="Разведка без скачивания (для ИИ-агента)")
@@ -386,6 +426,13 @@ def main(argv=None, conf: vconf.Conf | None = None) -> int:
                 recheck_dead=ns.recheck_dead)
             rep = run_albums(client, ns.groups, out_root, opts)
             _print_totals(rep)
+        elif ns.cmd == "search":
+            run_search_groups(client, ns.queries, out_root, count=ns.count,
+                              group_type=ns.group_type)
+        elif ns.cmd == "sample":
+            run_sample(client, ns.group, out_root, SampleOptions(
+                n=ns.n, source=ns.source, album_id=ns.album_id, sheet=ns.sheet,
+                min_side=ns.min_side))
         elif ns.cmd == "scan" and getattr(ns, "what", None) == "albums":
             run_scan_albums(client, ns.group, out_root)
         elif ns.cmd == "scan" and getattr(ns, "what", None) == "wall":
@@ -405,7 +452,7 @@ def main(argv=None, conf: vconf.Conf | None = None) -> int:
         else:
             print("Неизвестная команда", file=sys.stderr)
             rc = 1
-    except WallError as e:
+    except (WallError, SearchError, SampleError, SheetError) as e:
         print("\n[!] {}".format(e), file=sys.stderr)
         rc = 2
     except BudgetExceeded as e:

@@ -6,15 +6,20 @@ maintainers' side), from the tool folder:
 
     ..\\venv\\Scripts\\python.exe tools\\capture_fixtures.py <group> [--out-dir tests\\fixtures] [--dry-run]
 
-About 6 calls through VkClient, with the ledger of vkds.conf and a built-in
+About 7 calls through VkClient, with the ledger of vkds.conf and a built-in
 run cap of 8 attempts: groups.getById; the first page of photos.getAlbums;
 one photos.get page (50 photos) of the largest album and one of the oldest
 album (photos without dimensions); two wall.get pages of 100 posts
-(filter=owner). Each response is written as <out-dir>/<method>_<n>.json as
-received (an error payload too), plus _capture.json with the group ref, the
-date, the parameters of every call and the call count. A file in which the
-token string occurs is never written. What the script prints is Russian, for
-the partner (D2).
+(filter=owner); and groups.search with the neutral query SEARCH_QUERY and
+count=5. That last call settles whether the key may search groups at all:
+the `search groups` verb depends on it, and VK documents groups.search for
+user keys, while the partner runs a service key. An error answer (for
+example error 28, the method is unavailable with this key) is written like
+any other and is exactly the answer wanted. Each response is written as
+<out-dir>/<method>_<n>.json as received (an error payload too), plus
+_capture.json with the group ref, the date, the parameters of every call and
+the call count. A file in which the token string occurs is never written.
+What the script prints is Russian, for the partner (D2).
 """
 from __future__ import annotations
 
@@ -35,6 +40,8 @@ from vkds.budget import Budget, BudgetExceeded, Ledger, now_iso  # noqa: E402
 RUN_CAP = 8
 PHOTOS_PAGE = 50
 WALL_PAGE = 100
+SEARCH_QUERY = "музей"
+SEARCH_COUNT = 5
 
 
 class TokenLeak(RuntimeError):
@@ -68,6 +75,8 @@ def plan_text(group: str) -> list[str]:
         "4) photos.get из самого старого альбома (по дате создания), так же",
         "5) wall.get owner_id=-<id группы> filter=owner extended=0 count={} offset=0".format(WALL_PAGE),
         "6) wall.get то же, offset={} (если на стене больше {} постов)".format(WALL_PAGE, WALL_PAGE),
+        "7) groups.search q={} count={} (можно ли этим ключом искать сообщества)".format(
+            SEARCH_QUERY, SEARCH_COUNT),
     ]
 
 
@@ -131,6 +140,7 @@ def capture(client: VkClient, group: str, out_dir: Path, token: str) -> dict:
         if wall and int(wall.get("count") or 0) > WALL_PAGE:
             call("wall.get", owner_id=owner, filter="owner", extended=0,
                  offset=WALL_PAGE, count=WALL_PAGE)
+        call("groups.search", q=SEARCH_QUERY, count=SEARCH_COUNT)
     finally:
         meta["call_count"] = client.attempts
         _dump(out_dir / "_capture.json", meta, token)
@@ -144,7 +154,7 @@ def main(argv=None) -> int:
         except Exception:
             pass
     ap = argparse.ArgumentParser(
-        description="Снять сырые ответы VK API для офлайн-тестов (около 6 вызовов)")
+        description="Снять сырые ответы VK API для офлайн-тестов (около 7 вызовов)")
     ap.add_argument("group", help="Короткое имя / id / ссылка открытого сообщества")
     ap.add_argument("--out-dir", default=str(TOOL_DIR / "tests" / "fixtures"),
                     help="Куда записать файлы (по умолчанию tests\\fixtures)")

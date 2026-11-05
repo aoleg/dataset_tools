@@ -8,6 +8,7 @@ The tool needs a VK access token of your own application. Read [The photographs 
 
 Groups of old photographs ("old Moscow", Soviet buses, a factory's history) keep thousands of scans in their albums and on their walls. The tool takes a group by its short name, id or link and downloads everything, because the files come from VK's CDN, which costs nothing; only the listing costs API calls, and few of them: one call lists 1,000 photos of an album or 100 posts of a wall. Curation happens afterwards, on the downloaded folder, with the tools of this repository.
 
+- **Finding groups:** `search groups` finds groups by their name and description; `sample` downloads a dozen photos of one group, with a contact sheet on request, for the choice before any download.
 - **Albums:** `scan albums` lists the albums of a group with their sizes; `albums` downloads them, every album into a folder named after its title.
 - **The wall:** `scan wall` indexes the posts of a wall into `_wall.json` with their full text; `wall` downloads the photos of the posts you select, by date, text or id, and gives every photo the text of its post as its caption. For a repost the text and the owner of the original post are used.
 - **Resume and reruns:** a rerun downloads only what is missing. An album or a post whose photos are all on disk costs no call at all.
@@ -47,6 +48,8 @@ delay = 0.35
 Run the tool with `run.bat` in this folder, from anywhere:
 
 ```
+run.bat search groups --q "<query>" [--q "<query>" ...] [--count N] [--type group|page|all]
+run.bat sample <group> [--n 12] [--from wall|albums] [--album-id ID] [--sheet] [--min-side N]
 run.bat scan albums <group>
 run.bat scan wall <group> [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--limit N] [--all]
 run.bat albums <group> [<group> ...] [--album-id ID ...] [--title-regex RX] [--include-wall] [--min-area N] [--min-side N] [--dry-run] [--recheck-dead] [--redownload-missing] [--no-meta] [--workers N]
@@ -64,6 +67,8 @@ What each verb costs in API calls (the files themselves come from the CDN for fr
 
 | verb | what it does | calls |
 |---|---|---|
+| `search groups` | searches groups by name and description, merges the results into `_candidates.json` and prints a short table | 1 per query, plus 1 per 500 groups found |
+| `sample` | downloads a few photos of a group into `_samples\` for a look, with a contact sheet on request | 1 from the wall, 2 from an album; 1 more for a group not yet in `_candidates.json` or `_groups.json` |
 | `scan albums` | lists the albums of a group with sizes and dates into `_albums.json` | 1, plus 1 per 100 albums |
 | `scan wall` | indexes the wall into `_wall.json`, prints posts and photos per year and the cost of a download | 1, plus 1 per 100 posts |
 | `albums` | downloads albums; an album with nothing missing is checked against the manifest and costs nothing | 1, plus 1 per 100 albums, plus 1 per 1,000 photos of each album it lists |
@@ -93,6 +98,24 @@ run.bat wall examplegroup --text-regex "трамва|tram" --min-side 512
 run.bat budget
 ```
 
+## Finding groups
+
+Before a download comes the choice of groups. `search groups` asks VK's group search once for every `--q`, so a grid of queries (synonyms, abbreviations, a transliteration) costs one call per query; then it fetches the member count, the description and the counters of the groups found with `groups.getById`, 500 groups per call, because the search itself returns little more than the names. `--count N` takes up to N groups per query (20 by default, at most 1,000), `--type group` or `--type page` limits the search to groups or to public pages. The results of all queries are merged by group id into `<base>\_candidates.json`: earlier candidates stay, fresh data updates them, and each keeps the queries that found it.
+
+The table that `search groups` prints has one line per group found, the largest first: the id, the short name, the title, the members, whether the group is open, how many of the queries found it, the estimated calls of a `scan albums` plus a `scan wall`, and the first 60 characters of the description. The estimate is a lower bound until the number of albums and wall posts is known; a closed group can be neither scanned nor sampled.
+
+Whether VK lets a service key search groups is not known on our side: VK documents `groups.search` for user keys. `tools\capture_fixtures.py` makes one search call to settle it ([Fixtures for the offline tests](#fixtures-for-the-offline-tests)). When the key may not search, `search groups` stops after one call with a message, and groups can still be named by hand and sampled.
+
+`sample <group>` downloads a dozen photos of a group for a look. From the wall, the default, it reads one page of 100 posts and spreads the photos evenly over the posts that have photos, one photo per post; with fewer such posts than photos, each post gives several. With `--from albums` it reads the album list and one page of up to 1,000 photos of the largest album, or of `--album-id`, and spreads the photos over that page. A group found in `_candidates.json` or in the dataset's `_groups.json` costs no lookup. The photos go to `<base>\_samples\<group folder>\`, named as in a download and with their cleaned captions as `.txt` (the post text for a wall photo), next to `_sample.json` with the group, the source and the photos. A photo whose every copy is gone from the CDN is skipped and replaced by a neighbour, and is not registered as dead; `--min-side N` skips small photos the same way. The sample also writes the number of wall posts or albums into the group's candidate entry, which makes its estimate exact.
+
+`--sheet` adds `sheet.jpg`, a contact sheet: the group's title and member count on top, then tiles about 320 pixels wide, four per row, each with its number and the first 60 characters of its caption. One image per group is what a vision model or a person needs to judge a group at a glance. The sheet needs Pillow, which the shared venv has from the other tools, so `requirements.txt` stays `requests`; without Pillow the sample is still written and the sheet is refused with a message. The captions are drawn with Arial or Segoe UI from the Windows fonts folder, for the Cyrillic.
+
+```
+run.bat search groups --q "старые автобусы" --q "советский автобус" --q "ЛиАЗ"
+run.bat sample examplegroup --sheet
+run.bat sample examplegroup --from albums --sheet
+```
+
 ## Output
 
 ```
@@ -101,6 +124,8 @@ run.bat budget
   _vkds\budget.json               the journal of the calls made for this dataset root
   _vkds\cache\                    the response cache of scan and --dry-run
   _peek\<short name>\album_<id>\  samples of peek
+  _candidates.json                the groups found by search groups
+  _samples\<group folder>\        the photos of sample, _sample.json and sheet.jpg
   <group folder>\                 named after the group's title
     _group.json, _albums.json     the group, and the album index with every album's state
     _wall.json                    the wall index of scan wall
@@ -150,12 +175,12 @@ Versions before 0.5 named the files `photo_<id>.jpg`. A rerun still recognises t
 
 - `0` done;
 - `1` an error: a VK API error other than the limit, or an unexpected failure;
-- `2` a refusal: no token, no `base` and no `--out`, no wall index, the run cap of `--budget`, or the limit error;
+- `2` a refusal: no token, no `base` and no `--out`, no wall index, a search the key may not make, a closed or empty group for `sample`, a sheet without Pillow, the run cap of `--budget`, or the limit error;
 - `130` interrupted with Ctrl+C; what was downloaded stays, and the same command resumes.
 
 ## Fixtures for the offline tests
 
-`tools\capture_fixtures.py` records the raw answers of VK for the tool's offline tests, for whoever has a token: `..\venv\Scripts\python.exe tools\capture_fixtures.py <group> [--out-dir <folder>] [--dry-run]`, run from this folder. It makes about six calls, with a cap of eight: the group, the first page of its albums, 50 photos of the largest album and 50 of the oldest one, and two pages of 100 wall posts. Choose a public group whose wall has a pinned post and reposts. Each answer is written as a JSON file, with `_capture.json` listing the calls; a file that would contain the token is refused. `--dry-run` lists the calls and writes nothing. Send the folder back by hand.
+`tools\capture_fixtures.py` records the raw answers of VK for the tool's offline tests, for whoever has a token: `..\venv\Scripts\python.exe tools\capture_fixtures.py <group> [--out-dir <folder>] [--dry-run]`, run from this folder. It makes about seven calls, with a cap of eight: the group, the first page of its albums, 50 photos of the largest album and 50 of the oldest one, two pages of 100 wall posts, and a search for the word `музей` (five results), whose answer, results or an error, tells whether the key may search groups. Choose a public group whose wall has a pinned post and reposts. Each answer is written as a JSON file, with `_capture.json` listing the calls; a file that would contain the token is refused. `--dry-run` lists the calls and writes nothing. Send the folder back by hand.
 
 ## From download to collection
 
@@ -204,6 +229,8 @@ The code is checked with ruff from the repository root's `ruff.toml` (check only
 | `vkds\cache.py` | the response cache of scan and --dry-run |
 | `vkds\albums.py` | albums: listing, download, size fallback, dead registry, manifest, reconcile |
 | `vkds\wall.py` | the wall: `scan wall` and `wall` |
+| `vkds\discover.py` | `search groups` and `sample` |
+| `vkds\sheet.py` | the contact sheet of `sample --sheet` |
 | `vkds\captions.py` | caption cleaning for the `.txt` |
 | `vkds\recheck.py` | `recheck-dead` |
 | `vkds\migrate.py` | `migrate` |

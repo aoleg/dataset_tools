@@ -12,6 +12,7 @@ from typing import Any
 
 import requests
 
+from . import __version__
 from .budget import Budget, Ledger
 from .cache import ApiCache
 
@@ -67,7 +68,7 @@ class VkClient:
         self.refresh = refresh
         self.session = session if session is not None else requests.Session()
         if session is None:
-            self.session.headers["User-Agent"] = "vkds/0.6.1 (dataset harvester)"
+            self.session.headers["User-Agent"] = "vkds/{} (dataset harvester)".format(__version__)
         self.api_calls = 0          # successful live calls of this run (for the report)
         self.attempts = 0           # HTTP attempts of this run (retries and failures included)
         self.cache_hits = 0         # responses served from the cache (free)
