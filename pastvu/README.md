@@ -18,7 +18,7 @@ You give a place and years, for example “Belarus, 1917 to 1991” or “Ukrain
    - It trims scanned frames and white borders.
    - It paints out printed captions, photographer credits and watermarks. It paints only marks it is confident about, so real shop signs and buildings are left alone.
    - Cropping never lowers JPEG quality; only painting re-saves an image.
-   - A picture with more than 2048 x 2048 pixels (4 MP, `max_pixels` in the conf) is downscaled to that area right after the band is cut, before anything else looks at it, and is saved from the downscaled pixels (JPEG at quality 95, `jpeg_quality_downscaled`). Training needs no more; a 65 MP scan would only cost time at every step.
+   - A picture with more than 2048 x 2048 pixels (4 MP, `max_pixels` in the conf) is downscaled to that area by area averaging right after the band is cut, before anything else looks at it, and is saved from the downscaled pixels (JPEG at quality 95, `jpeg_quality_downscaled`). Training needs no more; a 65 MP scan would only cost time at every step.
 3. **Black-and-white or colour:** a fast pixel test tells colour photos from black-and-white ones, and counts sepia, toned prints and yellowed paper as black-and-white.
 4. **Sort:** it first leaves out low-quality photos, such as film and TV frame grabs and blurry or washed-out scans, learned from two folders of examples. Then it puts the photo into your categories, such as transport, people or monuments, learned from example images you put in a samples folder. When two categories fit about equally, the one with the lower folder number wins. Every photo goes into a category, a doubtful one into its best guess.
 5. **Caption:** it writes a short facts line from PastVu’s record: title, years, place and description.

@@ -302,7 +302,8 @@ class Stream:
             return
         small = pr.downscale(pr.crop_array(job.array, job.pic_box), area)
         h, w = small.shape[:2]
-        job.downscale = {"from": [pw, ph], "to": [w, h], "limit": o.max_pixels, "band_rows": job.rows}
+        job.downscale = {"from": [pw, ph], "to": [w, h], "limit": o.max_pixels, "band_rows": job.rows,
+                         "filter": pr.DOWNSCALE_FILTER}
         job.head_orig = job.head
         job.head = dict(job.head, stored=[w, h], orientation=1, mcu=None)
         job.array = small

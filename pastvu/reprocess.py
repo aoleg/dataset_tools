@@ -1,6 +1,6 @@
 """reprocess --downscale: the saved photos of a base with more pixels than the limit
 are rewritten at the limit's area, in place, by the stream's own rule
-(process.downscale_size, Lanczos) and its own encoder (encode.array_bytes: JPEG at
+(process.downscale_size, OpenCV area averaging) and its own encoder (encode.array_bytes: JPEG at
 jpeg_quality_downscaled without chroma subsampling, or PNG; EXIF with the
 orientation reset and the new size, ICC kept). A saved PNG stays PNG, a JPEG stays
 JPEG; --png makes every one PNG.
@@ -42,6 +42,7 @@ import encode as enc
 import layout
 
 MODE = "downscaled"
+DOWNSCALE_FILTER = enc.pr.DOWNSCALE_FILTER
 TEMP_NAME = re.compile(r"^~[0-9a-f]{8}\.(jpg|png)$")
 AHEAD = 4                       # photos handed to each worker ahead of its results
 
@@ -71,8 +72,14 @@ def sweep_temp(base: Path, items: list[dict]) -> int:
 
 
 def _ignore_sigint() -> None:
-    """A worker process leaves Ctrl+C to the main process, which finishes the photos in hand."""
+    """A worker process leaves Ctrl+C to the main process, which finishes the photos in hand,
+    and resizes on one thread: the workers are the parallelism."""
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        import cv2
+        cv2.setNumThreads(1)
+    except ImportError:
+        pass
 
 
 def shrink_file(task: dict) -> dict:
@@ -125,9 +132,10 @@ def record_after(rec: dict | None, res: dict, rel: str, side: int) -> tuple[str,
     old_write = p.get("write", "")
     changed = [c for c in (p.get("changed") or []) if c != "downscale"] + ["downscale"]
     p["downscale"] = {"from": res["from"], "to": [res["width"], res["height"]], "limit": side, "band_rows": 0,
-                      "reprocessed": time.time(), "was": old_write}
+                      "filter": DOWNSCALE_FILTER, "reprocessed": time.time(), "was": old_write}
     if res.get("already"):
         p["downscale"]["repaired"] = True        # the file was rewritten by a run that stopped before this record
+        p["downscale"]["filter"] = None          # by a run of unknown version: Lanczos before 2026-11-05
     p["write"] = MODE
     p["changed"] = changed
     output = dict(p.get("output") or {})

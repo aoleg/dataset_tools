@@ -44,9 +44,12 @@ ASPECT_REASON = "aspect ratio"
 DEFAULT_MAX_PIXELS = 2048      # the side of the square: a picture over 2048^2 pixels is downscaled to that area
 
 
+DOWNSCALE_FILTER = "area"      # OpenCV INTER_AREA; the records say which filter made a downscaled photo
+
+
 def downscale_size(w: int, h: int, area: int) -> tuple[int, int]:
     """The largest size with the aspect ratio of w x h and at most area pixels: the
-    normalize tool's rule, so the two agree to the pixel."""
+    normalize tool's rule, so the two agree on the size."""
     import math
     scale = math.sqrt(area / (w * h))
     nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
@@ -59,14 +62,16 @@ def downscale_size(w: int, h: int, area: int) -> tuple[int, int]:
 
 
 def downscale(array: np.ndarray, area: int) -> np.ndarray:
-    """An upright RGB uint8 array over `area` pixels resized to downscale_size with
-    Lanczos (reducing_gap 3, as normalize does); the array itself when it fits."""
+    """An upright RGB uint8 array over `area` pixels resized to downscale_size by area
+    averaging (OpenCV INTER_AREA); the array itself when it fits. Chosen over Pillow's
+    Lanczos on 2026-11-05: 28 ms against 93 ms for a 7 MP photo, the same at 1:1 on
+    the owner's comparison sheets (PSNR 46 to 52 dB between the two)."""
+    import cv2
     h, w = array.shape[:2]
     if w * h <= area:
         return array
     nw, nh = downscale_size(w, h, area)
-    im = Image.fromarray(np.ascontiguousarray(array)).resize((nw, nh), Image.Resampling.LANCZOS, reducing_gap=3.0)
-    return np.asarray(im, dtype=np.uint8)
+    return cv2.resize(np.ascontiguousarray(array), (nw, nh), interpolation=cv2.INTER_AREA)
 
 
 def aspect_reason(w: int, h: int, max_aspect: float) -> str | None:
