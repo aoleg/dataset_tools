@@ -138,7 +138,8 @@ judge делит видеокарту по очереди: сначала под
 
 - `.opencode\skills\vk-dataset\SKILL.md` — текст из `partner\skill_vk-dataset.md`;
 - `.opencode\skills\dataset-tools-postprocess\SKILL.md` — из `partner\skill_dataset-tools-postprocess.md`;
-- `.opencode\skills\vk-agent-scenarios\SKILL.md` — из `partner\skill_vk-agent-scenarios.md` (оба сценария этого руководства).
+- `.opencode\skills\vk-agent-scenarios\SKILL.md` — из `partner\skill_vk-agent-scenarios.md` (оба сценария этого руководства);
+- `.opencode\skills\dataset-tools-menu\SKILL.md` — из `partner\skill_dataset-tools-menu.md`: меню «С чем работаем?» в начале сессии и скиллы остальных инструментов dataset_tools, которые агент строит сам. Как это устроено и какие права нужны — `partner\МЕНЮ.md`, правки AGENTS.md — `partner\AGENTS_меню.md`.
 
 Команда `/status` (`.opencode\commands\status.md`) читает `STATUS.md` из папки проекта и выводит сводку: этап, расход вызовов за месяц, планы, открытые вопросы.
 

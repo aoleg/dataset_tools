@@ -211,7 +211,7 @@ The manifest keeps what attribution and a takedown need: the group, the album or
 
 ## For the partner
 
-The folder `partner\` holds the handover for the partner who runs the tool through his local agent, in Russian. `partner\README.md` is his manual: the two scenarios of his agent (finding groups with `search groups` and `sample --sheet`, and downloading groups with a selection by a condition through [judge](../judge/README.md)), the wiring of OpenCode for them and two sample tasks. `ПЕРЕХОД.md` is the one-time move from the old package. The three OpenCode skills (`skill_vk-dataset.md`, `skill_dataset-tools-postprocess.md`, `skill_vk-agent-scenarios.md`) and the checklist of edits to his agent files complete it.
+The folder `partner\` holds the handover for the partner who runs the tool through his local agent, in Russian. `partner\README.md` is his manual: the two scenarios of his agent (finding groups with `search groups` and `sample --sheet`, and downloading groups with a selection by a condition through [judge](../judge/README.md)), the wiring of OpenCode for them and two sample tasks. `ПЕРЕХОД.md` is the one-time move from the old package. The three OpenCode skills (`skill_vk-dataset.md`, `skill_dataset-tools-postprocess.md`, `skill_vk-agent-scenarios.md`) and the checklist of edits to his agent files complete it. `МЕНЮ.md`, `AGENTS_меню.md` and `skill_dataset-tools-menu.md` extend his agent to the other tools of this repository: a menu at the start of a session, and one skill per tool that the agent writes itself from the tool's `--help` and README the first time the tool is chosen.
 
 ## Lint
 
