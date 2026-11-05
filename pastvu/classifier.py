@@ -134,6 +134,13 @@ class Classifier:
     def embed(self, array: np.ndarray) -> np.ndarray:
         return self.encoder.embed_arrays([pr.naflex_resize(array, self.patches)])[0]
 
+    def prepare_naflex(self, array: np.ndarray) -> np.ndarray:
+        """The encoder's input (the NaFlex resize) made ahead, in another thread; no model."""
+        return pr.naflex_resize(array, self.patches)
+
+    def embed_prepared(self, naflex: np.ndarray) -> np.ndarray:
+        return self.encoder.embed_arrays([naflex])[0]
+
     def embed_file(self, path: Path) -> np.ndarray:
         data = Path(path).read_bytes()
         head = pr.head_of(data)

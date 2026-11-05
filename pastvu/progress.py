@@ -18,7 +18,7 @@ from rich.progress import BarColumn, MofNCompleteColumn, Progress, TaskProgressC
     TimeRemainingColumn
 from rich.text import Text
 
-STAGES = ["fetch", "pull", "detect", "paint", "colour", "classify", "encode", "write", "caption"]
+STAGES = ["fetch", "pull", "prepare", "detect", "paint", "classify", "colour", "encode", "write", "caption"]
 
 
 def hms(seconds: float) -> str:
@@ -97,7 +97,7 @@ def interval_block(snap: dict, live: dict) -> tuple[str, dict]:
     p90 = lat[min(n - 1, int(n * 0.9))] if n else 0.0
     over = sum(1 for x in lat if x > 30)
     writers = max(1, int(live.get("writers", 1)))
-    busy = sum(sec.get(k, 0.0) for k in ("encode", "write", "colour_w")) / writers
+    busy = sum(sec.get(k, 0.0) for k in ("encode", "write", "colour")) / writers
     moves, move_s = int(c.get("chunk_moves", 0)), sec.get("chunk_move", 0.0)
     d = {"wall": round(wall, 1), "photos": done, "rate": round(done / wall, 2) if wall > 0 else 0.0,
          "main_stage": round(stage, 1), "main_wait_input": round(w_in, 1), "main_wait_writers": round(w_out, 1),

@@ -79,7 +79,7 @@ class Options:
     dark_borders: bool = True
     fetchers: int = 4
     depth: int = 16
-    writers: int = 2
+    writers: int = 4                  # encode, colour test and write: 0.02 to 0.2 s per photo each
     report_every: int = 500
     limit: int | None = None
     retries: int = 3
@@ -91,7 +91,7 @@ class Options:
     display: str = "live"
     raw: bool = False                 # run --raw: download into the storage, no processing
     keep_rejects: bool = False        # a stored photo rejected by the processing keeps its raw files
-    storage_threads: int = 4          # threads that read and prepare stored photos
+    storage_threads: int = 6          # threads that read and prepare stored photos (decode, borders, model inputs)
     storage_depth: int = 4            # stored photos prepared ahead of the GPU (at least the threads)
 
     @property
@@ -118,7 +118,11 @@ class Job:
     sidecars: dict = None             # an import: the source's other sidecars, copied as they are
     written: list = None              # an import: the sidecars written next to the image
     raw: str | None = None            # from the storage: the raw image's path relative to the base
+    det_input: np.ndarray = None      # the detector's input, made by the worker (watermark.detector_input)
+    det_scale: float = 1.0
+    naflex: np.ndarray = None         # the encoder's input of the picture, made by the worker
     t_fetch: float = 0.0
+    t_prepare: float = 0.0            # of which: the models' inputs
 
 
 def cleanup_interrupted(store: Store, base: Path, scope: str) -> int:
@@ -140,6 +144,10 @@ class Stream:
         self.client, self.store, self.opts = client, store, opts
         self.classifier = classifier
         self.det_name, self.det = detector or (None, None)
+        self.det_imgsz = 0
+        if self.det is not None:
+            import watermark as wm
+            self.det_imgsz = wm.detector_imgsz(self.det)
         self.lama = lama
         self.scope = opts.scope["name"]
         self.scopes = opts.scopes or {self.scope: opts.scope}
@@ -211,6 +219,7 @@ class Stream:
             job.borders = pr.borders_plan(job.array, {"dark": o.dark_borders})
         job.caption = importer.read_caption(path)
         job.sidecars = importer.read_sidecars(path)
+        self.prepare_inputs(job)
         job.t_fetch = time.perf_counter() - t0
         return job
 
@@ -267,8 +276,26 @@ class Stream:
         if o.borders:
             picture = pr.crop_array(job.array, job.pic_box)
             job.borders = pr.borders_plan(picture, {"dark": o.dark_borders})
+        self.prepare_inputs(job)
         job.t_fetch += time.perf_counter() - t0
         return job
+
+    def prepare_inputs(self, job: Job) -> None:
+        """The models' inputs, made in the worker thread that decoded the photo so the
+        main thread runs the kernels and no full-resolution copy or resize: the
+        detector's letterbox-sized BGR image (the detector then resizes nothing, so
+        the boxes are those of the full array), and the encoder's NaFlex resize of the
+        picture, used when the final pixels are the picture (no border cut, no trim,
+        no paint) and made again from the final pixels otherwise."""
+        t0 = time.perf_counter()
+        picture = pr.crop_array(job.array, job.pic_box)
+        if self.det is not None and self.det_imgsz:
+            import watermark as wm
+            job.det_input, job.det_scale = wm.detector_input(picture, self.det_imgsz)
+        prep = getattr(self.classifier, "prepare_naflex", None)
+        if prep is not None:
+            job.naflex = prep(picture)
+        job.t_prepare = time.perf_counter() - t0
 
     def fetch(self, cid: int, scope: str) -> Job:
         if self.source is not None:
@@ -426,14 +453,22 @@ class Stream:
 
     def process(self, job: Job) -> tuple:
         import watermark as wm
+        """The main thread's part: the kernels on the inputs the worker prepared, the
+        crop plan and its gates, LaMa on the painted few, the decisions. No
+        full-resolution copy unless a photo is painted or its final pixels are not
+        the picture. The colour test is the writer's. -> what write() takes; final is
+        None when the writer is to crop it itself."""
         o, d, s = self.opts, self.display, self.stats
-        picture = pr.crop_array(job.array, job.pic_box)
         boxes = []
         if self.det is not None:
             d.set(f"{job.cid}: detecting watermarks")
             t = time.perf_counter()
-            boxes = wm.detect(self.det, picture, o.wm_conf)
+            if job.det_input is not None:
+                boxes = wm.detect_prepared(self.det, job.det_input, job.det_scale, o.wm_conf)
+            else:
+                boxes = wm.detect(self.det, pr.crop_array(job.array, job.pic_box), o.wm_conf)
             s.time("detect", time.perf_counter() - t)
+        job.det_input = None
         plan = pr.compose(job.head, job.pic_box, job.rows > 0, job.borders, boxes,
                           {"mode": o.wm_mode, "dilate": o.wm_dilate, "paint_conf": o.wm_paint_conf})
         cw, ch = plan["size"]
@@ -442,38 +477,43 @@ class Stream:
         wide = pr.aspect_reason(cw, ch, o.max_aspect)
         if wide:
             raise pr.Rejected(wide + " after crop")
-        crop = pr.crop_array(job.array, plan["box"])
-        painted = None
+        painted = final = None
         if plan["wm_inside"]:
             d.set(f"{job.cid}: painting {len(plan['wm_inside'])} watermark box(es)")
             t = time.perf_counter()
-            painted = wm.inpaint(crop, plan["wm_inside"], o.wm_dilate, o.wm_max_size, self.lama)
+            crop = pr.crop_array(job.array, plan["box"])
+            painted = final = wm.inpaint(crop, plan["wm_inside"], o.wm_dilate, o.wm_max_size, self.lama)
             self.release_cache()
             s.time("paint", time.perf_counter() - t)
-        final = painted if painted is not None else crop
-        t = time.perf_counter()
-        tone = colour.scores(final, plan["wm_inside"], o.wm_dilate) if o.colour else None  # painted boxes left out
-        s.time("colour", time.perf_counter() - t)
         vec = verdict = None
         if self.classifier is not None:
             d.set(f"{job.cid}: classifying")
             t = time.perf_counter()
-            vec = self.classifier.embed(final)
+            W, H = pr.upright_size(job.head)
+            is_picture = painted is None and (plan["box"] or [0, 0, W, H]) == list(job.pic_box)
+            if job.naflex is not None and is_picture:
+                vec = self.classifier.embed_prepared(job.naflex)
+            else:
+                if final is None:
+                    final = pr.crop_array(job.array, plan["box"])
+                vec = self.classifier.embed(final)
+            job.naflex = None
             bad = float(self.classifier.low_quality(vec)[0])
             if not np.isnan(bad):          # at or above the threshold
                 s.time("classify", time.perf_counter() - t)
                 raise pr.Rejected(self.classifier.quality.reason(bad))
             if self.against is not None:
                 d.set(f"{job.cid}: looking for a copy in the base")
+                if final is None:
+                    final = pr.crop_array(job.array, plan["box"])
                 hit = self.against.match(vec, final)
                 if hit:
                     s.time("classify", time.perf_counter() - t)
                     raise pr.Rejected(self.against.reason(hit))
             verdict = self.classifier.decide(vec)
             s.time("classify", time.perf_counter() - t)
-        if tone is not None:
-            tone = colour.decide(tone, self.mode_probe, vec)
-        return plan, boxes, painted, vec, verdict, final.shape[1], final.shape[0], final, tone
+        tone = None
+        return plan, boxes, painted, vec, verdict, cw, ch, final, tone
 
     # --- writer threads ------------------------------------------------------------
 
@@ -538,8 +578,12 @@ class Stream:
         folder = verdict.folder if verdict else ""
         scope = job.scope
         chunker = self.chunker_for(scope)
-        if o.colour:
-            tone = tone or colour.decide({"off_hue": 0.0, "strong": 0.0, "tone": 0.0})
+        if final is None and (o.colour or self.captioner is not None):
+            final = pr.crop_array(job.array, plan["box"])       # the writer's copy, not the main thread's
+        if o.colour and tone is None:
+            t = time.perf_counter()
+            tone = colour.decide(colour.scores(final, plan["wm_inside"], o.wm_dilate), self.mode_probe, vec)
+            s.time("colour", time.perf_counter() - t)          # painted boxes left out of the test
         tone_mode = tone["mode"] if tone else None
         rel_scope = chunker.place(layout.with_mode(chunker.sc, tone_mode, folder), f"{layout.stem_of(job.cid)}{ext}")
         rel = chunker.rel(rel_scope)
@@ -594,6 +638,7 @@ class Stream:
             # after the photo is committed: a wait here (the VLM is behind) slows the stream, nothing else
             import autocaption as ac
             self.captioner.put(ac.Target(job.cid, path, image=final, tags=facts, scope=scope, base=o.base))
+        job.array = None
         s.add(done=1)
         d.advance(saved=True)
         d.line({"cid": job.cid, "state": DONE, "path": rel, "write": mode, "changed": plan["changed"],
@@ -836,11 +881,11 @@ class Stream:
                             self.put_to_writers(wq, (item,))
                         else:
                             self.stats.time("pull" if source == "storage" else "fetch", item.t_fetch)
+                            self.stats.time("prepare", item.t_prepare)
                             t_stage = time.perf_counter()
                             res = None
                             try:
-                                res = self.process(item)
-                                item.array = None
+                                res = self.process(item)       # the writer drops item.array when it is done
                             except pr.Rejected as r:
                                 self.reject(item.cid, r, item.scope)
                             except Exception as e:  # noqa: BLE001

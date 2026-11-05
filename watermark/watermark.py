@@ -252,11 +252,7 @@ def unload(detector: bool = True, lama: bool = True) -> None:
 
 # --- detection and painting ---------------------------------------------------------
 
-def detect(model, array: np.ndarray, conf: float) -> list:
-    """The watermark boxes of an upright RGB uint8 array: [[x0, y0, x1, y1, conf], ...]
-    with integer edges, as the detector reports them (no dilation)."""
-    bgr = np.ascontiguousarray(array[:, :, ::-1])        # ultralytics takes a numpy array as BGR
-    r = model.predict(bgr, conf=conf, verbose=False)[0]
+def _boxes_of(r) -> list:
     if r.boxes is None or len(r.boxes) == 0:
         return []
     out = []
@@ -264,6 +260,58 @@ def detect(model, array: np.ndarray, conf: float) -> list:
         x0, y0, x1, y1 = (int(v) for v in box)
         out.append([x0, y0, x1, y1, round(float(c), 3)])
     return out
+
+
+def detect_many(model, arrays: list, conf: float) -> list[list]:
+    """The watermark boxes of several upright RGB uint8 arrays in one call of the
+    detector (one letterbox per image, one forward pass): a list of box lists,
+    each [[x0, y0, x1, y1, conf], ...] in its own image's pixels."""
+    if not arrays:
+        return []
+    bgrs = [np.ascontiguousarray(a[:, :, ::-1]) for a in arrays]      # ultralytics takes numpy arrays as BGR
+    return [_boxes_of(r) for r in model.predict(bgrs, conf=conf, verbose=False)]
+
+
+def detect(model, array: np.ndarray, conf: float) -> list:
+    """The watermark boxes of an upright RGB uint8 array: [[x0, y0, x1, y1, conf], ...]
+    with integer edges, as the detector reports them (no dilation)."""
+    return detect_many(model, [array], conf)[0]
+
+
+def detector_imgsz(model) -> int:
+    """The input size the detector runs at: the override set when it was loaded, else
+    the size in the checkpoint's training arguments, else 640."""
+    size = (getattr(model, "overrides", None) or {}).get("imgsz")
+    if not size:
+        args = getattr(getattr(model, "model", None), "args", None) or {}
+        size = args.get("imgsz") if isinstance(args, dict) else getattr(args, "imgsz", None)
+    size = size[0] if isinstance(size, (list, tuple)) else size
+    return int(size or 640)
+
+
+def detector_input(array: np.ndarray, imgsz: int) -> tuple[np.ndarray, float]:
+    """The detector's input made ahead of the call, in another thread: the upright RGB
+    array resized the way ultralytics' letterbox would (the same ratio, the same
+    rounding, cv2.INTER_LINEAR) and turned BGR. The letterbox then finds the image at
+    its size and resizes nothing, so the network sees the same pixels as from the full
+    array (measured: every confidence identical). -> (bgr, r), r the scale applied."""
+    import cv2
+    h, w = array.shape[:2]
+    r = min(imgsz / h, imgsz / w)
+    new = (int(round(w * r)), int(round(h * r)))
+    bgr = np.ascontiguousarray(array[:, :, ::-1])
+    if (w, h) != new:
+        bgr = cv2.resize(bgr, new, interpolation=cv2.INTER_LINEAR)
+    return bgr, r
+
+
+def detect_prepared(model, bgr: np.ndarray, r: float, conf: float) -> list:
+    """detect() on an input from detector_input: the boxes come back in the full
+    array's pixels (divided by r, within a few pixels of the full-size call)."""
+    boxes = _boxes_of(model.predict(bgr, conf=conf, verbose=False)[0])
+    if r == 1.0:
+        return boxes
+    return [[int(v / r) for v in b[:4]] + [b[4]] for b in boxes]
 
 
 def boxes_mask(shape, boxes, dilate: int) -> np.ndarray:

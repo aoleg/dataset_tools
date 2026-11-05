@@ -1654,12 +1654,13 @@ def parse_args(argv=None):
                             f"(default {','.join(sidecars.TXT_FIELDS)})")
         p.add_argument("--json-sidecar", action="store_true", help="also write the record next to the image")
         p.add_argument("--depth", type=int, default=16, metavar="N", help="images fetched ahead of the GPU (default 16)")
-        p.add_argument("--writers", type=int, default=2, metavar="N", help="encoder and writer threads (default 2)")
+        p.add_argument("--writers", type=int, default=4, metavar="N",
+                       help="threads that test the colour, encode and write (default 4)")
         p.add_argument("--keep-rejects", action="store_true",
                        help="a stored photo the processing rejects keeps its raw files in the storage (default: "
                             "deleted, since nothing fetches it again)")
-        p.add_argument("--storage-threads", type=int, default=4, metavar="N",
-                       help="threads that read and decode stored photos ahead of the GPU (default 4)")
+        p.add_argument("--storage-threads", type=int, default=6, metavar="N",
+                       help="threads that read, decode and prepare stored photos ahead of the GPU (default 6)")
         p.add_argument("--export", action="store_true",
                        help="hard-link every saved photo into <base parent>/pastvu_export/<category>/<bw|color>/<NNN> "
                             "as it is written (photos saved before are linked at the start)")
