@@ -21,3 +21,6 @@ _vkds/
 tmp/
 datasets/
 tests/_smoke_out/
+# Ready-made agent files and the instruction for the partner, with his machine paths; passed to him by hand
+partner/файлы_агента/
+partner/инструкция/

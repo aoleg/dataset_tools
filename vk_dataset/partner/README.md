@@ -71,75 +71,11 @@ judge делит видеокарту по очереди: сначала под
 
 ## Настройка OpenCode
 
-Проект OpenCode — папка `<папка dataset_tools>\vk_dataset`. Ниже — нужные блоки `opencode.jsonc`; пути в нём пишутся прямыми слэшами, вместо заглушек — ваши пути. Если `opencode.jsonc` уже правлен по `AGENTS_изменения.md`, сверьте и допишите недостающее.
+Файлы агента (`AGENTS.md`, `opencode.jsonc`, папка `.opencode` со скиллами и командой `/status`) мы присылаем готовыми, под ваши пути, вместе с инструкцией по установке: скопировать в папку проекта с заменой и открыть OpenCode заново. Править в них ничего не нужно. Для справки, что в них записано:
 
-Модель — без изменений: локальная Ollama, контекст 57344 при 65536 у Ollama (запас на погрешность оценки токенов), вывод 16384, по умолчанию без размышлений, вариант `think` — для сложных задач (Ctrl+T).
-
-```jsonc
-"model": "local/qwen3.8-27b",
-"plugins": ["-opencode.provider.ollama"],
-"providers": {
-  "local": {
-    "name": "Ollama Local",
-    "package": "@opencode/ai/providers/openai-compatible",
-    "settings": { "baseURL": "http://127.0.0.1:11434/v1", "headerTimeout": 900000 },
-    "models": {
-      "qwen3.8-27b": {
-        "modelID": "qwen3.8-27b-64k",
-        "name": "Qwen 3.8 27B (Ollama, 64K)",
-        "capabilities": { "tools": true, "input": ["text", "image"], "output": ["text"] },
-        "limit": { "context": 57344, "output": 16384 },
-        "body": { "reasoning_effort": "none" },
-        "variants": [ { "id": "think", "body": { "reasoning_effort": "high" } } ]
-      }
-    }
-  }
-},
-```
-
-Компакция и вывод инструментов — без изменений. `buffer: 20000` **не уменьшать**: при маленьком зазоре суммаризации не хватает места, и компакция всегда падает.
-
-```jsonc
-"compaction": { "auto": true, "keep": { "tokens": 8000 }, "buffer": 20000 },
-"tool_output": { "max_lines": 1000, "max_bytes": 32768 },
-"references": {
-  "dataset_tools": {
-    "path": "..",
-    "description": "Инструменты dataset_tools: vk_dataset, judge, deduplicate, scripts. Разрешены чтение и запуск; изменять файлы запрещено. Начинать с README.md в корне."
-  }
-},
-```
-
-Права: побеждает **последнее** совпавшее правило, порядок важен. judge агент может читать и запускать (`--help`), но не править; прогоны judge запускаете вы. Запреты на токен — последними.
-
-```jsonc
-"permissions": [
-  { "action": "external_directory", "resource": "<папка dataset_tools>/*", "effect": "allow" },
-  { "action": "read", "resource": "<папка dataset_tools>/*", "effect": "allow" },
-  { "action": "edit", "resource": "<папка dataset_tools>/*", "effect": "deny" },
-  { "action": "edit", "resource": "<папка dataset_tools>/vk_dataset/STATUS.md", "effect": "allow" },
-  { "action": "edit", "resource": "<папка dataset_tools>/vk_dataset/tmp/*", "effect": "allow" },
-  { "action": "edit", "resource": "<папка dataset_tools>/vk_dataset/vkds/*", "effect": "deny" },
-  { "action": "edit", "resource": "<папка dataset_tools>/vk_dataset/tools/*", "effect": "deny" },
-  { "action": "edit", "resource": "<папка dataset_tools>/judge/*", "effect": "deny" },
-  { "action": "external_directory", "resource": "<папка датасетов>/*", "effect": "allow" },
-  { "action": "read", "resource": "<папка датасетов>/*", "effect": "allow" },
-  { "action": "edit", "resource": "<папка датасетов>/*", "effect": "deny" },
-  { "action": "read", "resource": "vk_token.txt", "effect": "deny" },
-  { "action": "read", "resource": "<папка dataset_tools>/vk_dataset/vk_token.txt", "effect": "deny" }
-],
-"watcher": {
-  "ignore": ["_vkds/**", "_removed/**", "tests/**", "tmp/**", "**/*.jpg", "**/*.jpeg", "**/*.png",
-             "**/*.gif", "**/*.webp", "**/*.mp4", "**/*.zip"]
-}
-```
-
-Скиллы — три файла, каждый в своей папке `.opencode\skills\<имя>\SKILL.md`:
-
-- `.opencode\skills\vk-dataset\SKILL.md` — текст из `partner\skill_vk-dataset.md`;
-- `.opencode\skills\dataset-tools-postprocess\SKILL.md` — из `partner\skill_dataset-tools-postprocess.md`;
-- `.opencode\skills\vk-agent-scenarios\SKILL.md` — из `partner\skill_vk-agent-scenarios.md` (оба сценария этого руководства);
-- `.opencode\skills\dataset-tools-menu\SKILL.md` — из `partner\skill_dataset-tools-menu.md`: меню «С чем работаем?» в начале сессии и скиллы остальных инструментов dataset_tools, которые агент строит сам. Как это устроено и какие права нужны — `partner\МЕНЮ.md`, правки AGENTS.md — `partner\AGENTS_меню.md`.
+- модель — локальная Ollama, контекст 57344 при 65536 у Ollama, вариант `think` для сложных задач (Ctrl+T); компакция с запасом `buffer: 20000`, который уменьшать нельзя;
+- права: инструменты dataset_tools агент читает и запускает, но не правит; менять он может только `STATUS.md`, `tmp\` и свои скиллы инструментов `tool-*`; датасеты пишут инструменты, не агент; токен агенту читать запрещено;
+- скиллы: `vk-dataset` (работа с ВК), `vk-agent-scenarios` (оба сценария этого руководства), `dataset-tools-postprocess` (дубли и фото не по теме) и `dataset-tools-menu` (меню «С чем работаем?» в начале сессии и скиллы остальных инструментов набора, которые агент пишет себе сам). Их тексты лежат в `partner\skill_*.md`.
 
 Команда `/status` (`.opencode\commands\status.md`) читает `STATUS.md` из папки проекта и выводит сводку: этап, расход вызовов за месяц, планы, открытые вопросы.
 
