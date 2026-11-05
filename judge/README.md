@@ -90,7 +90,7 @@ A rerun with another condition is refused while `verdicts.csv` holds verdicts fo
 
 ## Where it fits
 
-For a [vk_dataset](../vk_dataset/README.md) download, judge with a condition replaces step 4 of the sequence there: with the captions alone (the default) it is `scripts\unrelated.py` with your condition in place of the fixed topic, and with `--images` it also judges the photos without captions. `unrelated.py` stays for its fixed topic. Run it after `deduplicate`, on the raw group folder, before the pastvu import.
+For a [vk_dataset](../vk_dataset/README.md) download, judge with a condition replaces step 4 of the sequence there: with the captions alone (the default) it is `scripts\unrelated.py` with your condition in place of the fixed topic, and with `--images` it also judges the photos without captions. `unrelated.py` stays for its fixed topic. Run it after `deduplicate`, on the raw group folder, before the pastvu import. The Russian manual of the partner who runs vk_dataset through a local agent, `vk_dataset\partner\README.md`, walks through that scenario step by step: the person starts judge in a terminal, the agent reads `report.txt` afterwards.
 
 Judge is agnostic about the condition. The era of a photograph for a historic collection stays the business of the pastvu import and the classify samples folder.
 
