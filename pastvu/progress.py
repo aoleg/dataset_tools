@@ -34,23 +34,94 @@ def hms(seconds: float) -> str:
 
 class Stats:
     """Pace and counts of this process; the store keeps the totals of the
-    scope across runs, written with each photo."""
+    scope across runs, written with each photo. Beside the run's totals (c,
+    seconds, calls) the same counts are kept since the last report block
+    (interval()), so a block says what happened lately, not on average."""
 
     def __init__(self):
         self.lock = threading.Lock()
         self.c = Counter()
         self.seconds = Counter()
         self.calls = Counter()
+        self.i = Counter()                 # counts since the last interval()
+        self.iseconds = Counter()
+        self.icalls = Counter()
+        self.latencies: list[float] = []   # download seconds since the last interval()
+        self.t_interval = time.time()
 
     def add(self, **kw) -> None:
         with self.lock:
             for k, v in kw.items():
                 self.c[k] += v
+                self.i[k] += v
 
     def time(self, stage: str, seconds: float) -> None:
         with self.lock:
             self.seconds[stage] += seconds
             self.calls[stage] += 1
+            self.iseconds[stage] += seconds
+            self.icalls[stage] += 1
+
+    def latency(self, seconds: float) -> None:
+        with self.lock:
+            self.latencies.append(seconds)
+
+    def interval(self) -> dict:
+        """The counts, stage seconds and download latencies since the last call, and the
+        wall seconds they cover; then they start again."""
+        with self.lock:
+            now = time.time()
+            out = {"wall": now - self.t_interval, "c": dict(self.i), "seconds": dict(self.iseconds),
+                   "calls": dict(self.icalls), "latencies": sorted(self.latencies)}
+            self.i.clear()
+            self.iseconds.clear()
+            self.icalls.clear()
+            self.latencies = []
+            self.t_interval = now
+        return out
+
+
+def _pct(part: float, whole: float) -> str:
+    return f"{100 * part / whole:.0f} %" if whole > 0 else "-"
+
+
+def interval_block(snap: dict, live: dict) -> tuple[str, dict]:
+    """The report lines about the photos since the last block, from Stats.interval()
+    and the stream's live view (threads in a request and the oldest's age, storage
+    threads waiting, writers). -> (text, the same numbers as a dict for a JSON line)."""
+    c, sec, calls, lat, wall = snap["c"], snap["seconds"], snap["calls"], snap["latencies"], snap["wall"]
+    done = int(c.get("done", 0) + c.get("stored", 0))
+    stage, w_in, w_out = sec.get("stage", 0.0), sec.get("wait_input", 0.0), sec.get("wait_writers", 0.0)
+    n = len(lat)
+    med = lat[n // 2] if n else 0.0
+    p90 = lat[min(n - 1, int(n * 0.9))] if n else 0.0
+    over = sum(1 for x in lat if x > 30)
+    writers = max(1, int(live.get("writers", 1)))
+    busy = sum(sec.get(k, 0.0) for k in ("encode", "write", "colour_w")) / writers
+    moves, move_s = int(c.get("chunk_moves", 0)), sec.get("chunk_move", 0.0)
+    d = {"wall": round(wall, 1), "photos": done, "rate": round(done / wall, 2) if wall > 0 else 0.0,
+         "main_stage": round(stage, 1), "main_wait_input": round(w_in, 1), "main_wait_writers": round(w_out, 1),
+         "downloads": n, "download_median": round(med, 2), "download_p90": round(p90, 2), "download_over_30s": over,
+         "retries": int(c.get("retries", 0)), "in_request": int(live.get("in_request", 0)),
+         "oldest_request": round(float(live.get("oldest_request", 0.0)), 1),
+         "stored_prepared": int(calls.get("pull", 0)), "store_read": round(sec.get("store_read", 0.0), 2),
+         "storage_wait_put": round(sec.get("storage_wait_put", 0.0), 1), "storage_threads": int(live.get("storage_threads", 0)),
+         "writers_busy": round(busy, 1), "chunk_moves": moves, "chunk_move_seconds": round(move_s, 1),
+         "export_links": int(c.get("exported", 0))}
+    lines = [f"  last {done:,} photo{'s' if done != 1 else ''} ({hms(wall)}): {d['rate']:.2f}/s; "
+             f"main thread: stage {_pct(stage, wall)}, "
+             f"waiting for input {_pct(w_in, wall)}, for the writers {_pct(w_out, wall)}"]
+    if n or live.get("in_request"):
+        lines.append(f"    downloads: {n:,} done, median {med:.1f} s, 90 % under {p90:.1f} s, {over} over 30 s, "
+                     f"{d['retries']} retries; {d['in_request']} threads in a request, oldest {d['oldest_request']:.0f} s")
+    if calls.get("pull"):
+        st = int(live.get("storage_threads", 0)) or 1
+        lines.append(f"    storage: {d['stored_prepared']:,} prepared, store reads {sec.get('store_read', 0.0) / max(1, calls.get('pull', 1)) * 1000:.0f} ms "
+                     f"each, waiting for a free slot {_pct(sec.get('storage_wait_put', 0.0), wall * st)}")
+    lines.append(f"    writers: busy {_pct(busy, wall)}"
+                 + (f", {moves} chunk move{'s' if moves != 1 else ''} ({move_s:.0f} s)" if moves else "")
+                 + (f", {d['export_links']:,} export links" if d["export_links"] else ""))
+    return "\n".join(lines), d
 
 
 def _reason_lines(c: dict) -> list[str]:

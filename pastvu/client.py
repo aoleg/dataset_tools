@@ -21,6 +21,15 @@ IMG = "https://img.pastvu.com"
 PAGE = "https://pastvu.com"
 USER_AGENT = "dataset_tools-pastvu/0.1 (+https://github.com/aoleg/dataset_tools)"
 TIMEOUT = httpx.Timeout(connect=20.0, read=180.0, write=20.0, pool=60.0)
+# A stalled transfer held a fetch thread for the read timeout per read (a trickle: minutes),
+# then the retries; one photo could hold a thread for twenty minutes. Now: 30 s without a
+# byte, or 60 s for the whole image, and the photo is left for a later attempt.
+READ_TIMEOUT = 30.0
+IMAGE_DEADLINE = 60.0
+
+
+class DeadlineExceeded(httpx.ReadTimeout):
+    """An image download that took longer than the deadline in all."""
 RETRY_STATUS = {408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524}
 MAX_RETRIES = 6
 BACKOFF_BASE = 1.5                        # seconds; doubles each retry, with jitter, capped
@@ -71,12 +80,17 @@ class RateCap:
 class Client:
     """Thread-safe: httpx.Client pools connections and may be shared by threads."""
 
-    def __init__(self, max_per_second: float | None = None, connections: int = 8, user_agent: str = USER_AGENT):
+    def __init__(self, max_per_second: float | None = None, connections: int = 8, user_agent: str = USER_AGENT,
+                 read_timeout: float = READ_TIMEOUT, image_deadline: float = IMAGE_DEADLINE):
+        """read_timeout: seconds without a byte after which a request is abandoned (and retried);
+        image_deadline: seconds an image download may take in all, 0 for no limit."""
         self.http = httpx.Client(
             headers={"User-Agent": user_agent, "Accept": "application/json, image/*;q=0.9, */*;q=0.1"},
-            timeout=TIMEOUT, follow_redirects=True,
+            timeout=httpx.Timeout(connect=TIMEOUT.connect, read=read_timeout, write=TIMEOUT.write, pool=TIMEOUT.pool),
+            follow_redirects=True,
             limits=httpx.Limits(max_connections=connections, max_keepalive_connections=connections),
         )
+        self.image_deadline = image_deadline
         self.cap = RateCap(max_per_second)
         self.stats = {"requests": 0, "retries": 0, "bytes": 0}
         self.lock = threading.Lock()
@@ -92,7 +106,19 @@ class Client:
 
     # --- transport -------------------------------------------------------------
 
-    def _request(self, method: str, url: str, what: str, **kw) -> httpx.Response:
+    def _download(self, method: str, url: str, deadline: float, **kw) -> httpx.Response:
+        """A request read in chunks against a clock: DeadlineExceeded once it has taken
+        longer than deadline seconds in all. The chunks are joined into a Response."""
+        t0 = time.monotonic()
+        with self.http.stream(method, url, **kw) as r:
+            chunks = []
+            for chunk in r.iter_bytes():
+                chunks.append(chunk)
+                if time.monotonic() - t0 > deadline:
+                    raise DeadlineExceeded(f"took more than {deadline:.0f} s", request=r.request)
+            return httpx.Response(r.status_code, headers=r.headers, content=b"".join(chunks), request=r.request)
+
+    def _request(self, method: str, url: str, what: str, deadline: float = 0.0, **kw) -> httpx.Response:
         delay = BACKOFF_BASE
         last = ""
         for attempt in range(MAX_RETRIES + 1):
@@ -100,7 +126,7 @@ class Client:
             with self.lock:
                 self.stats["requests"] += 1
             try:
-                r = self.http.request(method, url, **kw)
+                r = self._download(method, url, deadline, **kw) if deadline > 0 else self.http.request(method, url, **kw)
             except (httpx.TransportError, httpx.TimeoutException) as e:
                 last = f"{type(e).__name__}: {e}"
             else:
@@ -163,7 +189,7 @@ class Client:
 
     def image(self, file: str, variant: str = "a") -> tuple[bytes, str]:
         """The bytes of an image variant (a: original, d: standard, h: thumb) and its content type."""
-        r = self._request("GET", f"{IMG}/{variant}/{file}", f"image {variant}/{file}")
+        r = self._request("GET", f"{IMG}/{variant}/{file}", f"image {variant}/{file}", deadline=self.image_deadline)
         return r.content, r.headers.get("Content-Type", "")
 
 

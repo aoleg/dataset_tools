@@ -46,7 +46,7 @@ import conf as cf  # noqa: E402
 import index as ix  # noqa: E402
 import layout  # noqa: E402
 import sidecars  # noqa: E402
-from client import Client, filter_string  # noqa: E402
+from client import IMAGE_DEADLINE, READ_TIMEOUT, Client, filter_string  # noqa: E402
 from store import DB_NAME, Store  # noqa: E402
 
 USSR = [1, 20, 22, 189, 267, 149, 154, 92, 45, 35, 29, 24, 30, 32, 31]   # the order of the countries section
@@ -1693,6 +1693,12 @@ def parse_args(argv=None):
                    help="skip images whose picture is smaller than this on either side (default 512)")
     p.add_argument("--comments", action="store_true", help="add the comment tree to the record (one more request)")
     p.add_argument("--fetchers", type=int, metavar="N", help="download threads (default: [defaults] fetchers of the conf)")
+    p.add_argument("--read-timeout", type=float, default=READ_TIMEOUT, metavar="S",
+                   help=f"give up a request that sends nothing for S seconds; the photo is tried again later "
+                        f"(default {READ_TIMEOUT:.0f})")
+    p.add_argument("--image-deadline", type=float, default=IMAGE_DEADLINE, metavar="S",
+                   help=f"give up an image download that takes more than S seconds in all; 0: no limit "
+                        f"(default {IMAGE_DEADLINE:.0f})")
     p.add_argument("--skip", type=int, default=0, metavar="N",
                    help="start at photo N+1 in PastVu number order: the first N are left out, not downloaded, and "
                         "stay to do for a run without --skip")
@@ -1897,7 +1903,9 @@ def main(argv=None) -> int:
     os.environ.setdefault("YOLO_OFFLINE", "1")
     conf = cf.load(Path(args.conf) if args.conf else None)
     fetchers = getattr(args, "fetchers", None) or conf.fetchers
-    client = Client(max_per_second=args.max_per_second, connections=max(8, fetchers * 2))
+    client = Client(max_per_second=args.max_per_second, connections=max(8, fetchers * 2),
+                    read_timeout=getattr(args, "read_timeout", READ_TIMEOUT),
+                    image_deadline=getattr(args, "image_deadline", IMAGE_DEADLINE))
     try:
         cmds = {"regions": cmd_regions, "aliases": cmd_aliases, "count": cmd_count, "scopes": cmd_scopes,
                 "index": cmd_index, "run": cmd_run, "pull": cmd_pull, "captions": cmd_captions,

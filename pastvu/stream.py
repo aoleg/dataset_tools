@@ -56,7 +56,7 @@ import layout
 import process as pr
 import sidecars
 from client import IMG, Client, PastvuError, Stopped, TransportError, page_url
-from progress import Display, Stats, raw_report_block, report_block
+from progress import Display, Stats, interval_block, raw_report_block, report_block
 from store import DONE, FAILED, SKIPPED, STORED, Store
 
 TOOL_VERSION = "0.2"
@@ -158,6 +158,9 @@ class Stream:
         self.budget: int | None = None     # photos still to take under --limit, over both sources
         self.storage_source = False        # this run reads the storage too
         self.records_refetched = 0         # stored photos whose JSON was missing
+        self.in_request: dict[int, float] = {}   # fetch thread -> when its current fetch began (the report)
+        self.storage_threads_n = 0
+        self.retries_seen = 0              # the client's retry count at the last report block
         enc_model = getattr(getattr(classifier, "encoder", None), "model_id", None)
         self.emb_key = (enc_model, getattr(classifier, "patches", None))
         self.tool = {"name": "dataset_tools/pastvu", "version": TOOL_VERSION, "detector": self.det_name,
@@ -234,7 +237,9 @@ class Stream:
             raise pr.Rejected(wide)
         if not p.get("file"):
             raise pr.Rejected("no file in the record", failed=True)
+        t_dl = time.perf_counter()
         job.data, job.ctype = self.client.image(p["file"], "a")
+        self.stats.latency(time.perf_counter() - t_dl)
         if not job.ctype.startswith("image/"):
             raise pr.Rejected(f"download: not an image ({job.ctype or 'no type'})", failed=True)
         try:
@@ -278,7 +283,9 @@ class Stream:
         o = self.opts
         t0 = time.perf_counter()
         job = Job(cid, scope)
+        t_row = time.perf_counter()
         row = self.store.status(cid) or {}
+        self.stats.time("store_read", time.perf_counter() - t_row)      # waits for the store's lock too
         rel = row.get("raw") or row.get("path")
         if not rel:
             raise pr.Rejected("stored file unknown", failed=True)
@@ -335,8 +342,10 @@ class Stream:
             if pair is None:
                 break
             cid, scope = pair
+            me = threading.get_ident()
             with self.lock:
                 self.in_flight += 1
+                self.in_request[me] = time.time()
             try:
                 item = self.fetch_remote(cid, scope) if self.opts.raw else self.fetch(cid, scope)
             except Stopped:
@@ -350,6 +359,7 @@ class Stream:
             finally:
                 with self.lock:
                     self.in_flight -= 1
+                    self.in_request.pop(me, None)
             if item is None:
                 continue
             if isinstance(item, pr.Rejected):
@@ -376,7 +386,9 @@ class Stream:
                 item = pr.Rejected(f"stored: {type(e).__name__}: {e}", failed=True)
             if isinstance(item, pr.Rejected):
                 item.cid, item.scope = cid, scope
+            t_put = time.perf_counter()
             sq.put(item)
+            self.stats.time("storage_wait_put", time.perf_counter() - t_put)   # the GPU had no slot for it
         sq.put(None)
 
     # --- outcomes ------------------------------------------------------------------
@@ -565,12 +577,18 @@ class Stream:
                 f.unlink(missing_ok=True)
             self.store.unclaim(job.cid)
             raise
+        t_move = time.perf_counter()
         chunker.done(rel_scope)          # may move the category's images into 001 now that it passed the split
+        moved = time.perf_counter() - t_move
+        if moved > 0.5:                  # a chunk move: thousands of files, the writer queue fills behind it
+            s.time("chunk_move", moved)
+            s.add(chunk_moves=1)
         if job.raw:
             self.remove_raw(job.raw)     # committed: the storage copy has served
             s.add(pulled=1)
         if self.exporter is not None:
-            self.exporter.add(job.cid, self.store.status(job.cid)["path"], tone_mode, folder)
+            if self.exporter.add(job.cid, self.store.status(job.cid)["path"], tone_mode, folder):
+                s.add(exported=1)
         s.time("write", time.perf_counter() - t)
         if self.captioner is not None:
             # after the photo is committed: a wait here (the VLM is behind) slows the stream, nothing else
@@ -687,6 +705,7 @@ class Stream:
         if self.storage_source:
             text += (f"\n  from the storage: {int(self.stats.c['pulled']):,} processed this run, "
                      f"{self.store.stored_count():,} left in it")
+        text += "\n" + self.interval_report()
         if self.caption_client is not None:
             text += f"\n  captioned by the VLM in this run: {int(self.stats.c['captioned']):,}"
         if self.vram is not None and self.vram.ok:
@@ -702,6 +721,31 @@ class Stream:
                          f"{c['failed']:>4,} failed  {c['elsewhere']:>6,} in other scopes  {c['pending']:>7,} left"
                          f"{modes}")
         return text
+
+    def interval_report(self) -> str:
+        """What happened since the last report block: the rate, where the main thread's
+        time went, the downloads' latencies and the threads in a request, the storage
+        side, the writers. Also one JSON line (--json-progress) with the same numbers."""
+        snap = self.stats.interval()
+        stats = getattr(self.client, "stats", None)
+        if isinstance(stats, dict):
+            r = int(stats.get("retries", 0))
+            snap["c"]["retries"] = r - self.retries_seen
+            self.retries_seen = r
+        now = time.time()
+        with self.lock:
+            ages = [now - t0 for t0 in self.in_request.values()]
+        live = {"writers": self.opts.writers, "in_request": len(ages), "oldest_request": max(ages) if ages else 0.0,
+                "storage_threads": self.storage_threads_n}
+        text, numbers = interval_block(snap, live)
+        if self.display is not None:
+            self.display.line({"interval": numbers})
+        return text
+
+    def put_to_writers(self, wq: queue.Queue, item: tuple) -> None:
+        t = time.perf_counter()
+        wq.put(item)
+        self.stats.time("wait_writers", time.perf_counter() - t)
 
     def run(self, pairs: list[tuple[int, str]], scope_total: int, completed: int,
             stored: list[tuple[int, str]] = ()) -> dict:
@@ -749,12 +793,14 @@ class Stream:
                        for i in range(o.writers)]
             for t in fetchers + writers + storages:
                 t.start()
+            self.storage_threads_n = len(storages)
             ended, sended, interrupts = 0, 0, 0
             remote_ended, storage_ended = not fetchers, not storages
             try:
                 while not (remote_ended and storage_ended):
                     try:
                         # downloads first; a stored photo only when no download is ready
+                        t_loop = time.perf_counter()
                         item, source = None, None
                         if not remote_ended:
                             try:
@@ -768,6 +814,7 @@ class Stream:
                                 source = "storage"
                             except queue.Empty:
                                 pass
+                        self.stats.time("wait_input", time.perf_counter() - t_loop)
                         if source is None:
                             with self.lock:
                                 n = self.in_flight
@@ -786,13 +833,14 @@ class Stream:
                             self.reject(item.cid, item, item.scope)
                         elif o.raw:
                             self.stats.time("fetch", item.t_fetch)
-                            wq.put((item,))
+                            self.put_to_writers(wq, (item,))
                         else:
                             self.stats.time("pull" if source == "storage" else "fetch", item.t_fetch)
+                            t_stage = time.perf_counter()
+                            res = None
                             try:
                                 res = self.process(item)
                                 item.array = None
-                                wq.put((item,) + res)
                             except pr.Rejected as r:
                                 self.reject(item.cid, r, item.scope)
                             except Exception as e:  # noqa: BLE001
@@ -802,6 +850,9 @@ class Stream:
                                 if "out of memory" in str(e).lower():
                                     import torch
                                     torch.cuda.empty_cache()
+                            self.stats.time("stage", time.perf_counter() - t_stage)
+                            if res is not None:
+                                self.put_to_writers(wq, (item,) + res)
                         processed += 1
                         if o.report_every and processed % o.report_every == 0:
                             d.print(self.report(t_start))
