@@ -114,7 +114,17 @@ def array_bytes(array: np.ndarray, head: dict, png: bool) -> tuple[bytes, str]:
     if png:
         im.save(buf, "PNG", compress_level=PNG_LEVEL, **kw)
         return buf.getvalue(), "PNG"
-    im.save(buf, "JPEG", quality=JPEG_QUALITY, subsampling=0, optimize=True, **kw)
+    try:
+        im.save(buf, "JPEG", quality=JPEG_QUALITY, subsampling=0, optimize=True, **kw)
+    except OSError as e:
+        # Pillow gives the optimize pass a buffer of 2 bytes per pixel at this quality, and a
+        # grainy scan at q97 without chroma subsampling can need more: libjpeg then says
+        # "Suspension not allowed here" and Pillow "broken data stream when writing image
+        # file". Without the optimize pass the encoder streams, at a few percent more bytes.
+        if "writing image file" not in str(e):
+            raise
+        buf = io.BytesIO()
+        im.save(buf, "JPEG", quality=JPEG_QUALITY, subsampling=0, **kw)
     return buf.getvalue(), "JPEG"
 
 
