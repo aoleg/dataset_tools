@@ -1,0 +1,3 @@
+# judge installs nothing of its own: torch, transformers, numpy, Pillow and safetensors
+# come with classify (classify\install.bat), and the LLM and VLM are reached over HTTP
+# with the standard library.

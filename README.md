@@ -14,6 +14,7 @@ Tools that prepare image datasets for LoRA and fine-tune training, mainly with [
 | [deduplicate](deduplicate/README.md) | Finds copies of the same picture across folders (hashes plus a feature check for crops, borders and mock-ups) and moves the worse copies, with their captions, to a `<folder>_duplicates` folder next to each folder; a kept copy without a caption gets a copy of one. A curated collection given with `--sorted` receives the better copies from raw folders under its own names and keeps its captions. `compare.bat` shows which files were judged copies of which, side by side, for a check by eye; `review.bat` (or `--review` after a run) opens the groups full screen and lets you change the kept copy with a click. `--undo` puts everything back, including review changes. `--gpu` matches the image features on the GPU when torch is in the shared venv, which cuts the slow stage from minutes to seconds on large sets. `--watermark` runs the watermark tool's two detectors on the copies: a clean copy stays over a watermarked one whatever their size, a clean copy replaces a watermarked one in the collection, and the better copies that carry a watermark are collected in `<folder>_replacements` under the names they would replace, to clean with the watermark tool and copy over. |
 | [reframe](reframe/README.md) | Crops photos of people to the subject (one person or a group, without passers-by) in a [k2prep](k2prep/README.md) aspect ratio; lossless for JPEG, and with `--resize` straight into k2prep buckets, for Ostris AI Toolkit (`--ostris`) or musubi-tuner (`--musubi`). |
 | [classify](classify/README.md) | Sorts a dataset into category folders from a folder of hand-sorted examples per category: every image is embedded once with SigLIP 2, a classifier is trained on the examples, and each image is copied with its caption into its category folder, or into `_unsure` when the classifier is not confident. A dry run writes a report with a confusion matrix, a confidence histogram and contact sheets; `--undo` puts everything back. |
+| [judge](judge/README.md) | Keeps the images of a folder that meet a condition stated in words and moves the rest, with every file of their name, to `<folder>_rejected`: a local LLM reads the captions, SigLIP 2 scores every image against prompts made from the condition, and a local vision model looks only at the doubtful band, at most a set number of images. `verdicts.csv` keeps every layer's result; `--undo` puts everything back. |
 | [remove_borders](remove_borders/README.md) | Finds images with borders (light and dark frames, thin lines, slanted frames of rotated scans, banners with text at the bottom or top) and cuts the borders off in place; lossless for JPEG, exact for PNG and other lossless formats, lossy formats become PNG. Originals and captions go to the backup folder `<dataset>_backup` next to the dataset first, an image too small after its crop moves there instead, and `--undo` puts everything back. A dry run writes a report and contact sheets with the cut lines magnified. |
 | [watermark](watermark/README.md) | Finds watermarks with a YOLO detector (a YOLOv12 with a DINOv3 backbone, or the YOLOv11 fallback) and paints them out with LaMa in a window of context around each, or with `--trim` cuts the largest watermark-free rectangle out instead, losslessly for JPEG. The output goes to `<folder>_watermark_removed` next to the dataset with the captions; `--dry-run` writes a report and previews of the masks. |
 | [pipeline](pipeline/README.md) | Runs remove_borders, watermark, reframe, jpeg_cleanup and face_masks over a dataset image by image from a job file: each image is decoded once, the crop boxes are composed into one on the JPEG block grid, the watermarks inside it are painted, the quality is restored, and the image is written once (a lossless crop of the file when no stage touched the pixels), then its face mask. In place with backups, a log and `--undo`, or into a new folder. One JSON line per image on stdout, for a GUI to drive it. |
@@ -68,10 +69,13 @@ The stages of a dataset and the tools that come in at each of them. Tools marked
  |__________________________________________________________________|
                                     |
                                     v
- 3. SORT AND SELECT  (cleanup.bat first; the rest only copy, so
-                      they can run side by side)
+ 3. SORT AND SELECT  (cleanup.bat and judge first, they move files;
+                      the rest only copy, so they can run side by side)
   __________________________________________________________________
  | k2prep cleanup.bat        moves images too small to train on out |
+ | judge                     moves images that miss a condition in  |
+ |                           words aside: captions, SigLIP 2 and a  |
+ |                           vision model on the doubtful band      |
  | classify                  sorts into category folders, learned   |
  |                           from a few hand-sorted examples        |
  | k2prep --sort             files the originals by quality tier    |
@@ -176,6 +180,7 @@ No tool writes into the dataset folder anything that a trainer must not train, f
 | `<dataset>_reframed` | reframe | the reframed copy of the dataset, to caption and train as a dataset of its own |
 | `<dataset>_faces` | face_masks (`extract.bat`) | the face crops, a separate face dataset |
 | `<dataset>_uncaptioned` | scripts/extract_uncaptioned_images.py | the images that wait for a caption |
+| `<dataset>_rejected` | judge | the images that miss the condition, with their captions, and in `_judge` the verdicts, the prompts, the undo log and the contact sheets |
 | `<dataset>_classified` | classify | the category folders; train the category folders, not the whole folder |
 | `<dataset>_watermark_removed`, `<dataset>_jpeg_extract`, `<dataset>_media-rebalanced`, `_<dataset>` | watermark, jpeg_cleanup, rebalance_medium, k2prep's `cleanup.bat` | see their READMEs |
 
@@ -203,6 +208,7 @@ All tools share one virtual environment: the `venv` folder in the repository roo
 | `face_masks`, `reframe`, `classify`, `jpeg_cleanup`, `watermark` | a CUDA GPU; their `install.bat` installs torch from the PyTorch CUDA index and downloads their models, after which they run offline |
 | `pipeline` | the five tools it runs, installed by their `install.bat` |
 | `vk_dataset` | `requests`; runs on the CPU. Its `install.bat` needs the shared `venv` that another tool's `install.bat` creates, and makes `vkds.conf` |
+| `judge` | what classify installs (torch, transformers) and classify's SigLIP 2 model, which its `install.bat` checks; a CUDA GPU for `--images`; the captions and the vision model need a local OpenAI-compatible model server such as Ollama |
 
 The `install.bat` in the repository root runs the `install.bat` of every tool in this table that has one, one after the other: remove_borders, reframe, jpeg_cleanup, face_masks and watermark first, then deduplicate, k2prep, ddg_images, classify, duck, pastvu, normalize and vk_dataset. Use it to set up everything at once, or run the `install.bat` of single tools.
 
