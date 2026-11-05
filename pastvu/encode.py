@@ -127,7 +127,16 @@ def encode(data: bytes, head: dict, plan: dict, painted: np.ndarray | None, png:
     if not plan.get("stored_box"):
         return data, EXTENSIONS.get(head["format"], ".bin"), "verbatim"
     if head["kind"] == rb.KIND_JPEG:
-        return jpeg_crop(data, head, plan["stored_box"]), ".jpg", "lossless"
+        try:
+            return jpeg_crop(data, head, plan["stored_box"]), ".jpg", "lossless"
+        except ValueError as e:
+            if "jpeg_subsample" not in str(e):
+                raise
+            # libjpeg-turbo cannot name this file's chroma subsampling (an odd sampling
+            # factor), so there is no DCT-domain crop: the pixels are cropped and
+            # re-encoded at q97 (or PNG), as a painted image is saved.
+            out, fmt = array_bytes(pr.crop_array(pr.decode(data, head), plan["box"]), head, png)
+            return out, EXTENSIONS[fmt], "array"
     out, fmt = exact_crop(data, head, plan["stored_box"])
     return out, EXTENSIONS.get(fmt, ".png"), "exact" if fmt == head["format"] else "png"
 
