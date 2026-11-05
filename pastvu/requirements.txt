@@ -8,3 +8,7 @@ PyTurboJPEG>=2.0
 zstandard>=0.22
 # GPU memory of the whole device (autocaption next to a local VLM)
 nvidia-ml-py>=12.0
+# ultralytics (watermark detection) patches PIL.Image.open and, on the first
+# file Pillow cannot identify, demands pi-heif; without it the check runs
+# pip install inside the venv in the middle of the run
+pi-heif>=0.22
