@@ -41,6 +41,32 @@ BAND_MIN_LUMA, BAND_MAX_LUMA = 10, 200    # a custom uploader signature comes on
 
 
 ASPECT_REASON = "aspect ratio"
+DEFAULT_MAX_PIXELS = 2048      # the side of the square: a picture over 2048^2 pixels is downscaled to that area
+
+
+def downscale_size(w: int, h: int, area: int) -> tuple[int, int]:
+    """The largest size with the aspect ratio of w x h and at most area pixels: the
+    normalize tool's rule, so the two agree to the pixel."""
+    import math
+    scale = math.sqrt(area / (w * h))
+    nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
+    while nw * nh > area:        # float rounding at the edge
+        if nw >= nh:
+            nw -= 1
+        else:
+            nh -= 1
+    return nw, nh
+
+
+def downscale(array: np.ndarray, area: int) -> np.ndarray:
+    """An upright RGB uint8 array over `area` pixels resized to downscale_size with
+    Lanczos (reducing_gap 3, as normalize does); the array itself when it fits."""
+    h, w = array.shape[:2]
+    if w * h <= area:
+        return array
+    nw, nh = downscale_size(w, h, area)
+    im = Image.fromarray(np.ascontiguousarray(array)).resize((nw, nh), Image.Resampling.LANCZOS, reducing_gap=3.0)
+    return np.asarray(im, dtype=np.uint8)
 
 
 def aspect_reason(w: int, h: int, max_aspect: float) -> str | None:

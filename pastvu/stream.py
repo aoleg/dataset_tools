@@ -69,6 +69,7 @@ class Options:
     scopes: dict | None = None        # every scope the run writes into (run --by), name -> scope
     min_side: int = 512
     max_aspect: float = 21 / 9        # long side over short side; 0: no limit
+    max_pixels: int = pr.DEFAULT_MAX_PIXELS   # a picture over this^2 pixels is downscaled to that area; 0: never
     png: bool = False
     wm_conf: float = 0.1
     wm_paint_conf: float = 0.4
@@ -118,6 +119,8 @@ class Job:
     sidecars: dict = None             # an import: the source's other sidecars, copied as they are
     written: list = None              # an import: the sidecars written next to the image
     raw: str | None = None            # from the storage: the raw image's path relative to the base
+    head_orig: dict = None            # a downscaled photo: the original file's head, for the record
+    downscale: dict = None            # a downscaled photo: {"from", "to", "limit", "band_rows"}
     det_input: np.ndarray = None      # the detector's input, made by the worker (watermark.detector_input)
     det_scale: float = 1.0
     naflex: np.ndarray = None         # the encoder's input of the picture, made by the worker
@@ -215,6 +218,7 @@ class Stream:
         job.result = {}
         job.ctype = "image/" + str(job.head.get("format") or "").lower()
         job.pic_box = pr.picture_box(job.head, 0)
+        self.shrink(job)
         if o.borders:
             job.borders = pr.borders_plan(job.array, {"dark": o.dark_borders})
         job.caption = importer.read_caption(path)
@@ -273,12 +277,34 @@ class Stream:
         job.array = pr.decode(job.data, job.head)
         job.band = pr.verify_band(job.array, job.head, job.rows)
         job.pic_box = pr.picture_box(job.head, job.rows)
+        self.shrink(job)
         if o.borders:
             picture = pr.crop_array(job.array, job.pic_box)
             job.borders = pr.borders_plan(picture, {"dark": o.dark_borders})
         self.prepare_inputs(job)
         job.t_fetch += time.perf_counter() - t0
         return job
+
+    def shrink(self, job: Job) -> None:
+        """The 4 MP rule, in the worker thread: a picture (the array without the band) over
+        max_pixels^2 is downscaled to that area, after the band was cut as exact rows. From
+        here on the job is a photo without a band whose original bytes cannot be cropped:
+        it is saved from pixels. The original head stays for the record."""
+        o = self.opts
+        if not o.max_pixels:
+            return
+        area = o.max_pixels * o.max_pixels
+        pw, ph = job.pic_box[2] - job.pic_box[0], job.pic_box[3] - job.pic_box[1]
+        if pw * ph <= area:
+            return
+        small = pr.downscale(pr.crop_array(job.array, job.pic_box), area)
+        h, w = small.shape[:2]
+        job.downscale = {"from": [pw, ph], "to": [w, h], "limit": o.max_pixels, "band_rows": job.rows}
+        job.head_orig = job.head
+        job.head = dict(job.head, stored=[w, h], orientation=1, mcu=None)
+        job.array = small
+        job.rows = 0
+        job.pic_box = [0, 0, w, h]
 
     def prepare_inputs(self, job: Job) -> None:
         """The models' inputs, made in the worker thread that decoded the photo so the
@@ -471,6 +497,9 @@ class Stream:
         job.det_input = None
         plan = pr.compose(job.head, job.pic_box, job.rows > 0, job.borders, boxes,
                           {"mode": o.wm_mode, "dilate": o.wm_dilate, "paint_conf": o.wm_paint_conf})
+        if job.downscale:                # the band was cut before the downscale; the record says both
+            plan["changed"] = (["band"] if job.downscale["band_rows"] else []) + ["downscale"] + \
+                [c for c in plan["changed"] if c != "band"]
         cw, ch = plan["size"]
         if min(cw, ch) < o.min_side:
             raise pr.Rejected("too small after crop")
@@ -569,17 +598,17 @@ class Stream:
     def write(self, job: Job, plan: dict, boxes: list, painted, vec, verdict, fw: int, fh: int, final=None,
               tone=None) -> None:
         o, s, d = self.opts, self.stats, self.display
+        if final is None and (o.colour or self.captioner is not None or job.downscale):
+            final = pr.crop_array(job.array, plan["box"])       # the writer's copy, not the main thread's
         d.set(f"{job.cid}: encoding")
         t = time.perf_counter()
-        data, ext, mode = enc.encode(job.data, job.head, plan, painted, o.png)
+        data, ext, mode = enc.encode(job.data, job.head, plan, painted, o.png, pixels=final if job.downscale else None)
         s.time("encode", time.perf_counter() - t)
         if self.classifier is not None:
             verdict = self.classifier.example_override(data, verdict)
         folder = verdict.folder if verdict else ""
         scope = job.scope
         chunker = self.chunker_for(scope)
-        if final is None and (o.colour or self.captioner is not None):
-            final = pr.crop_array(job.array, plan["box"])       # the writer's copy, not the main thread's
         if o.colour and tone is None:
             t = time.perf_counter()
             tone = colour.decide(colour.scores(final, plan["wm_inside"], o.wm_dilate), self.mode_probe, vec)
@@ -648,9 +677,11 @@ class Stream:
     def record_json(self, job: Job, plan, boxes, mode, rel, data, sha, fw, fh, verdict, tone=None) -> str:
         o = self.opts
         p = job.photo
+        head = job.head_orig or job.head                       # a downscaled photo: the file as downloaded
         if self.source is not None:
             import importer
-            processing = {"borders": pr.describe_borders(job.borders) if job.borders else None,
+            processing = {"downscale": job.downscale,
+                          "borders": pr.describe_borders(job.borders) if job.borders else None,
                           "watermarks": {"detected": boxes, "painted": plan["wm_inside"], "trim": plan["trim"],
                                          "mode": o.wm_mode, "conf": o.wm_conf, "paint_conf": o.wm_paint_conf,
                                          "dilate": o.wm_dilate},
@@ -663,9 +694,10 @@ class Stream:
                                         verdict.as_dict() if verdict else None, {**self.tool, "scope": job.scope},
                                         job.written)
         download = {"url": f"{IMG}/a/{p['file']}", "bytes": len(job.data), "sha256": hashlib.sha256(job.data).hexdigest(),
-                    "content_type": job.ctype, "format": job.head["format"], "stored_size": job.head["stored"],
-                    "orientation": job.head["orientation"], "mcu": job.head["mcu"]}
-        processing = {"band": {"rows": job.rows, **(job.band or {})},
+                    "content_type": job.ctype, "format": head["format"], "stored_size": head["stored"],
+                    "orientation": head["orientation"], "mcu": head["mcu"]}
+        processing = {"band": {"rows": job.downscale["band_rows"] if job.downscale else job.rows, **(job.band or {})},
+                      "downscale": job.downscale,
                       "borders": pr.describe_borders(job.borders) if job.borders else None,
                       "watermarks": {"detected": boxes, "painted": plan["wm_inside"], "trim": plan["trim"],
                                      "mode": o.wm_mode, "conf": o.wm_conf, "paint_conf": o.wm_paint_conf,

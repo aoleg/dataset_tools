@@ -199,6 +199,22 @@ class Exporter:
         self.store.set_export(cid, new_rel)
         self.stats["moved"] += 1
 
+    def relink(self, cid: int, base_rel: str) -> bool:
+        """The photo's file was rewritten in the base (reprocess --downscale): a hard link
+        shares the old file, so the export's link is made again from the new one, under the
+        new name when the extension changed. An exclusion stays. -> relinked"""
+        rel = self.store.export_of(cid)
+        if not rel or rel == EXCLUDED:
+            return False
+        old = self.root / rel
+        new = old.with_suffix(Path(base_rel).suffix)
+        if old.exists():
+            old.unlink()
+        self._link(self.base / base_rel, new)
+        if new != old:
+            self.store.set_export(cid, new.relative_to(self.root).as_posix())
+        return True
+
     def remove(self, cid: int) -> None:
         """drop: delete the photo's links and forget them (an exclusion stays: it was your choice)."""
         rel = self.store.export_of(cid)

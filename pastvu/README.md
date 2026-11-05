@@ -18,6 +18,7 @@ You give a place and years, for example “Belarus, 1917 to 1991” or “Ukrain
    - It trims scanned frames and white borders.
    - It paints out printed captions, photographer credits and watermarks. It paints only marks it is confident about, so real shop signs and buildings are left alone.
    - Cropping never lowers JPEG quality; only painting re-saves an image.
+   - A picture with more than 2048 x 2048 pixels (4 MP, `max_pixels` in the conf) is downscaled to that area right after the band is cut, before anything else looks at it, and is saved from the downscaled pixels (JPEG q97). Training needs no more; a 65 MP scan would only cost time at every step.
 3. **Black-and-white or colour:** a fast pixel test tells colour photos from black-and-white ones, and counts sepia, toned prints and yellowed paper as black-and-white.
 4. **Sort:** it first leaves out low-quality photos, such as film and TV frame grabs and blurry or washed-out scans, learned from two folders of examples. Then it puts the photo into your categories, such as transport, people or monuments, learned from example images you put in a samples folder. When two categories fit about equally, the one with the lower folder number wins. Every photo goes into a category, a doubtful one into its best guess.
 5. **Caption:** it writes a short facts line from PastVu’s record: title, years, place and description.
@@ -71,6 +72,7 @@ json_files = no                       also write each record as a JSON file
 priority_margin = 0.15                within this of the top score, the lower-numbered category wins
 quality_threshold = 0.88              skip photos the quality probe scores at or above this; 0: off
 max_aspect = 21:9                     skip photos whose long side is more than this times the short side; 0: off
+max_pixels = 2048                     downscale a picture over this^2 pixels to that area before processing; 0: never
 export_layout = categories_first      folder order of the live export and of an import: categories_first or color_first
 
 [caption]                             the VLM of autocaption; see Autocaption
@@ -164,6 +166,7 @@ run.bat run --region <alias> --by decade|country|region|country,decade|region,de
 run.bat run --scope <name>
 run.bat run --region <alias> ... --raw | --pull
 run.bat pull [<scope> ...] [--limit N] [--keep-rejects]
+run.bat reprocess --downscale [<2048>] [<scope> ...] [--png] [--dry-run] [--yes]
 run.bat regroup --by RULE [<scope> ...] [--dry-run] [--undo]
 run.bat drop <scope> [...] [--yes]
 run.bat reclassify [<scope> ...] [--dry-run] [--undo] [--yes]
@@ -242,6 +245,15 @@ run.bat run --region belarus --pull
 `pull` processes the storage through the complete pipeline (band, borders, watermarks, quality, colour, category) into the scope folders, as a download would, and deletes each raw file once the photo is saved. It takes the processing options of `run`. `run --pull` does both: it downloads as usual and, whenever no download is ready for the GPU, processes a stored photo instead, so the storage drains in the gaps and at full speed once the downloads are finished. Both take the whole storage, whatever scope a photo was listed for. A plain `run` leaves the storage alone and says how many photos wait in it.
 
 A stored photo the processing rejects (too small after the crop, low quality) is marked skipped as in a download and its raw files are deleted, since nothing fetches it again; `--keep-rejects` keeps them for a look. A raw file that went missing or changed is marked failed and downloaded again by the next run. `--limit` counts the photos taken from the downloads and the storage together. Ctrl+C and resume work as for a download: a stored photo whose write was cut short goes back to the storage.
+
+**Bring the photos saved before down to 4 MP:**
+
+```
+run.bat reprocess --downscale
+run.bat reprocess --downscale 1536 estonia_* --dry-run
+```
+
+The photos whose saved size is over the limit (the store knows every photo's size, so no file is opened to decide) are rewritten at that area in place, by the same rule as a download: JPEG q97, a PNG stays PNG, `--png` makes every one PNG; EXIF and ICC kept, captions kept. The number is the side of the square whose area is the limit, 2048 when left out. The latent caches of the old pixels (.npz, .safetensors) are deleted, the live export's links are made again, the records say what happened, and the classifier's embeddings stay. It cannot be undone, so it asks first; `--yes` skips the question, `--dry-run` lists the photos in `<base>\_reports`. Reading, resizing and encoding run in worker processes (`--workers`, half the CPUs by default): 143 scans of up to 65 MP took 13 seconds.
 
 A run downloads a **scope**: regions and years. Its name is the aliases (or region names) joined by `+`, an underscore, and the years: `belarus_1917-1991`, `ukraine_1970s`, `minsk+brest_oblast_1945-1960`. More than three regions need `--name` or an alias of their own. Running the same command again continues it, as does `run --scope <name>`. The scope's folder follows `layout` in the conf (see [Folder layouts](#folder-layouts)): `<base>\1970s\ukraine\` by default.
 

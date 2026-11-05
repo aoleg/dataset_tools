@@ -118,12 +118,17 @@ def array_bytes(array: np.ndarray, head: dict, png: bool) -> tuple[bytes, str]:
     return buf.getvalue(), "JPEG"
 
 
-def encode(data: bytes, head: dict, plan: dict, painted: np.ndarray | None, png: bool) -> tuple[bytes, str, str]:
+def encode(data: bytes, head: dict, plan: dict, painted: np.ndarray | None, png: bool,
+           pixels: np.ndarray | None = None) -> tuple[bytes, str, str]:
     """The output bytes of one image. -> (bytes, extension, write mode:
-    verbatim, lossless, exact, png or array)."""
+    verbatim, lossless, exact, png, array or downscaled). pixels: the final
+    pixels of a downscaled photo, which has no original bytes to crop."""
     if painted is not None:
         out, fmt = array_bytes(painted, head, png)
         return out, EXTENSIONS[fmt], "array"
+    if pixels is not None:
+        out, fmt = array_bytes(pixels, head, png)
+        return out, EXTENSIONS[fmt], "downscaled"
     if not plan.get("stored_box"):
         return data, EXTENSIONS.get(head["format"], ".bin"), "verbatim"
     if head["kind"] == rb.KIND_JPEG:

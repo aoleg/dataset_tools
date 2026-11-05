@@ -174,7 +174,8 @@ def report_block(totals: dict, session: Stats, counts: dict, elapsed: float, fin
                  f"the paint threshold (recorded, not painted)")
     lines.append(f"  saved as: {int(c.get('write.verbatim', 0)):,} untouched, {int(c.get('write.lossless', 0)):,} "
                  f"lossless JPEG crops, {int(c.get('write.exact', 0)) + int(c.get('write.png', 0)):,} exact crops, "
-                 f"{int(c.get('write.array', 0)):,} re-encoded after painting")
+                 f"{int(c.get('write.array', 0)):,} re-encoded after painting, "
+                 f"{int(c.get('write.downscaled', 0)):,} downscaled")
     bw, col = int(c.get("mode.bw", 0)), int(c.get("mode.color", 0))
     if bw or col:
         lines.append(f"  black-and-white {bw:,}, colour {col:,} ({col / max(1, bw + col):.1%} colour; "

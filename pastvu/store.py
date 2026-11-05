@@ -712,6 +712,29 @@ class Store:
                     db.execute("UPDATE records SET json=? WHERE cid=?", (record, cid))
         self.tx(work)
 
+    def resize(self, cid: int, path: str, width: int, height: int, size: int, sha256: str, changed: list,
+               record: str) -> None:
+        """A saved photo rewritten at another size (reprocess --downscale): its path (the
+        extension may change), size, bytes, checksum, changed list and record, in one transaction."""
+        def work(db):
+            db.execute("UPDATE status SET path=?, width=?, height=?, bytes=?, sha256=?, changed=?, updated=? WHERE cid=?",
+                       (path, width, height, size, sha256, json.dumps(changed), time.time(), cid))
+            db.execute("INSERT OR REPLACE INTO records (cid, json) VALUES (?, ?)", (cid, record))
+        self.tx(work)
+
+    def oversized_rows(self, scopes: list[str] | None, area: int) -> list[tuple]:
+        """(cid, scope, path, width, height, bytes) of the saved photos with more than `area`
+        pixels, from the store alone; scopes None: the whole base."""
+        q = "SELECT cid, scope, path, width, height, bytes FROM status WHERE state=? AND width * height > ?"
+        args: list = [DONE, area]
+        if scopes is not None:
+            if not scopes:
+                return []
+            q += f" AND scope IN ({','.join('?' * len(scopes))})"
+            args += list(scopes)
+        with self.lock:
+            return self.db.execute(q + " ORDER BY cid", args).fetchall()
+
     def move(self, cid: int, path: str, category: str, record: str | None = None, mode: str | None = None) -> None:
         def work(db):
             db.execute("UPDATE status SET path=?, category=?, updated=? WHERE cid=?", (path, category, time.time(), cid))
@@ -755,6 +778,10 @@ class Store:
     def move_counter(self, scope: str, old: str, new: str) -> None:
         """A photo changed category: move one count between cat.<old> and cat.<new>."""
         self.tx(lambda db: self._add_counters(db, scope, {f"cat.{old}": -1, f"cat.{new}": 1}))
+
+    def shift_counters(self, scope: str, delta: dict) -> None:
+        """Add deltas to the scope's counters by their full names (c.write.lossless: -1, ...)."""
+        self.tx(lambda db: self._add_counters(db, scope, delta))
 
     def start_run(self, scope: str, args: dict) -> int:
         with self.lock:

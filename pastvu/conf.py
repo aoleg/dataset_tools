@@ -72,6 +72,8 @@ class Conf:
     quality_in_file: bool = False      # the key is in the file (else it is written there on first use)
     max_aspect: float = 21 / 9         # long side over short side; 0: no limit
     aspect_in_file: bool = False
+    max_pixels: int = 2048             # a picture over this^2 pixels is downscaled to that area; 0: never
+    pixels_in_file: bool = False
     export_layout: str = "categories_first"   # the live export and an import: categories_first or color_first
     export_layout_in_file: bool = False
     layout: str | None = None          # the folder tree of a new base; None: not in the file (written on first use)
@@ -126,6 +128,11 @@ QUALITY_COMMENT = ["; Photos the quality probe (trained on _quality_good and _qu
                    "; and reclassify deletes the saved ones. 0 turns it off."]
 
 
+PIXELS_COMMENT = ["; A photo whose picture (without the PastVu band) has more pixels than this",
+                  "; number squared is downscaled to that area before it is processed and is saved",
+                  "; from the downscaled pixels (JPEG q97, or PNG with --png). Training needs no",
+                  "; more than 2048 x 2048. 0: never downscale. reprocess --downscale does the same",
+                  "; to photos saved before."]
 ASPECT_COMMENT = ["; Photos whose long side is more than this times the short side (panoramas,",
                   "; strips) are skipped like the ones under 512 pixels, and reclassify deletes",
                   "; the saved ones. W:H or a number; 0 turns it off."]
@@ -222,6 +229,11 @@ def load(path: Path | None = None) -> Conf:
             if d.get("max_aspect", "").strip():
                 conf.max_aspect = parse_aspect(d.get("max_aspect"))
                 conf.aspect_in_file = True
+            if d.get("max_pixels", "").strip():
+                conf.max_pixels = d.getint("max_pixels")
+                if conf.max_pixels < 0:
+                    raise ValueError(f"max_pixels {conf.max_pixels}: give the side of the square (2048), or 0")
+                conf.pixels_in_file = True
             if d.get("export_layout", "").strip():
                 v = d.get("export_layout").strip().lower()
                 if v not in ("categories_first", "color_first"):
