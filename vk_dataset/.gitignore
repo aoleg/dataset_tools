@@ -10,6 +10,8 @@ docs/
 examples/
 .opencode/
 opencode.jsonc
+# The partner's custom OpenCode agents (his machine, his files)
+agents/
 # Code removed from the tool but kept for the record (the local PLAN.md, section 8)
 _removed/
 # secrets and local state
