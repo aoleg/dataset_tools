@@ -5,7 +5,7 @@ description: Шаги 3 и 4 после скачивания vk_dataset — ду
 
 ## Общие правила
 
-- Работаешь из папки `vk_dataset`. Инструменты dataset_tools лежат на уровень выше: `..\<инструмент>\`, общий Python — `..\venv\Scripts\python.exe`.
+- Проект OpenCode — папка `<папка dataset_tools>`, инструменты лежат в её подпапках `<папка dataset_tools>\<инструмент>\`. Команды пиши с полными путями; общий Python — `<папка dataset_tools>/venv/Scripts/python.exe`.
 - Не вызывай `.bat` — при ошибке они ждут нажатия клавиши. Вызывай python-скрипт напрямую.
 - ЖЕЛЕЗНОЕ ПРАВИЛО: сначала `--dry-run`, разбор плана, потом боевой прогон.
 - Ничего не удаляется: дубли уезжают в `<папка группы>_duplicates`, фото не по теме — в `<папка группы>_unrelated`, рядом с папкой группы. Это норма. vk_dataset такие фото повторно не скачивает.
@@ -14,15 +14,15 @@ description: Шаги 3 и 4 после скачивания vk_dataset — ду
 
 ## Шаг 3 — дубли
 
-1. `..\venv\Scripts\python.exe ..\deduplicate\dedup.py <папка группы> --gpu --dry-run` — план в `<папка группы>_duplicates\plan.json`; доложи число найденных копий.
-2. `..\venv\Scripts\python.exe ..\deduplicate\dedup.py <папка группы> --gpu` — боевой прогон.
+1. `<папка dataset_tools>/venv/Scripts/python.exe <папка dataset_tools>/deduplicate/dedup.py <папка группы> --gpu --dry-run` — план в `<папка группы>_duplicates\plan.json`; доложи число найденных копий.
+2. `<папка dataset_tools>/venv/Scripts/python.exe <папка dataset_tools>/deduplicate/dedup.py <папка группы> --gpu` — боевой прогон.
 3. Откат при необходимости: тот же вызов с `--undo`.
 
 `--gpu` использует видеокарту, если в общем `venv` есть torch; иначе считает на процессоре с пометкой, результат тот же.
 
 ## Шаг 4 — фото не по теме
 
-1. `..\venv\Scripts\python.exe ..\scripts\unrelated.py <папка группы> --endpoint http://127.0.0.1:11434/v1/ --dry-run` — модель читает подписи и печатает вердикты, ничего не переносит.
+1. `<папка dataset_tools>/venv/Scripts/python.exe <папка dataset_tools>/scripts/unrelated.py <папка группы> --endpoint http://127.0.0.1:11434/v1/ --dry-run` — модель читает подписи и печатает вердикты, ничего не переносит.
 2. Тот же вызов без `--dry-run` — фото с вердиктом «не про Советский Союз» уезжают в `<папка группы>_unrelated`.
 3. Фото без подписи и с неопределённым вердиктом остаются — это нормально.
 

@@ -2,3 +2,8 @@ venv/
 # Test suites stay local, in every tool folder
 tests/
 datasorterv1.3/
+# The partner's OpenCode files: OpenCode reads them from the repository root
+/AGENTS.md
+/opencode.json
+/opencode.jsonc
+/.opencode/
