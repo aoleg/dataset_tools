@@ -39,6 +39,11 @@ class TransportError(Exception):
     """A request that failed after every retry."""
 
 
+class Stopped(TransportError):
+    """A request given up because the run is stopping (Client.stop is set): not a
+    failure of the photo, which stays as it was for the next run."""
+
+
 class RateCap:
     """A token bucket: at most `per_second` requests per second, off when None."""
 
@@ -75,6 +80,12 @@ class Client:
         self.cap = RateCap(max_per_second)
         self.stats = {"requests": 0, "retries": 0, "bytes": 0}
         self.lock = threading.Lock()
+        # Set by the stream to its stop event: once set, no request is retried (the back-off
+        # doubles up to 90 s, so one refused download could hold a Ctrl+C for minutes).
+        self.stop: threading.Event | None = None
+
+    def stopping(self) -> bool:
+        return self.stop is not None and self.stop.is_set()
 
     def close(self) -> None:
         self.http.close()
@@ -105,9 +116,16 @@ class Client:
                     delay = max(delay, float(retry_after))
             if attempt == MAX_RETRIES:
                 break
+            if self.stopping():
+                raise Stopped(f"{what}: not retried, the run is stopping ({last})")
             with self.lock:
                 self.stats["retries"] += 1
-            time.sleep(min(BACKOFF_CAP, delay) * (0.75 + random.random() * 0.5))
+            wait = min(BACKOFF_CAP, delay) * (0.75 + random.random() * 0.5)
+            if self.stop is not None:
+                if self.stop.wait(wait):            # woken by the stop: give up at once
+                    raise Stopped(f"{what}: not retried, the run is stopping ({last})")
+            else:
+                time.sleep(wait)
             delay = min(BACKOFF_CAP, delay * 2)
         raise TransportError(f"{what}: gave up after {MAX_RETRIES} retries ({last})")
 

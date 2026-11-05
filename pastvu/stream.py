@@ -55,7 +55,7 @@ import folders
 import layout
 import process as pr
 import sidecars
-from client import IMG, Client, PastvuError, TransportError, page_url
+from client import IMG, Client, PastvuError, Stopped, TransportError, page_url
 from progress import Display, Stats, raw_report_block, report_block
 from store import DONE, FAILED, SKIPPED, STORED, Store
 
@@ -339,6 +339,8 @@ class Stream:
                 self.in_flight += 1
             try:
                 item = self.fetch_remote(cid, scope) if self.opts.raw else self.fetch(cid, scope)
+            except Stopped:
+                item = None                      # the run is stopping: the photo stays pending for the next run
             except pr.Rejected as r:
                 item = r
             except TransportError as e:
@@ -348,6 +350,8 @@ class Stream:
             finally:
                 with self.lock:
                     self.in_flight -= 1
+            if item is None:
+                continue
             if isinstance(item, pr.Rejected):
                 item.cid, item.scope = cid, scope
             out_q.put(item)
@@ -362,6 +366,8 @@ class Stream:
             cid, scope = pair
             try:
                 item = self.fetch_stored(cid, scope)
+            except Stopped:
+                continue                         # the run is stopping: the photo stays in the storage
             except pr.Rejected as r:
                 item = r
             except TransportError as e:
@@ -394,6 +400,18 @@ class Stream:
 
     # --- the GPU stage -------------------------------------------------------------
 
+    def release_cache(self) -> None:
+        """Give the allocator's cache back after a paint. A LaMa window of 2048 px needs
+        4.6 GB at its peak and leaves 7 to 14 GB reserved, which the allocator would keep
+        for the rest of the run; giving it back costs about 40 ms, and the next big window
+        is re-allocated in the same time it took cached (cuDNN keeps its tuning)."""
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:  # noqa: BLE001 - never let a cache release stop the stream
+            pass
+
     def process(self, job: Job) -> tuple:
         import watermark as wm
         o, d, s = self.opts, self.display, self.stats
@@ -418,6 +436,7 @@ class Stream:
             d.set(f"{job.cid}: painting {len(plan['wm_inside'])} watermark box(es)")
             t = time.perf_counter()
             painted = wm.inpaint(crop, plan["wm_inside"], o.wm_dilate, o.wm_max_size, self.lama)
+            self.release_cache()
             s.time("paint", time.perf_counter() - t)
         final = painted if painted is not None else crop
         t = time.perf_counter()
@@ -694,6 +713,8 @@ class Stream:
             raise ValueError("a raw run does not read the storage")
         self.budget = max(0, o.limit) if o.limit is not None else None
         self.storage_source = bool(stored)
+        if self.client is not None and hasattr(self.client, "stop"):
+            self.client.stop = self.stop         # Ctrl+C: no request is retried, photos in flight stay pending
         it, sit = iter(pairs), iter(stored)
         cid_lock = threading.Lock()
         out_q: queue.Queue = queue.Queue(maxsize=max(1, o.depth))
