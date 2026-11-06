@@ -304,7 +304,7 @@ Both kinds of regroup move files the same way:
 ## What happens to one photo
 
 1. **Fetch** (download threads): the PastVu record; the photo is skipped when it is smaller than `--min-side` (512) on either side, when its long side is more than `max_aspect` (21:9 in the conf) times its short side, when it is a painting, or when it is not public. Then the original file, which is the picture with PastVu's grey band appended at the bottom (`pastvu.com/<cid> uploaded by ...`). The file must have the size the record gives, picture plus band, or the photo counts as failed.
-2. **Band and borders** (download threads): the band rows are known from the record and come off exactly. [remove_borders](../remove_borders/README.md) analyses the picture without the band for scanned frames, mounts, thin lines and text banners.
+2. **Band and borders** (worker processes): the band rows are known from the record and come off exactly. [remove_borders](../remove_borders/README.md) analyses the picture without the band for scanned frames, mounts, thin lines and text banners. The decode, this analysis and the models' inputs run in worker processes (`--prepare-workers`), because in threads they hold Python's GIL, which the GPU stage needs back after every model call; on a run of many hours that slowed it from 10 to under 4 photos per second.
 3. **Watermarks** (GPU): the [watermark](../watermark/README.md) detector runs on the picture without the band, so the band's own text is never taken for a watermark. Detections from `--wm-conf` (0.1) go into the record; only those from `--wm-paint-conf` (0.4) are painted out with LaMa. Below 0.4 the detector often finds scene text and objects (a shop sign, a building facade); from 0.4 up it found printed captions and credits in every case checked.
 4. **Crop**: the band, the border cuts and a watermark trim (`--wm-mode trim`) make one crop, put on the JPEG block grid: the top and left edges move inward to the next block where a cut set them, so the cut part goes completely, and the far edges are exact.
 5. **Classify** (GPU): the final pixels are embedded with SigLIP 2 and scored by classify's probe, trained once at start on the samples folder. Among the categories within `priority_margin` of the top score, the lowest-numbered takes the image ([The samples folder](#the-samples-folder)). Then classify's gates: the summed score of those near categories against the confidence threshold (`--min-confidence`, 0.7) and their summed share of the 10 nearest examples against 0.3; an image that fails still goes into the chosen category, its best guess, and the record keeps the reason (`low confidence` or `disagree`), so doubtful photos can be found later. A byte-identical copy of a sample takes the sample's category. The record keeps the score of the chosen category and, when the priority chose it over a higher score, which category that was. Before the categories, the quality probe scores the same embedding, and a photo at or above `quality_threshold` is skipped ([Low-quality photos](#low-quality-photos)).
@@ -678,7 +678,8 @@ Each saved photo costs one API call and one image download; a photo skipped as t
 | `--comments` | off | add the comment thread to the record |
 | `--fetchers N` | conf (4) | download threads; 8 is about 30 to 70 % faster and doubles the load on PastVu |
 | `--depth N` | 16 | photos downloaded ahead of the GPU |
-| `--writers N` | 2 | encoder and writer threads |
+| `--writers N` | 4 | threads that test the colour, encode and write |
+| `--prepare-workers N` | half the logical processors, at most 8 | processes that decode, plan the borders and make the models' inputs; 0: in the download and storage threads |
 | `--limit N` | | do at most N photos in this run |
 | `--skip N` | 0 | start at photo N+1 in PastVu number order; the first N are not downloaded and stay to do |
 | `--retries N` | 3 | attempts for a photo that failed |
@@ -735,6 +736,7 @@ Each record carries what attribution and a takedown need: the PastVu page, the u
 | `sidecars.py` | the caption and the record |
 | `progress.py` | the live display and the report blocks |
 | `stream.py` | the threads and the run |
+| `prepare.py` | the decode, band check, 4 MP rule, border plan and models' inputs, in worker processes |
 | `fetch_turbojpeg.py` | fetches `turbojpeg.dll` into `bin\` |
 | `pastvu.conf.example` | the example conf with the aliases |
 | `install.bat`, `run.bat`, `requirements.txt` | install into the shared venv, run with it |

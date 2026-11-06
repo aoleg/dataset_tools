@@ -96,6 +96,7 @@ class Options:
     keep_rejects: bool = False        # a stored photo rejected by the processing keeps its raw files
     storage_threads: int = 6          # threads that read and prepare stored photos (decode, borders, model inputs)
     storage_depth: int = 4            # stored photos prepared ahead of the GPU (at least the threads)
+    prepare_workers: int = 0          # processes for decode, borders and model inputs; 0: in the fetch threads
 
     @property
     def scope_dir(self) -> Path:
@@ -175,6 +176,8 @@ class Stream:
         self.in_request: dict[int, float] = {}   # fetch thread -> when its current fetch began (the report)
         self.storage_threads_n = 0
         self.retries_seen = 0              # the client's retry count at the last report block
+        self.pool = None                   # prepare.Pool: the worker processes of this run, if any
+        self.prep_cfg = None
         enc_model = getattr(getattr(classifier, "encoder", None), "model_id", None)
         self.emb_key = (enc_model, getattr(classifier, "patches", None))
         self.tool = {"name": "dataset_tools/pastvu", "version": TOOL_VERSION, "detector": self.det_name,
@@ -273,19 +276,45 @@ class Stream:
         job.t_fetch = time.perf_counter() - t0
         return job
 
-    def prepare(self, job: Job) -> Job:
-        """The pixels: decode upright, verify the band, the picture box, the border plan."""
+    def prepare_config(self):
+        import prepare as pp
         o = self.opts
+        # The encoder's input in the worker needs only the patch budget (pr.naflex_resize, what
+        # Classifier.prepare_naflex does); any other classifier makes it in this thread.
+        patches = 0
+        if self.classifier is not None:
+            import classifier as clf
+            if isinstance(self.classifier, clf.Classifier):
+                patches = self.classifier.patches
+        return pp.Config(borders=o.borders, dark_borders=o.dark_borders, max_pixels=o.max_pixels,
+                         det_imgsz=self.det_imgsz if self.det is not None else 0, patches=int(patches or 0))
+
+    def prepare(self, job: Job) -> Job:
+        """The pixels: decode upright, verify the band, the picture box, the 4 MP rule, the
+        border plan, the models' inputs (prepare.run), in a worker process when the run
+        has them, else in this thread."""
+        import prepare as pp
         t0 = time.perf_counter()
-        job.array = pr.decode(job.data, job.head)
-        job.band = pr.verify_band(job.array, job.head, job.rows)
-        job.pic_box = pr.picture_box(job.head, job.rows)
-        self.shrink(job)
-        if o.borders:
-            picture = pr.crop_array(job.array, job.pic_box)
-            job.borders = pr.borders_plan(picture, {"dark": o.dark_borders})
-        self.prepare_inputs(job)
-        job.t_fetch += time.perf_counter() - t0
+        if self.prep_cfg is None:
+            self.prep_cfg = self.prepare_config()
+        if self.pool is not None:
+            r = self.pool.run(job.data, job.head, job.rows, self.prep_cfg)
+        else:
+            r = pp.run(job.data, job.head, job.rows, self.prep_cfg)
+        job.array, job.band, job.pic_box, job.borders = r["array"], r["band"], r["pic_box"], r["borders"]
+        job.head, job.rows, job.downscale = r["head"], r["rows"], r["downscale"]
+        if r["head_orig"] is not None:
+            job.head_orig = r["head_orig"]
+        job.det_input, job.det_scale, job.naflex, job.t_prepare = r["det_input"], r["det_scale"], r["naflex"], \
+            r["t_prepare"]
+        prep = getattr(self.classifier, "prepare_naflex", None)
+        if job.naflex is None and prep is not None:
+            t = time.perf_counter()
+            job.naflex = prep(pr.crop_array(job.array, job.pic_box))
+            job.t_prepare += time.perf_counter() - t
+        wall = time.perf_counter() - t0
+        job.t_fetch += wall
+        self.stats.time("prepare_wait", wall - r["t_total"])     # the queue for a worker and the transfer
         return job
 
     def shrink(self, job: Job) -> None:
@@ -868,6 +897,9 @@ class Stream:
             if o.limit is not None:
                 text += f", at most {o.limit:,} in this run"
             d.print(f"{text}; {completed:,} of {scope_total:,} done, skipped or saved under another scope before.")
+            if o.prepare_workers and not o.raw and self.source is None and (pairs or stored):
+                import prepare as pp
+                self.pool = pp.Pool(o.prepare_workers)
             fetchers = [threading.Thread(target=self.fetch_worker, args=(it, cid_lock, out_q), daemon=True,
                                          name=f"fetch-{i}") for i in range(o.fetchers)] if pairs else []
             storages = [threading.Thread(target=self.storage_worker, args=(sit, cid_lock, sq), daemon=True,
@@ -878,7 +910,7 @@ class Stream:
             for t in fetchers + writers + storages:
                 t.start()
             self.storage_threads_n = len(storages)
-            ended, sended, interrupts = 0, 0, 0
+            ended, sended, interrupts, hard_stop = 0, 0, 0, False
             remote_ended, storage_ended = not fetchers, not storages
             try:
                 while not (remote_ended and storage_ended):
@@ -949,6 +981,7 @@ class Stream:
                         else:
                             raise
             except KeyboardInterrupt:
+                hard_stop = True
                 d.print("Stopped. The images being written are finished; everything else is left for the next run.")
             finally:
                 self.stop.set()
@@ -957,6 +990,9 @@ class Stream:
                     wq.put(None)
                 for t in writers:
                     t.join()
+                if self.pool is not None:
+                    self.pool.close(wait=not hard_stop)
+                    self.pool = None
                 if self.captioner is not None:
                     d.set("finishing the captions")
                     self.captioner.close()
