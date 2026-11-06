@@ -86,19 +86,32 @@ def plan(store: Store, base: Path, scope: dict, classifier, threshold: float, ov
             if embedded % 200 == 0:
                 log(f"  embedded {embedded:,} images without a stored embedding ({time.time() - t0:.0f} s)")
         vecs.append(v)
-    p = classifier.quality.p_bad(np.stack(vecs)) if vecs else np.zeros(0)
+    niqe_on = getattr(classifier, "niqe_on", False)
+    no_niqe = 0
+    if vecs and niqe_on:
+        import reclassify as rc
+        p, _, scored = classifier.quality.score(np.stack(vecs), rc.niqe_scores(store, [t[0] for t in todo]))
+        no_niqe = int((~scored).sum())
+    else:
+        p = classifier.quality.p_bad(np.stack(vecs)) if vecs else np.zeros(0)
+        scored = np.ones(len(vecs), bool)
     label, _ = classifier.sample_match(vecs) if vecs else (np.zeros(0, int), np.zeros(0))
-    # a copy of a _quality_bad sample goes to review whatever its score, a copy of a _quality_good one never
+    # a copy of a _quality_bad sample goes to review whatever its score, a copy of a _quality_good one never;
+    # with NIQE on, a photo without a NIQE score is left out (its probe score is on another scale)
     picks = [{"cid": cid, "src": actual, "p_bad": round(float(b), 4)}
-             for (cid, actual), b, lab in zip(todo, p, label) if lab == 1 or (lab != 0 and b >= threshold)]
+             for (cid, actual), b, lab, ok in zip(todo, p, label, scored)
+             if lab == 1 or (lab != 0 and ok and b >= threshold)]
     picks.sort(key=lambda m: -m["p_bad"])
     return {"picks": picks, "checked": len(rows), "manual": manual, "missing": missing, "kept_good": kept_good,
-            "embedded": embedded}
+            "embedded": embedded, "no_niqe": no_niqe, "niqe": niqe_on}
 
 
 def summary(name: str, p: dict, threshold: float) -> str:
-    return (f"{name}: {p['checked']:,} saved photos, {len(p['picks']):,} at P(bad) >= {threshold} to review; "
-            f"{p['kept_good']:,} kept in an earlier review, {p['manual']:,} sorted by hand and {p['missing']:,} "
+    nn = p.get("no_niqe", 0)
+    return (f"{name}: {p['checked']:,} saved photos, {len(p['picks']):,} at P(bad) >= {threshold}"
+            f"{' with NIQE' if p.get('niqe') else ''} to review; "
+            f"{p['kept_good']:,} kept in an earlier review, {p['manual']:,} sorted by hand"
+            f"{f', {nn:,} without a NIQE score (run niqe first)' if nn else ''} and {p['missing']:,} "
             f"with their file gone are left out; {p['embedded']:,} embedded from their files")
 
 

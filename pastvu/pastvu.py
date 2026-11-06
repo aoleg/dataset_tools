@@ -774,9 +774,10 @@ def cmd_pull(args, conf, client) -> int:
         return process_stream(args, conf, client, base, store, sm, opts, mine, [], len(stored), 0, stored, where)
 
 
-def load_models(args, conf: cf.Conf, quality: float | None = None, colour_probe: bool = True) -> tuple:
-    """The watermark detector and LaMa, the classifier with its quality probe (at quality,
-    default the conf's threshold), and the colour probe, all resident on the GPU.
+def load_models(args, conf: cf.Conf, quality: float | None = None, colour_probe: bool = True,
+                quality_niqe: float | None = None) -> tuple:
+    """The watermark detector and LaMa, the classifier with its quality probe (at quality and
+    quality_niqe, default the conf's thresholds), and the colour probe, all resident on the GPU.
     -> (vram monitor, detector, lama, classifier, colour probe)"""
     import vram as vr
     vram = vr.VramMonitor().start()
@@ -796,7 +797,9 @@ def load_models(args, conf: cf.Conf, quality: float | None = None, colour_probe:
         samples = Path(args.samples).resolve() if args.samples else conf.samples
         classifier = clf.Classifier(samples, args.patches, args.min_confidence,
                                     priority_margin=margin_of(args, conf),
-                                    quality_threshold=quality_of(conf) if quality is None else quality)
+                                    quality_threshold=quality_of(conf) if quality is None else quality,
+                                    quality_threshold_niqe=quality_niqe_of(conf) if quality_niqe is None
+                                    else quality_niqe)
         classifier.embed(np.zeros((64, 64, 3), np.uint8))         # load the encoder now
         print(f"  classifier: {len(classifier.class_names)} classes from {samples}", flush=True)
         if colour_probe:
@@ -855,6 +858,7 @@ def cmd_import(args, conf, client) -> int:
     if args.top:
         store.set_meta("top", args.top)
     quality = quality_for(store, conf, args.quality_threshold)
+    quality_niqe = quality_niqe_for(store, conf, args.quality_threshold_niqe)
     if args.against:
         store.set_meta("against", str(Path(args.against).resolve()))
     against_base = store.get_meta("against")
@@ -891,7 +895,8 @@ def cmd_import(args, conf, client) -> int:
             print(f"Nothing to do: all {total:,} images are processed.")
             return 0
         args.no_classify = False
-        vram, detector, lama, classifier, mode_probe = load_models(args, conf, quality, colour_probe=split)
+        vram, detector, lama, classifier, mode_probe = load_models(args, conf, quality, colour_probe=split,
+                                                                   quality_niqe=quality_niqe)
         against = None
         if against_base:
             against = importer.Against(Path(against_base), classifier.model_id, classifier.patches)
@@ -992,7 +997,8 @@ def cmd_reclassify(args, conf, client) -> int:
             samples = Path(args.samples).resolve() if args.samples else conf.samples
             classifier = clf.Classifier(samples, args.patches, args.min_confidence,
                                         priority_margin=margin_of(args, conf),
-                                        quality_threshold=quality_for(store, conf))
+                                        quality_threshold=quality_for(store, conf),
+                                        quality_threshold_niqe=quality_niqe_for(store, conf))
         against = None
         if classifier is not None and store.is_import and store.get_meta("against"):
             import importer
@@ -1026,8 +1032,13 @@ def cmd_reclassify(args, conf, client) -> int:
         if low + wide + copies:
             what = []
             samples_bad = sum(1 for _, p in plans for m in p["low_quality"] if m.get("sample"))
-            if low - samples_bad:
-                what.append(f"{low - samples_bad:,} low quality (P(bad) >= {classifier.quality.threshold})")
+            by_niqe = sum(1 for _, p in plans for m in p["low_quality"] if m.get("niqe"))
+            if low - samples_bad - by_niqe:
+                what.append(f"{low - samples_bad - by_niqe:,} low quality by the probe "
+                            f"(P(bad) >= {classifier.quality.threshold:g})")
+            if by_niqe:
+                what.append(f"{by_niqe:,} low quality by the probe + NIQE "
+                            f"(P(bad) >= {classifier.quality.threshold_niqe:g})")
             if samples_bad:
                 what.append(f"{samples_bad:,} copies of _quality_bad samples")
             if wide:
@@ -1037,7 +1048,8 @@ def cmd_reclassify(args, conf, client) -> int:
             again = "imported" if store.is_import else "downloaded"
             if not confirm(f"This deletes {low + wide + copies:,} photos, {', '.join(what)}; they are never {again} "
                            f"again, and --undo cannot bring them back. Continue? [y/N] ", args.yes):
-                print("Nothing done. quality_threshold = 0 and max_aspect = 0 in [defaults] of the conf reclassify "
+                print("Nothing done. quality_threshold = 0, quality_threshold_niqe = 0 and max_aspect = 0 in "
+                      "[defaults] of the conf reclassify "
                       "without deleting" + (" (this import keeps the quality threshold it was given: import "
                                             "--quality-threshold 0 changes it)"
                                             if store.is_import and store.get_meta("quality_threshold") is not None
@@ -1087,7 +1099,8 @@ def cmd_cleanup(args, conf, client) -> int:
     with locked(store, "cleanup", "shared" if args.dry_run else "exclusive"):
         import classifier as clf
         samples = Path(args.samples).resolve() if args.samples else conf.samples
-        classifier = clf.Classifier(samples, args.patches, 0.7, quality_threshold=threshold, categories=False)
+        classifier = clf.Classifier(samples, args.patches, 0.7, quality_threshold=threshold, categories=False,
+                                    quality_threshold_niqe=threshold if quality_niqe_of(conf) > 0 else 0)
         if classifier.quality is None:
             raise SystemExit(f"no quality probe: {samples} needs at least 20 images in _quality_good and in "
                              f"_quality_bad")
@@ -1454,6 +1467,18 @@ def quality_of(conf: cf.Conf) -> float:
     return q
 
 
+def quality_niqe_of(conf: cf.Conf) -> float:
+    """[defaults] quality_threshold_niqe of the conf; written into the file with its default when it is not there."""
+    q = conf.quality_threshold_niqe
+    if not 0 <= q <= 1:
+        raise SystemExit(f"{conf.path}: [defaults] quality_threshold_niqe {q}: give a P(bad) from 0 (off) to 1")
+    if not conf.quality_niqe_in_file and conf.path and Path(conf.path).is_file():
+        cf.save_default(conf.path, "quality_threshold_niqe", f"{q:g}", cf.QUALITY_NIQE_COMMENT)
+        conf.quality_niqe_in_file = True
+        print(f"  quality_threshold_niqe = {q:g} written into [defaults] of {conf.path}")
+    return q
+
+
 def aspect_of(conf: cf.Conf) -> float:
     """[defaults] max_aspect of the conf; written into the file with its default when it is not there."""
     if not conf.aspect_in_file and conf.path and Path(conf.path).is_file():
@@ -1526,6 +1551,18 @@ def quality_for(store: Store, conf: cf.Conf, given: float | None = None) -> floa
         return given
     q = store.get_meta("quality_threshold") if store.is_import else None
     return quality_of(conf) if q is None else float(q)
+
+
+def quality_niqe_for(store: Store, conf: cf.Conf, given: float | None = None) -> float:
+    """The NIQE stack's threshold of a base, remembered by an import like quality_for's."""
+    if given is not None:
+        if not 0 <= given <= 1:
+            raise SystemExit(f"--quality-threshold-niqe {given}: give a P(bad) from 0 (off) to 1")
+        if store.is_import:
+            store.set_meta("quality_threshold_niqe", given)
+        return given
+    q = store.get_meta("quality_threshold_niqe") if store.is_import else None
+    return quality_niqe_of(conf) if q is None else float(q)
 
 
 def margin_of(args, conf: cf.Conf) -> float:
@@ -1659,6 +1696,11 @@ priority_margin = 0.15
 ; samples folder) scores at or above this P(bad) are skipped and never saved,
 ; and reclassify deletes the saved ones. 0 turns it off.
 quality_threshold = 0.88
+; The same for photos with a NIQE score (all new ones; `niqe` scores the older
+; ones): the probe stacked with NIQE above 12, where print screens and noise
+; survive the downscale to 1024² pixels and film grain does not reach. Photos
+; without a NIQE score keep quality_threshold. 0: the probe alone for all.
+quality_threshold_niqe = 0.8
 ; Photos whose long side is more than this times the short side (panoramas,
 ; strips) are skipped like the ones under 512 pixels, and reclassify deletes
 ; the saved ones. W:H or a number; 0 turns it off.
@@ -1904,6 +1946,9 @@ def parse_args(argv=None):
     p.add_argument("--quality-threshold", type=float, metavar="X",
                    help="skip photos the quality probe scores at or above this P(bad); 0: off (default: [defaults] "
                         "quality_threshold of the conf). Remembered, also by reclassify of the import")
+    p.add_argument("--quality-threshold-niqe", type=float, metavar="X",
+                   help="the same for the probe stacked with NIQE, which decides for every photo with a NIQE score; "
+                        "0: the probe alone (default: [defaults] quality_threshold_niqe of the conf). Remembered")
     p.add_argument("--samples", metavar="DIR", help="classify samples folder (default: [paths] samples of the conf)")
     p.add_argument("--min-confidence", type=float, default=0.7, metavar="X",
                    help="below this the record marks the photo as doubtful; it still goes to its best-guess category")

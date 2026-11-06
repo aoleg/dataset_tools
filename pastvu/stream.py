@@ -189,6 +189,8 @@ class Stream:
                      "detector_conf": opts.wm_conf, "paint_conf": opts.wm_paint_conf, "encoder": enc_model,
                      "priority_margin": getattr(classifier, "priority_margin", None),
                      "quality_threshold": getattr(getattr(classifier, "quality", None), "threshold", None),
+                     "quality_threshold_niqe": getattr(getattr(classifier, "quality", None), "threshold_niqe",
+                                                       None) or None,
                      "patches": getattr(classifier, "patches", None)}
 
     def log(self, text: str) -> None:
@@ -571,7 +573,11 @@ class Stream:
                 dn = time.perf_counter() - t_n
                 s.time("niqe", dn)
                 t += dn                    # the classify time leaves NIQE out
-            why = self.classifier.quality_reason(vec)
+            if getattr(self.classifier, "niqe_on", False):
+                score = job.niqe[1] if job.niqe is not None else None
+                why = self.classifier.quality_reason(vec, np.nan if score is None else score)
+            else:
+                why = self.classifier.quality_reason(vec)
             if why:                        # at or above the threshold, or a _quality_bad sample
                 s.time("classify", time.perf_counter() - t)
                 raise pr.Rejected(why)

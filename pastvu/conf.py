@@ -13,6 +13,7 @@ the defaults of a run, and the region aliases, in three groups: countries
     json_files = no
     priority_margin = 0.15
     quality_threshold = 0.88
+    quality_threshold_niqe = 0.8
     max_aspect = 21:9
     export_layout = categories_first
 
@@ -70,6 +71,8 @@ class Conf:
     priority_margin: float = 0.15
     quality_threshold: float = 0.88
     quality_in_file: bool = False      # the key is in the file (else it is written there on first use)
+    quality_threshold_niqe: float = 0.80
+    quality_niqe_in_file: bool = False
     max_aspect: float = 21 / 9         # long side over short side; 0: no limit
     aspect_in_file: bool = False
     max_pixels: int = 2048             # a picture over this^2 pixels is downscaled to that area; 0: never
@@ -130,6 +133,11 @@ BW_COLOR_COMMENT = [
 QUALITY_COMMENT = ["; Photos the quality probe (trained on _quality_good and _quality_bad in the",
                    "; samples folder) scores at or above this P(bad) are skipped and never saved,",
                    "; and reclassify deletes the saved ones. 0 turns it off."]
+
+QUALITY_NIQE_COMMENT = ["; The same for photos with a NIQE score (all new ones; `niqe` scores the older",
+                        "; ones): the probe stacked with NIQE above 12, where print screens and noise",
+                        "; survive the downscale to 1024² pixels and film grain does not reach. Photos",
+                        "; without a NIQE score keep quality_threshold. 0: the probe alone for all."]
 
 
 JPEG_COMMENT = ["; The JPEG quality (1 to 100, saved without chroma subsampling) of a photo",
@@ -235,6 +243,9 @@ def load(path: Path | None = None) -> Conf:
             if d.get("quality_threshold", "").strip():
                 conf.quality_threshold = d.getfloat("quality_threshold")
                 conf.quality_in_file = True
+            if d.get("quality_threshold_niqe", "").strip():
+                conf.quality_threshold_niqe = d.getfloat("quality_threshold_niqe")
+                conf.quality_niqe_in_file = True
             if d.get("max_aspect", "").strip():
                 conf.max_aspect = parse_aspect(d.get("max_aspect"))
                 conf.aspect_in_file = True

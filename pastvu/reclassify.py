@@ -56,6 +56,13 @@ def update_record(store: Store, cid: int, rel: str, verdict_dict: dict | None, n
     return json.dumps(rec, ensure_ascii=False, indent=1, default=str)
 
 
+def niqe_scores(store: Store, cids: list[int]) -> np.ndarray:
+    """The stored NIQE score of each photo at the current niqe.VERSION; NaN for none."""
+    import niqe
+    rows = store.niqe_rows(cids, niqe.VERSION)
+    return np.array([np.nan if rows.get(c) is None else rows[c][0] for c in cids], float)
+
+
 def plan(store: Store, base: Path, scope: dict, classifier, override_manual: bool, log=print,
          max_aspect: float = 0.0, against=None) -> dict:
     """What a reclassify would do. -> {"moves": [...], "low_quality": [...], "aspect": [...], "copies": [...],
@@ -98,7 +105,11 @@ def plan(store: Store, base: Path, scope: dict, classifier, override_manual: boo
             if embedded % 200 == 0:
                 log(f"  embedded {embedded:,} images without a stored embedding ({time.time() - t0:.0f} s)")
         vecs.append(v)
-    bad = classifier.low_quality(vecs) if vecs else np.zeros(0)
+    with_niqe = np.zeros(len(vecs), bool)
+    if vecs and getattr(classifier, "niqe_on", False):
+        bad, with_niqe = classifier.quality_scores(vecs, niqe_scores(store, [t[0] for t in todo]))
+    else:
+        bad = classifier.low_quality(vecs) if vecs else np.zeros(0)
     label, cos = classifier.sample_match(vecs) if vecs else (np.zeros(0, int), np.zeros(0))
     good = store.reviewed_good()                 # kept in a cleanup review: their quality was looked at
     low, keep = [], []
@@ -110,7 +121,8 @@ def plan(store: Store, base: Path, scope: dict, classifier, override_manual: boo
         elif label[i] == 0 or cid in good or np.isnan(b):
             keep.append(i)
         else:
-            low.append({**m, "p_bad": round(float(b), 4), "reason": f"{quality.REASON} (P(bad) {b:.2f})"})
+            low.append({**m, "p_bad": round(float(b), 4), "niqe": bool(with_niqe[i]),
+                        "reason": quality.reason(float(b), bool(with_niqe[i]))})
     todo, vecs = [todo[i] for i in keep], [vecs[i] for i in keep]
     copies = []
     if against is not None and todo:

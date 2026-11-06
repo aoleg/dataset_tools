@@ -6,7 +6,9 @@ example rule. The embeddings of the saved images go into the store, keyed by
 PastVu number, so reclassify needs the GPU only for images without one.
 
 The quality folders (_quality_good, _quality_bad) are embedded in the same
-pass and cache, and train the quality probe on the same embedding.
+pass and cache, and train the quality probe on the same embedding. With
+quality_threshold_niqe above 0 the samples also get their NIQE (cached) and
+the probe its NIQE stack (quality.py).
 """
 
 from __future__ import annotations
@@ -92,7 +94,7 @@ class Verdict:
 class Classifier:
     def __init__(self, samples: Path, patches: int, min_confidence: float, encoder=None,
                  priority_margin: float = DEFAULT_PRIORITY_MARGIN, quality_threshold: float = quality.THRESHOLD,
-                 categories: bool = True):
+                 categories: bool = True, quality_threshold_niqe: float = 0.0):
         """categories False: the quality probe alone (cleanup); the samples are embedded all the same,
         since the cache keeps only the files of the pass that saves it."""
         from threadpoolctl import threadpool_limits
@@ -123,6 +125,14 @@ class Classifier:
             self.n_classes = len(self.ts.class_names)
         self.quality = quality.probe_from_samples(q_items, res.vectors, quality_threshold)
         self._niqe = None
+        if self.quality is not None and quality_threshold_niqe > 0:
+            scores = quality.sample_niqe(self.samples, self.quality.rels, self.niqe)
+            self.quality.fit_stack(scores, quality_threshold_niqe)
+
+    @property
+    def niqe_on(self) -> bool:
+        """The quality decision uses NIQE (the stack is fitted)."""
+        return self.quality is not None and self.quality.stack is not None
 
     @property
     def niqe(self):
@@ -174,14 +184,19 @@ class Classifier:
                                top=self.ts.class_names[top] if top != ci else "", group=group))
         return out
 
-    def low_quality(self, X) -> np.ndarray:
-        """P(bad) of each embedding when it is at or above the threshold, else NaN (all NaN with the filter off)."""
+    def low_quality(self, X, niqe=None) -> np.ndarray:
+        """P(bad) of each embedding when it is at or above its threshold, else NaN (all NaN with the filter
+        off). niqe: the NIQE score of each (NaN for none); where given, the NIQE stack decides."""
+        return self.quality_scores(X, niqe)[0]
+
+    def quality_scores(self, X, niqe=None) -> tuple[np.ndarray, np.ndarray]:
+        """(P(bad) at or above its threshold else NaN, whether NIQE was used) of each embedding."""
         X = np.asarray(X, np.float32)
         X = X.reshape(len(X), -1) if X.ndim > 1 else X.reshape(1, -1)
         if self.quality is None or not len(X):
-            return np.full(len(X), np.nan)
-        p = self.quality.p_bad(X)
-        return np.where(p >= self.quality.threshold, p, np.nan)
+            return np.full(len(X), np.nan), np.zeros(len(X), bool)
+        p, thr, with_niqe = self.quality.score(X, niqe)
+        return np.where(p >= thr, p, np.nan), with_niqe
 
     def sample_match(self, X) -> tuple[np.ndarray, np.ndarray]:
         """Which embeddings are copies of a quality sample: (label 0 good, 1 bad or quality.NONE, cosine);
@@ -192,16 +207,17 @@ class Classifier:
             return np.full(len(X), quality.NONE), np.zeros(len(X))
         return self.quality.match(X)
 
-    def quality_reason(self, vec) -> str | None:
+    def quality_reason(self, vec, niqe: float | None = None) -> str | None:
         """Why one photo is left out for its quality, or None: a copy of a _quality_bad sample always,
-        a copy of a _quality_good sample never, any other at or above the threshold."""
+        a copy of a _quality_good sample never, any other at or above the threshold (with its NIQE
+        score, the NIQE stack's)."""
         label, cos = self.sample_match(vec)
         if label[0] == 1:
             return quality.sample_reason(float(cos[0]))
         if label[0] == 0:
             return None
-        bad = float(self.low_quality(vec)[0])
-        return None if np.isnan(bad) else self.quality.reason(bad)
+        bad, with_niqe = self.quality_scores(vec, None if niqe is None else [niqe])
+        return None if np.isnan(bad[0]) else self.quality.reason(float(bad[0]), bool(with_niqe[0]))
 
     def decide(self, vec: np.ndarray) -> Verdict:
         return self.decide_many(vec[None])[0]

@@ -36,6 +36,11 @@ priority_margin = 0.15
 ; samples folder) scores at or above this P(bad) are skipped and never saved,
 ; and reclassify deletes the saved ones. 0 turns it off.
 quality_threshold = 0.88
+; The same for photos with a NIQE score (all new ones; `niqe` scores the older
+; ones): the probe stacked with NIQE above 12, where print screens and noise
+; survive the downscale to 1024² pixels and film grain does not reach. Photos
+; without a NIQE score keep quality_threshold. 0: the probe alone for all.
+quality_threshold_niqe = 0.8
 ; Photos whose long side is more than this times the short side (panoramas,
 ; strips) are skipped like the ones under 512 pixels, and reclassify deletes
 ; the saved ones. W:H or a number; 0 turns it off.
