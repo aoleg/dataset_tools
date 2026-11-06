@@ -60,6 +60,33 @@ class CaptionConf:
 
 
 @dataclass
+class InterestConf:
+    """[interest]: the thresholds of the rules of cherrypick --interest, on the
+    columns of the boxes rows (shares of the frame), and the rule of a category
+    by its name after the number (rule.<name> = <rule>), which overrides the
+    defaults in interest.py."""
+    vehicle_min: float = 0.08         # vehicle: the largest vehicle's area, at least
+    vehicle_max: float = 0.70         # ... and at most (a vehicle that fills the frame has no context)
+    vehicle_width: float = 0.30       # ... and its width, at least
+    person_height: float = 0.35       # people: the tallest person's height, at least
+    face_height: float = 0.04         # ... and the tallest face's height (readable from about 4 %)
+    group_min: int = 4                # group: counted persons, at least
+    group_face_height: float = 0.03   # ... and the tallest face's height
+    thing_min: float = 0.08           # thing: the largest thing's area (any family but people and context)
+    presence_persons: int = 1         # presence: counted persons, at least
+    presence_faces: int = 1           # ... and faces inside persons, at least
+    rules: dict = field(default_factory=dict)     # category name (after the number) -> rule
+
+    def thresholds(self) -> dict:
+        return {k: getattr(self, k) for k in INTEREST_KEYS}
+
+
+INTEREST_KEYS = ("vehicle_min", "vehicle_max", "vehicle_width", "person_height", "face_height", "group_min",
+                 "group_face_height", "thing_min", "presence_persons", "presence_faces")
+INTEREST_RULES = ("vehicle", "people", "group", "thing", "presence", "pass")
+
+
+@dataclass
 class Conf:
     path: Path | None = None
     base: Path | None = None
@@ -86,6 +113,7 @@ class Conf:
     layout: str | None = None          # the folder tree of a new base; None: not in the file (written on first use)
     bw_color: bool | None = None       # bw/ and color/ at the top of a new base; None: not in the file
     caption: CaptionConf = field(default_factory=CaptionConf)
+    interest: InterestConf = field(default_factory=InterestConf)
     aliases: dict[str, list[int]] = field(default_factory=dict)
     groups: dict[str, str] = field(default_factory=dict)      # alias -> its group
 
@@ -285,6 +313,23 @@ def load(path: Path | None = None) -> Conf:
             cc.reasoning = c.getboolean("reasoning", fallback=cc.reasoning)
         except ValueError as e:
             raise SystemExit(f"{path}: [caption] {e}")
+    if cp.has_section("interest"):
+        c, ic = cp["interest"], conf.interest
+        try:
+            for key in INTEREST_KEYS:
+                if key in c:
+                    cur = getattr(ic, key)
+                    setattr(ic, key, c.getint(key) if isinstance(cur, int) else c.getfloat(key))
+            for key, value in c.items():
+                if key.startswith("rule."):
+                    rule = value.strip().lower()
+                    if rule not in INTEREST_RULES:
+                        raise ValueError(f"{key} = {value}: give one of {', '.join(INTEREST_RULES)}")
+                    ic.rules[key[len("rule."):].strip().lower()] = rule
+                elif key not in INTEREST_KEYS:
+                    raise ValueError(f"unknown key {key}")
+        except ValueError as e:
+            raise SystemExit(f"{path}: [interest] {e}")
     for group in ALIAS_GROUPS:
         sec = f"aliases.{group}"
         if not cp.has_section(sec):

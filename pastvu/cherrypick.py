@@ -188,12 +188,14 @@ def score(store, quality, model: str, patches: int, cids: set[int], log=print) -
 
 
 def _cut(ranked: list[int], scores: dict[int, float], c: dict) -> list[int]:
-    """One bucket, ranked best first, under the threshold and the percentile."""
+    """One bucket, ranked first to last, under the threshold and the percentile. The threshold is
+    a floor whatever the order (with --interest the ranking is by tier before quality): the photos
+    under it leave first, then the top of the rest; the percentile is of the bucket as it is."""
     n = len(ranked)
     if c["quality"] is not None:
-        n = min(n, sum(1 for cid in ranked if scores[cid] >= c["quality"]))
+        ranked = [cid for cid in ranked if scores[cid] >= c["quality"]]
     if c["top"] is not None:
-        n = min(n, len(ranked) * c["top"] // 100)
+        n = min(n, n * c["top"] // 100)
     return ranked[:n]
 
 
@@ -210,9 +212,12 @@ def balanced(colour: int, bw: int, percent: int, n: int | None = None) -> tuple[
     return c, b
 
 
-def select(photos: dict, scores: dict[int, float], c: dict, balance: int | None) -> tuple[dict[int, dict], list[dict]]:
-    """The picked photos and a table row per category.
-    -> ({cid: photo}, [{"cat", "color_pool", "bw_pool", "color", "bw", "note"}])"""
+def select(photos: dict, scores: dict[int, float], c: dict, balance: int | None,
+           tiers: dict[int, int] | None = None) -> tuple[dict[int, dict], list[dict]]:
+    """The picked photos and a table row per category. tiers (cherrypick --interest): cid -> 0, 1
+    or 2 from interest.tiers; a bucket is then ranked by (tier, quality) and cut as without them,
+    so the tiers order the photos and never remove one; the row gains the picked per tier.
+    -> ({cid: photo}, [{"cat", "color_pool", "bw_pool", "color", "bw", "note", "color_tiers", "bw_tiers"}])"""
     buckets: dict[str, dict[str, list[int]]] = defaultdict(lambda: {"color": [], "bw": []})
     unscored = 0
     for cid, ph in photos.items():
@@ -223,7 +228,11 @@ def select(photos: dict, scores: dict[int, float], c: dict, balance: int | None)
     picked: dict[int, dict] = {}
     table = []
     for cat in sorted(buckets):
-        ranked = {m: sorted(cids, key=lambda cid: (-scores[cid], cid)) for m, cids in buckets[cat].items()}
+        if tiers is None:
+            ranked = {m: sorted(cids, key=lambda cid: (-scores[cid], cid)) for m, cids in buckets[cat].items()}
+        else:
+            ranked = {m: sorted(cids, key=lambda cid: (tiers.get(cid, 1), -scores[cid], cid))
+                      for m, cids in buckets[cat].items()}
         pools = {m: len(v) for m, v in ranked.items()}
         cut = {m: _cut(v, scores, c) for m, v in ranked.items()}
         want = {m: len(v) for m, v in cut.items()}
@@ -234,24 +243,47 @@ def select(photos: dict, scores: dict[int, float], c: dict, balance: int | None)
             if not want["color"] + want["bw"] and had["color"] + had["bw"]:
                 short = "colour" if not had["color"] else "black-and-white"
                 note = f"no {short} photos pass: nothing picked at {balance} % colour"
+        row = {"cat": cat, "color_pool": pools["color"], "bw_pool": pools["bw"], "color": want["color"],
+               "bw": want["bw"], "note": note}
         for m in ("color", "bw"):
-            for cid in cut[m][:want[m]]:
+            chosen = cut[m][:want[m]]
+            for cid in chosen:
                 picked[cid] = photos[cid]
-        table.append({"cat": cat, "color_pool": pools["color"], "bw_pool": pools["bw"], "color": want["color"],
-                      "bw": want["bw"], "note": note})
+            if tiers is not None:
+                counts = [0, 0, 0]
+                for cid in chosen:
+                    counts[tiers.get(cid, 1)] += 1
+                row[f"{m}_tiers"] = counts
+        table.append(row)
     if unscored:
         table.append({"cat": "(no embedding, left out)", "color_pool": unscored, "bw_pool": 0, "color": 0, "bw": 0,
                       "note": ""})
     return picked, table
 
 
-def table_text(table: list[dict]) -> str:
-    lines = [f"  {'category':30} {'colour':>16}   {'black-and-white':>16}"]
+def table_text(table: list[dict], interest: bool = False) -> str:
+    """The pools and picks per category; with interest, the picked per tier (interesting / unknown
+    / not) after each mode's pick."""
+    tiers_w = 22 if interest else 0
+    head = f"  {'category':30} {'colour':>16}{'':{tiers_w}}   {'black-and-white':>16}"
+    if interest:
+        head += "      (picked: interesting / unknown / not)"
+    lines = [head]
+
+    def tiers_of(r, m):
+        t = r.get(f"{m}_tiers")
+        return f"  {t[0]:5,} /{t[1]:5,} /{t[2]:5,}" if t else " " * tiers_w
+
     for r in table:
-        lines.append(f"  {r['cat']:30} {r['color_pool']:7,} -> {r['color']:6,}   {r['bw_pool']:7,} -> {r['bw']:6,}"
+        lines.append(f"  {r['cat']:30} {r['color_pool']:7,} -> {r['color']:6,}{tiers_of(r, 'color') if interest else ''}"
+                     f"   {r['bw_pool']:7,} -> {r['bw']:6,}{tiers_of(r, 'bw') if interest else ''}"
                      + (f"   {r['note']}" if r["note"] else ""))
     tc, tb = sum(r["color"] for r in table), sum(r["bw"] for r in table)
-    lines.append(f"  {'total':30} {'':7} -> {tc:6,}   {'':7} -> {tb:6,}   ({tc + tb:,} photos)")
+    lines.append(f"  {'total':30} {'':7} -> {tc:6,}{'':{tiers_w}}   {'':7} -> {tb:6,}{'':{tiers_w}}   ({tc + tb:,} photos)")
+    if interest:
+        tot = [sum(r.get(f"{m}_tiers", [0, 0, 0])[i] for r in table for m in ("color", "bw")) for i in range(3)]
+        lines.append(f"  picked: {tot[0]:,} interesting, {tot[1]:,} unknown (no boxes row, or a category without a "
+                     f"rule), {tot[2]:,} whose rule fails")
     return "\n".join(lines)
 
 

@@ -1400,12 +1400,25 @@ def cmd_cherrypick(args, conf, client) -> int:
             raise SystemExit(f"no quality probe: {samples} needs at least 20 images in _quality_good and in "
                              f"_quality_bad")
         scores = cp.score(store, classifier.quality, classifier.model_id, classifier.patches, set(photos))
-        picked, table = cp.select(photos, scores, c, balance)
+        tiers = None
+        if args.interest:
+            import detect as dt
+            import interest as it
+            cats = {p["cat"] for p in photos.values()}
+            print(it.describe(cats, conf.interest), flush=True)
+            tiers = it.tiers(store, photos, conf.interest, dt.vocab_hash())
+            known = sum(1 for t in tiers.values() if t != it.UNKNOWN)
+            print(f"  {known:,} of {len(tiers):,} photos have a boxes row and a rule"
+                  + ("" if known else "; run detect first for the ordering to mean anything"), flush=True)
+        picked, table = cp.select(photos, scores, c, balance, tiers)
         print(f"{len(photos):,} saved photos in {len({p['cat'] for p in photos.values()})} categories; "
               f"pool -> picked per category:")
-        print(cp.table_text(table), flush=True)
+        print(cp.table_text(table, interest=args.interest), flush=True)
         criteria = {"base": str(base), **{k: v for k, v in c.items() if v is not None}, "balance": balance,
                     "decades": decades, "categories": args.category or [], "samples": str(samples)}
+        if args.interest:
+            criteria["interest"] = {"vocab": dt.vocab_hash(), "rules": it.rules_of(cats, conf.interest),
+                                    **conf.interest.thresholds()}
         res = cp.write(picked, base, out, criteria, None if no_modes else export_layout_of(conf), args.split,
                        args.link, args.prune, args.dry_run, record=not store.is_import)
         if args.dry_run:
@@ -1796,6 +1809,36 @@ timeout = 300
 ; Let a reasoning model think before it answers (slower).
 reasoning = no
 
+[interest]
+; cherrypick --interest: the saved photos are ordered by what detect found in
+; them before the quality ceilings cut each category. A rule per category reads
+; the boxes row (sizes as shares of the frame); a photo whose rule passes comes
+; first, then one without a row, then one whose rule fails; nothing is removed.
+; The rule of a category comes from its name after the number: transport ->
+; vehicle; people_adult, people_children, school -> people; group_photo_adult,
+; group_photo_children -> group; futurism, objects, military -> thing;
+; environment_indoors, environment_outdoors -> presence; every other name ->
+; pass (no ordering). rule.<name> = <rule> overrides one category, e.g.
+;   rule.monuments = thing
+; vehicle: the largest vehicle covers between vehicle_min and vehicle_max of the
+; frame and is at least vehicle_width of its width.
+vehicle_min = 0.08
+vehicle_max = 0.70
+vehicle_width = 0.30
+; people: the tallest person is at least person_height of the frame's height
+; and the tallest face at least face_height (faces are readable from about 4 %).
+person_height = 0.35
+face_height = 0.04
+; group: at least group_min persons, the tallest face at least group_face_height.
+group_min = 4
+group_face_height = 0.03
+; thing: the largest vehicle or object covers at least thing_min of the frame.
+thing_min = 0.08
+; presence: at least presence_persons persons with presence_faces faces inside
+; them (a street or an interior with people before one without).
+presence_persons = 1
+presence_faces = 1
+
 ; Aliases: a name for one or more PastVu region numbers, used with --region.
 ; Three groups: countries (and groups of countries), regions (the first level
 ; under each country), cities and smaller parts (capitals and federal cities,
@@ -2172,6 +2215,9 @@ def parse_args(argv=None):
     p.add_argument("--decades", nargs="+", metavar="DECADE", help="only these decades, e.g. 1960s 1970s (default: all)")
     p.add_argument("--category", nargs="+", metavar="CATEGORY",
                    help="only these categories, by number, name or full name (default: all but 200-outliers)")
+    p.add_argument("--interest", action="store_true",
+                   help="order each category by what detect found (a subject at a readable size, people with "
+                        "faces) before the ceilings cut it; the rules and thresholds are [interest] in the conf")
     p.add_argument("--link", action="store_true", help="hard-link the images instead of copying them")
     p.add_argument("--prune", action="store_true", help="delete the files of this base in the folder that are no "
                                                         "longer picked")

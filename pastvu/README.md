@@ -79,6 +79,7 @@ jpeg_quality_downscaled = 95          JPEG quality of a photo re-encoded while i
 export_layout = categories_first      folder order of the live export and of an import: categories_first or color_first
 
 [caption]                             the VLM of autocaption; see Autocaption
+[interest]                            the rules of cherrypick --interest; see Cherrypick
 api_url = http://localhost:5001/v1
 system_prompt = tagging/sysprompt.txt
 prompt = tagging/main_prompt.txt
@@ -188,7 +189,7 @@ run.bat detect [<scope or folder> ...] [--follow] [--redo] [--limit N]
 run.bat export <scope> [...] [--format jsonl|parquet]
 run.bat import --dataset <folder> [-o <folder>] [--against <base>] [--top color|category|none] [--quality-threshold X] [--split N] [--limit N]
 run.bat --base <import folder> reclassify [--dry-run] [--yes]
-run.bat cherrypick <0.85 | 30 | 5000> [...] -o <folder> [--balance 70] [--decades 1960s 1970s] [--link] [--prune]
+run.bat cherrypick <0.85 | 30 | 5000> [...] -o <folder> [--balance 70] [--decades 1960s 1970s] [--interest] [--link] [--prune]
 run.bat extract <category> [...] [--region R] [--years A B | --decade D] [--bw | --color] [--min-res N]
                    [--target N [--colour-share X]] [-o DIR]
 run.bat scopes | aliases | count --region <alias> | regions [--find TEXT]
@@ -593,6 +594,7 @@ Picks the best photos of every category, by the quality probe, into one folder f
 - **Which photos:** every saved photo of the base, in the categories and modes the store records (run `reclassify` first to record hand moves), `200-outliers` never. `--decades 1960s 1970s` keeps only those decades, by the photo's start year, still as one bucket per category and mode; an import has no years. `--category` narrows to some categories, by number, name or full name. A photo that has no embedding is left out and counted.
 - **The output:** `<folder>\<category>\bw\` and `color\` (`export_layout = color_first` in the conf puts `bw\` and `color\` first); `--split N` adds numbered folders. Images are copied, or hard-linked with `--link`; every other file of the image's name (`.txt`, `.short`, ...) is copied, except the record `.json` of a PastVu base. The `.json` of an import is a caption and is copied. The report lists each category's pools and picks.
 - **Running it again** copies what is picked and missing, keeps what is there, and reports the files of this base that are no longer picked; `--prune` deletes them. So without `--prune` the folder can hold more than the ceilings say, and nothing you edited there is lost. `cherrypick.json` in the folder holds the criteria and the files per base; a PastVu base and an import can go into the same folder, since their names do not collide.
+- **Interest** (`--interest`): the quality probe is not a judge of composition, so each category can be ordered first by what `detect` found in the photos ([What is in the picture](#what-is-in-the-picture-detect)). Each category has a rule, by its name after the number: transport takes `vehicle` (the largest vehicle covers 8 to 70 % of the frame and at least 30 % of its width: the tram in its street passes, the parking lot and the wide square fail); people_adult, people_children and school take `people` (the tallest person at least 35 % of the frame's height and the tallest face at least 4 %, whatever the count: the vendor with the queue behind passes, the ceremony of dots fails); the group photo categories take `group` (at least 4 persons and a face of 3 %); futurism, objects and military take `thing` (the largest vehicle or object covers at least 8 %: the big thing of any name); environment_indoors and environment_outdoors take `presence` (a person with a face: a street or an interior with people before one without); every other name takes `pass`. A photo whose rule passes comes first, then a photo without a boxes row or in a category of rule `pass`, then a photo whose rule fails, and within a tier the quality order holds. The ceilings then cut the bucket exactly as without `--interest`, so the ordering removes nothing: a category short of interesting photos fills up with its best others, a category of rule `pass` picks the same photos as without, and the quality floor stays a floor. The table gains the picked per tier (interesting / unknown / not), which with `--dry-run` is how the thresholds of `[interest]` in the conf are tuned; `rule.<name> = <rule>` there changes a category's rule. The manifest records the rules, the thresholds and the word list's hash. Without `--interest` the picks are as before.
 - **What the score is.** The probe was trained to find film frames and soft scans, and its order holds beyond that: in both modes the top is sharp, well-exposed and clear, the bottom faded, halftone or damaged. It is not a judge of composition. It favours late decades (sharp press photos and slides), so the top 30 % of black-and-white holds fewer 1910s-1940s photos than the base; `--decades` holds a decade's share. The threshold treats categories unequally (at 0.8, transport keeps two thirds, postcards almost nothing, since reproductions look like the probe's "bad"); the percentile and the number per category take the best of each category whatever its scores, so the threshold is best used as a floor under them.
 
 ## Extract
@@ -770,6 +772,7 @@ Each record carries what attribution and a takedown need: the PastVu page, the u
 | `reclassify.py` | sorting a scope again, and undo |
 | `cleanup.py` | the review of saved photos by their quality: `cleanup`, `--done`, `--undo` |
 | `cherrypick.py` | the training set picked by quality, balanced between colour and black-and-white |
+| `interest.py` | the rules of `cherrypick --interest` on the boxes rows, and the tier of each photo |
 | `autocaption.py` | the VLM client, the caption runs, and undo |
 | `detect.py` | the box statistics of the saved photos (YOLOE-26l with text prompts and the face model), and the `detect` command |
 | `vram.py` | the GPU memory of the whole card, through NVML |
