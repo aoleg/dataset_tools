@@ -560,10 +560,10 @@ class Stream:
                     final = pr.crop_array(job.array, plan["box"])
                 vec = self.classifier.embed(final)
             job.naflex = None
-            bad = float(self.classifier.low_quality(vec)[0])
-            if not np.isnan(bad):          # at or above the threshold
+            why = self.classifier.quality_reason(vec)
+            if why:                        # at or above the threshold, or a _quality_bad sample
                 s.time("classify", time.perf_counter() - t)
-                raise pr.Rejected(self.classifier.quality.reason(bad))
+                raise pr.Rejected(why)
             if self.against is not None:
                 d.set(f"{job.cid}: looking for a copy in the base")
                 if final is None:

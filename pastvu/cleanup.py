@@ -19,6 +19,8 @@ anything yourself would not.
 - A photo in review is in the state review: not pending (no run downloads it
   again), not done (reclassify, extract, export and autocaption leave it
   alone). regroup and drop wait until the review is settled.
+- A copy of a _quality_bad sample goes to review whatever its score, and a
+  copy of a _quality_good sample never goes.
 - Hand-sorted photos are left out, as in reclassify (--override-manual takes
   them too), and so are the photos you kept in an earlier review.
 - The live export keeps its links during the review (a hard link stays valid
@@ -85,8 +87,10 @@ def plan(store: Store, base: Path, scope: dict, classifier, threshold: float, ov
                 log(f"  embedded {embedded:,} images without a stored embedding ({time.time() - t0:.0f} s)")
         vecs.append(v)
     p = classifier.quality.p_bad(np.stack(vecs)) if vecs else np.zeros(0)
+    label, _ = classifier.sample_match(vecs) if vecs else (np.zeros(0, int), np.zeros(0))
+    # a copy of a _quality_bad sample goes to review whatever its score, a copy of a _quality_good one never
     picks = [{"cid": cid, "src": actual, "p_bad": round(float(b), 4)}
-             for (cid, actual), b in zip(todo, p) if b >= threshold]
+             for (cid, actual), b, lab in zip(todo, p, label) if lab == 1 or (lab != 0 and b >= threshold)]
     picks.sort(key=lambda m: -m["p_bad"])
     return {"picks": picks, "checked": len(rows), "manual": manual, "missing": missing, "kept_good": kept_good,
             "embedded": embedded}

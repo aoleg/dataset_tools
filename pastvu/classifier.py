@@ -174,6 +174,26 @@ class Classifier:
         p = self.quality.p_bad(X)
         return np.where(p >= self.quality.threshold, p, np.nan)
 
+    def sample_match(self, X) -> tuple[np.ndarray, np.ndarray]:
+        """Which embeddings are copies of a quality sample: (label 0 good, 1 bad or quality.NONE, cosine);
+        all NONE with the filter off."""
+        X = np.asarray(X, np.float32)
+        X = X.reshape(len(X), -1) if X.ndim > 1 else X.reshape(1, -1)
+        if self.quality is None or not len(X):
+            return np.full(len(X), quality.NONE), np.zeros(len(X))
+        return self.quality.match(X)
+
+    def quality_reason(self, vec) -> str | None:
+        """Why one photo is left out for its quality, or None: a copy of a _quality_bad sample always,
+        a copy of a _quality_good sample never, any other at or above the threshold."""
+        label, cos = self.sample_match(vec)
+        if label[0] == 1:
+            return quality.sample_reason(float(cos[0]))
+        if label[0] == 0:
+            return None
+        bad = float(self.low_quality(vec)[0])
+        return None if np.isnan(bad) else self.quality.reason(bad)
+
     def decide(self, vec: np.ndarray) -> Verdict:
         return self.decide_many(vec[None])[0]
 

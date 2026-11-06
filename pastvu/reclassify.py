@@ -14,8 +14,10 @@ joined.
   caption, JSON sidecar, export links) and marked skipped, so no run fetches
   it again. Hand-sorted photos are kept unless --override-manual. Deleting
   cannot be undone.
+- A photo that is a copy of a _quality_bad sample is deleted whatever its
+  score; a copy of a _quality_good sample is never deleted for its quality.
 - A photo kept in a cleanup review (cleanup --done) is never deleted for its
-  quality.
+  quality, unless it is a copy of a _quality_bad sample.
 - Every move goes into the store, so --undo puts the last reclassify back.
 """
 
@@ -97,12 +99,18 @@ def plan(store: Store, base: Path, scope: dict, classifier, override_manual: boo
                 log(f"  embedded {embedded:,} images without a stored embedding ({time.time() - t0:.0f} s)")
         vecs.append(v)
     bad = classifier.low_quality(vecs) if vecs else np.zeros(0)
+    label, cos = classifier.sample_match(vecs) if vecs else (np.zeros(0, int), np.zeros(0))
     good = store.reviewed_good()                 # kept in a cleanup review: their quality was looked at
-    bad = np.array([np.nan if t[0] in good else b for t, b in zip(todo, bad)])
-    low = [{"cid": cid, "src": actual, "category": cat_now, "p_bad": round(float(b), 4),
-            "reason": f"{quality.REASON} (P(bad) {b:.2f})"}
-           for (cid, actual, cat_now, _), b in zip(todo, bad) if not np.isnan(b)]
-    keep = [i for i, b in enumerate(bad) if np.isnan(b)]
+    low, keep = [], []
+    for i, ((cid, actual, cat_now, _), b) in enumerate(zip(todo, bad)):
+        m = {"cid": cid, "src": actual, "category": cat_now}
+        if label[i] == 1:                        # a _quality_bad sample: your latest word, over a review
+            low.append({**m, "sample": quality.BAD, "cos": round(float(cos[i]), 4),
+                        "reason": quality.sample_reason(float(cos[i]))})
+        elif label[i] == 0 or cid in good or np.isnan(b):
+            keep.append(i)
+        else:
+            low.append({**m, "p_bad": round(float(b), 4), "reason": f"{quality.REASON} (P(bad) {b:.2f})"})
     todo, vecs = [todo[i] for i in keep], [vecs[i] for i in keep]
     copies = []
     if against is not None and todo:
@@ -290,8 +298,11 @@ def undo(store: Store, base: Path, scope: dict, log=print, exporter=None) -> dic
 
 def summary(p: dict) -> str:
     flows = Counter((m["from"], m["to"]) for m in p["moves"])
+    low = p.get("low_quality") or []
+    samples_bad = sum(1 for m in low if m.get("sample"))
     lines = [f"{p['checked']:,} photos: {len(p['moves']):,} to move, {p['kept']:,} stay, "
-             f"{len(p.get('low_quality') or []):,} low quality, {len(p.get('aspect') or []):,} over the aspect "
+             f"{len(low):,} low quality ({samples_bad:,} of them copies of {quality.BAD} samples), "
+             f"{len(p.get('aspect') or []):,} over the aspect "
              f"ratio and {len(p.get('copies') or []):,} copies of base photos (to delete), "
              f"{len(p['manual']):,} moved by hand (kept), {len(p['missing']):,} files missing; "
              f"{p['embedded']:,} embedded from their files"]

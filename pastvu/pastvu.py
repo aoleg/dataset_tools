@@ -1025,8 +1025,11 @@ def cmd_reclassify(args, conf, client) -> int:
         copies = sum(len(p["copies"]) for _, p in plans)
         if low + wide + copies:
             what = []
-            if low:
-                what.append(f"{low:,} low quality (P(bad) >= {classifier.quality.threshold})")
+            samples_bad = sum(1 for _, p in plans for m in p["low_quality"] if m.get("sample"))
+            if low - samples_bad:
+                what.append(f"{low - samples_bad:,} low quality (P(bad) >= {classifier.quality.threshold})")
+            if samples_bad:
+                what.append(f"{samples_bad:,} copies of _quality_bad samples")
             if wide:
                 what.append(f"{wide:,} with an aspect ratio over {conf.max_aspect:.2f}:1")
             if copies:

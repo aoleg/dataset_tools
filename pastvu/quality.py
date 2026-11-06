@@ -12,6 +12,14 @@ and soft, foggy or washed-out scans. The probability shifts whenever the two
 folders change, so check the threshold again after editing them. C is fixed:
 a looser fit spreads the scores towards 0 and 1 and moves every threshold.
 
+A photo that is one of the samples (its embedding at cosine MATCH_COS or
+closer to a sample's) takes the sample's label whatever the probe says: a
+copy of a _quality_bad sample is skipped or deleted, a copy of a
+_quality_good sample is never sent away for its quality. The probe catches
+only about half of its own bad samples (on 428 bad and 270 good), and a
+sample copied out of the base stayed there. The cosine finds a copy that was
+re-encoded or downscaled since; the sha256 does not.
+
 Like every folder whose name starts with "_", the two folders (and any other,
 such as a folder of photos not sorted yet) are ignored by the category
 classifier.
@@ -28,6 +36,20 @@ THRESHOLD = 0.88
 C = 8
 MIN_EACH = 20
 REASON = "low quality"
+# A saved photo and the sample copied from it measured 0.998 or more (167 of them, 34 rewritten since);
+# two different photos of the same scene stay well under.
+MATCH_COS = 0.995
+NONE = -1
+
+
+def sample_reason(cos: float) -> str:
+    return f"{REASON} (a {BAD} sample, cos {cos:.3f})"
+
+
+def _unit(X) -> np.ndarray:
+    X = np.asarray(X, np.float32)
+    X = X.reshape(len(X), -1) if X.ndim > 1 else X.reshape(1, -1)
+    return X / np.maximum(np.linalg.norm(X, axis=1, keepdims=True), 1e-9)
 
 
 def sample_items(samples: Path, scan) -> dict[int, list]:
@@ -44,10 +66,14 @@ def sample_items(samples: Path, scan) -> dict[int, list]:
 
 
 class Probe:
-    """P(bad) of L2-normalised embeddings."""
+    """P(bad) of L2-normalised embeddings, and which embeddings are copies of the samples."""
 
-    def __init__(self, model, threshold: float, n_good: int, n_bad: int):
+    def __init__(self, model, threshold: float, n_good: int, n_bad: int, samples=None, labels=None):
+        """samples: the unit embeddings of both folders; labels: 0 good, 1 bad for each."""
         self.model, self.threshold, self.n_good, self.n_bad = model, threshold, n_good, n_bad
+        dim = model.coef_.shape[1]
+        self.samples = np.zeros((0, dim), np.float32) if samples is None else np.asarray(samples, np.float32)
+        self.labels = np.zeros(0, int) if labels is None else np.asarray(labels, int)
 
     def p_bad(self, X) -> np.ndarray:
         X = np.asarray(X, np.float32).reshape(-1, self.model.coef_.shape[1])
@@ -56,6 +82,17 @@ class Probe:
 
     def reason(self, p: float) -> str:
         return f"{REASON} (P(bad) {p:.2f})"
+
+    def match(self, X) -> tuple[np.ndarray, np.ndarray]:
+        """For each embedding, the label of the sample it is a copy of (0 good, 1 bad, NONE) and the
+        cosine to that sample (to the nearest one when NONE)."""
+        X = _unit(X).reshape(-1, self.model.coef_.shape[1])
+        if not len(X) or not len(self.samples):
+            return np.full(len(X), NONE), np.zeros(len(X))
+        sims = X @ self.samples.T
+        near = sims.argmax(axis=1)
+        cos = sims[np.arange(len(X)), near]
+        return np.where(cos >= MATCH_COS, self.labels[near], NONE), cos.astype(float)
 
 
 def probe_from_samples(items: dict[int, list], vectors: dict, threshold: float = THRESHOLD, log=print,
@@ -84,4 +121,4 @@ def probe_from_samples(items: dict[int, list], vectors: dict, threshold: float =
     model = LogisticRegression(C=C, max_iter=5000, class_weight="balanced").fit(X, np.array(y))
     log(f"  quality filter: trained on {n_good:,} good and {n_bad:,} bad sample images; "
         f"P(bad) >= {threshold} is skipped")
-    return Probe(model, threshold, n_good, n_bad)
+    return Probe(model, threshold, n_good, n_bad, X, np.array(y))
