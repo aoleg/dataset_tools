@@ -741,7 +741,7 @@ Each record carries what attribution and a takedown need: the PastVu page, the u
 | `regroup.py` | moving photos between scopes, drop, and undo |
 | `colour.py` | the black-and-white or colour test, and the probe for borderline photos |
 | `quality.py` | the quality probe: low-quality photos are skipped, or deleted by reclassify |
-| `niqe.py`, `niqe_pris_params.npz` | NIQE at the training resolution on the GPU, and the `niqe` command; the parameters are BasicSR's (Apache-2.0), from the LIVE release |
+| `niqe.py`, `niqe_pris_params.npz`, `NIQE_NOTICE.txt` | NIQE at the training resolution on the GPU, and the `niqe` command. The parameters are those of the NIQE release of LIVE, The University of Texas at Austin, in BasicSR's file (Apache-2.0); `NIQE_NOTICE.txt` holds both notices |
 | `folders.py` | finding and moving files, and the move of a category into numbered folders |
 | `runlock.py` | whether the process that holds the lock still runs |
 | `layout.py` | scope names, the folder tree, and the numbered-folder allocator |

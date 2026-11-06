@@ -40,7 +40,10 @@ The algorithm follows BasicSR's numpy NIQE (basicsr/metrics/niqe.py,
 https://github.com/XPixelGroup/BasicSR, Apache License 2.0), which reproduces
 the official MATLAB release to four decimals. niqe_pris_params.npz is BasicSR's
 file: the pristine model and the Gaussian window of the LIVE MATLAB release
-(http://live.ece.utexas.edu/research/quality/niqe_release.zip).
+(http://live.ece.utexas.edu/research/quality/niqe_release.zip), whose values
+are those of its modelparameters.mat. Copyright (c) 2011 The University of
+Texas at Austin; the release's notice, which must go with every copy, and
+BasicSR's licence are in NIQE_NOTICE.txt.
 """
 
 from __future__ import annotations
