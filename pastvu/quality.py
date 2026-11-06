@@ -35,7 +35,12 @@ folds) and NIQE of each sample at 1024² (cached in the samples folder).
 Chosen on the base (2026-11-06) with 134 verdicts on 500 random saved photos:
 the full NIQE score or its 72 block features in the stack flagged film grain,
 which no _quality_good sample had; at 0.80 this rule lost 2 of 93 good
-verdicts and caught 13 of 41 bad ones, 4.7 % of the base. A photo without a
+verdicts and caught 13 of 41 bad ones, 4.7 % of the base. A review of what it
+flagged showed that a fine halftone screen (about 1.65 px at 1024²) is fine for
+training too, with NIQE 27 to 32, above the coarse screens of _quality_bad
+(13 to 19). With three such photos in _quality_good the fitted NIQE weight
+fell to 0.011 against 1.09 for the logit: the weights come from the folders.
+That base downloads and reviews at 0.85. A photo without a
 NIQE score is judged by the probe alone at quality_threshold.
 """
 
