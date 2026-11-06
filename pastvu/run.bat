@@ -21,6 +21,10 @@ set "HF_HUB_OFFLINE=1"
 set "TRANSFORMERS_OFFLINE=1"
 set "YOLO_OFFLINE=1"
 
+rem mimalloc for Python's own allocations: the Windows heap slows down over a run of many
+rem hours, and threads that allocate while they hold the GIL then starve the GPU thread.
+set "PYTHONMALLOC=mimalloc"
+
 "%VPY%" "%~dp0pastvu.py" %*
 set "RC=%ERRORLEVEL%"
 if not "%RC%"=="0" (

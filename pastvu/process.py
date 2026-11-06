@@ -124,9 +124,59 @@ def head_of(data: bytes) -> dict:
     return h
 
 
+def jpeg_complete(data: bytes) -> bool:
+    """Whether the JPEG's end-of-image marker follows its first scan. OpenCV decodes a
+    truncated file with grey fill where Pillow raises, so a file that stops early is
+    left to Pillow. The segments before the scan are walked by their lengths, so an
+    EXIF thumbnail's own end marker does not count; inside a scan an FF byte is
+    always followed by 00 or a restart marker, so the first FF D9 after it is the end."""
+    n, i = len(data), 2
+    if data[:2] != b"\xff\xd8":
+        return False
+    while i + 4 <= n:
+        if data[i] != 0xFF:
+            return False
+        marker = data[i + 1]
+        if marker == 0xFF:                 # fill byte
+            i += 1
+            continue
+        if marker == 0xDA:
+            return data.find(b"\xff\xd9", i) != -1
+        if 0xD0 <= marker <= 0xD7 or marker == 0x01:
+            i += 2
+            continue
+        i += 2 + int.from_bytes(data[i + 2:i + 4], "big")
+    return False
+
+
+def decode_jpeg(data: bytes, size: tuple[int, int]) -> np.ndarray | None:
+    """The stored RGB pixels of a baseline or progressive YCbCr or greyscale JPEG,
+    decoded by OpenCV, or None when OpenCV cannot give the size Pillow read.
+
+    OpenCV decodes with the GIL released and into one buffer. Pillow's
+    np.asarray(im.convert("RGB")) holds the GIL while it builds the whole image as
+    a bytes object and then copies it, and on a long run those allocations starved
+    the GPU thread of the GIL (2026-11-06). The pixels are the same: both use
+    libjpeg-turbo with the same IDCT and upsampling, identical on 400 of 400 stored
+    downloads, greyscale ones included."""
+    import cv2
+    if not jpeg_complete(data):
+        return None
+    a = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR_RGB | cv2.IMREAD_IGNORE_ORIENTATION)
+    if a is None or (a.shape[1], a.shape[0]) != size:
+        return None
+    return a
+
+
 def decode(data: bytes, head: dict) -> np.ndarray:
     """The upright RGB uint8 pixels, transparency composited over white."""
     with Image.open(io.BytesIO(data)) as im:
+        # Image.open reads the header only; a YCbCr or greyscale JPEG goes to OpenCV.
+        # CMYK and the rest stay with Pillow, whose colour conversion OpenCV does not share.
+        if im.format == "JPEG" and im.mode in ("RGB", "L"):
+            stored = decode_jpeg(data, im.size)
+            if stored is not None:
+                return np.ascontiguousarray(rb.to_upright(stored, head["orientation"]))
         im.load()
         if im.mode.startswith("I;16") or im.mode in ("I", "F"):
             a = np.asarray(im.convert("I"), dtype=np.int64)
