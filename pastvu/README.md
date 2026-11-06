@@ -51,7 +51,7 @@ The README covers setup, the samples folder, the history behind the three Ukrain
 
 ## Install
 
-Run `install.bat` in the repository root first: it installs remove_borders, watermark and classify, whose code and models this tool uses, and then this tool. Or run `install.bat` in this folder after the root one. It installs `httpx`, `rich`, PyTurboJPEG, `zstandard` and `nvidia-ml-py` into the shared `..\venv`, puts `turbojpeg.dll` into `bin\` (PyTurboJPEG does not include the library, and libjpeg-turbo publishes its Windows builds only as installers, so the installer takes the DLL out of conda-forge's `libjpeg-turbo` package, pinned by version and sha256), and makes `pastvu.conf` from `pastvu.conf.example` when there is none.
+Run `install.bat` in the repository root first: it installs remove_borders, watermark and classify, whose code and models this tool uses, and then this tool. Or run `install.bat` in this folder after the root one. It installs `httpx`, `rich`, PyTurboJPEG, `zstandard` and `nvidia-ml-py` into the shared `..\venv`, puts `turbojpeg.dll` into `bin\` (PyTurboJPEG does not include the library, and libjpeg-turbo publishes its Windows builds only as installers, so the installer takes the DLL out of conda-forge's `libjpeg-turbo` package, pinned by version and sha256), fetches the two models of `detect` into `models\` and makes the prompt embeddings of its word list, and makes `pastvu.conf` from `pastvu.conf.example` when there is none.
 
 ## The conf file
 
@@ -184,6 +184,7 @@ run.bat cleanup --done | --undo
 run.bat captions <scope> [...] [--txt-fields LIST] [--dry-run]
 run.bat autocaption <scope or folder> [...] [--limit N] [--recaption] [--undo]
 run.bat niqe [<scope or folder> ...] [--follow] [--redo] [--limit N]
+run.bat detect [<scope or folder> ...] [--follow] [--redo] [--limit N]
 run.bat export <scope> [...] [--format jsonl|parquet]
 run.bat import --dataset <folder> [-o <folder>] [--against <base>] [--top color|category|none] [--quality-threshold X] [--split N] [--limit N]
 run.bat --base <import folder> reclassify [--dry-run] [--yes]
@@ -271,7 +272,7 @@ A run downloads a **scope**: regions and years. Its name is the aliases (or regi
 
 **A photo is downloaded once per base folder.** The store at `<base>\pastvu.db` is shared by every scope, so a photo already saved under one scope (Minsk) is not downloaded again for another (Belarus); the report counts it as already saved under another scope, and `scopes` shows how many there are.
 
-**One command at a time changes a base folder.** The store holds a lock. A second download into the same base folder stops at the start with the name of the command that holds the lock (`run --raw`, `run --pull` and `pull` are downloads to the lock), and so does a `regroup`, `drop` or `reclassify` while anything else runs. `autocaption`, `captions` and `niqe` can run beside a download. A lock left by a process that no longer runs is taken over.
+**One command at a time changes a base folder.** The store holds a lock. A second download into the same base folder stops at the start with the name of the command that holds the lock (`run --raw`, `run --pull` and `pull` are downloads to the lock), and so does a `regroup`, `drop` or `reclassify` while anything else runs. `autocaption`, `captions`, `niqe` and `detect` can run beside a download. A lock left by a process that no longer runs is taken over.
 
 ## Splitting and regrouping
 
@@ -558,6 +559,24 @@ A download, `pull` and `import` score every photo they save, after the embedding
 
 A photo whose file is missing or cannot be read gets no row, so the next `niqe` tries it again. A picture with fewer than two blocks a side, or with no texture at all, gets a row with no score. A rewrite by `reprocess --downscale` deletes the row, so the photo is scored again from its new file. The rows carry the version of the measure (`niqe1-1024`); after a change of the measure, `niqe` scores every photo again.
 
+## What is in the picture: `detect`
+
+```
+run.bat detect
+run.bat detect --follow
+run.bat detect 050-transport --limit 2000
+```
+
+The quality probe ranks sharpness and print condition and says nothing about what the picture shows. A training set should show its subjects clearly: a bus at a readable size in its street, people with readable faces, a rocket on its pad, rather than an aerial boulevard, a crowd of dots or an empty street. `detect` writes box statistics for every saved photo into the store, and `cherrypick --interest` orders each category's photos by them ([Cherrypick](#cherrypick-a-training-set-by-quality)).
+
+Two detectors run over the saved file of each photo (the file cherrypick copies, EXIF-upright, reduced to 640 pixels on the long side): YOLOE-26l with text prompts, an open-vocabulary detector that finds the words it is given, and the face model of ADetailer (`face_yolov8m.pt`, shared with reframe). The words are fixed in `detect.py`, in four families: people (person); vehicle (car, bus, truck, train, boat, aircraft, helicopter, rocket, submarine); object (chair, counter, chandelier, bed, display case, sign, poster, flag, monument, satellite dish, robot); context (building). The families matter and the names do not: the detector's fine names are nets, not labels (every tram comes back as bus, a missile as submarine), so the rules of cherrypick read a box's family and size, never its name. Superordinate words (vehicle, transport, furniture) almost never fire on these photos and are not in the list.
+
+Each photo gets one row in the store's `boxes` table: the counted persons and the height of the tallest (a share of the frame height), the faces inside persons and the height of the tallest, the counted vehicles and the area and width of the largest, the area of the largest object, the area of the largest thing of any family but people and context, and every stored box and face as JSON with its name, confidence and corners as shares of the frame. A box counts from confidence 0.25 and is stored from 0.15, so a threshold between the two is a query later. A box over 90 % of the frame is stored and not counted, because rare words produce full-frame false positives. A face counts only when at least 80 % of it lies inside a counted person, because the face model once boxed a window ornament. The rows carry the hash of the word list; after a change of the list `detect` lists every photo again, and the old rows stay until they are replaced.
+
+`detect` boxes the saved photos that have no row of the current list: every scope of the base, or the scopes and folders given, in batches of `--batch` (16) at `--imgsz` (640) pixels, with 4 threads reading ahead. It changes no file and holds the lock in the shared mode, so it runs beside a download; the two models take under 2 GB of GPU memory. The display and the report blocks are autocaption's: the photo being boxed, the rate, and every `--report-every` photos (500) the photos boxed, the share with a counted person, a face, a vehicle and a thing, and the VRAM. `--follow` keeps it running after the list: every 30 seconds it looks for photos saved since, until Ctrl+C, so one `detect --follow` started beside a download ends up level with it. `--redo` boxes every photo again, and `--limit N` takes at most N photos in this run. Ctrl+C finishes the batch in hand and stops, a second Ctrl+C stops at once, and the same command continues with the rest. A photo whose file is missing (a reclassify moved it between the listing and the read) gets no row, so the next run tries it again. A photo deleted by `drop` loses its row; reclassify and regroup move files and leave the rows alone, since the key is the photo's number.
+
+`install.bat` fetches the two models into `models\` and makes the prompt embeddings of the word list once (the text encoder, 254 MB, is needed for that and for nothing else); `detect.py --fetch-models` does the same by hand.
+
 ## Cherrypick: a training set by quality
 
 ```
@@ -752,6 +771,7 @@ Each record carries what attribution and a takedown need: the PastVu page, the u
 | `cleanup.py` | the review of saved photos by their quality: `cleanup`, `--done`, `--undo` |
 | `cherrypick.py` | the training set picked by quality, balanced between colour and black-and-white |
 | `autocaption.py` | the VLM client, the caption runs, and undo |
+| `detect.py` | the box statistics of the saved photos (YOLOE-26l with text prompts and the face model), and the `detect` command |
 | `vram.py` | the GPU memory of the whole card, through NVML |
 | `tagging\` | the default prompts of autocaption |
 | `export.py` | records as JSON Lines or Parquet |

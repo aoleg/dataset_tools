@@ -31,7 +31,6 @@ import json
 import os
 import shutil
 import sys
-import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -276,13 +275,25 @@ def _hms(seconds: float) -> str:
     return f"{h} h {m:02d} min" if h else f"{m} min {s:02d} s" if m else f"{s} s"
 
 
+FOLLOW_EVERY = 30        # --follow: seconds between two looks for new photos
+
+
 def run(store, base: Path, targets: list[tuple[int, str]], models: Models, display, report_every: int = 500,
-        vram=None, batch: int = BATCH, decoders: int = DECODERS, stop: threading.Event | None = None) -> dict:
-    """Box the targets in batches: a pool decodes the next batch while the GPU runs this one; a
-    batch's rows go into the store in one transaction, so a stopped run continues with the rest.
-    The path of each photo is asked from the store at decode time (a reclassify may have moved it);
-    a photo whose file is gone is counted and skipped, and no row is written for it."""
+        vram=None, batch: int = BATCH, decoders: int = DECODERS, follow=None) -> dict:
+    """Box the targets ((cid, path), in order) in batches: a pool decodes the next batch while the
+    detector runs this one, and a batch's rows go into the store in one transaction, so a stopped
+    run continues with the rest. The path of each photo is asked from the store at decode time (a
+    reclassify may have moved it); a photo whose file is gone is counted and skipped, and no row is
+    written for it, so the next run lists it again. follow: a function giving the targets to add
+    when the list is done, asked every FOLLOW_EVERY s until Ctrl+C (None: stop when the list is
+    done); a photo tried once in this run is not tried again. The first Ctrl+C finishes the batch
+    in hand, the second stops at once. -> the counts, and "stopped" ("Ctrl+C" or None)."""
+    from collections import deque
+    from autocaption import _Interrupt
     stats = {"boxed": 0, "missing": 0, "person": 0, "face": 0, "vehicle": 0, "thing": 0}
+    tried = {cid for cid, _ in targets}
+    queue_ = deque(targets)
+    total = len(targets)
     t_start = time.time()
     stopped = None
 
@@ -292,40 +303,68 @@ def run(store, base: Path, targets: list[tuple[int, str]], models: Models, displ
         rel = st["path"] if st and st.get("path") else path
         return cid, rel, load_image(base / rel, models.imgsz)
 
-    batches = [targets[i:i + batch] for i in range(0, len(targets), batch)]
-    with ThreadPoolExecutor(decoders) as pool:
-        ahead = pool.map(decode, batches[0]) if batches else None
-        for i, items in enumerate(batches):
-            if stop is not None and stop.is_set():
-                stopped = "Ctrl+C"
-                break
-            decoded = list(ahead)
-            ahead = pool.map(decode, batches[i + 1]) if i + 1 < len(batches) else None
-            loaded = [(cid, rel, im) for cid, rel, im in decoded if im is not None]
-            for cid, rel, im in decoded:
-                if im is None:
-                    stats["missing"] += 1
-                    display.line({"cid": cid, "state": "missing", "path": rel})
-            if loaded:
-                display.set(f"{loaded[0][0]}: boxing {loaded[0][1]} (+{len(loaded) - 1})")
-                results = detect_batch(models, [im for _, _, im in loaded])
-                now = time.time()
-                rows = [row_of(cid, models, boxes, faces, now) for (cid, _, _), (boxes, faces) in zip(loaded, results)]
-                store.save_boxes(rows)
-                for row in rows:
-                    stats["boxed"] += 1
-                    stats["person"] += row["n_person"] > 0
-                    stats["face"] += row["n_face"] > 0
-                    stats["vehicle"] += row["n_vehicle"] > 0
-                    stats["thing"] += row["max_thing_area"] > 0
-                    display.line({"cid": row["cid"], "state": "boxed", **{k: row[k] for k in
-                                  ("n_person", "max_person_h", "n_face", "max_face_h", "n_vehicle",
-                                   "max_vehicle_area", "max_thing_area")}})
-            for cid, _, im in decoded:
-                display.advance(saved=im is not None)
-            if report_every and loaded and stats["boxed"] // report_every != (stats["boxed"] - len(loaded)) // report_every:
-                display.print(report(stats, len(targets), time.time() - t_start, vram))
-    display.print(report(stats, len(targets), time.time() - t_start, vram, final=True))
+    def submit():
+        return [pool.submit(decode, queue_.popleft()) for _ in range(min(batch, len(queue_)))]
+
+    pool = ThreadPoolExecutor(max(1, decoders))
+    try:
+        with _Interrupt() as intr:
+            ahead = submit()
+            while True:
+                if intr.stop:
+                    stopped = "Ctrl+C"
+                    break
+                if not ahead:
+                    if follow is None:
+                        break
+                    display.set(f"{stats['boxed']:,} boxed; caught up with the download, waiting for new photos")
+                    deadline = time.time() + FOLLOW_EVERY
+                    while time.time() < deadline and not intr.stop:
+                        time.sleep(0.5)
+                    if intr.stop:
+                        stopped = "Ctrl+C"
+                        break
+                    new = [(c, p) for c, p in follow() if c not in tried]
+                    tried.update(c for c, _ in new)
+                    queue_.extend(new)
+                    total += len(new)
+                    if new:
+                        display.add_total(len(new))
+                    ahead = submit()
+                    continue
+                decoded = [f.result() for f in ahead]
+                ahead = submit()
+                loaded = [(cid, rel, im) for cid, rel, im in decoded if im is not None]
+                for cid, rel, im in decoded:
+                    if im is None:
+                        stats["missing"] += 1
+                        display.line({"cid": cid, "state": "missing", "path": rel})
+                if loaded:
+                    display.set(f"{loaded[0][0]}: boxing {loaded[0][1]} (+{len(loaded) - 1})")
+                    results = detect_batch(models, [im for _, _, im in loaded])
+                    now = time.time()
+                    rows = [row_of(cid, models, boxes, faces, now)
+                            for (cid, _, _), (boxes, faces) in zip(loaded, results)]
+                    store.save_boxes(rows)
+                    for row in rows:
+                        stats["boxed"] += 1
+                        stats["person"] += row["n_person"] > 0
+                        stats["face"] += row["n_face"] > 0
+                        stats["vehicle"] += row["n_vehicle"] > 0
+                        stats["thing"] += row["max_thing_area"] > 0
+                        display.line({"cid": row["cid"], "state": "boxed", **{k: row[k] for k in (
+                            "n_person", "max_person_h", "n_face", "max_face_h", "n_vehicle", "max_vehicle_area",
+                            "max_thing_area")}})
+                for cid, _, im in decoded:
+                    display.advance(saved=im is not None)
+                if report_every and loaded and \
+                        stats["boxed"] // report_every != (stats["boxed"] - len(loaded)) // report_every:
+                    display.print(report(stats, total, time.time() - t_start, vram))
+    except KeyboardInterrupt:
+        stopped = "Ctrl+C"
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
+    display.print(report(stats, total, time.time() - t_start, vram, final=True))
     if stopped:
         display.print(f"Stopped: {stopped}. Run the same command again to continue.")
     stats["stopped"] = stopped

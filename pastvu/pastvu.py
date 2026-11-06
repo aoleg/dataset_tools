@@ -68,7 +68,7 @@ UKRAINE_PRESETS = [          # name, regions, comment
 
 # --- setup -------------------------------------------------------------------------------
 
-IMPORT_COMMANDS = ("reclassify", "cleanup", "cherrypick", "autocaption", "scopes", "reprocess", "niqe")
+IMPORT_COMMANDS = ("reclassify", "cleanup", "cherrypick", "autocaption", "scopes", "reprocess", "niqe", "detect")
 IMPORT_TOPS = ("color", "category", "none")
 # The options of the processing: a raw run (run --raw) refuses them, since it processes nothing.
 RAW_REFUSES = ("samples", "no_classify", "min_confidence", "priority_margin", "patches", "png", "no_watermark",
@@ -1241,6 +1241,57 @@ def cmd_niqe(args, conf, client) -> int:
     return 0
 
 
+def cmd_detect(args, conf, client) -> int:
+    """detect [target ...]: boxes rows for the saved photos that have none of the current vocabulary
+    (detect.py). Shared lock: it runs beside run, pull, import, niqe and autocaption."""
+    import detect as dt
+    import vram as vr
+    from progress import Display
+    base, store = open_base(args, conf)
+    targets_of = caption_targets(base, store, args.target) if args.target else [(sc, "") for sc in store.scopes()]
+    if not targets_of:
+        print(f"{base} has no scopes yet")
+        return 0
+    vocab = dt.vocab_hash()
+
+    def pending() -> list[tuple[int, str]]:
+        out = []
+        for sc, prefix in targets_of:
+            out += store.boxes_pending(sc["name"], prefix, vocab, redo=False)
+        return out
+
+    with locked(store, "detect", "shared"):
+        targets, saved, boxed = [], 0, 0
+        for sc, prefix in targets_of:
+            rows = store.boxes_pending(sc["name"], prefix, vocab, redo=args.redo)
+            targets += rows
+            if prefix:
+                print(f"{prefix.rstrip('/')}: {len(rows):,} saved photos to box")
+                continue
+            c = store.boxes_count(sc["name"], vocab)
+            saved, boxed = saved + c["saved"], boxed + c["boxed"]
+            if args.target:                  # every scope of the base: one line for all, below
+                print(f"{sc['name']}: {c['saved']:,} saved photos, {c['boxed']:,} with boxes of vocabulary {vocab}; "
+                      f"{len(rows):,} to box")
+        if not args.target:
+            print(f"{base}: {saved:,} saved photos in {len(targets_of)} scopes, {boxed:,} with boxes of vocabulary "
+                  f"{vocab}; {len(targets):,} to box")
+        if args.limit is not None:
+            targets = targets[:max(0, args.limit)]
+        if not targets and not args.follow:
+            return 0
+        models = dt.load_models(args.imgsz)
+        print(f"  YOLOE-26l and the face model at {args.imgsz} px, batches of {args.batch}, vocabulary {vocab}"
+              + ("; then waiting for new photos until Ctrl+C" if args.follow else ""), flush=True)
+        vram = vr.VramMonitor().start()
+        mode = "json" if args.json_progress else "quiet" if args.quiet else "live"
+        with Display(len(targets), 0, mode, vram=vram) as d:
+            dt.run(store, base, targets, models, d, args.report_every, vram, args.batch,
+                   follow=pending if args.follow else None)
+        vram.stop()
+    return 0
+
+
 def cmd_export(args, conf, client) -> int:
     import export as ex
     base, store = open_base(args, conf)
@@ -2058,6 +2109,20 @@ def parse_args(argv=None):
     p.add_argument("--quiet", action="store_true", help="report blocks only, no live display")
     p.add_argument("--json-progress", action="store_true", help="one JSON line per photo on stdout")
 
+    p = sub.add_parser("detect", help="box statistics of the saved photos (persons, faces, vehicles, objects) for "
+                                       "cherrypick --interest (beside a download)")
+    p.add_argument("target", nargs="*", metavar="SCOPE|FOLDER",
+                   help="a scope's name or name pattern, or its folder or any folder inside it (default: every scope)")
+    p.add_argument("--follow", action="store_true",
+                   help="when done, look for newly saved photos without boxes every 30 s until Ctrl+C")
+    p.add_argument("--redo", action="store_true", help="box every saved photo again, also those with a row")
+    p.add_argument("--limit", type=int, metavar="N", help="box at most N photos in this run")
+    p.add_argument("--batch", type=int, default=16, metavar="N", help="photos per detector call (default 16)")
+    p.add_argument("--imgsz", type=int, default=640, metavar="PX", help="the long side the detector sees (default 640)")
+    p.add_argument("--report-every", type=int, default=500, metavar="N", help="a report block every N photos")
+    p.add_argument("--quiet", action="store_true", help="report blocks only, no live display")
+    p.add_argument("--json-progress", action="store_true", help="one JSON line per photo on stdout")
+
     p = sub.add_parser("export", help="write the records of a scope as JSON Lines or Parquet")
     p.add_argument("scope", nargs="+", metavar="SCOPE", help="a scope's name, folder or name pattern (estonia_*)")
     p.add_argument("--format", choices=["jsonl", "parquet"], default="jsonl")
@@ -2127,7 +2192,7 @@ def parse_args(argv=None):
     p.add_argument("scope", nargs="+", metavar="SCOPE", help="a scope's name, folder or name pattern")
     p.add_argument("--yes", action="store_true", help="delete; without it, only show what would be deleted")
     args = ap.parse_args(argv)
-    if args.cmd == "niqe" and args.follow and (args.limit is not None or args.redo):
+    if args.cmd in ("niqe", "detect") and args.follow and (args.limit is not None or args.redo):
         ap.error("--follow waits for new photos; give --limit and --redo without it")
     if args.cmd == "run" and args.raw:
         if args.pull:
@@ -2162,7 +2227,7 @@ def main(argv=None) -> int:
                 "reclassify": cmd_reclassify,
                 "export": cmd_export, "autocaption": cmd_autocaption, "regroup": cmd_regroup, "drop": cmd_drop,
                 "extract": cmd_extract, "import": cmd_import, "cleanup": cmd_cleanup,
-                "cherrypick": cmd_cherrypick, "niqe": cmd_niqe}
+                "cherrypick": cmd_cherrypick, "niqe": cmd_niqe, "detect": cmd_detect}
         return cmds[args.cmd](args, conf, client)
     finally:
         client.close()
