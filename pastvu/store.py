@@ -13,6 +13,9 @@ scope in it.
   interrupted write goes back to stored), done, skipped or failed.
 - records, embeddings: the PastVu record with what was done, and the
   classifier's embedding of the saved pixels, per photo.
+- boxes: detect's box statistics per photo: the columns cherrypick --interest
+  reads (counted persons, faces, vehicles, objects, the largest of each) and
+  every stored box as JSON, marked with the vocabulary hash of the run.
 - counters: per-scope totals for the reports.
 - reclass_runs, reclass_moves: what reclassify moved, for --undo.
 - review, reviewed: cleanup. review lists the photos moved into the review
@@ -66,6 +69,11 @@ CREATE INDEX IF NOT EXISTS status_state ON status(state);
 CREATE INDEX IF NOT EXISTS status_scope ON status(scope);
 CREATE TABLE IF NOT EXISTS records (cid INTEGER PRIMARY KEY, json TEXT);
 CREATE TABLE IF NOT EXISTS embeddings (cid INTEGER PRIMARY KEY, model TEXT, patches INTEGER, vec BLOB);
+CREATE TABLE IF NOT EXISTS boxes (
+    cid INTEGER PRIMARY KEY, model TEXT, vocab TEXT, imgsz INTEGER, time REAL,
+    n_person INTEGER, max_person_h REAL, n_face INTEGER, max_face_h REAL,
+    n_vehicle INTEGER, max_vehicle_area REAL, max_vehicle_w REAL,
+    max_object_area REAL, max_thing_area REAL, json TEXT);
 CREATE TABLE IF NOT EXISTS counters (scope TEXT, name TEXT, value REAL DEFAULT 0, PRIMARY KEY (scope, name));
 CREATE TABLE IF NOT EXISTS runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT, scope TEXT, started REAL, ended REAL, args TEXT, done INTEGER,
@@ -101,6 +109,9 @@ REVIEW = "review"          # moved by cleanup into the review folder, waiting fo
 REGION_COLS = "cid, parent, parents, title_en, title_local, phc, pac, child_len"
 STATUS_COLS = ("cid", "state", "reason", "attempts", "scope", "category", "path", "sha256", "bytes", "width", "height",
                "changed", "mode", "raw")
+BOX_COLS = ("cid", "model", "vocab", "imgsz", "time", "n_person", "max_person_h", "n_face", "max_face_h",
+            "n_vehicle", "max_vehicle_area", "max_vehicle_w", "max_object_area", "max_thing_area", "json")
+BOX_STATS = BOX_COLS[5:-1]        # the derived columns cherrypick reads
 
 
 class Store:
@@ -543,7 +554,7 @@ class Store:
                            "sha256=NULL, bytes=NULL, width=NULL, height=NULL, changed=NULL, mode=NULL, raw=NULL, "
                            "updated=? WHERE cid=?",
                            (PENDING, time.time(), cid))
-                for t in ("records", "embeddings", "captions", "caption_fails", "caption_log"):
+                for t in ("records", "embeddings", "boxes", "captions", "caption_fails", "caption_log"):
                     db.execute(f"DELETE FROM {t} WHERE cid=?", (cid,))
         self.tx(work)
 
@@ -762,6 +773,58 @@ class Store:
         with self.lock:
             self.db.execute("INSERT OR REPLACE INTO embeddings (cid, model, patches, vec) VALUES (?,?,?,?)",
                             (cid, model, patches, np.asarray(vec, np.float16).tobytes()))
+
+    # --- boxes (detect) ----------------------------------------------------------------
+
+    def save_boxes(self, rows: list[dict]) -> None:
+        """One batch of detect's rows (BOX_COLS each) in one transaction; a row replaces the photo's old one."""
+        sql = f"INSERT OR REPLACE INTO boxes ({', '.join(BOX_COLS)}) VALUES ({', '.join('?' * len(BOX_COLS))})"
+        self.tx(lambda db: db.executemany(sql, [tuple(r[c] for c in BOX_COLS) for r in rows]))
+
+    def boxes_pending(self, scope: str, prefix: str, vocab: str, redo: bool = False) -> list[tuple[int, str]]:
+        """(cid, path) of the photos saved under the scope and the folder prefix that have no boxes
+        row of this vocabulary (every saved photo with redo), in cid order."""
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT s.cid, s.path FROM status s LEFT JOIN boxes b ON b.cid=s.cid WHERE s.state=? AND s.scope=? "
+                "AND s.path IS NOT NULL AND (? OR b.cid IS NULL OR b.vocab<>?) ORDER BY s.cid",
+                (DONE, scope, int(redo), vocab)).fetchall()
+        return [(cid, path) for cid, path in rows if path.startswith(prefix)]
+
+    def boxes_count(self, scope: str, vocab: str) -> dict:
+        """{"saved": photos of the scope, "boxed": of them with a boxes row of this vocabulary}."""
+        with self.lock:
+            saved = self.db.execute("SELECT COUNT(*) FROM status WHERE state=? AND scope=?", (DONE, scope)).fetchone()[0]
+            boxed = self.db.execute("SELECT COUNT(*) FROM status s JOIN boxes b ON b.cid=s.cid WHERE s.state=? "
+                                    "AND s.scope=? AND b.vocab=?", (DONE, scope, vocab)).fetchone()[0]
+        return {"saved": saved, "boxed": boxed}
+
+    def boxes_stats(self, cids) -> dict[int, dict]:
+        """cid -> the derived columns (BOX_STATS) and the vocab of the boxes rows of the cids
+        given, in one pass over the table."""
+        cids = set(cids)
+        out = {}
+        cols = ("cid", "vocab") + BOX_STATS
+        with self.lock:
+            cur = self.db.execute(f"SELECT {', '.join(cols)} FROM boxes")
+            while True:
+                rows = cur.fetchmany(20000)
+                if not rows:
+                    break
+                for r in rows:
+                    if r[0] in cids:
+                        out[r[0]] = dict(zip(cols[1:], r[1:]))
+        return out
+
+    def boxes_row(self, cid: int) -> dict | None:
+        """The whole boxes row of a photo, its JSON parsed."""
+        with self.lock:
+            row = self.db.execute(f"SELECT {', '.join(BOX_COLS)} FROM boxes WHERE cid=?", (cid,)).fetchone()
+        if not row:
+            return None
+        d = dict(zip(BOX_COLS, row))
+        d["json"] = json.loads(d["json"]) if d["json"] else {}
+        return d
 
     # --- counters and runs -------------------------------------------------------------
 

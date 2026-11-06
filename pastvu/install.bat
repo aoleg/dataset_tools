@@ -5,12 +5,14 @@ title PastVu - install
 
 rem ============================================================
 rem  install.bat - installs the dependencies of this tool into the shared
-rem  venv (..\venv) and fetches turbojpeg.dll into bin\. The models and
-rem  their dependencies come from the installers of remove_borders,
-rem  watermark and classify, which the root install.bat runs before this
-rem  one; run that first on a new machine. It also makes pastvu.conf from
-rem  pastvu.conf.example when there is none. Running install.bat again
-rem  installs what is missing and leaves pastvu.conf alone.
+rem  venv (..\venv), fetches turbojpeg.dll into bin\ and the models of the
+rem  detect command into models\ (with the prompt embeddings of its
+rem  vocabulary). The other models and their dependencies come from the
+rem  installers of remove_borders, watermark and classify, which the root
+rem  install.bat runs before this one; run that first on a new machine. It
+rem  also makes pastvu.conf from pastvu.conf.example when there is none.
+rem  Running install.bat again installs what is missing and leaves
+rem  pastvu.conf alone.
 rem ============================================================
 
 cd /d "%~dp0"
@@ -39,6 +41,11 @@ if errorlevel 1 goto :fail
 echo.
 echo Fetching turbojpeg.dll ...
 "%VPY%" fetch_turbojpeg.py
+if errorlevel 1 goto :fail
+
+echo.
+echo Fetching the models of detect (YOLOE-26l, the face model) and making the prompt embeddings...
+"%VPY%" detect.py --fetch-models
 if errorlevel 1 goto :fail
 
 echo.

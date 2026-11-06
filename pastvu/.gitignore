@@ -3,6 +3,8 @@ __pycache__/
 .pytest_cache/
 # fetched by install.bat (fetch_turbojpeg.py)
 bin/
+# the detect weights and prompt embeddings (install.bat, detect.py --fetch-models)
+models/
 # the PastVu development database dump, unpacked locally
 database/
 # planning and research notes stay local
