@@ -122,6 +122,15 @@ class Classifier:
             self.ts, self.cv, self.probe, self.example_hashes = cl.fit_probe(classes, res, rep)
             self.n_classes = len(self.ts.class_names)
         self.quality = quality.probe_from_samples(q_items, res.vectors, quality_threshold)
+        self._niqe = None
+
+    @property
+    def niqe(self):
+        """NIQE of a picture at the training resolution (niqe.Niqe), made on first use."""
+        if getattr(self, "_niqe", None) is None:
+            import niqe
+            self._niqe = niqe.Niqe()
+        return self._niqe
 
     @property
     def model_id(self) -> str:

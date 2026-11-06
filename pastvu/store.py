@@ -16,6 +16,10 @@ scope in it.
 - boxes: detect's box statistics per photo: the columns cherrypick --interest
   reads (counted persons, faces, vehicles, objects, the largest of each) and
   every stored box as JSON, marked with the vocabulary hash of the run.
+- niqe: NIQE of the saved picture at the training resolution (niqe.py): the
+  score and the 72 block-feature statistics the quality rule may read, marked
+  with niqe.VERSION. Written with the photo by the stream, or later by the
+  niqe command; a reprocess --downscale drops it, the file having changed.
 - counters: per-scope totals for the reports.
 - reclass_runs, reclass_moves: what reclassify moved, for --undo.
 - review, reviewed: cleanup. review lists the photos moved into the review
@@ -74,6 +78,7 @@ CREATE TABLE IF NOT EXISTS boxes (
     n_person INTEGER, max_person_h REAL, n_face INTEGER, max_face_h REAL,
     n_vehicle INTEGER, max_vehicle_area REAL, max_vehicle_w REAL,
     max_object_area REAL, max_thing_area REAL, json TEXT);
+CREATE TABLE IF NOT EXISTS niqe (cid INTEGER PRIMARY KEY, version TEXT, score REAL, feat BLOB);
 CREATE TABLE IF NOT EXISTS counters (scope TEXT, name TEXT, value REAL DEFAULT 0, PRIMARY KEY (scope, name));
 CREATE TABLE IF NOT EXISTS runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT, scope TEXT, started REAL, ended REAL, args TEXT, done INTEGER,
@@ -112,6 +117,12 @@ STATUS_COLS = ("cid", "state", "reason", "attempts", "scope", "category", "path"
 BOX_COLS = ("cid", "model", "vocab", "imgsz", "time", "n_person", "max_person_h", "n_face", "max_face_h",
             "n_vehicle", "max_vehicle_area", "max_vehicle_w", "max_object_area", "max_thing_area", "json")
 BOX_STATS = BOX_COLS[5:-1]        # the derived columns cherrypick reads
+
+
+def _niqe_row(cid: int, version: str, score, feat) -> tuple:
+    """A niqe table row: feat as float16 bytes (72 numbers, 144 bytes)."""
+    return (cid, version, None if score is None else float(score),
+            None if feat is None else np.asarray(feat, np.float16).tobytes())
 
 
 class Store:
@@ -554,7 +565,7 @@ class Store:
                            "sha256=NULL, bytes=NULL, width=NULL, height=NULL, changed=NULL, mode=NULL, raw=NULL, "
                            "updated=? WHERE cid=?",
                            (PENDING, time.time(), cid))
-                for t in ("records", "embeddings", "boxes", "captions", "caption_fails", "caption_log"):
+                for t in ("records", "embeddings", "boxes", "niqe", "captions", "caption_fails", "caption_log"):
                     db.execute(f"DELETE FROM {t} WHERE cid=?", (cid,))
         self.tx(work)
 
@@ -631,9 +642,10 @@ class Store:
                                       (STORED, *scopes)).fetchone()
         return int(row[0])
 
-    def finish(self, cid: int, scope: str, facts: dict, record: str, emb: tuple | None, counters: dict) -> None:
-        """Done: status, record, embedding and counters in one transaction.
-        emb: (model, patches, float16 vector) or None."""
+    def finish(self, cid: int, scope: str, facts: dict, record: str, emb: tuple | None, counters: dict,
+               niqe: tuple | None = None) -> None:
+        """Done: status, record, embedding, NIQE and counters in one transaction.
+        emb: (model, patches, float16 vector) or None; niqe: (version, score, feat) or None."""
         now = time.time()
 
         def work(db):
@@ -647,6 +659,9 @@ class Store:
                 model, patches, vec = emb
                 db.execute("INSERT OR REPLACE INTO embeddings (cid, model, patches, vec) VALUES (?,?,?,?)",
                            (cid, model, patches, np.asarray(vec, np.float16).tobytes()))
+            if niqe is not None:
+                db.execute("INSERT OR REPLACE INTO niqe (cid, version, score, feat) VALUES (?,?,?,?)",
+                           _niqe_row(cid, *niqe))
             self._add_counters(db, scope, counters)
 
         self.tx(work)
@@ -731,6 +746,7 @@ class Store:
             db.execute("UPDATE status SET path=?, width=?, height=?, bytes=?, sha256=?, changed=?, updated=? WHERE cid=?",
                        (path, width, height, size, sha256, json.dumps(changed), time.time(), cid))
             db.execute("INSERT OR REPLACE INTO records (cid, json) VALUES (?, ?)", (cid, record))
+            db.execute("DELETE FROM niqe WHERE cid=?", (cid,))          # scored again from the new file
         self.tx(work)
 
     def oversized_rows(self, scopes: list[str] | None, area: int) -> list[tuple]:
@@ -825,6 +841,48 @@ class Store:
         d = dict(zip(BOX_COLS, row))
         d["json"] = json.loads(d["json"]) if d["json"] else {}
         return d
+
+    # --- niqe ----------------------------------------------------------------------------
+
+    def save_niqe(self, rows: list[tuple]) -> None:
+        """(cid, version, score, feat) rows in one transaction; a row replaces the photo's old one.
+        score and feat None: the picture has no NIQE (too small, or flat)."""
+        self.tx(lambda db: db.executemany("INSERT OR REPLACE INTO niqe (cid, version, score, feat) VALUES (?,?,?,?)",
+                                          [_niqe_row(*r) for r in rows]))
+
+    def niqe_pending(self, scope: str, prefix: str, version: str, redo: bool = False) -> list[tuple[int, str]]:
+        """(cid, path) of the photos saved under the scope and the folder prefix that have no niqe row of
+        this version (every saved photo with redo), in cid order."""
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT s.cid, s.path FROM status s LEFT JOIN niqe n ON n.cid=s.cid WHERE s.state=? AND s.scope=? "
+                "AND s.path IS NOT NULL AND (? OR n.cid IS NULL OR n.version<>?) ORDER BY s.cid",
+                (DONE, scope, int(redo), version)).fetchall()
+        return [(cid, path) for cid, path in rows if path.startswith(prefix)]
+
+    def niqe_count(self, scope: str, version: str) -> dict:
+        """{"saved": photos of the scope, "scored": of them with a niqe row of this version}."""
+        with self.lock:
+            saved = self.db.execute("SELECT COUNT(*) FROM status WHERE state=? AND scope=?", (DONE, scope)).fetchone()[0]
+            scored = self.db.execute("SELECT COUNT(*) FROM status s JOIN niqe n ON n.cid=s.cid WHERE s.state=? "
+                                     "AND s.scope=? AND n.version=?", (DONE, scope, version)).fetchone()[0]
+        return {"saved": saved, "scored": scored}
+
+    def niqe_rows(self, cids, version: str) -> dict[int, tuple[float, np.ndarray] | None]:
+        """cid -> (score, feat float32) of the cids given that have a row of this version; None for a
+        row of a picture with no NIQE. Cids without a row of the version are left out."""
+        cids = set(cids)
+        out = {}
+        with self.lock:
+            cur = self.db.execute("SELECT cid, score, feat FROM niqe WHERE version=?", (version,))
+            while True:
+                rows = cur.fetchmany(20000)
+                if not rows:
+                    break
+                for cid, score, feat in rows:
+                    if cid in cids:
+                        out[cid] = None if score is None else (score, np.frombuffer(feat, np.float16).astype(np.float32))
+        return out
 
     # --- counters and runs -------------------------------------------------------------
 

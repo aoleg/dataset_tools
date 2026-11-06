@@ -31,6 +31,10 @@ A photo the quality probe scores at or above its threshold is skipped after
 the embedding, before the category decision and the writing, and never
 fetched again (like a photo under --min-side).
 
+Every photo that reaches the quality decision gets its NIQE (niqe.py) of the
+final pixels at the training resolution, on the GPU from a view of the
+picture; a saved photo stores it with its embedding.
+
 Ctrl+C finishes the images already fetched and stops; a second Ctrl+C stops
 at once. Either way the store says what is done, and the next run of the same
 command continues with the rest.
@@ -128,6 +132,7 @@ class Job:
     det_input: np.ndarray = None      # the detector's input, made by the worker (watermark.detector_input)
     det_scale: float = 1.0
     naflex: np.ndarray = None         # the encoder's input of the picture, made by the worker
+    niqe: tuple = None                # (niqe.VERSION, score, feat) of the final pixels, for the store
     t_fetch: float = 0.0
     t_prepare: float = 0.0            # of which: the models' inputs
 
@@ -560,6 +565,12 @@ class Stream:
                     final = pr.crop_array(job.array, plan["box"])
                 vec = self.classifier.embed(final)
             job.naflex = None
+            t_n = time.perf_counter()
+            job.niqe = self.niqe_of(job, plan, final)
+            if job.niqe is not None:
+                dn = time.perf_counter() - t_n
+                s.time("niqe", dn)
+                t += dn                    # the classify time leaves NIQE out
             why = self.classifier.quality_reason(vec)
             if why:                        # at or above the threshold, or a _quality_bad sample
                 s.time("classify", time.perf_counter() - t)
@@ -576,6 +587,28 @@ class Stream:
             s.time("classify", time.perf_counter() - t)
         tone = None
         return plan, boxes, painted, vec, verdict, cw, ch, final, tone
+
+    def niqe_of(self, job: Job, plan: dict, final) -> tuple | None:
+        """(niqe.VERSION, score, feat) of the final pixels: the painted or materialised picture, else a
+        view of the crop box (no copy; the GPU gets the strided view). None without a NIQE scorer, or
+        when the scoring fails: the photo goes on without a row, and the niqe command scores it later."""
+        scorer = getattr(self.classifier, "niqe", None)
+        if scorer is None:
+            return None
+        import niqe
+        if final is not None:
+            pic = final
+        else:
+            box = plan["box"]
+            pic = job.array[box[1]:box[3], box[0]:box[2]] if box else job.array
+        try:
+            r = scorer(pic)
+        except Exception as e:  # noqa: BLE001 - never let NIQE cost a photo
+            self.stats.add(niqe_failed=1)
+            if self.stats.c["niqe_failed"] <= 3:
+                self.display.print(f"[niqe] {job.cid}: {type(e).__name__}: {e}")
+            return None
+        return niqe.VERSION, r.score, r.feat
 
     # --- writer threads ------------------------------------------------------------
 
@@ -679,7 +712,7 @@ class Stream:
             self.store.finish(job.cid, scope, {"category": folder, "path": rel, "sha256": sha, "bytes": len(data),
                                                     "width": fw, "height": fh, "changed": plan["changed"],
                                                     "mode": tone_mode},
-                              doc, emb, counters)
+                              doc, emb, counters, niqe=job.niqe)
         except BaseException:
             chunker.abandon(rel_scope)
             for f in (path, *layout.sidecars(path)):

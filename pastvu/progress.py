@@ -18,7 +18,7 @@ from rich.progress import BarColumn, MofNCompleteColumn, Progress, TaskProgressC
     TimeRemainingColumn
 from rich.text import Text
 
-STAGES = ["fetch", "pull", "prepare", "detect", "paint", "classify", "colour", "encode", "write", "caption"]
+STAGES = ["fetch", "pull", "prepare", "detect", "paint", "classify", "niqe", "colour", "encode", "write", "caption"]
 
 
 def hms(seconds: float) -> str:
