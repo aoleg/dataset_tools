@@ -162,6 +162,8 @@ At 0.88, with 94 good and 131 bad samples, about 3 % of 28,620 downloaded photos
 
 Other folders whose names start with `_`, such as a folder of photos that you did not sort yet, are ignored by both probes.
 
+Every saved photo also gets its NIQE, a classic measure of how far a picture is from the statistics of natural photos ([NIQE: `niqe`](#niqe-niqe)). It is stored for a second quality rule; the decision does not use it yet.
+
 ## Usage
 
 ```
@@ -178,6 +180,7 @@ run.bat cleanup <threshold> [<scope> ...] [--dry-run] [--yes]
 run.bat cleanup --done | --undo
 run.bat captions <scope> [...] [--txt-fields LIST] [--dry-run]
 run.bat autocaption <scope or folder> [...] [--limit N] [--recaption] [--undo]
+run.bat niqe [<scope or folder> ...] [--follow] [--redo] [--limit N]
 run.bat export <scope> [...] [--format jsonl|parquet]
 run.bat import --dataset <folder> [-o <folder>] [--against <base>] [--top color|category|none] [--quality-threshold X] [--split N] [--limit N]
 run.bat --base <import folder> reclassify [--dry-run] [--yes]
@@ -265,7 +268,7 @@ A run downloads a **scope**: regions and years. Its name is the aliases (or regi
 
 **A photo is downloaded once per base folder.** The store at `<base>\pastvu.db` is shared by every scope, so a photo already saved under one scope (Minsk) is not downloaded again for another (Belarus); the report counts it as already saved under another scope, and `scopes` shows how many there are.
 
-**One command at a time changes a base folder.** The store holds a lock. A second download into the same base folder stops at the start with the name of the command that holds the lock (`run --raw`, `run --pull` and `pull` are downloads to the lock), and so does a `regroup`, `drop` or `reclassify` while anything else runs. `autocaption` and `captions` can run beside a download. A lock left by a process that no longer runs is taken over.
+**One command at a time changes a base folder.** The store holds a lock. A second download into the same base folder stops at the start with the name of the command that holds the lock (`run --raw`, `run --pull` and `pull` are downloads to the lock), and so does a `regroup`, `drop` or `reclassify` while anything else runs. `autocaption`, `captions` and `niqe` can run beside a download. A lock left by a process that no longer runs is taken over.
 
 ## Splitting and regrouping
 
@@ -536,6 +539,22 @@ Moves the saved photos that the quality probe scores at or above the threshold i
 - **The images you deleted,** with either one, are marked skipped (`low quality (reviewed)`) and never downloaded again. Their captions left in the folder are deleted, and so are their export links. The review folder is deleted when nothing else is left in it; a file that you put there yourself keeps it.
 - The images you keep are not copied into `_quality_good`: a photo may be worth keeping for its picture although its quality is poor. Add the ones that show good quality there yourself, then check the threshold again ([Low-quality photos](#low-quality-photos)).
 
+## NIQE: `niqe`
+
+```
+run.bat niqe
+run.bat niqe --follow
+run.bat niqe "estonia_*" --limit 1000
+```
+
+NIQE (Mittal, Soundararajan and Bovik, 2013) compares the statistics of a picture's 96-pixel blocks with those of a collection of clean natural photos; a higher score is worse. It needs no training on your samples. On the quality samples it adds to the probe: printed reproductions (raster dots, postcard print texture) and grain that the probe's 384-pixel view does not see.
+
+The score is taken where it matters for training: on the picture downscaled to at most 1024 x 1024 pixels (box filter, never upscaled). Raster dots that a downscale to that size removes do not count. Each photo gets two things in the store's `niqe` table: the score, and the mean and spread of the 36 block statistics (72 numbers). A quality rule can learn from the 72 numbers, which the published score cannot do.
+
+A download, `pull` and `import` score every photo they save, after the embedding, in about 5.5 ms on an RTX 5090. `niqe` scores the saved photos that have no row: every scope of the base, or the scopes and folders given. It reads the files with 12 threads and scores one photo at a time on the GPU, about 85 photos per second beside a running download. It changes no file and holds the lock in the shared mode, so it can run beside a download. `--follow` keeps it running after the list: every minute it scores the photos saved since, until Ctrl+C. `--redo` scores every photo again. Ctrl+C stops at once; the photos scored so far keep their rows, and the same command continues with the rest.
+
+A photo whose file is missing or cannot be read gets no row, so the next `niqe` tries it again. A picture with fewer than two blocks a side, or with no texture at all, gets a row with no score. A rewrite by `reprocess --downscale` deletes the row, so the photo is scored again from its new file. The rows carry the version of the measure (`niqe1-1024`); after a change of the measure, `niqe` scores every photo again.
+
 ## Cherrypick: a training set by quality
 
 ```
@@ -719,6 +738,7 @@ Each record carries what attribution and a takedown need: the PastVu page, the u
 | `regroup.py` | moving photos between scopes, drop, and undo |
 | `colour.py` | the black-and-white or colour test, and the probe for borderline photos |
 | `quality.py` | the quality probe: low-quality photos are skipped, or deleted by reclassify |
+| `niqe.py`, `niqe_pris_params.npz` | NIQE at the training resolution on the GPU, and the `niqe` command; the parameters are BasicSR's (Apache-2.0), from the LIVE release |
 | `folders.py` | finding and moving files, and the move of a category into numbered folders |
 | `runlock.py` | whether the process that holds the lock still runs |
 | `layout.py` | scope names, the folder tree, and the numbered-folder allocator |

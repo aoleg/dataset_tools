@@ -234,6 +234,11 @@ class Display:
         with self.lock:
             self.status = status
 
+    def add_total(self, n: int) -> None:
+        """n more items to come (a command that follows new work)."""
+        total = self.progress.tasks[0].total or 0
+        self.progress.update(self.task, total=total + n)
+
     def advance(self, saved: bool) -> None:
         if saved:
             self.session_done += 1

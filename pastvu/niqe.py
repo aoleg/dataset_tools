@@ -32,6 +32,10 @@ a photo moved by up to 9. The half-size resize is a strided 8-tap convolution
 36x36 algebra of the score runs on the CPU in float64. About 5.5 ms per photo
 on an RTX 5090, 3 ms of it on the GPU, the rest kernel launches.
 
+The niqe command (run() at the end) scores the saved photos that have no row of
+VERSION in the store: threads read and decode the files, the calling thread
+scores them one at a time, and the rows go in BATCH per transaction.
+
 The algorithm follows BasicSR's numpy NIQE (basicsr/metrics/niqe.py,
 https://github.com/XPixelGroup/BasicSR, Apache License 2.0), which reproduces
 the official MATLAB release to four decimals. niqe_pris_params.npz is BasicSR's
@@ -287,3 +291,152 @@ class Niqe:
         d = self.mu_p - mu
         q = float(d @ np.linalg.pinv((self.cov_p + cov) / 2) @ d)
         return Result(math.sqrt(max(q, 0.0)), feat)
+
+
+# --- the niqe command: the saved photos without a row --------------------------------------
+
+THREADS = 12          # decode threads: a 2.5 MP JPEG takes about 40 ms of CPU, the GPU about 5 ms
+AHEAD = 4             # decoded photos per thread waiting for the GPU
+BATCH = 64            # rows per transaction
+FOLLOW_EVERY = 60     # --follow: seconds between two looks for new photos
+
+
+def read_photo(store, base: Path, cid: int, path: str) -> tuple:
+    """(cid, rel, upright RGB array or None, why None). The path is asked from the store at read time
+    (a reclassify may have moved the photo); a photo no longer saved (forgotten, in a review) is
+    "gone". The stream's decoder, so the pixels are the ones the stream scores."""
+    import process as pr
+    from store import DONE
+    st = store.status(cid)
+    if not st or st.get("state") != DONE or not st.get("path"):
+        return cid, path, None, "gone"
+    rel = st["path"]
+    try:
+        data = (base / rel).read_bytes()
+    except OSError:
+        return cid, rel, None, "missing"
+    try:
+        return cid, rel, pr.decode(data, pr.head_of(data)), None
+    except Exception:  # noqa: BLE001 - a damaged file is counted, not fatal
+        return cid, rel, None, "unreadable"
+
+
+def save_rows(store, rows: list[tuple], tries: int = 10) -> None:
+    """save_niqe, waiting out a writer that holds the database longer than the busy timeout."""
+    import sqlite3
+    import time
+    for attempt in range(tries):
+        try:
+            store.save_niqe(rows)
+            return
+        except sqlite3.OperationalError as e:
+            if "locked" not in str(e) or attempt == tries - 1:
+                raise
+            time.sleep(2)
+
+
+def report(stats: dict, total: int, seconds: float, vram=None, final: bool = False) -> str:
+    done = stats["scored"] + stats["no_niqe"]
+    rate = done / seconds if seconds > 0 else 0.0
+    left = max(0, total - done - stats["missing"] - stats["unreadable"] - stats["gone"] - stats["failed"])
+    eta = f", about {left / rate / 60:,.0f} min left" if rate > 0 and left and not final else ""
+    text = (f"{'Finished: ' if final else ''}{done:,} of {total:,} photos scored in {seconds / 60:.1f} min "
+            f"({rate:.1f}/s{eta}); {stats['no_niqe']:,} have no NIQE (too small or flat)")
+    rest = [f"{stats[k]:,} {k}" for k in ("missing", "unreadable", "gone", "failed") if stats[k]]
+    if rest:
+        text += "; " + ", ".join(rest)
+    if vram is not None and getattr(vram, "ok", False):
+        text += f"\n  {vram.text()}"
+    return text
+
+
+def run(store, base: Path, targets: list[tuple[int, str]], scorer, display, report_every: int = 1000,
+        threads: int = THREADS, follow=None, vram=None, stop=None) -> dict:
+    """Score the targets ((cid, path), in order) and write their rows, BATCH per transaction.
+    The threads read and decode at most threads * AHEAD photos ahead; the calling thread scores
+    them one at a time. follow: a function giving the targets to add when the list is done, asked
+    every FOLLOW_EVERY s until Ctrl+C (None: stop when the list is done); a photo tried once in this
+    run is not tried again. A photo missing, unreadable, gone or failed gets no row, so the next run
+    lists it again; a picture without NIQE gets a row with no score, so it is not listed again.
+    -> the counts, and "stopped" ("Ctrl+C" or None)."""
+    import time
+    from collections import Counter, deque
+    from concurrent.futures import ThreadPoolExecutor
+    stats = Counter()
+    rows: list[tuple] = []
+    tried = {cid for cid, _ in targets}
+    queue_ = deque(targets)
+    total = len(targets)
+    t0 = time.time()
+    stopped = None
+    window = deque()
+
+    def flush():
+        if rows:
+            save_rows(store, list(rows))
+            rows.clear()
+
+    def note_progress():
+        done = sum(stats[k] for k in ("scored", "no_niqe", "missing", "unreadable", "gone", "failed"))
+        if report_every and done % report_every == 0:
+            display.print(report(stats, total, time.time() - t0, vram))
+
+    pool = ThreadPoolExecutor(max(1, threads))
+    try:
+        while True:
+            while queue_ and len(window) < max(1, threads) * AHEAD:
+                window.append(pool.submit(read_photo, store, base, *queue_.popleft()))
+            if not window:
+                flush()
+                if follow is None:
+                    break
+                display.set(f"{stats['scored'] + stats['no_niqe']:,} scored; waiting for new photos")
+                deadline = time.time() + FOLLOW_EVERY
+                while time.time() < deadline and not (stop is not None and stop.is_set()):
+                    time.sleep(0.5)
+                if stop is not None and stop.is_set():
+                    stopped = "Ctrl+C"
+                    break
+                new = [(c, p) for c, p in follow() if c not in tried]
+                tried.update(c for c, _ in new)
+                queue_.extend(new)
+                total += len(new)
+                if new:
+                    display.add_total(len(new))
+                continue
+            cid, rel, array, why = window.popleft().result()
+            if array is None:
+                stats[why] += 1
+                display.line({"cid": cid, "state": why, "path": rel})
+            else:
+                display.set(f"{cid}: {rel}")
+                try:
+                    r = scorer(array)
+                except Exception as e:  # noqa: BLE001 - one photo's error is counted; the next run tries again
+                    stats["failed"] += 1
+                    if stats["failed"] <= 3:
+                        display.print(f"[niqe] {cid}: {type(e).__name__}: {e}")
+                else:
+                    rows.append((cid, VERSION, r.score, r.feat))
+                    stats["scored" if r.score is not None else "no_niqe"] += 1
+                    display.line({"cid": cid, "state": "scored", "niqe": None if r.score is None else round(r.score, 4)})
+                if len(rows) >= BATCH:
+                    flush()
+            display.advance(saved=array is not None)
+            note_progress()
+            if stop is not None and stop.is_set():
+                stopped = "Ctrl+C"
+                break
+    except KeyboardInterrupt:
+        stopped = "Ctrl+C"
+    finally:
+        for f in window:
+            f.cancel()
+        pool.shutdown(wait=True, cancel_futures=True)
+        flush()
+    display.print(report(stats, total, time.time() - t0, vram, final=True))
+    if stopped:
+        display.print(f"Stopped: {stopped}. Run the same command again to continue.")
+    out = dict(stats)
+    out.update(stopped=stopped, total=total)
+    return out

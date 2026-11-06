@@ -68,7 +68,7 @@ UKRAINE_PRESETS = [          # name, regions, comment
 
 # --- setup -------------------------------------------------------------------------------
 
-IMPORT_COMMANDS = ("reclassify", "cleanup", "cherrypick", "autocaption", "scopes", "reprocess")
+IMPORT_COMMANDS = ("reclassify", "cleanup", "cherrypick", "autocaption", "scopes", "reprocess", "niqe")
 IMPORT_TOPS = ("color", "category", "none")
 # The options of the processing: a raw run (run --raw) refuses them, since it processes nothing.
 RAW_REFUSES = ("samples", "no_classify", "min_confidence", "priority_margin", "patches", "png", "no_watermark",
@@ -1178,6 +1178,56 @@ def cmd_autocaption(args, conf, client) -> int:
     return code
 
 
+def cmd_niqe(args, conf, client) -> int:
+    """niqe [target ...]: NIQE rows for the saved photos that have none of the current version
+    (niqe.py). Shared lock: it runs beside run, pull, import, detect and autocaption."""
+    import niqe
+    import vram as vr
+    from progress import Display
+    base, store = open_base(args, conf)
+    targets_of = caption_targets(base, store, args.target) if args.target else [(sc, "") for sc in store.scopes()]
+    if not targets_of:
+        print(f"{base} has no scopes yet")
+        return 0
+
+    def pending() -> list[tuple[int, str]]:
+        out = []
+        for sc, prefix in targets_of:
+            out += store.niqe_pending(sc["name"], prefix, niqe.VERSION, redo=False)
+        return out
+
+    with locked(store, "niqe", "shared"):
+        targets, saved, scored = [], 0, 0
+        for sc, prefix in targets_of:
+            rows = store.niqe_pending(sc["name"], prefix, niqe.VERSION, redo=args.redo)
+            targets += rows
+            if prefix:
+                print(f"{prefix.rstrip('/')}: {len(rows):,} saved photos to score")
+                continue
+            c = store.niqe_count(sc["name"], niqe.VERSION)
+            saved, scored = saved + c["saved"], scored + c["scored"]
+            if args.target:                  # every scope of the base: one line for all, below
+                print(f"{sc['name']}: {c['saved']:,} saved photos, {c['scored']:,} with NIQE {niqe.VERSION}; "
+                      f"{len(rows):,} to score")
+        if not args.target:
+            print(f"{base}: {saved:,} saved photos in {len(targets_of)} scopes, {scored:,} with NIQE {niqe.VERSION}; "
+                  f"{len(targets):,} to score")
+        if args.limit is not None:
+            targets = targets[:max(0, args.limit)]
+        if not targets and not args.follow:
+            return 0
+        scorer = niqe.Niqe()
+        print(f"  NIQE at {niqe.PIXELS:,} pixels on {scorer.device}, {args.threads} read threads"
+              + ("; then waiting for new photos until Ctrl+C" if args.follow else ""), flush=True)
+        vram = vr.VramMonitor().start()
+        mode = "json" if args.json_progress else "quiet" if args.quiet else "live"
+        with Display(len(targets), 0, mode, vram=vram) as d:
+            niqe.run(store, base, targets, scorer, d, args.report_every, args.threads,
+                     follow=pending if args.follow else None, vram=vram)
+        vram.stop()
+    return 0
+
+
 def cmd_export(args, conf, client) -> int:
     import export as ex
     base, store = open_base(args, conf)
@@ -1950,6 +2000,19 @@ def parse_args(argv=None):
     p.add_argument("--quiet", action="store_true", help="report blocks only, no live display")
     p.add_argument("--json-progress", action="store_true", help="one JSON line per photo on stdout")
 
+    p = sub.add_parser("niqe", help="NIQE of the saved photos at the training resolution, for the quality rule "
+                                     "(beside a download)")
+    p.add_argument("target", nargs="*", metavar="SCOPE|FOLDER",
+                   help="a scope's name or name pattern, or its folder or any folder inside it (default: every scope)")
+    p.add_argument("--follow", action="store_true",
+                   help="when done, look for newly saved photos without NIQE every minute until Ctrl+C")
+    p.add_argument("--redo", action="store_true", help="score every saved photo again, also those with a row")
+    p.add_argument("--limit", type=int, metavar="N", help="score at most N photos in this run")
+    p.add_argument("--threads", type=int, default=12, metavar="N", help="reading and decoding threads (default 12)")
+    p.add_argument("--report-every", type=int, default=5000, metavar="N", help="a report block every N photos")
+    p.add_argument("--quiet", action="store_true", help="report blocks only, no live display")
+    p.add_argument("--json-progress", action="store_true", help="one JSON line per photo on stdout")
+
     p = sub.add_parser("export", help="write the records of a scope as JSON Lines or Parquet")
     p.add_argument("scope", nargs="+", metavar="SCOPE", help="a scope's name, folder or name pattern (estonia_*)")
     p.add_argument("--format", choices=["jsonl", "parquet"], default="jsonl")
@@ -2019,6 +2082,8 @@ def parse_args(argv=None):
     p.add_argument("scope", nargs="+", metavar="SCOPE", help="a scope's name, folder or name pattern")
     p.add_argument("--yes", action="store_true", help="delete; without it, only show what would be deleted")
     args = ap.parse_args(argv)
+    if args.cmd == "niqe" and args.follow and (args.limit is not None or args.redo):
+        ap.error("--follow waits for new photos; give --limit and --redo without it")
     if args.cmd == "run" and args.raw:
         if args.pull:
             ap.error("--raw downloads without processing and --pull processes the storage: give one of them")
@@ -2052,7 +2117,7 @@ def main(argv=None) -> int:
                 "reclassify": cmd_reclassify,
                 "export": cmd_export, "autocaption": cmd_autocaption, "regroup": cmd_regroup, "drop": cmd_drop,
                 "extract": cmd_extract, "import": cmd_import, "cleanup": cmd_cleanup,
-                "cherrypick": cmd_cherrypick}
+                "cherrypick": cmd_cherrypick, "niqe": cmd_niqe}
         return cmds[args.cmd](args, conf, client)
     finally:
         client.close()
