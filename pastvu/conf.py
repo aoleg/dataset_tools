@@ -65,25 +65,32 @@ class InterestConf:
     columns of the boxes rows (shares of the frame), and the rule of a category
     by its name after the number (rule.<name> = <rule>), which overrides the
     defaults in interest.py."""
-    vehicle_min: float = 0.08         # vehicle: the largest vehicle's area, at least
+    vehicle_min: float = 0.06         # vehicle: the largest vehicle's area, at least
     vehicle_max: float = 0.70         # ... and at most (a vehicle that fills the frame has no context)
     vehicle_width: float = 0.30       # ... and its width, at least
-    person_height: float = 0.35       # people: the tallest person's height, at least
-    face_height: float = 0.04         # ... and the tallest face's height (readable from about 4 %)
+    person_height: float = 0.35       # people: the tallest person's height, at least,
+    people_pair: int = 2              # ... or this many persons 0.20 tall or more (0: not this way)
+    face_height: float = 0.0          # ... and the tallest face's height, at least (0: no face check)
     group_min: int = 4                # group: counted persons, at least
     group_face_height: float = 0.03   # ... and the tallest face's height
     thing_min: float = 0.08           # thing: the largest thing's area (any family but people and context)
     presence_persons: int = 1         # presence: counted persons, at least
     presence_faces: int = 1           # ... and faces inside persons, at least
+    life_persons: int = 1             # life: persons 0.08 tall or more, at least (0: not this way),
+    life_vehicles: int = 1            # ... or counted vehicles, at least (0: not this way)
+    street_persons: int = 2           # street: persons 0.08 tall or more, at least (0: not this way),
+    street_crowd: int = 5             # ... or counted persons of any size, at least (0: not this way),
+    street_vehicle_area: float = 0.02  # ... or the largest vehicle's area, at least (0: not this way)
     rules: dict = field(default_factory=dict)     # category name (after the number) -> rule
 
     def thresholds(self) -> dict:
         return {k: getattr(self, k) for k in INTEREST_KEYS}
 
 
-INTEREST_KEYS = ("vehicle_min", "vehicle_max", "vehicle_width", "person_height", "face_height", "group_min",
-                 "group_face_height", "thing_min", "presence_persons", "presence_faces")
-INTEREST_RULES = ("vehicle", "people", "group", "thing", "presence", "pass")
+INTEREST_KEYS = ("vehicle_min", "vehicle_max", "vehicle_width", "person_height", "people_pair", "face_height",
+                 "group_min", "group_face_height", "thing_min", "presence_persons", "presence_faces",
+                 "life_persons", "life_vehicles", "street_persons", "street_crowd", "street_vehicle_area")
+INTEREST_RULES = ("vehicle", "people", "group", "thing", "presence", "life", "street", "pass")
 
 
 @dataclass
@@ -114,6 +121,7 @@ class Conf:
     bw_color: bool | None = None       # bw/ and color/ at the top of a new base; None: not in the file
     caption: CaptionConf = field(default_factory=CaptionConf)
     interest: InterestConf = field(default_factory=InterestConf)
+    cherrypick: dict[str, dict] = field(default_factory=dict)  # [cherrypick]: category name (or default) -> setting
     aliases: dict[str, list[int]] = field(default_factory=dict)
     groups: dict[str, str] = field(default_factory=dict)      # alias -> its group
 
@@ -330,6 +338,13 @@ def load(path: Path | None = None) -> Conf:
                     raise ValueError(f"unknown key {key}")
         except ValueError as e:
             raise SystemExit(f"{path}: [interest] {e}")
+    if cp.has_section("cherrypick"):
+        import cherrypick as pick
+        for key, value in cp["cherrypick"].items():
+            try:
+                conf.cherrypick[key.strip()] = pick.parse_setting(value)
+            except ValueError as e:
+                raise SystemExit(f"{path}: [cherrypick] {key} = {value}: {e}")
     for group in ALIAS_GROUPS:
         sec = f"aliases.{group}"
         if not cp.has_section(sec):

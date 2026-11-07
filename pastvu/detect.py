@@ -69,6 +69,10 @@ COUNT_CONF = 0.25        # boxes that count in the derived columns
 FACE_CONF = 0.30
 MAX_AREA = 0.90          # a counted box covers less of the frame than this
 FACE_INSIDE = 0.80       # share of a face box inside a counted person for the face to count
+MID_PERSON = 0.20        # n_person_20: counted persons at least this tall (a figure whose clothes show)
+SMALL_PERSON = 0.08      # n_person_08: counted persons at least this tall (life in a street or a room)
+COVER_GRID = 64          # person_cover: the union of the person boxes on a grid of this many cells a side
+DERIVE = "d2"            # the version of stats_of; a change refills the derived columns from the JSON
 IMGSZ = 640
 BATCH = 16
 DECODERS = 4
@@ -206,7 +210,8 @@ def stats_of(boxes: list, faces: list, count_conf: float = COUNT_CONF, max_area:
     """The derived columns from a photo's boxes ([name, conf, x1, y1, x2, y2] as shares) and faces
     ([conf, x1, y1, x2, y2]): the counted persons and the tallest, the faces inside persons and the
     tallest, the counted vehicles and the largest with its width, the largest object, the largest
-    thing of any family but people and context."""
+    thing of any family but people and context; the counted persons at least MID_PERSON and
+    SMALL_PERSON tall, and the share of the frame the person boxes cover together."""
     def area(b):
         return (b[4] - b[2]) * (b[5] - b[3])
 
@@ -227,7 +232,29 @@ def stats_of(boxes: list, faces: list, count_conf: float = COUNT_CONF, max_area:
         "max_vehicle_w": round(big_v[4] - big_v[2], 4) if big_v else 0.0,
         "max_object_area": round(max((area(b) for b in objects), default=0.0), 4),
         "max_thing_area": round(max((area(b) for b in things), default=0.0), 4),
+        "n_person_20": sum(1 for b in persons if b[5] - b[3] >= MID_PERSON),
+        "n_person_08": sum(1 for b in persons if b[5] - b[3] >= SMALL_PERSON),
+        "person_cover": _cover(persons),
     }
+
+
+def _cover(persons: list) -> float:
+    """The share of the frame inside at least one of the boxes, on a COVER_GRID raster."""
+    if not persons:
+        return 0.0
+    g = COVER_GRID
+    grid = np.zeros((g, g), bool)
+    for b in persons:
+        x1, y1 = int(b[2] * g), int(b[3] * g)
+        x2, y2 = max(x1 + 1, int(np.ceil(b[4] * g))), max(y1 + 1, int(np.ceil(b[5] * g)))
+        grid[y1:y2, x1:x2] = True
+    return round(float(grid.mean()), 4)
+
+
+def stats_from_json(text: str) -> dict:
+    """The derived columns of a stored boxes row from its JSON (store.refill_boxes)."""
+    d = json.loads(text)
+    return stats_of(d["b"], d["f"])
 
 
 def boxes_json(boxes: list, faces: list) -> str:

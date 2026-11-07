@@ -1372,24 +1372,58 @@ def cmd_extract(args, conf, client) -> int:
 def cmd_cherrypick(args, conf, client) -> int:
     import cherrypick as cp
     base, store = open_base(args, conf)
-    c = cp.parse_values(args.value, args.quality, args.top, args.per_category)
-    balance = args.balance if args.balance is not None else (50 if c["per_category"] is not None else None)
-    if balance is not None and not 0 <= balance <= 100:
-        raise SystemExit(f"--balance {balance}: a percentage of colour photos, 0 to 100")
+    lines = conf.cherrypick
+    c = cp.parse_values(args.value, args.quality, args.top, args.per_category, require=not lines)
+    given = any(v is not None for v in c.values())
+    if args.balance is not None and not 0 <= args.balance <= 100:
+        raise SystemExit(f"--balance {args.balance}: a percentage of colour photos, 0 to 100")
     no_modes = store.is_import and not store.get_meta("bw_color")
-    if no_modes:
+    if no_modes and args.balance is not None:
+        raise SystemExit("--balance: this import does not tell black-and-white from colour (--top none)")
+    default = None                                   # the setting of a category without a line of its own
+    if given:
+        default = {**c, "color": args.balance, "skip": False}
+    elif "default" in lines:
+        default = dict(lines["default"])
         if args.balance is not None:
-            raise SystemExit("--balance: this import does not tell black-and-white from colour (--top none)")
-        balance = None
+            default["color"] = args.balance
+    if default is not None:
+        default = cp.effective(default, modes=not no_modes)
+    balance = default["color"] if default else None
     decades = cp.parse_decades(args.decades)
     if decades and store.is_import:
         raise SystemExit("--decades: an import has no years")
     out = Path(args.out).resolve()
     if out == base or base in out.parents:
         raise SystemExit(f"-o {out} is inside the base folder; give a folder outside it")
-    print(cp.describe(c, balance, decades), flush=True)
+    if default is not None and not default["skip"]:
+        print(cp.describe(default, balance, decades) + (" (the default)" if lines else ""), flush=True)
+    else:
+        print("Decades: " + (", ".join(f"{d}s" for d in decades) if decades else "all") + ".", flush=True)
+    settings = None
     with locked(store, "cherrypick", "shared"):
-        photos = cp.load_photos(store, decades, args.category)
+        photos = cp.load_photos(store, decades, args.category, outliers=bool(lines))
+        if lines:
+            with store.lock:
+                names = [r[0] for r in store.db.execute(
+                    "SELECT DISTINCT category FROM status WHERE state=? AND category IS NOT NULL", (cp.DONE,))]
+            try:
+                resolved, warnings = cp.resolve_settings(lines, names, default)
+            except ValueError as e:
+                raise SystemExit(f"{conf.path}: {e}")
+            for w in warnings:
+                print(f"  {w}")
+            used = {p["cat"] for p in photos.values()}
+            missing = sorted(n for n in used if resolved[n] is None)
+            if missing:
+                raise SystemExit(f"no setting for {', '.join(missing)}: give values on the command line or a "
+                                 f"default line in [cherrypick] of {conf.path}")
+            settings = {n: cp.effective(resolved[n], modes=not no_modes) for n in used}
+            if no_modes and any(lines[k]["color"] is not None for k in lines):
+                print("  --color on a [cherrypick] line is ignored: this import does not tell black-and-white "
+                      "from colour")
+            print(f"Per category: the [cherrypick] lines of {conf.path} ({len(lines)} lines); each row of the "
+                  f"table ends with its category's setting", flush=True)
         if not photos:
             print("No saved photos match.")
             return 0
@@ -1404,18 +1438,23 @@ def cmd_cherrypick(args, conf, client) -> int:
         if args.interest:
             import detect as dt
             import interest as it
-            cats = {p["cat"] for p in photos.values()}
+            cats = {p["cat"] for p in photos.values() if not (settings and settings[p["cat"]]["skip"])}
             print(it.describe(cats, conf.interest), flush=True)
+            store.refill_boxes(dt.stats_from_json, dt.DERIVE)     # once after a change of the derived columns
             tiers = it.tiers(store, photos, conf.interest, dt.vocab_hash())
             known = sum(1 for t in tiers.values() if t != it.UNKNOWN)
             print(f"  {known:,} of {len(tiers):,} photos have a boxes row and a rule"
                   + ("" if known else "; run detect first for the ordering to mean anything"), flush=True)
-        picked, table = cp.select(photos, scores, c, balance, tiers)
+        picked, table = cp.select(photos, scores, default, balance, tiers, settings)
         print(f"{len(photos):,} saved photos in {len({p['cat'] for p in photos.values()})} categories; "
               f"pool -> picked per category:")
         print(cp.table_text(table, interest=args.interest), flush=True)
         criteria = {"base": str(base), **{k: v for k, v in c.items() if v is not None}, "balance": balance,
                     "decades": decades, "categories": args.category or [], "samples": str(samples)}
+        if settings:
+            criteria["settings"] = {n: ({"skip": True} if v["skip"] else
+                                        {k: x for k, x in v.items() if x is not None and k != "skip"})
+                                    for n, v in sorted(settings.items())}
         if args.interest:
             criteria["interest"] = {"vocab": dt.vocab_hash(), "rules": it.rules_of(cats, conf.interest),
                                     **conf.interest.thresholds()}
@@ -1815,20 +1854,22 @@ reasoning = no
 ; the boxes row (sizes as shares of the frame); a photo whose rule passes comes
 ; first, then one without a row, then one whose rule fails; nothing is removed.
 ; The rule of a category comes from its name after the number: transport ->
-; vehicle; people_adult, people_children, school -> people; group_photo_adult,
+; vehicle; people_adult, people_children -> people; group_photo_adult,
 ; group_photo_children -> group; futurism, objects, military -> thing;
-; environment_indoors, environment_outdoors -> presence; every other name ->
-; pass (no ordering). rule.<name> = <rule> overrides one category, e.g.
+; environment_indoors -> life; environment_outdoors -> street; school and every
+; other name -> pass (no ordering). rule.<name> = <rule> overrides one category, e.g.
 ;   rule.monuments = thing
 ; vehicle: the largest vehicle covers between vehicle_min and vehicle_max of the
 ; frame and is at least vehicle_width of its width.
-vehicle_min = 0.08
+vehicle_min = 0.06
 vehicle_max = 0.70
 vehicle_width = 0.30
-; people: the tallest person is at least person_height of the frame's height
-; and the tallest face at least face_height (faces are readable from about 4 %).
+; people (bodies: clothes and activity): the tallest person is at least
+; person_height of the frame's height, or people_pair persons are each at least
+; 0.20 tall (0: not this way); face_height above 0 also asks for a face that tall.
 person_height = 0.35
-face_height = 0.04
+people_pair = 2
+face_height = 0
 ; group: at least group_min persons, the tallest face at least group_face_height.
 group_min = 4
 group_face_height = 0.03
@@ -1838,6 +1879,35 @@ thing_min = 0.08
 ; them (a street or an interior with people before one without).
 presence_persons = 1
 presence_faces = 1
+; life: at least life_persons persons 0.08 tall or more, or life_vehicles
+; vehicles (0: not this way): an interior with someone in it before an empty one.
+life_persons = 1
+life_vehicles = 1
+; street: at least street_persons persons 0.08 tall or more, or street_crowd
+; persons of any size, or a vehicle covering street_vehicle_area of the frame
+; (0: not this way): passers-by, a parade or a tram before a facade with one
+; pedestrian or a car parked far off.
+street_persons = 2
+street_crowd = 5
+street_vehicle_area = 0.02
+
+[cherrypick]
+; cherrypick per category: a line per category, by its folder name with or
+; without the number, or a pattern (group_photo_*). A line takes the values of
+; the command line, in any order: a threshold with a dot (0.85), a percentile
+; from 1 to 100 (30), a number per category over 100 (5000; a smaller number is
+; --per-category 50), and --color PERCENT, the share of colour photos (the
+; --balance of that category; a number per category alone means 50). 0 leaves
+; the category out. A line is the whole setting of its category. default is the
+; line of every category without one; values on the command line replace it for
+; that run. 200-outliers is left out unless a line names it. With lines here,
+; cherrypick runs without values: run.bat cherrypick -o D:\\training
+;default = 0.85 30
+;churches = 0
+;aerial = 0.85 15
+;environment_outdoors = 0.85 12000
+;school = 0.5
+;group_photo_* = 1000 0.5 --color 100
 
 ; Aliases: a name for one or more PastVu region numbers, used with --region.
 ; Three groups: countries (and groups of countries), regions (the first level
@@ -2204,7 +2274,8 @@ def parse_args(argv=None):
                                           "balanced between colour and black-and-white")
     p.add_argument("value", nargs="*", metavar="VALUE",
                    help="a P(good) threshold with a dot (0.85), a top percentile from 1 to 100 (30), a number per "
-                        "category over 100 (5000); any of them, in any order")
+                        "category over 100 (5000); any of them, in any order; none: the [cherrypick] lines of the conf, "
+                        "whose default line they replace when given")
     p.add_argument("-o", "--out", required=True, metavar="DIR", help="the output folder (outside the base)")
     p.add_argument("--quality", type=float, metavar="P", help="the threshold, named")
     p.add_argument("--top", type=int, metavar="X", help="the percentile, named")

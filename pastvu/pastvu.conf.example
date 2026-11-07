@@ -91,20 +91,22 @@ reasoning = no
 ; the boxes row (sizes as shares of the frame); a photo whose rule passes comes
 ; first, then one without a row, then one whose rule fails; nothing is removed.
 ; The rule of a category comes from its name after the number: transport ->
-; vehicle; people_adult, people_children, school -> people; group_photo_adult,
+; vehicle; people_adult, people_children -> people; group_photo_adult,
 ; group_photo_children -> group; futurism, objects, military -> thing;
-; environment_indoors, environment_outdoors -> presence; every other name ->
-; pass (no ordering). rule.<name> = <rule> overrides one category, e.g.
+; environment_indoors -> life; environment_outdoors -> street; school and every
+; other name -> pass (no ordering). rule.<name> = <rule> overrides one category, e.g.
 ;   rule.monuments = thing
 ; vehicle: the largest vehicle covers between vehicle_min and vehicle_max of the
 ; frame and is at least vehicle_width of its width.
-vehicle_min = 0.08
+vehicle_min = 0.06
 vehicle_max = 0.70
 vehicle_width = 0.30
-; people: the tallest person is at least person_height of the frame's height
-; and the tallest face at least face_height (faces are readable from about 4 %).
+; people (bodies: clothes and activity): the tallest person is at least
+; person_height of the frame's height, or people_pair persons are each at least
+; 0.20 tall (0: not this way); face_height above 0 also asks for a face that tall.
 person_height = 0.35
-face_height = 0.04
+people_pair = 2
+face_height = 0
 ; group: at least group_min persons, the tallest face at least group_face_height.
 group_min = 4
 group_face_height = 0.03
@@ -114,6 +116,35 @@ thing_min = 0.08
 ; them (a street or an interior with people before one without).
 presence_persons = 1
 presence_faces = 1
+; life: at least life_persons persons 0.08 tall or more, or life_vehicles
+; vehicles (0: not this way): an interior with someone in it before an empty one.
+life_persons = 1
+life_vehicles = 1
+; street: at least street_persons persons 0.08 tall or more, or street_crowd
+; persons of any size, or a vehicle covering street_vehicle_area of the frame
+; (0: not this way): passers-by, a parade or a tram before a facade with one
+; pedestrian or a car parked far off.
+street_persons = 2
+street_crowd = 5
+street_vehicle_area = 0.02
+
+[cherrypick]
+; cherrypick per category: a line per category, by its folder name with or
+; without the number, or a pattern (group_photo_*). A line takes the values of
+; the command line, in any order: a threshold with a dot (0.85), a percentile
+; from 1 to 100 (30), a number per category over 100 (5000; a smaller number is
+; --per-category 50), and --color PERCENT, the share of colour photos (the
+; --balance of that category; a number per category alone means 50). 0 leaves
+; the category out. A line is the whole setting of its category. default is the
+; line of every category without one; values on the command line replace it for
+; that run. 200-outliers is left out unless a line names it. With lines here,
+; cherrypick runs without values: run.bat cherrypick -o D:\training
+;default = 0.85 30
+;churches = 0
+;aerial = 0.85 15
+;environment_outdoors = 0.85 12000
+;school = 0.5
+;group_photo_* = 1000 0.5 --color 100
 
 ; Aliases: a name for one or more PastVu region numbers, used with --region.
 ; Three groups: countries (and groups of countries), regions (the first level

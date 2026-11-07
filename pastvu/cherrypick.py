@@ -22,8 +22,15 @@ other: 100 colour and 20 black-and-white at 50 give 20 and 20, at 80 give 80
 and 20. A category with none of a mode the share asks for picks nothing.
 Without balance each mode is cut on its own.
 
+Per category (the [cherrypick] section of the conf): a line per category, by
+its folder name with or without the number or a pattern (group_photo_*), takes
+the same values and --color PERCENT (the colour share, --balance of that
+category); 0 leaves the category out; default is the line of every category
+without one. Values on the command line replace the default line for the run.
+200-outliers is left out unless a line names it.
+
 The decades are all, or --decades (from the photo's start year; not on an
-import, which has no years). 200-outliers is never included. Photos come
+import, which has no years). Photos come
 from the store (category, mode, path), so a hand move counts once reclassify
 has recorded it. A photo without an embedding is left out and counted.
 
@@ -41,6 +48,7 @@ longer selected, and deletes them with --prune.
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import math
 import os
@@ -62,8 +70,9 @@ OUTLIERS = "outliers"
 # --- the parameters -----------------------------------------------------------------------------
 
 
-def parse_values(values: list[str], quality=None, top=None, per_category=None) -> dict:
-    """The ceilings from the positional values (by their shape) and the named forms.
+def parse_values(values: list[str], quality=None, top=None, per_category=None, require: bool = True) -> dict:
+    """The ceilings from the positional values (by their shape) and the named forms; require:
+    at least one of them (a [cherrypick] line may give only --color).
     -> {"quality": float | None, "top": int | None, "per_category": int | None}"""
     out = {"quality": quality, "top": top, "per_category": per_category}
     for v in values:
@@ -92,10 +101,140 @@ def parse_values(values: list[str], quality=None, top=None, per_category=None) -
         raise SystemExit("--per-category takes a number of photos, 1 or more")
     if out["quality"] is not None and not 0 < out["quality"] <= 1:
         raise SystemExit("--quality takes a P(good) above 0 and at most 1")
-    if all(v is None for v in out.values()):
+    if require and all(v is None for v in out.values()):
         raise SystemExit("give at least one of: a quality threshold (0.85), a percentile (30), a number per "
                          "category (5000)")
     return out
+
+
+SETTING_OPTIONS = {"quality": "quality", "top": "top", "per-category": "per_category", "color": "color",
+                   "balance": "color"}
+
+
+def parse_setting(text: str) -> dict:
+    """One line of [cherrypick] in the conf: the values of the command line (a threshold with a dot,
+    a percentile from 1 to 100, a number per category over 100, in any order, or named with
+    --quality, --top, --per-category) and --color PERCENT, the share of colour photos (--balance is
+    the same); 0 alone leaves the category out. The line is the whole setting of its category:
+    nothing comes from the default line.
+    -> {"quality", "top", "per_category", "color", "skip"}; ValueError with the reason."""
+    toks = text.split()
+    if not toks:
+        raise ValueError("no values; give 0 to leave the category out")
+    if toks == ["0"]:
+        return {"quality": None, "top": None, "per_category": None, "color": None, "skip": True}
+    values, named = [], {}
+    i = 0
+    while i < len(toks):
+        t = toks[i]
+        i += 1
+        if not t.startswith("--"):
+            if t == "0":
+                raise ValueError("0 leaves the category out and stands alone on its line")
+            values.append(t)
+            continue
+        opt, _, val = t[2:].partition("=")
+        key = SETTING_OPTIONS.get(opt.lower())
+        if key is None:
+            raise ValueError(f"unknown option {t}; a line takes --quality, --top, --per-category and --color")
+        if not val:
+            if i == len(toks):
+                raise ValueError(f"{t} needs a value")
+            val = toks[i]
+            i += 1
+        if key in named:
+            raise ValueError(f"{t}: given twice")
+        named[key] = val
+    color = named.pop("color", None)
+    if color is not None:
+        if not color.isdigit() or not 0 <= int(color) <= 100:
+            raise ValueError(f"--color {color}: a percentage of colour photos, 0 to 100")
+        color = int(color)
+    try:
+        conv = {"quality": float, "top": int, "per_category": int}
+        kwargs = {k: conv[k](v) for k, v in named.items()}
+    except ValueError:
+        raise ValueError(f"not a number in {' '.join(f'--{k} {v}' for k, v in named.items())}")
+    try:
+        c = parse_values(values, **kwargs, require=color is None)
+    except SystemExit as e:
+        raise ValueError(str(e))
+    return {**c, "color": color, "skip": False}
+
+
+def _line_hits(key: str, names: list[str]) -> list[str]:
+    """The folder names one [cherrypick] line names: by the folder name with or without its number,
+    or a pattern with * or ? (group_photo_*), matched against both."""
+    if any(ch in key for ch in "*?["):
+        pat = key.lower()
+        return [n for n in names if fnmatch.fnmatchcase(n.lower(), pat)
+                or fnmatch.fnmatchcase(xt.split_name(n)[1], xt.norm(pat))]
+    return [n for n in names if xt.matches(key, n)]
+
+
+def resolve_settings(settings: dict[str, dict], names, default: dict | None) -> tuple[dict[str, dict | None], list[str]]:
+    """The setting of every category in names (folder names) from the [cherrypick] lines (name ->
+    parsed line: the folder name with or without its number, or a pattern such as group_photo_*)
+    and the default (the command's values, else the default line; None: no default). A line by
+    name beats a pattern. 200-outliers is left out unless a line names it. A line that names no
+    category here is a warning (one conf serves several bases); two lines by name on one category,
+    two patterns on one, or a name that means two categories, are errors.
+    -> ({folder name: setting or None}, [warnings]); ValueError for the errors."""
+    skip = {"quality": None, "top": None, "per_category": None, "color": None, "skip": True}
+    names = list(names)
+    exact: dict[str, str] = {}
+    pattern: dict[str, str] = {}
+    warnings = []
+    for key in settings:
+        if key == "default":
+            continue
+        hits = _line_hits(key, names)
+        if not hits:
+            warnings.append(f"[cherrypick] {key}: no category of that name here")
+            continue
+        is_pattern = any(ch in key for ch in "*?[")
+        if not is_pattern and len({xt.split_name(n) for n in hits}) > 1:
+            raise ValueError(f"[cherrypick] {key} means several categories ({', '.join(sorted(hits))}); "
+                             f"give the full name")
+        seen = pattern if is_pattern else exact
+        for n in hits:
+            if n in seen:
+                raise ValueError(f"[cherrypick] {seen[n]} and {key} both set {n}")
+            seen[n] = key
+    out: dict[str, dict | None] = {}
+    for n in names:
+        key = exact.get(n) or pattern.get(n)
+        if key is not None:
+            out[n] = settings[key]
+        else:
+            out[n] = skip if xt.split_name(n)[1] == OUTLIERS else default
+    return out, warnings
+
+
+def effective(setting: dict, modes: bool = True) -> dict:
+    """A setting with its colour share resolved as the command resolves --balance: the line's
+    --color, else 50 with a number per category, else none (each mode cut on its own); none
+    where the base has no modes (an import made with --top none)."""
+    color = setting["color"]
+    if color is None and setting["per_category"] is not None and not setting["skip"]:
+        color = 50
+    return {**setting, "color": color if modes else None}
+
+
+def setting_text(setting: dict) -> str:
+    """A setting in a few words, for the table: "0.85, top 30 %, 12,000, 50 % colour", "left out"."""
+    if setting["skip"]:
+        return "0: left out"
+    parts = []
+    if setting["quality"] is not None:
+        parts.append(f"{setting['quality']:g}")
+    if setting["top"] is not None:
+        parts.append(f"top {setting['top']} %")
+    if setting["per_category"] is not None:
+        parts.append(f"{setting['per_category']:,}")
+    if setting["color"] is not None:
+        parts.append(f"{setting['color']} % colour")
+    return ", ".join(parts) or "every photo"
 
 
 def _float(t: str) -> float:
@@ -140,9 +279,11 @@ def parse_decades(values: list[str] | None) -> list[int] | None:
 # --- the photos and their scores ------------------------------------------------------------------
 
 
-def load_photos(store, decades: list[int] | None, categories: list[str] | None, log=print) -> dict:
-    """Every saved photo of the base, outliers left out: cid -> {"cat", "mode", "path", "decade"}.
-    categories: extract-style arguments (050, transport, 050-transport) that narrow the set."""
+def load_photos(store, decades: list[int] | None, categories: list[str] | None, log=print,
+                outliers: bool = False) -> dict:
+    """Every saved photo of the base, outliers left out unless outliers (the [cherrypick] lines
+    decide then): cid -> {"cat", "mode", "path", "decade"}. categories: extract-style arguments
+    (050, transport, 050-transport) that narrow the set."""
     with store.lock:
         rows = store.db.execute("SELECT s.cid, s.category, s.mode, s.path, p.year FROM status s LEFT JOIN photos p "
                                 "ON p.cid=s.cid WHERE s.state=? AND s.path IS NOT NULL", (DONE,)).fetchall()
@@ -154,7 +295,7 @@ def load_photos(store, decades: list[int] | None, categories: list[str] | None, 
             keep.update(xt.resolve_category(arg, names))
     out = {}
     for cid, cat, mode, path, year in rows:
-        if not cat or xt.split_name(cat)[1] == OUTLIERS or (keep is not None and cat not in keep):
+        if not cat or (not outliers and xt.split_name(cat)[1] == OUTLIERS) or (keep is not None and cat not in keep):
             continue
         dec = (year // 10 * 10) if year is not None else None
         if decades and dec not in decades:
@@ -212,12 +353,17 @@ def balanced(colour: int, bw: int, percent: int, n: int | None = None) -> tuple[
     return c, b
 
 
-def select(photos: dict, scores: dict[int, float], c: dict, balance: int | None,
-           tiers: dict[int, int] | None = None) -> tuple[dict[int, dict], list[dict]]:
+def select(photos: dict, scores: dict[int, float], c: dict | None, balance: int | None,
+           tiers: dict[int, int] | None = None,
+           settings: dict[str, dict] | None = None) -> tuple[dict[int, dict], list[dict]]:
     """The picked photos and a table row per category. tiers (cherrypick --interest): cid -> 0, 1
     or 2 from interest.tiers; a bucket is then ranked by (tier, quality) and cut as without them,
     so the tiers order the photos and never remove one; the row gains the picked per tier.
-    -> ({cid: photo}, [{"cat", "color_pool", "bw_pool", "color", "bw", "note", "color_tiers", "bw_tiers"}])"""
+    settings (the [cherrypick] lines, from effective()): category -> its ceilings and its colour
+    share in "color", which replace c and balance for that category; a skip setting picks nothing
+    and the row says so; the row gains the setting.
+    -> ({cid: photo}, [{"cat", "color_pool", "bw_pool", "color", "bw", "note", "setting", "color_tiers",
+    "bw_tiers"}])"""
     buckets: dict[str, dict[str, list[int]]] = defaultdict(lambda: {"color": [], "bw": []})
     unscored = 0
     for cid, ph in photos.items():
@@ -228,23 +374,37 @@ def select(photos: dict, scores: dict[int, float], c: dict, balance: int | None,
     picked: dict[int, dict] = {}
     table = []
     for cat in sorted(buckets):
+        setting = settings.get(cat) if settings else None
+        cc, bal = (setting, setting["color"]) if setting else (c, balance)
+        if setting and setting["skip"]:
+            table.append({"cat": cat, "color_pool": len(buckets[cat]["color"]), "bw_pool": len(buckets[cat]["bw"]),
+                          "color": 0, "bw": 0, "note": "left out", "setting": setting_text(setting)})
+            continue
         if tiers is None:
             ranked = {m: sorted(cids, key=lambda cid: (-scores[cid], cid)) for m, cids in buckets[cat].items()}
         else:
             ranked = {m: sorted(cids, key=lambda cid: (tiers.get(cid, 1), -scores[cid], cid))
                       for m, cids in buckets[cat].items()}
         pools = {m: len(v) for m, v in ranked.items()}
-        cut = {m: _cut(v, scores, c) for m, v in ranked.items()}
+        cut = {m: _cut(v, scores, cc) for m, v in ranked.items()}
         want = {m: len(v) for m, v in cut.items()}
         note = ""
-        if balance is not None:
+        if bal is not None:
             had = dict(want)
-            want = dict(zip(("color", "bw"), balanced(want["color"], want["bw"], balance, c["per_category"])))
+            want = dict(zip(("color", "bw"), balanced(want["color"], want["bw"], bal, cc["per_category"])))
             if not want["color"] + want["bw"] and had["color"] + had["bw"]:
                 short = "colour" if not had["color"] else "black-and-white"
-                note = f"no {short} photos pass: nothing picked at {balance} % colour"
+                note = f"no {short} photos pass: nothing picked at {bal} % colour"
+        elif cc["per_category"] is not None and want["color"] + want["bw"] > cc["per_category"]:
+            n = cc["per_category"]                    # no modes to balance (an import): the best n of the two
+            best = sorted(cut["color"][:want["color"]] + cut["bw"][:want["bw"]], key=lambda cid: -scores[cid])[:n]
+            keep = set(best)
+            want = {m: sum(1 for cid in cut[m][:want[m]] if cid in keep) for m in cut}
+            cut = {m: [cid for cid in cut[m] if cid in keep] for m in cut}
         row = {"cat": cat, "color_pool": pools["color"], "bw_pool": pools["bw"], "color": want["color"],
                "bw": want["bw"], "note": note}
+        if setting:
+            row["setting"] = setting_text(setting)
         for m in ("color", "bw"):
             chosen = cut[m][:want[m]]
             for cid in chosen:
@@ -263,7 +423,7 @@ def select(photos: dict, scores: dict[int, float], c: dict, balance: int | None,
 
 def table_text(table: list[dict], interest: bool = False) -> str:
     """The pools and picks per category; with interest, the picked per tier (interesting / unknown
-    / not) after each mode's pick."""
+    / not) after each mode's pick; with settings, each category's setting at the end of its line."""
     tiers_w = 22 if interest else 0
     head = f"  {'category':30} {'colour':>16}{'':{tiers_w}}   {'black-and-white':>16}"
     if interest:
@@ -277,6 +437,7 @@ def table_text(table: list[dict], interest: bool = False) -> str:
     for r in table:
         lines.append(f"  {r['cat']:30} {r['color_pool']:7,} -> {r['color']:6,}{tiers_of(r, 'color') if interest else ''}"
                      f"   {r['bw_pool']:7,} -> {r['bw']:6,}{tiers_of(r, 'bw') if interest else ''}"
+                     + (f"   [{r['setting']}]" if r.get("setting") else "")
                      + (f"   {r['note']}" if r["note"] else ""))
     tc, tb = sum(r["color"] for r in table), sum(r["bw"] for r in table)
     lines.append(f"  {'total':30} {'':7} -> {tc:6,}{'':{tiers_w}}   {'':7} -> {tb:6,}{'':{tiers_w}}   ({tc + tb:,} photos)")

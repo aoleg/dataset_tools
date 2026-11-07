@@ -77,7 +77,8 @@ CREATE TABLE IF NOT EXISTS boxes (
     cid INTEGER PRIMARY KEY, model TEXT, vocab TEXT, imgsz INTEGER, time REAL,
     n_person INTEGER, max_person_h REAL, n_face INTEGER, max_face_h REAL,
     n_vehicle INTEGER, max_vehicle_area REAL, max_vehicle_w REAL,
-    max_object_area REAL, max_thing_area REAL, json TEXT);
+    max_object_area REAL, max_thing_area REAL, json TEXT,
+    n_person_20 INTEGER, n_person_08 INTEGER, person_cover REAL);
 CREATE TABLE IF NOT EXISTS niqe (cid INTEGER PRIMARY KEY, version TEXT, score REAL, feat BLOB);
 CREATE TABLE IF NOT EXISTS counters (scope TEXT, name TEXT, value REAL DEFAULT 0, PRIMARY KEY (scope, name));
 CREATE TABLE IF NOT EXISTS runs (
@@ -115,8 +116,10 @@ REGION_COLS = "cid, parent, parents, title_en, title_local, phc, pac, child_len"
 STATUS_COLS = ("cid", "state", "reason", "attempts", "scope", "category", "path", "sha256", "bytes", "width", "height",
                "changed", "mode", "raw")
 BOX_COLS = ("cid", "model", "vocab", "imgsz", "time", "n_person", "max_person_h", "n_face", "max_face_h",
-            "n_vehicle", "max_vehicle_area", "max_vehicle_w", "max_object_area", "max_thing_area", "json")
-BOX_STATS = BOX_COLS[5:-1]        # the derived columns cherrypick reads
+            "n_vehicle", "max_vehicle_area", "max_vehicle_w", "max_object_area", "max_thing_area",
+            "n_person_20", "n_person_08", "person_cover", "json")
+BOX_STATS = BOX_COLS[5:-1]        # the derived columns cherrypick reads (detect.stats_of, refilled from json
+                                  # when detect.DERIVE changes: refill_boxes)
 
 
 def _niqe_row(cid: int, version: str, score, feat) -> tuple:
@@ -153,6 +156,10 @@ class Store:
             self.db.execute("ALTER TABLE status ADD COLUMN export TEXT")
         if "raw" not in status_cols:
             self.db.execute("ALTER TABLE status ADD COLUMN raw TEXT")
+        box_cols = {r[1] for r in self.db.execute("PRAGMA table_info(boxes)")}
+        for col, kind in (("n_person_20", "INTEGER"), ("n_person_08", "INTEGER"), ("person_cover", "REAL")):
+            if col not in box_cols:
+                self.db.execute(f"ALTER TABLE boxes ADD COLUMN {col} {kind}")
         self.set_meta("schema", SCHEMA_VERSION)
         if self.get_meta("kind") == "import":
             import layout as lay
@@ -831,6 +838,34 @@ class Store:
                     if r[0] in cids:
                         out[r[0]] = dict(zip(cols[1:], r[1:]))
         return out
+
+    def refill_boxes(self, derive, version: str, log=print, batch: int = 20000) -> int:
+        """Recompute the derived columns of every boxes row from its JSON with derive(json text) ->
+        {column: value} (detect.stats_from_json), when the store's derivation (meta boxes_derive) is
+        not version; then record version. Rows written by detect meanwhile carry the same columns.
+        -> rows refilled (0: nothing to do)."""
+        if self.get_meta("boxes_derive") == version:
+            return 0
+        cols = BOX_STATS
+        sql = f"UPDATE boxes SET {', '.join(f'{c}=?' for c in cols)} WHERE cid=?"
+        last, n, t0 = -1, 0, time.time()
+        while True:
+            with self.lock:
+                rows = self.db.execute("SELECT cid, json FROM boxes WHERE cid>? ORDER BY cid LIMIT ?",
+                                       (last, batch)).fetchall()
+            if not rows:
+                break
+            vals = []
+            for cid, js in rows:
+                st = derive(js)
+                vals.append(tuple(st[c] for c in cols) + (cid,))
+            self.tx(lambda db: db.executemany(sql, vals))
+            last, n = rows[-1][0], n + len(rows)
+        self.set_meta("boxes_derive", version)
+        if n:
+            log(f"  boxes: the derived columns of {n:,} rows recomputed from their boxes ({version}, "
+                f"{time.time() - t0:.0f} s)")
+        return n
 
     def boxes_row(self, cid: int) -> dict | None:
         """The whole boxes row of a photo, its JSON parsed."""

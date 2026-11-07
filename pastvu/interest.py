@@ -21,14 +21,14 @@ from __future__ import annotations
 import extract as xt
 from conf import InterestConf
 
-RULES = ("vehicle", "people", "group", "thing", "presence", "pass")
+RULES = ("vehicle", "people", "group", "thing", "presence", "life", "street", "pass")
 DEFAULT_RULES = {
     "transport": "vehicle",
-    "people_adult": "people", "people_children": "people", "school": "people",
+    "people_adult": "people", "people_children": "people",
     "group_photo_children": "group", "group_photo_adult": "group",
     "futurism": "thing", "objects": "thing", "military": "thing",
-    "environment_indoors": "presence", "environment_outdoors": "presence",
-}
+    "environment_indoors": "life", "environment_outdoors": "street",
+}                                   # school: pass (the uniform is the subject, and its floor takes them all)
 PASS, UNKNOWN, FAIL = 0, 1, 2
 TIER_NAMES = ("interesting", "unknown", "not")
 
@@ -48,14 +48,23 @@ def passes(rule: str, st: dict, ic: InterestConf) -> bool | None:
     """The rule on one photo's derived columns; None for the rule pass (no gate)."""
     if rule == "vehicle":
         return ic.vehicle_min <= st["max_vehicle_area"] <= ic.vehicle_max and st["max_vehicle_w"] >= ic.vehicle_width
-    if rule == "people":
-        return st["max_person_h"] >= ic.person_height and st["max_face_h"] >= ic.face_height
+    if rule == "people":                # bodies (clothes, activity); a face only when face_height asks
+        body = st["max_person_h"] >= ic.person_height or (
+            ic.people_pair > 0 and (st.get("n_person_20") or 0) >= ic.people_pair)
+        return body and (ic.face_height <= 0 or st["max_face_h"] >= ic.face_height)
     if rule == "group":
         return st["n_person"] >= ic.group_min and st["max_face_h"] >= ic.group_face_height
     if rule == "thing":
         return st["max_thing_area"] >= ic.thing_min
     if rule == "presence":
         return st["n_person"] >= ic.presence_persons and st["n_face"] >= ic.presence_faces
+    if rule == "life":                  # a person of any readable size or a vehicle: not an empty street
+        return ((ic.life_persons > 0 and (st.get("n_person_08") or 0) >= ic.life_persons)
+                or (ic.life_vehicles > 0 and st["n_vehicle"] >= ic.life_vehicles))
+    if rule == "street":                # life in a street: not one pedestrian or a parked car before a facade
+        return ((ic.street_persons > 0 and (st.get("n_person_08") or 0) >= ic.street_persons)
+                or (ic.street_crowd > 0 and st["n_person"] >= ic.street_crowd)
+                or (ic.street_vehicle_area > 0 and st["max_vehicle_area"] >= ic.street_vehicle_area))
     if rule == "pass":
         return None
     raise ValueError(f"unknown interest rule {rule!r}")
