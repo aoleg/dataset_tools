@@ -36,6 +36,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
+import cv2
+import numpy as np
 from PIL import Image, ImageOps
 
 HERE = Path(__file__).resolve().parent
@@ -164,18 +166,25 @@ def load_models(imgsz: int = IMGSZ, download: bool = True, log=print) -> Models:
 
 # --- one image -----------------------------------------------------------------------------
 
-def load_image(path: Path, imgsz: int = IMGSZ) -> Image.Image | None:
-    """The photo EXIF-upright, RGB, reduced to imgsz on the long side (never enlarged: the
-    detector's own letterbox scales a small image up, as the probes had it). None when the
-    file is gone (a reclassify moved it between the listing and the read)."""
+def load_image(path: Path, imgsz: int = IMGSZ) -> np.ndarray | None:
+    """The photo EXIF-upright as a BGR array reduced to imgsz on the long side the way the
+    detector's own letterbox does it (cv2.INTER_LINEAR, no antialiasing), so the network sees
+    the pixels it would see from the full file. That matters: an antialiased downscale (PIL's
+    thumbnail or resize, cv2's INTER_AREA) loses the detections, a person at 0.92 from the full
+    file came back at 0.75 after Lanczos and not at all after PIL's bilinear. A small image is
+    left as it is (the letterbox scales it up). None when the file is gone (a reclassify moved it
+    between the listing and the read)."""
     try:
         with Image.open(path) as im:
             im = ImageOps.exif_transpose(im).convert("RGB")
     except (FileNotFoundError, OSError):
         return None
-    if max(im.size) > imgsz:
-        im.thumbnail((imgsz, imgsz))
-    return im
+    arr = np.asarray(im)[:, :, ::-1]
+    w, h = im.size
+    if max(w, h) > imgsz:
+        r = imgsz / max(w, h)
+        arr = cv2.resize(arr, (round(w * r), round(h * r)), interpolation=cv2.INTER_LINEAR)
+    return np.ascontiguousarray(arr)
 
 
 def _inside(face, person) -> float:
@@ -220,9 +229,9 @@ def boxes_json(boxes: list, faces: list) -> str:
     return json.dumps({"b": boxes, "f": faces}, separators=(",", ":"))
 
 
-def detect_batch(models: Models, images: list[Image.Image]) -> list[tuple[list, list]]:
-    """(boxes, faces) per image: the detector's boxes from STORE_CONF up and the face model's
-    from FACE_CONF up, both as shares of the image, four decimals."""
+def detect_batch(models: Models, images: list[np.ndarray]) -> list[tuple[list, list]]:
+    """(boxes, faces) per image (BGR arrays from load_image): the detector's boxes from STORE_CONF
+    up and the face model's from FACE_CONF up, both as shares of the image, four decimals."""
     if not images:
         return []
     out = []
