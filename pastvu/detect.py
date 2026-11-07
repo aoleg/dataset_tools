@@ -173,11 +173,16 @@ def load_image(path: Path, imgsz: int = IMGSZ) -> np.ndarray | None:
     thumbnail or resize, cv2's INTER_AREA) loses the detections, a person at 0.92 from the full
     file came back at 0.75 after Lanczos and not at all after PIL's bilinear. A small image is
     left as it is (the letterbox scales it up). None when the file is gone (a reclassify moved it
-    between the listing and the read)."""
+    between the listing and the read) or cannot be decoded; a corrupt EXIF block (one photo in the
+    first 100,000 of the base) only loses the orientation."""
     try:
         with Image.open(path) as im:
-            im = ImageOps.exif_transpose(im).convert("RGB")
-    except (FileNotFoundError, OSError):
+            try:
+                im = ImageOps.exif_transpose(im)
+            except Exception:  # noqa: BLE001 - a corrupt EXIF block (Pillow re-serialises it): the pixels as stored
+                im.load()
+            im = im.convert("RGB")
+    except Exception:  # noqa: BLE001 - missing, unreadable or truncated: no row, listed again by the next run
         return None
     arr = np.asarray(im)[:, :, ::-1]
     w, h = im.size
