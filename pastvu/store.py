@@ -20,6 +20,14 @@ scope in it.
   score and the 72 block-feature statistics the quality rule may read, marked
   with niqe.VERSION. Written with the photo by the stream, or later by the
   niqe command; a reprocess --downscale drops it, the file having changed.
+- hashes: the perceptual hashes of the saved picture, for deduplicate
+  (copies.py): pHash and dHash of the picture and of its mirror image as
+  signed 64-bit integers, the luma spread and the colourfulness, by the
+  deduplicate tool's recipe, marked with copies.HASH_VERSION. A reprocess
+  --downscale drops the row, as for niqe.
+- dedupe_runs, dedupe_moves: what deduplicate moved out to <base>_duplicates
+  (the copy, the photo kept, the rule, the path before and in the folder),
+  for --undo. A moved copy is skipped with the reason "copy of <keeper>".
 - counters: per-scope totals for the reports.
 - reclass_runs, reclass_moves: what reclassify moved, for --undo.
 - review, reviewed: cleanup. review lists the photos moved into the review
@@ -80,6 +88,14 @@ CREATE TABLE IF NOT EXISTS boxes (
     max_object_area REAL, max_thing_area REAL, json TEXT,
     n_person_20 INTEGER, n_person_08 INTEGER, person_cover REAL);
 CREATE TABLE IF NOT EXISTS niqe (cid INTEGER PRIMARY KEY, version TEXT, score REAL, feat BLOB);
+CREATE TABLE IF NOT EXISTS hashes (
+    cid INTEGER PRIMARY KEY, version TEXT, phash INTEGER, dhash INTEGER, phash_m INTEGER, dhash_m INTEGER,
+    luma_std REAL, colour REAL);
+CREATE TABLE IF NOT EXISTS dedupe_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, started REAL, args TEXT, moved INTEGER DEFAULT 0, undone REAL);
+CREATE TABLE IF NOT EXISTS dedupe_moves (
+    run INTEGER, seq INTEGER, cid INTEGER, keeper INTEGER, rule TEXT, scope TEXT, src TEXT, dst TEXT,
+    PRIMARY KEY (run, seq)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS counters (scope TEXT, name TEXT, value REAL DEFAULT 0, PRIMARY KEY (scope, name));
 CREATE TABLE IF NOT EXISTS runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT, scope TEXT, started REAL, ended REAL, args TEXT, done INTEGER,
@@ -120,6 +136,7 @@ BOX_COLS = ("cid", "model", "vocab", "imgsz", "time", "n_person", "max_person_h"
             "n_person_20", "n_person_08", "person_cover", "json")
 BOX_STATS = BOX_COLS[5:-1]        # the derived columns cherrypick reads (detect.stats_of, refilled from json
                                   # when detect.DERIVE changes: refill_boxes)
+HASH_COLS = ("phash", "dhash", "phash_m", "dhash_m", "luma_std", "colour")
 
 
 def _niqe_row(cid: int, version: str, score, feat) -> tuple:
@@ -572,7 +589,8 @@ class Store:
                            "sha256=NULL, bytes=NULL, width=NULL, height=NULL, changed=NULL, mode=NULL, raw=NULL, "
                            "updated=? WHERE cid=?",
                            (PENDING, time.time(), cid))
-                for t in ("records", "embeddings", "boxes", "niqe", "captions", "caption_fails", "caption_log"):
+                for t in ("records", "embeddings", "boxes", "niqe", "hashes", "captions", "caption_fails",
+                          "caption_log"):
                     db.execute(f"DELETE FROM {t} WHERE cid=?", (cid,))
         self.tx(work)
 
@@ -754,6 +772,7 @@ class Store:
                        (path, width, height, size, sha256, json.dumps(changed), time.time(), cid))
             db.execute("INSERT OR REPLACE INTO records (cid, json) VALUES (?, ?)", (cid, record))
             db.execute("DELETE FROM niqe WHERE cid=?", (cid,))          # scored again from the new file
+            db.execute("DELETE FROM hashes WHERE cid=?", (cid,))        # hashed again from the new file
         self.tx(work)
 
     def oversized_rows(self, scopes: list[str] | None, area: int) -> list[tuple]:
@@ -885,22 +904,32 @@ class Store:
         self.tx(lambda db: db.executemany("INSERT OR REPLACE INTO niqe (cid, version, score, feat) VALUES (?,?,?,?)",
                                           [_niqe_row(*r) for r in rows]))
 
-    def niqe_pending(self, scope: str, prefix: str, version: str, redo: bool = False) -> list[tuple[int, str]]:
-        """(cid, path) of the photos saved under the scope and the folder prefix that have no niqe row of
-        this version (every saved photo with redo), in cid order."""
+    def _saved_without(self, table: str, scope: str, prefix: str, version: str, redo: bool) -> list[tuple[int, str]]:
+        """(cid, path) of the photos saved under the scope and the folder prefix that have no row of
+        this version in the table (every saved photo with redo), in cid order."""
         with self.lock:
             rows = self.db.execute(
-                "SELECT s.cid, s.path FROM status s LEFT JOIN niqe n ON n.cid=s.cid WHERE s.state=? AND s.scope=? "
+                f"SELECT s.cid, s.path FROM status s LEFT JOIN {table} n ON n.cid=s.cid WHERE s.state=? AND s.scope=? "
                 "AND s.path IS NOT NULL AND (? OR n.cid IS NULL OR n.version<>?) ORDER BY s.cid",
                 (DONE, scope, int(redo), version)).fetchall()
         return [(cid, path) for cid, path in rows if path.startswith(prefix)]
 
-    def niqe_count(self, scope: str, version: str) -> dict:
-        """{"saved": photos of the scope, "scored": of them with a niqe row of this version}."""
+    def _saved_with(self, table: str, scope: str, version: str) -> tuple[int, int]:
+        """(photos saved under the scope, of them with a row of this version in the table)."""
         with self.lock:
             saved = self.db.execute("SELECT COUNT(*) FROM status WHERE state=? AND scope=?", (DONE, scope)).fetchone()[0]
-            scored = self.db.execute("SELECT COUNT(*) FROM status s JOIN niqe n ON n.cid=s.cid WHERE s.state=? "
-                                     "AND s.scope=? AND n.version=?", (DONE, scope, version)).fetchone()[0]
+            have = self.db.execute(f"SELECT COUNT(*) FROM status s JOIN {table} n ON n.cid=s.cid WHERE s.state=? "
+                                   "AND s.scope=? AND n.version=?", (DONE, scope, version)).fetchone()[0]
+        return saved, have
+
+    def niqe_pending(self, scope: str, prefix: str, version: str, redo: bool = False) -> list[tuple[int, str]]:
+        """(cid, path) of the photos saved under the scope and the folder prefix that have no niqe row of
+        this version (every saved photo with redo), in cid order."""
+        return self._saved_without("niqe", scope, prefix, version, redo)
+
+    def niqe_count(self, scope: str, version: str) -> dict:
+        """{"saved": photos of the scope, "scored": of them with a niqe row of this version}."""
+        saved, scored = self._saved_with("niqe", scope, version)
         return {"saved": saved, "scored": scored}
 
     def niqe_rows(self, cids, version: str) -> dict[int, tuple[float, np.ndarray] | None]:
@@ -918,6 +947,86 @@ class Store:
                     if cid in cids:
                         out[cid] = None if score is None else (score, np.frombuffer(feat, np.float16).astype(np.float32))
         return out
+
+    # --- hashes (deduplicate) ------------------------------------------------------------
+
+    def save_hashes(self, rows: list[tuple]) -> None:
+        """(cid, version, phash, dhash, phash_m, dhash_m, luma_std, colour) rows in one transaction, the
+        hashes as signed 64-bit integers; a row replaces the photo's old one."""
+        self.tx(lambda db: db.executemany(
+            "INSERT OR REPLACE INTO hashes (cid, version, phash, dhash, phash_m, dhash_m, luma_std, colour) "
+            "VALUES (?,?,?,?,?,?,?,?)", rows))
+
+    def hashes_pending(self, scope: str, prefix: str, version: str, redo: bool = False) -> list[tuple[int, str]]:
+        """(cid, path) of the photos saved under the scope and the folder prefix that have no hashes row
+        of this version (every saved photo with redo), in cid order."""
+        return self._saved_without("hashes", scope, prefix, version, redo)
+
+    def hashes_count(self, scope: str, version: str) -> dict:
+        """{"saved": photos of the scope, "hashed": of them with a hashes row of this version}."""
+        saved, hashed = self._saved_with("hashes", scope, version)
+        return {"saved": saved, "hashed": hashed}
+
+    def hash_rows(self, version: str) -> dict[str, np.ndarray]:
+        """The hashes rows of this version of every saved photo, in cid order, as arrays: "cid" (int64),
+        "phash", "dhash", "phash_m", "dhash_m" (uint64: the stored signed values read back as unsigned),
+        "luma_std" and "colour" (float32)."""
+        with self.lock:
+            rows = self.db.execute(                      # sorted below: no ORDER BY, no temp B-tree
+                "SELECT h.cid, h.phash, h.dhash, h.phash_m, h.dhash_m, h.luma_std, h.colour FROM hashes h "
+                "JOIN status s ON s.cid=h.cid WHERE s.state=? AND h.version=?", (DONE, version)).fetchall()
+        rows.sort()
+        ints = np.array([r[:5] for r in rows], np.int64).reshape(-1, 5)
+        floats = np.array([r[5:] for r in rows], np.float32).reshape(-1, 2)
+        out = {"cid": ints[:, 0].copy()}
+        for i, k in enumerate(HASH_COLS[:4], 1):
+            out[k] = ints[:, i].view(np.uint64)
+        out["luma_std"], out["colour"] = floats[:, 0].copy(), floats[:, 1].copy()
+        return out
+
+    def dedupe_start(self, args: dict) -> int:
+        """A new deduplicate run; -> its id."""
+        def work(db):
+            return db.execute("INSERT INTO dedupe_runs (started, args) VALUES (?, ?)",
+                              (time.time(), json.dumps(args, ensure_ascii=False))).lastrowid
+        return self.tx(work)
+
+    def dedupe_move(self, run: int, seq: int, cid: int, keeper: int, rule: str, scope: str, src: str, dst: str,
+                    reason: str) -> None:
+        """A copy moved out: logged, and skipped with the reason, in one transaction."""
+        def work(db):
+            db.execute("INSERT INTO dedupe_moves (run, seq, cid, keeper, rule, scope, src, dst) "
+                       "VALUES (?,?,?,?,?,?,?,?)", (run, seq, cid, keeper, rule, scope, src, dst))
+            db.execute("UPDATE status SET state=?, reason=?, path=NULL, updated=? WHERE cid=?",
+                       (SKIPPED, reason, time.time(), cid))
+            db.execute("UPDATE dedupe_runs SET moved=moved+1 WHERE id=?", (run,))
+        self.tx(work)
+
+    def dedupe_last(self) -> dict | None:
+        """The newest deduplicate run that moved something and is not undone."""
+        with self.lock:
+            row = self.db.execute("SELECT id, started, args, moved FROM dedupe_runs WHERE undone IS NULL AND moved>0 "
+                                  "ORDER BY id DESC LIMIT 1").fetchone()
+        return None if row is None else {"id": row[0], "started": row[1], "args": json.loads(row[2] or "{}"),
+                                         "moved": row[3]}
+
+    def dedupe_moves(self, run: int) -> list[tuple]:
+        """(seq, cid, keeper, rule, scope, src, dst) of a run, in order."""
+        with self.lock:
+            return self.db.execute("SELECT seq, cid, keeper, rule, scope, src, dst FROM dedupe_moves WHERE run=? "
+                                   "ORDER BY seq", (run,)).fetchall()
+
+    def dedupe_restore(self, cid: int, path: str, record: str | None) -> None:
+        """A moved copy is back in the base at path: done again."""
+        def work(db):
+            db.execute("UPDATE status SET state=?, reason='', path=?, updated=? WHERE cid=?",
+                       (DONE, path, time.time(), cid))
+            if record is not None:
+                db.execute("UPDATE records SET json=? WHERE cid=?", (record, cid))
+        self.tx(work)
+
+    def dedupe_undone(self, run: int) -> None:
+        self.tx(lambda db: db.execute("UPDATE dedupe_runs SET undone=? WHERE id=?", (time.time(), run)))
 
     # --- counters and runs -------------------------------------------------------------
 

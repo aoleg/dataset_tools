@@ -187,6 +187,9 @@ run.bat captions <scope> [...] [--txt-fields LIST] [--dry-run]
 run.bat autocaption <scope or folder> [...] [--limit N] [--recaption] [--undo]
 run.bat niqe [<scope or folder> ...] [--follow] [--redo] [--limit N]
 run.bat detect [<scope or folder> ...] [--follow] [--redo] [--limit N]
+run.bat deduplicate [<scope or folder> ...] [--dry-run [--review [N]]] [--min-cos 0.90] [--features off|report|copies]
+run.bat deduplicate --report <groups file> [--dry-run] | --undo
+run.bat deduplicate [<scope or folder> ...] --hashes-only [--redo] [--limit N]
 run.bat export <scope> [...] [--format jsonl|parquet]
 run.bat import --dataset <folder> [-o <folder>] [--against <base>] [--top color|category|none] [--quality-threshold X] [--split N] [--limit N]
 run.bat --base <import folder> reclassify [--dry-run] [--yes]
@@ -274,7 +277,7 @@ A run downloads a **scope**: regions and years. Its name is the aliases (or regi
 
 **A photo is downloaded once per base folder.** The store at `<base>\pastvu.db` is shared by every scope, so a photo already saved under one scope (Minsk) is not downloaded again for another (Belarus); the report counts it as already saved under another scope, and `scopes` shows how many there are.
 
-**One command at a time changes a base folder.** The store holds a lock. A second download into the same base folder stops at the start with the name of the command that holds the lock (`run --raw`, `run --pull` and `pull` are downloads to the lock), and so does a `regroup`, `drop` or `reclassify` while anything else runs. `autocaption`, `captions`, `niqe` and `detect` can run beside a download. A lock left by a process that no longer runs is taken over.
+**One command at a time changes a base folder.** The store holds a lock. A second download into the same base folder stops at the start with the name of the command that holds the lock (`run --raw`, `run --pull` and `pull` are downloads to the lock), and so does a `regroup`, `drop` or `reclassify` while anything else runs. `autocaption`, `captions`, `niqe`, `detect`, and `deduplicate --hashes-only` or `--dry-run` can run beside a download. A lock left by a process that no longer runs is taken over.
 
 ## Splitting and regrouping
 
@@ -579,6 +582,38 @@ Each photo gets one row in the store's `boxes` table: the counted persons and th
 
 `install.bat` fetches the two models into `models\` and makes the prompt embeddings of the word list once (the text encoder, 254 MB, is needed for that and for nothing else); `detect.py --fetch-models` does the same by hand.
 
+## Copies of one photo: `deduplicate`
+
+```
+run.bat deduplicate --dry-run --review 100
+run.bat deduplicate --report <base>\_reports\deduplicate-<time>-groups.jsonl
+run.bat deduplicate
+run.bat deduplicate --undo
+run.bat deduplicate "estonia_*" --dry-run
+run.bat deduplicate --hashes-only
+```
+
+PastVu holds some photos more than once: users uploaded the same picture again, at another size, from another scan, or mirrored. `deduplicate` finds these copies inside the base. Its first step stores the perceptual hashes of every saved photo in the store's `hashes` table: pHash and dHash of the picture and of its mirror image, the brightness spread and the colourfulness. The recipe is the one of the [deduplicate tool](../deduplicate), so both tools give the same hashes for the same file. The checksum of each file is already in the store and is not computed again.
+
+The hash pass reads the saved photos that have no row, with 12 threads, about 330 photos per second beside a running download (about 50 minutes for a million photos). A plain `deduplicate` hashes the photos that have no row first, so a new download needs no separate `--hashes-only`. It changes no file and holds the lock in the shared mode, so it can run beside a download. `--redo` hashes every photo again. Ctrl+C stops at once; the rows written so far stay, and the same command continues with the rest. A photo whose file is missing or cannot be read gets no row, so the next run tries it again. A rewrite by `reprocess --downscale` deletes the row. The rows carry the version of the recipe (`dh1-256`); after a change of the recipe, every photo is hashed again.
+
+**How a copy is found.** The SigLIP embeddings alone cannot tell a copy: in a base of historic photos, two thirds of the photos have a neighbour at cosine 0.90 or more, and most neighbours at 0.96 to 0.98 are other frames of the same film roll. So the embeddings only propose the pairs, and the hashes decide:
+
+1. Candidates: the 10 nearest photos of each saved photo by the cosine of their embeddings, at 0.90 or more (`--neighbours`, `--min-cos`). On the GPU this takes about a minute for a million photos.
+2. Two files with the same checksum are copies.
+3. A pair is not a copy when one picture is almost uniform, or when one is clearly in colour and the other is not (a coloured postcard and its black-and-white original are two pictures).
+4. The strict hash rule of the deduplicate tool (pHash distance 8 or less and dHash distance 10 or less) makes a copy: on the pictures as they are, or on one of them mirrored (a negative scanned from the wrong side).
+5. A pair whose hashes are near (both distances 22 or less) but not that near goes to the feature test of the deduplicate tool: ORB keypoints, a homography, and the centre of one picture warped onto the other. On a base of a million photos the test passed 8,120 of 73,398 such pairs, and a sample showed that it also passes other frames of the same scene taken from a tripod, and two photos of one building taken at different times. So by default a pass is not a copy: a dry run tests these pairs and lists them for a look (`--features report`), a run that moves does not test them (`--features off`), and `--features copies` makes a pass a copy.
+6. Any other pair is not a copy, whatever its cosine.
+
+The copies that match each other form a group. The copy kept is the one the deduplicate tool would keep: the largest training bucket the picture reaches (1024, 768, 512), then the score of its detail and JPEG blocking at that size. A copy with painted-out watermarks gives way to one without. When two copies score the same, the larger picture is kept, then the one with the lower number (the earlier upload).
+
+**The dry run.** `--dry-run` finds the copies and moves nothing. It writes three files to `<base>\_reports`: `deduplicate-<time>-groups.jsonl` (one line per group: every copy with its folder, size, PastVu title and year, score, the copy kept and why, and the matching pairs), `deduplicate-<time>-window.jsonl` (every pair of the feature test with its numbers) and `deduplicate-<time>-summary.json` (the counts per cosine band and per rule). `--review` also makes a folder next to the base, `<base>_duplicates_review`, with hard links for a look by eye: `g<group>_<rule>_K_<number>` is the copy kept and `D` a copy that would go; `w<n>_<pass|fail>_<inliers>_<ncc>_<number>` are pairs of the feature test. `--review 100` takes 100 random groups of each rule and 100 random pairs of the feature test. The next `--review` replaces the folder. With scopes or folders given, every saved photo is still a candidate, but only the copies inside them go.
+
+**Moving the copies out.** Without `--dry-run`, deduplicate finds the copies and moves every copy that is not kept out of the base, into `<base>_duplicates` next to it, at the same path as in the base, with every file of its name (captions, JSON). The store marks it skipped (`copy of <number kept>`), so no run downloads it again, and its export links are deleted. The folder carries the dataset tools' mark, so the other tools never scan it. `--report <groups file>` moves the groups of an earlier dry run instead of finding them again: the copies kept are the ones you looked at. The groups are built again from the report's pairs of the kinds that count, so a group that held a pair of the feature test is split at it. Moving needs the base for itself: it stops at the start while a download or another command that changes the base runs. A dry run does not.
+
+`--undo` puts back the copies of the last run: each image still in `<base>_duplicates` goes back into its category, is saved again in the store and is linked into the export again. An image you deleted from `<base>_duplicates` stays skipped. Delete the folder when you no longer want an undo.
+
 ## Cherrypick: a training set by quality
 
 ```
@@ -776,6 +811,7 @@ Each record carries what attribution and a takedown need: the PastVu page, the u
 | `colour.py` | the black-and-white or colour test, and the probe for borderline photos |
 | `quality.py` | the quality probe: low-quality photos are skipped, or deleted by reclassify |
 | `niqe.py`, `niqe_pris_params.npz`, `NIQE_NOTICE.txt` | NIQE at the training resolution on the GPU, and the `niqe` command. The parameters are those of the NIQE release of LIVE, The University of Texas at Austin, in BasicSR's file (Apache-2.0); `NIQE_NOTICE.txt` holds both notices |
+| `copies.py` | `deduplicate`: the perceptual hashes of the saved photos, and the copies found by embeddings and hashes |
 | `folders.py` | finding and moving files, and the move of a category into numbered folders |
 | `runlock.py` | whether the process that holds the lock still runs |
 | `layout.py` | scope names, the folder tree, and the numbered-folder allocator |

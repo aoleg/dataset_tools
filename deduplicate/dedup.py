@@ -375,7 +375,10 @@ def score_file(path: str) -> dict:
         with Image.open(path) as im:
             qtables = getattr(im, "quantization", None)
             fmt = im.format or ""
-            img = to_rgb(ImageOps.exif_transpose(im))
+            try:
+                img = to_rgb(ImageOps.exif_transpose(im))
+            except Exception:  # noqa: BLE001 - a corrupt EXIF block (Pillow re-serialises it): the pixels as stored
+                img = to_rgb(im)
         w, h = img.size
         family = assign_family(w / h)
         fit = assign_tier(w, h, family)
@@ -427,32 +430,51 @@ def colourfulness(img: Image.Image) -> float:
     return math.sqrt(total)
 
 
-def hash_file(path: str) -> dict:
+def image_hashes(im: Image.Image, mirror: bool = False) -> dict:
+    """Size, animation flag and the hashes of an opened image, as hash_file stores
+    them: the upright size, pHash and dHash of the 256 px luma (JPEG decoded at
+    reduced scale), the luma spread of a 32x32 BOX copy and the colourfulness.
+    mirror: also "phash_m" and "dhash_m", the hashes of the luma mirrored left to
+    right (the pastvu tool matches a negative scanned from the wrong side). The
+    image is decoded here; the caller closes it."""
     import imagehash
+    w, h = im.size
+    try:
+        orientation = im.getexif().get(274, 1) or 1
+    except Exception:  # noqa: BLE001
+        orientation = 1
+    animated = (getattr(im, "n_frames", 1) or 1) > 1
+    im.draft("RGB", (512, 512))          # JPEG: decode at reduced scale
+    try:
+        img = to_rgb(ImageOps.exif_transpose(im))
+    except Exception:  # noqa: BLE001 - a corrupt EXIF block (Pillow re-serialises it): the pixels as stored
+        img = to_rgb(im)
+        orientation = 1
+    if orientation in (5, 6, 7, 8):
+        w, h = h, w
+    img.thumbnail((256, 256), Image.LANCZOS)
+    luma = img.convert("L")
+    out = {
+        "w": w, "h": h, "animated": animated,
+        "phash": str(imagehash.phash(luma)), "dhash": str(imagehash.dhash(luma)),
+        "luma_std": round(float(np.asarray(luma.resize((32, 32), Image.BOX), dtype=np.float32).std()), 2),
+        "colour": round(colourfulness(img), 2),
+    }
+    if mirror:
+        flipped = ImageOps.mirror(luma)
+        out["phash_m"] = str(imagehash.phash(flipped))
+        out["dhash_m"] = str(imagehash.dhash(flipped))
+    return out
+
+
+def hash_file(path: str) -> dict:
     try:
         sha = hashlib.sha256()
         with open(path, "rb") as f:
             for chunk in iter(lambda: f.read(1 << 20), b""):
                 sha.update(chunk)
         with Image.open(path) as im:
-            w, h = im.size
-            try:
-                orientation = im.getexif().get(274, 1) or 1
-            except Exception:  # noqa: BLE001
-                orientation = 1
-            animated = (getattr(im, "n_frames", 1) or 1) > 1
-            im.draft("RGB", (512, 512))          # JPEG: decode at reduced scale
-            img = to_rgb(ImageOps.exif_transpose(im))
-        if orientation in (5, 6, 7, 8):
-            w, h = h, w
-        img.thumbnail((256, 256), Image.LANCZOS)
-        luma = img.convert("L")
-        return {
-            "sha256": sha.hexdigest(), "w": w, "h": h, "animated": animated,
-            "phash": str(imagehash.phash(luma)), "dhash": str(imagehash.dhash(luma)),
-            "luma_std": round(float(np.asarray(luma.resize((32, 32), Image.BOX), dtype=np.float32).std()), 2),
-            "colour": round(colourfulness(img), 2),
-        }
+            return {"sha256": sha.hexdigest(), **image_hashes(im)}
     except Exception as ex:  # noqa: BLE001
         return {"error": f"{type(ex).__name__}: {ex}"}
 

@@ -68,7 +68,8 @@ UKRAINE_PRESETS = [          # name, regions, comment
 
 # --- setup -------------------------------------------------------------------------------
 
-IMPORT_COMMANDS = ("reclassify", "cleanup", "cherrypick", "autocaption", "scopes", "reprocess", "niqe", "detect")
+IMPORT_COMMANDS = ("reclassify", "cleanup", "cherrypick", "autocaption", "scopes", "reprocess", "niqe", "detect",
+                   "deduplicate")
 IMPORT_TOPS = ("color", "category", "none")
 # The options of the processing: a raw run (run --raw) refuses them, since it processes nothing.
 RAW_REFUSES = ("samples", "no_classify", "min_confidence", "priority_margin", "patches", "png", "no_watermark",
@@ -1241,6 +1242,104 @@ def cmd_niqe(args, conf, client) -> int:
     return 0
 
 
+def cmd_deduplicate(args, conf, client) -> int:
+    """deduplicate [target ...]: copies of one photo inside the base (copies.py). First the hashes of
+    the saved photos that have no row of the current version, then the copies, then the moves.
+    Shared lock while it only reads (--hashes-only, --dry-run): it runs beside run, pull, import,
+    niqe and detect. Moving and --undo take the lock for themselves."""
+    import copies
+    from progress import Display
+    if args.undo and (args.dry_run or args.report or args.target or args.hashes_only):
+        raise SystemExit("--undo puts back the last deduplicate run of the whole base; give it alone")
+    if args.report and (args.target or args.hashes_only):
+        raise SystemExit("--report moves the groups of that report; give no scopes or --hashes-only with it")
+    features = args.features or ("report" if args.dry_run else "off")
+    kinds = copies.KINDS if features == "copies" else copies.SURE_KINDS
+    base, store = open_base(args, conf)
+    reads_only = args.hashes_only or args.dry_run
+    log = lambda text: print(text, flush=True)          # noqa: E731
+
+    def exporter_of():
+        import liveexport as lx
+        if not lx.Exporter.exists_for(store):
+            return None
+        return lx.Exporter(store, base, conf.split, order=export_layout_of(conf))
+
+    def move(groups, how):
+        n = sum(1 for g in groups if g["keeper"] is not None for m in g["members"] if m.get("copy"))
+        rules = Counter(g["rule"] for g in groups if g["keeper"] is not None for m in g["members"] if m.get("copy"))
+        print(f"{len(groups):,} groups ({how}; pairs: {', '.join(kinds)}): {n:,} copies to move ("
+              + ", ".join(f"{v:,} {k}" for k, v in rules.items()) + ")", flush=True)
+        if args.dry_run:
+            print("Dry run: nothing moved.")
+            return 0
+        res = copies.apply(store, base, groups, {"how": how, "kinds": list(kinds), "targets": args.target or None},
+                           exporter=exporter_of(), log=log)
+        print(f"Moved {res['moved']:,} copies to {res['folder']} (run {res['run']}); "
+              f"{res['missing']:,} not found where the store says, {res['failed']:,} failed. "
+              f"`deduplicate --undo` puts them back.")
+        return 0
+
+    if args.undo:
+        with locked(store, "deduplicate"):
+            res = copies.undo(store, base, exporter=exporter_of(), log=log)
+        print(f"Undid deduplicate run {res['run']}: {res['back']:,} copies put back, {res['gone']:,} deleted from "
+              f"{res['folder']} by hand stay skipped, {res['stuck']:,} could not be put back")
+        return 0
+    if args.report:
+        with locked(store, "deduplicate", "shared" if args.dry_run else "exclusive"):
+            return move(copies.groups_from_report(Path(args.report), kinds), f"from {Path(args.report).name}")
+
+    targets_of = caption_targets(base, store, args.target) if args.target else [(sc, "") for sc in store.scopes()]
+    if not targets_of:
+        print(f"{base} has no scopes yet")
+        return 0
+    with locked(store, "deduplicate", "shared" if reads_only else "exclusive"):
+        targets, saved, hashed = [], 0, 0
+        for sc, prefix in targets_of:
+            rows = store.hashes_pending(sc["name"], prefix, copies.HASH_VERSION, redo=args.redo)
+            targets += rows
+            if prefix:
+                print(f"{prefix.rstrip('/')}: {len(rows):,} saved photos to hash")
+                continue
+            c = store.hashes_count(sc["name"], copies.HASH_VERSION)
+            saved, hashed = saved + c["saved"], hashed + c["hashed"]
+            if args.target:
+                print(f"{sc['name']}: {c['saved']:,} saved photos, {c['hashed']:,} hashed; {len(rows):,} to hash")
+        if not args.target:
+            print(f"{base}: {saved:,} saved photos in {len(targets_of)} scopes, {hashed:,} hashed "
+                  f"({copies.HASH_VERSION}); {len(targets):,} to hash")
+        if args.limit is not None:
+            targets = targets[:max(0, args.limit)]
+        if targets:
+            print(f"  hashing with {args.threads} threads", flush=True)
+            mode = "json" if args.json_progress else "quiet" if args.quiet else "live"
+            with Display(len(targets), 0, mode) as d:
+                res = copies.hash_photos(store, base, targets, d, args.report_every, args.threads)
+            if res.get("stopped"):
+                return 1
+        if args.hashes_only:
+            return 0
+        import process  # noqa: F401 - puts the classify folder on sys.path
+        import classify as cl
+        in_targets = None
+        if args.target:
+            in_targets = {cid for sc, prefix in targets_of
+                          for cid, _ in store.hashes_pending(sc["name"], prefix, copies.HASH_VERSION, redo=True)}
+            print(f"  copies of {len(in_targets):,} saved photos in the targets, among the whole base")
+        review = False if args.review is None else None if args.review <= 0 else args.review
+        print(f"Finding the copies: the {args.neighbours} nearest photos of each at cosine {args.min_cos:g} or more; "
+              f"feature test {features}", flush=True)
+        summary = copies.find(store, base, cl.MODEL_REPO, args.patches, targets=in_targets, min_cos=args.min_cos,
+                              k=args.neighbours, features=features != "off", threads=args.threads, review=review,
+                              copy_kinds=kinds, log=log)
+        print(copies.summary_text(summary))
+        if args.dry_run:
+            print(f"Dry run: nothing moved ({summary['minutes']:.1f} min).")
+            return 0
+        return move(copies.groups_from_report(Path(summary["reports"]["groups"]), kinds), "found now")
+
+
 def cmd_detect(args, conf, client) -> int:
     """detect [target ...]: boxes rows for the saved photos that have none of the current vocabulary
     (detect.py). Shared lock: it runs beside run, pull, import, niqe and autocaption."""
@@ -2222,6 +2321,35 @@ def parse_args(argv=None):
     p.add_argument("--quiet", action="store_true", help="report blocks only, no live display")
     p.add_argument("--json-progress", action="store_true", help="one JSON line per photo on stdout")
 
+    p = sub.add_parser("deduplicate", help="copies of one photo inside the base, by their hashes and embeddings "
+                                            "(the hash pass runs beside a download)")
+    p.add_argument("target", nargs="*", metavar="SCOPE|FOLDER",
+                   help="a scope's name or name pattern, or its folder or any folder inside it (default: every scope)")
+    p.add_argument("--hashes-only", action="store_true", help="hash the saved photos that have no hashes, nothing else")
+    p.add_argument("--dry-run", action="store_true",
+                   help="find the copies and write the report to <base>/_reports, move nothing")
+    p.add_argument("--review", type=int, nargs="?", const=0, metavar="N",
+                   help="hard links of the groups next to the base (<base>_duplicates_review): N random groups "
+                        "per rule and N pairs of the feature window, or all without N")
+    p.add_argument("--min-cos", type=float, default=0.90, metavar="X",
+                   help="candidate pairs at this cosine or more (default 0.90)")
+    p.add_argument("--neighbours", type=int, default=10, metavar="N", help="nearest photos per photo (default 10)")
+    p.add_argument("--features", choices=("off", "report", "copies"),
+                   help="the feature test of the pairs in the hash window: off; report (tested and listed, never "
+                        "copies; the default of --dry-run); copies (a pass makes a copy). Default off when moving")
+    p.add_argument("--report", metavar="FILE",
+                   help="move the groups of an earlier dry run (its deduplicate-<time>-groups.jsonl) instead of "
+                        "finding them again; the pairs of the feature test count only with --features copies")
+    p.add_argument("--undo", action="store_true", help="put back the copies of the last deduplicate run")
+    p.add_argument("--patches", type=int, default=576, metavar="N", help="the embeddings of this patch budget (576)")
+    p.add_argument("--redo", action="store_true", help="hash every saved photo again, also those with a row")
+    p.add_argument("--limit", type=int, metavar="N", help="hash at most N photos in this run")
+    p.add_argument("--threads", type=int, default=12, metavar="N",
+                   help="reading, hashing, feature-test and scoring threads (default 12)")
+    p.add_argument("--report-every", type=int, default=50000, metavar="N", help="a report block every N photos")
+    p.add_argument("--quiet", action="store_true", help="report blocks only, no live display")
+    p.add_argument("--json-progress", action="store_true", help="one JSON line per photo on stdout")
+
     p = sub.add_parser("detect", help="box statistics of the saved photos (persons, faces, vehicles, objects) for "
                                        "cherrypick --interest (beside a download)")
     p.add_argument("target", nargs="*", metavar="SCOPE|FOLDER",
@@ -2344,7 +2472,8 @@ def main(argv=None) -> int:
                 "reclassify": cmd_reclassify,
                 "export": cmd_export, "autocaption": cmd_autocaption, "regroup": cmd_regroup, "drop": cmd_drop,
                 "extract": cmd_extract, "import": cmd_import, "cleanup": cmd_cleanup,
-                "cherrypick": cmd_cherrypick, "niqe": cmd_niqe, "detect": cmd_detect}
+                "cherrypick": cmd_cherrypick, "niqe": cmd_niqe, "detect": cmd_detect,
+                "deduplicate": cmd_deduplicate}
         return cmds[args.cmd](args, conf, client)
     finally:
         client.close()

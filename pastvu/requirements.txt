@@ -12,3 +12,5 @@ nvidia-ml-py>=12.0
 # file Pillow cannot identify, demands pi-heif; without it the check runs
 # pip install inside the venv in the middle of the run
 pi-heif>=0.22
+# the perceptual hashes of deduplicate, by the deduplicate tool's recipe
+imagehash>=4.3
