@@ -71,6 +71,10 @@ UKRAINE_PRESETS = [          # name, regions, comment
 IMPORT_COMMANDS = ("reclassify", "cleanup", "cherrypick", "autocaption", "scopes", "reprocess", "niqe", "detect",
                    "deduplicate")
 IMPORT_TOPS = ("color", "category", "none")
+# A shared pick (share, replica.py): run rebuilds it; the options it takes are the pace ones.
+REPLICA_COMMANDS = ("run",)
+REPLICA_OPTIONS = ("limit", "retries", "report_every", "quiet", "json_progress", "fetchers", "read_timeout",
+                   "image_deadline", "prepare_workers")
 # The options of the processing: a raw run (run --raw) refuses them, since it processes nothing.
 RAW_REFUSES = ("samples", "no_classify", "min_confidence", "priority_margin", "patches", "png", "no_watermark",
                "wm_conf", "wm_paint_conf", "wm_mode", "no_borders", "no_dark", "txt_fields", "json_sidecar", "depth",
@@ -98,6 +102,14 @@ def open_base(args, conf: cf.Conf) -> tuple[Path, Store]:
     base = Path(args.base).resolve() if getattr(args, "base", None) else conf.need_base()
     base.mkdir(parents=True, exist_ok=True)
     store = Store(base / DB_NAME)
+    if store.get_meta("kind") == "replica":
+        if args.cmd not in REPLICA_COMMANDS:
+            raise SystemExit(f"{base} is a shared pick ({store.get_meta('replica_name')}); {args.cmd} does not work "
+                             f"on it. run.bat run downloads and rebuilds its photos.")
+        import replica as rp
+        rp.check_format(store)
+        rp.ensure_schema(store.db)
+        return base, store
     if store.is_import:
         if args.cmd not in IMPORT_COMMANDS:
             raise SystemExit(f"{base} is the import of {store.get_meta('source')}; {args.cmd} works on PastVu base "
@@ -539,8 +551,62 @@ def cmd_index(args, conf, client) -> int:
 def cmd_run(args, conf, client) -> int:
     import stream as sm
     base, store = open_base(args, conf)
+    if store.get_meta("kind") == "replica":
+        with locked(store, "run", "run"):
+            return run_replica(args, conf, client, base, store)
     with locked(store, "run", "run"):
         return run_locked(args, conf, client, base, store, sm)
+
+
+def run_replica(args, conf, client, base: Path, store: Store) -> int:
+    """run on a shared pick: download and rebuild its photos (replica.py)."""
+    import replica as rp
+    defaults = getattr(args, "run_defaults", {})
+    given = [d for d, v in defaults.items() if d not in REPLICA_OPTIONS and getattr(args, d, v) != v]
+    if given:
+        names = ", ".join("--" + d.replace("_", "-") for d in given)
+        raise SystemExit(f"{base} is a shared pick: run rebuilds it as it is and takes no {names}")
+    c = rp.counts(store)
+    print(f"{base}: the shared pick {store.get_meta('replica_name')}, {c.get('total', 0):,} photos; "
+          f"{c.get('done', 0):,} saved, {c.get('skipped', 0):,} skipped, {c.get('failed', 0):,} failed so far", flush=True)
+    run = rp.Run(store, base, client, fetchers=args.fetchers or conf.fetchers, workers=prepare_workers_of(args),
+                 retries=args.retries, limit=args.limit, report_every=args.report_every,
+                 display="json" if args.json_progress else "quiet" if args.quiet else "live")
+    res = run.run()
+    c = rp.counts(store)
+    left = len(rp.pending(store, args.retries))
+    if res["taken"]:
+        print(f"This run: {rp.describe(res['stats'])} in {res['seconds'] / 60:.1f} min"
+              + (f"; LaMa on the {res['lama']}" if res.get("lama") else "") + ".")
+    print(f"The pick: {c.get('done', 0):,} of {c.get('total', 0):,} saved ({c.get(rp.IDENTICAL, 0):,} identical, "
+          f"{c.get(rp.REBUILT, 0):,} rebuilt, {c.get(rp.CHANGED, 0):,} from a changed original), "
+          f"{c.get('skipped', 0):,} skipped, {c.get('failed', 0):,} failed. Left to do: {left:,}.")
+    report = rp.write_report(store, base, args.retries)
+    if report is not None:
+        print(f"The photos skipped or failed for good are listed in {report}.")
+    if left and not res.get("stopped"):
+        print("Run the same command again to do the rest.")
+    return 0
+
+
+def cmd_share(args, conf, client) -> int:
+    """share <pick folder>: the pick as one zip that a partner rebuilds with run (share.py)."""
+    import share
+    base, store = open_base(args, conf)
+    with locked(store, "share", "shared"):
+        res = share.build(store, base, Path(args.pick), Path(args.out) if args.out else None, args.name,
+                          args.embeddings)
+    print(f"{res['zip']}: {res['bytes'] / 2**20:,.0f} MB, {res['records']:,} photos ({res['pick_bytes'] / 1e9:,.1f} "
+          f"GB in the pick), {res['sidecars']:,} sidecars; {res['dropped_values']:,} local paths taken out of the "
+          f"records" + (f"; {res['left_out']:,} photos no longer in the folder left out" if res['left_out'] else ""))
+    if res.get("missing_records"):
+        print(f"  {res['missing_records']:,} picked photos have no record in the store and are not in the zip")
+    print(f"  sha256 {res['sha256']}")
+    print(f"  The instructions name the program at commit {res['commit']}.")
+    if res.get("dirty"):
+        print("  The pastvu folder has changes that are not committed: commit and push them before the partner "
+              "downloads the program, or the commit named in the instructions lacks them.")
+    return 0
 
 
 def run_locked(args, conf, client, base: Path, store: Store, sm) -> int:
@@ -568,7 +634,9 @@ def run_locked(args, conf, client, base: Path, store: Store, sm) -> int:
         else:
             sc = do_index(args, client, store, sc)
     else:
-        raise SystemExit("give --region (an alias, a region number or a title) or --scope NAME")
+        raise SystemExit("give --region (an alias, a region number or a title) or --scope NAME. To rebuild a "
+                         f"shared pick, [paths] base in the conf (now {base}) must be the folder that holds its "
+                         f"pastvu.db.")
     names = sorted(scopes) if scopes else [sc["name"]]
     fields = parse_fields(args.txt_fields)
     n = sum(sm.cleanup_interrupted(store, base, name) for name in names)
@@ -2426,6 +2494,15 @@ def parse_args(argv=None):
     p.add_argument("--samples", metavar="DIR", help="classify samples folder (default: [paths] samples of the conf)")
     p.add_argument("--patches", type=int, default=576, metavar="N", help="encoder patch budget (default 576)")
 
+    p = sub.add_parser("share", help="a cherrypick folder as one zip (its database, a conf and instructions) that a "
+                                     "partner rebuilds from PastVu with run, without the images")
+    p.add_argument("pick", metavar="DIR", help="the output folder of a cherrypick of this base")
+    p.add_argument("-o", "--out", metavar="FILE", help="the zip (default: <pick parent>/<name>_share.zip)")
+    p.add_argument("--name", metavar="NAME",
+                   help="the folder name of the pick at the partner's (default: the pick folder's name)")
+    p.add_argument("--embeddings", action="store_true",
+                   help="also share the classifier's embeddings (about 2.3 KB a photo; the rebuild does not need them)")
+
     p = sub.add_parser("regroup", help="move saved photos into scopes by decade, country or region, no downloads")
     p.add_argument("target", nargs="*", metavar="SCOPE",
                    help="scopes to split (names, folders or patterns); none: group every scope of the base")
@@ -2437,6 +2514,8 @@ def parse_args(argv=None):
     p.add_argument("scope", nargs="+", metavar="SCOPE", help="a scope's name, folder or name pattern")
     p.add_argument("--yes", action="store_true", help="delete; without it, only show what would be deleted")
     args = ap.parse_args(argv)
+    if args.cmd == "run":                     # run on a shared pick refuses every option but the pace ones
+        args.run_defaults = {a.dest: a.default for a in run_p._actions if a.dest not in ("help",)}
     if args.cmd in ("niqe", "detect") and args.follow and (args.limit is not None or args.redo):
         ap.error("--follow waits for new photos; give --limit and --redo without it")
     if args.cmd == "run" and args.raw:
@@ -2473,7 +2552,7 @@ def main(argv=None) -> int:
                 "export": cmd_export, "autocaption": cmd_autocaption, "regroup": cmd_regroup, "drop": cmd_drop,
                 "extract": cmd_extract, "import": cmd_import, "cleanup": cmd_cleanup,
                 "cherrypick": cmd_cherrypick, "niqe": cmd_niqe, "detect": cmd_detect,
-                "deduplicate": cmd_deduplicate}
+                "deduplicate": cmd_deduplicate, "share": cmd_share}
         return cmds[args.cmd](args, conf, client)
     finally:
         client.close()

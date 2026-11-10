@@ -194,6 +194,7 @@ run.bat export <scope> [...] [--format jsonl|parquet]
 run.bat import --dataset <folder> [-o <folder>] [--against <base>] [--top color|category|none] [--quality-threshold X] [--split N] [--limit N]
 run.bat --base <import folder> reclassify [--dry-run] [--yes]
 run.bat cherrypick [<0.85 | 30 | 5000> ...] -o <folder> [--balance 70] [--decades 1960s 1970s] [--interest] [--link] [--prune]
+run.bat share <pick folder> [-o <zip>] [--name NAME] [--embeddings]
 run.bat extract <category> [...] [--region R] [--years A B | --decade D] [--bw | --color] [--min-res N]
                    [--target N [--colour-share X]] [-o DIR]
 run.bat scopes | aliases | count --region <alias> | regions [--find TEXT]
@@ -645,6 +646,31 @@ Picks the best photos of every category, by the quality probe, into one folder f
 - **Interest** (`--interest`): the quality probe is not a judge of composition, so each category can be ordered first by what `detect` found in the photos ([What is in the picture](#what-is-in-the-picture-detect)). Each category has a rule, by its name after the number: transport takes `vehicle` (the largest vehicle covers 6 to 70 % of the frame and at least 30 % of its width: the tram in its street passes, the parking lot and the wide square fail); people_adult and people_children take `people`, which reads bodies, since the clothes and the activity of the period are the subject (the tallest person at least 35 % of the frame's height, or at least 2 persons each 20 % tall: the vendor with the queue behind and the workers at their bench pass, the ceremony of dots fails; no face is needed, and `face_height` in the conf adds a face check); the group photo categories take `group` (at least 4 persons and a face of 3 %); futurism, objects and military take `thing` (the largest vehicle or object covers at least 8 %: the big thing of any name); environment_indoors takes `life` (a person at least 8 % tall or a vehicle: an interior with someone in it before an empty one) and environment_outdoors takes `street`, the stricter form for a category with a large pool (2 persons at least 8 % tall, or 5 persons of any size, or a vehicle covering at least 2 % of the frame: the street with passers-by, the parade of small figures and the tram pass, the facade with one pedestrian or a car parked far off fails); faces in street scenes are too small to ask for; school and every other name take `pass` (school's value is the uniform, and a floor such as `school = 0.5` in `[cherrypick]` takes all of it). The rule `presence` (a person with a face) stays available for `rule.<name>`. A photo whose rule passes comes first, then a photo without a boxes row or in a category of rule `pass`, then a photo whose rule fails, and within a tier the quality order holds. The ceilings then cut the bucket exactly as without `--interest`, so the ordering removes nothing: a category short of interesting photos fills up with its best others, a category of rule `pass` picks the same photos as without, and the quality floor stays a floor. The table gains the picked per tier (interesting / unknown / not), which with `--dry-run` is how the thresholds of `[interest]` in the conf are tuned; `rule.<name> = <rule>` there changes a category's rule. The manifest records the rules, the thresholds and the word list's hash. Without `--interest` the picks are as before.
 - **What the score is.** The probe was trained to find film frames and soft scans, and its order holds beyond that: in both modes the top is sharp, well-exposed and clear, the bottom faded, halftone or damaged. It is not a judge of composition. It favours late decades (sharp press photos and slides), so the top 30 % of black-and-white holds fewer 1910s-1940s photos than the base; `--decades` holds a decade's share. The threshold treats categories unequally (at 0.8, transport keeps two thirds, postcards almost nothing, since reproductions look like the probe's "bad"); the percentile and the number per category take the best of each category whatever its scores, so the threshold is best used as a floor under them.
 
+## Share a pick: `share`
+
+```
+run.bat share D:\training -o D:\training_share.zip
+run.bat share D:\training --name soviet_pick
+```
+
+Sends a pick to someone else without its images. A pick of 100,000 photos is about 100 GB, and its database is about 100 MB. `share` writes the database and a conf into one zip; the partner downloads the originals from PastVu and rebuilds the pick on their own computer with `run.bat run`.
+
+**The zip** holds three files:
+- `<name>\pastvu.db` is a base store with the picked photos only: their PastVu records, boxes, NIQE and hashes, a pending status row each, and the `replica` table. That table holds the photo's path in the pick, the text of its sidecars there (the captions), and the sha256 of the original download and of the saved file. The records lose their reclassify and review history and every value that is a local path. `--embeddings` adds the classifier's embeddings (about 2.3 KB a photo), which the rebuild does not read.
+- `pastvu.conf` has `[paths] base` and `fetchers`.
+- `README_RU.txt` is the partner's instructions, in Russian: install, unpack, edit one line, run.
+
+**The name.** `<name>` is the pick folder's name unless `--name` gives another, and it is the folder the partner makes. The photos are the ones the pick folder holds now: an image deleted from the folder by hand is left out. The instructions name the repository's commit; when the pastvu folder has changes that are not committed, `share` says so, since the partner downloads the program from GitHub.
+
+**The rebuild** (`replica.py`) needs no detector, border analysis or classifier. The record of each photo says what the download did: the band rows, the downscale (and whether a later `reprocess` made it), the crop box on the JPEG grid, and the painted watermark boxes. So `run` on such a base downloads each original and replays those steps; only LaMa is loaded, for the photos that had a watermark painted out.
+- An original whose sha256 is ours gives the same file: on a test of 275 photos of every kind, every lossless crop, every downscale and every painted photo was byte-identical. The exception is photos our base downscaled before 2026-11-05 with Lanczos: the rebuild uses area averaging, at median PSNR 41 to 47 dB. LaMa on another GPU paints a few pixels otherwise, too.
+- An original that PastVu no longer has: PastVu is asked for the record. A photo gone or not public is skipped with that reason. A new file with the same picture size is rebuilt with its own band (outcome `original changed`); anything else is skipped as `changed on PastVu`.
+- The CPU work runs in worker processes, and painted photos run with LaMa on the GPU (on the CPU when CUDA does not work). Twice as many threads as `fetchers` share the work, so PastVu never sees more than `fetchers` requests at once.
+- A photo is written like a download: claimed, then its image and sidecars are written, then the status and the outcome (`identical`, `rebuilt`, `original changed`) are committed together. Ctrl+C finishes the photos in hand; the same command continues. A failed photo is tried again by the next run, up to `--retries`.
+- At the end, `<base>\_reports\replica-missing.tsv` lists the photos skipped or failed for good, with their PastVu pages. A replica base takes no other command, and `run` on it takes only the pace options (`--limit`, `--retries`, `--fetchers`, `--quiet`, ...).
+
+`install.bat replica` installs only what the rebuild needs, into `..\venv` (made when missing): torch for LaMa, the packages of `requirements-replica.txt`, `turbojpeg.dll` and the LaMa weights. It needs no classify, no detector and no root `install.bat`.
+
 ## Extract
 
 ```
@@ -822,6 +848,8 @@ Each record carries what attribution and a takedown need: the PastVu page, the u
 | `cleanup.py` | the review of saved photos by their quality: `cleanup`, `--done`, `--undo` |
 | `cherrypick.py` | the training set picked by quality, balanced between colour and black-and-white, with a setting per category from the conf |
 | `interest.py` | the rules of `cherrypick --interest` on the boxes rows, and the tier of each photo |
+| `share.py`, `share_templates\` | `share`: a pick as one zip of its database, a conf and the Russian instructions |
+| `replica.py` | `run` on a shared pick: the download and the replay of each photo from its record |
 | `autocaption.py` | the VLM client, the caption runs, and undo |
 | `detect.py` | the box statistics of the saved photos (YOLOE-26l with text prompts and the face model), and the `detect` command |
 | `vram.py` | the GPU memory of the whole card, through NVML |
@@ -837,3 +865,4 @@ Each record carries what attribution and a takedown need: the PastVu page, the u
 | `fetch_turbojpeg.py` | fetches `turbojpeg.dll` into `bin\` |
 | `pastvu.conf.example` | the example conf with the aliases |
 | `install.bat`, `run.bat`, `requirements.txt` | install into the shared venv, run with it |
+| `requirements-replica.txt` | what `install.bat replica` installs for the rebuild of a shared pick |

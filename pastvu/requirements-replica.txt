@@ -1,0 +1,16 @@
+# What install.bat replica puts into the shared venv: the rebuild of a shared pick
+# (run on a base made by share) needs no classifier and no detector. torch and
+# torchvision come from the PyTorch CUDA index first (LaMa); everything else from PyPI.
+numpy>=2.0
+pillow>=10.0
+# decode, area downscale and LaMa's windows; opencv-python, not the headless build,
+# because the venv is shared with tools that need opencv-python
+opencv-python>=4.8
+# remove_borders' lossless JPEG paths
+jpeglib>=1.0
+httpx>=0.27
+rich>=13.0
+# the in-memory lossless JPEG crop; the DLL comes from fetch_turbojpeg.py
+PyTurboJPEG>=2.0
+# only for fetch_turbojpeg.py: the conda package holds a zstd-compressed tar
+zstandard>=0.22
