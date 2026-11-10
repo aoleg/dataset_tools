@@ -34,7 +34,7 @@ from store import PENDING, Store
 
 HERE = Path(__file__).resolve().parent
 TEMPLATES = HERE / "share_templates"
-CONF_TEMPLATE = TEMPLATES / "pastvu.conf"
+CONF_TEMPLATE = TEMPLATES / "conf.template"      # pastvu.conf in the zip (that name is git-ignored)
 README_TEMPLATE = TEMPLATES / "README_RU.txt"
 REPO_URL = "https://github.com/aoleg/dataset_tools"
 DROP_KEYS = ("reclassified", "reviewed")          # record keys that hold local folders and our own history
