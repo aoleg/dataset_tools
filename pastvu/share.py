@@ -150,7 +150,7 @@ def build_db(src_db: Path, pick: Path, files: dict[int, str], criteria: dict, pa
             "INSERT INTO main.status (cid, state, reason, attempts, scope, category, mode, updated) "
             "SELECT p.cid, ?, '', 0, ?, s.category, s.mode, ? FROM temp.pick p JOIN src.status s ON s.cid=p.cid",
             (PENDING, rp.SCOPE, now)).rowcount
-        dropped = shared = 0
+        dropped = shared = download_bytes = 0
         src_sha = dict(db.execute("SELECT s.cid, s.sha256 FROM src.status s JOIN temp.pick p ON p.cid=s.cid"))
         t0 = time.time()
         rows = db.execute("SELECT r.cid, r.json FROM src.records r JOIN temp.pick p ON p.cid=r.cid").fetchall()
@@ -159,6 +159,7 @@ def build_db(src_db: Path, pick: Path, files: dict[int, str], criteria: dict, pa
         for i, (cid, text) in enumerate(rows, 1):
             rec, n = clean_record(json.loads(text))
             dropped += n
+            download_bytes += int((rec.get("download") or {}).get("bytes") or 0)
             recs.append((cid, json.dumps(rec, ensure_ascii=False, separators=(",", ":"))))
             img = pick / files[cid]
             cars = {}
@@ -186,7 +187,7 @@ def build_db(src_db: Path, pick: Path, files: dict[int, str], criteria: dict, pa
         db.execute("DETACH DATABASE src")
         db.execute("VACUUM")
         res.update(records=len(recs), dropped_values=dropped, sidecars=sidecar_files, sidecar_bytes=sidecar_bytes,
-                   unreadable=unreadable, missing_records=missing)
+                   unreadable=unreadable, missing_records=missing, download_bytes=download_bytes)
         return res
     finally:
         db.close()
@@ -229,7 +230,7 @@ def build(store, base: Path, pick: Path, out: Path | None = None, name: str | No
         size =sum((pick / rel).stat().st_size for rel in present.values())
         commit = repo_commit()
         values = {"name": name, "photos": f"{res['records']:,}".replace(",", " "),
-                  "gb": f"{size / 1e9:.0f}", "commit": commit, "repo": REPO_URL, "format": rp.FORMAT,
+                  "gb": f"{size / 1e9:.0f}", "dl_gb": f"{res['download_bytes'] / 1e9:.0f}", "commit": commit, "repo": REPO_URL, "format": rp.FORMAT,
                   "date": time.strftime("%Y-%m-%d")}
         out.parent.mkdir(parents=True, exist_ok=True)
         tmp_zip = work / out.name
