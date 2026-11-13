@@ -43,7 +43,9 @@ cherrypick.json in the
 output holds, per base, the criteria and the files, so an import and the
 PastVu base can go into one folder. A rerun copies what is selected and
 missing, keeps what is there, reports the files of this base that are no
-longer selected, and deletes them with --prune.
+longer selected, and deletes them with --prune. A photo the manifest lists as
+excluded (moved out by curate) is never copied again; it still counts in the
+ceilings, so the folder holds that many fewer.
 """
 
 from __future__ import annotations
@@ -473,13 +475,18 @@ def write(picked: dict[int, dict], base: Path, out: Path, criteria: dict, order:
     mine = manifest["bases"].get(str(base), {})
     old = {int(k): v for k, v in (mine.get("files") or {}).items()}
     present = {cid: rel for cid, rel in old.items() if (out / rel).is_file()}
-    stats = Counter({k: 0 for k in ("copied", "linked", "there", "new", "failed", "gone", "stale", "pruned")})
+    excluded = {int(c) for c in mine.get("excluded") or []}      # moved out by curate: never copied again
+    stats = Counter({k: 0 for k in ("copied", "linked", "there", "new", "failed", "gone", "stale", "pruned",
+                                    "excluded")})
     numbered = None
     if split > 0:
         numbered = xt.Numbered(split, layout.chunk_width(len(picked) + len(present), split), present.values())
     files = dict(present)
     t0 = time.time()
     for i, (cid, ph) in enumerate(sorted(picked.items()), 1):
+        if cid in excluded and cid not in present:
+            stats["excluded"] += 1
+            continue
         if cid in present:
             stats["there"] += 1
             continue
@@ -533,7 +540,8 @@ def write(picked: dict[int, dict], base: Path, out: Path, criteria: dict, order:
     if not dry_run:
         out.mkdir(parents=True, exist_ok=True)
         manifest["bases"][str(base)] = {"criteria": criteria, "time": time.time(),
-                                        "files": {str(k): v for k, v in sorted(files.items())}}
+                                        "files": {str(k): v for k, v in sorted(files.items())},
+                                        **({"excluded": sorted(excluded)} if excluded else {})}
         (out / MANIFEST).write_text(json.dumps(manifest, ensure_ascii=False, indent=1), encoding="utf-8")
     stats["selected"] = len(picked)
     return dict(stats)

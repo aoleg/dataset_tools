@@ -536,6 +536,89 @@ class Run:
                 "stopped": self.stop.is_set(), "lama": self.lama.device}
 
 
+# --- snapshot: what the partner kept ---------------------------------------------------------
+
+SNAPSHOT_KIND = "pastvu-curation"
+SNAPSHOT_FORMAT = 1
+
+
+def scan_images(base: Path) -> dict[int, list[str]]:
+    """Every image under the base whose name is a photo number -> its paths relative to the base
+    (a photo can be there twice). _reports and other folders starting with _ are left out."""
+    import os
+    import layout
+    found: dict[int, list[str]] = {}
+    other = []
+    for dirpath, dirnames, filenames in os.walk(base):
+        dirnames[:] = [d for d in dirnames if not d.startswith("_")]
+        for name in filenames:
+            stem, ext = os.path.splitext(name)
+            if ext.lower() not in layout.IMAGE_EXTS:
+                continue
+            rel = Path(dirpath, name).relative_to(base).as_posix()
+            if stem.isdigit():
+                found.setdefault(int(stem), []).append(rel)
+            else:
+                other.append(rel)
+    found[-1] = other                                  # the images whose name is no photo number
+    return found
+
+
+def snapshot(store, base: Path) -> dict:
+    """The curation of a rebuilt pick: kept (saved by run and still in the folder, wherever it
+    is now), deleted (saved by run, no image of that number left), never received (skipped or
+    failed by run, or not done yet), moved (kept under another path), and images that are no
+    photo of the pick."""
+    found = scan_images(base)
+    other = found.pop(-1)
+    with store.lock:
+        rows = store.db.execute("SELECT s.cid, s.state, s.reason, s.path, r.path FROM status s "
+                                "JOIN replica r ON r.cid=s.cid ORDER BY s.cid").fetchall()
+    kept, deleted, never, moved = [], [], {}, {}
+    known = set()
+    for cid, state, reason, saved, target in rows:
+        known.add(cid)
+        here = found.get(cid) or []
+        if state != DONE:
+            never[str(cid)] = reason or state
+            continue
+        if not here:
+            deleted.append(cid)
+            continue
+        kept.append(cid)
+        if saved not in here:
+            moved[str(cid)] = here[0]
+    unknown = sorted(rel for cid, rels in found.items() if cid not in known for rel in rels) + sorted(other)
+    return {"kind": SNAPSHOT_KIND, "format": SNAPSHOT_FORMAT, "name": store.get_meta("replica_name"),
+            "replica_made": store.get_meta("replica_made"), "made": time.time(),
+            "made_text": time.strftime("%Y-%m-%d %H:%M"), "photos": len(rows),
+            "kept": kept, "deleted": deleted, "never": never, "moved": moved,
+            "unknown": len(unknown), "unknown_sample": unknown[:50]}
+
+
+def write_snapshot(snap: dict, base: Path) -> Path:
+    import gzip
+    path = base / f"curation-{time.strftime('%Y%m%d-%H%M', time.localtime(snap['made']))}.json.gz"
+    with gzip.open(path, "wt", encoding="utf-8") as f:
+        json.dump(snap, f, ensure_ascii=False)
+    return path
+
+
+def read_snapshot(path: Path) -> dict:
+    import gzip
+    try:
+        opener = gzip.open if Path(path).suffix.lower() == ".gz" else open
+        with opener(path, "rt", encoding="utf-8") as f:
+            snap = json.load(f)
+    except (OSError, ValueError) as e:
+        raise SystemExit(f"{path}: not a curation snapshot ({type(e).__name__}: {e})")
+    if not isinstance(snap, dict) or snap.get("kind") != SNAPSHOT_KIND:
+        raise SystemExit(f"{path}: not a curation snapshot (made by run.bat snapshot on a shared pick)")
+    if int(snap.get("format") or 0) > SNAPSHOT_FORMAT:
+        raise SystemExit(f"{path} was made by a newer version of the tool; update the repository")
+    return snap
+
+
 def describe(s: dict) -> str:
     parts = [f"{s.get('saved', 0):,} saved ({s.get(IDENTICAL, 0):,} identical, {s.get(REBUILT, 0):,} rebuilt, "
              f"{s.get(CHANGED, 0):,} from a changed original)"]

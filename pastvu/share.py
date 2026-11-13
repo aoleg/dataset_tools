@@ -36,6 +36,7 @@ HERE = Path(__file__).resolve().parent
 TEMPLATES = HERE / "share_templates"
 CONF_TEMPLATE = TEMPLATES / "conf.template"      # pastvu.conf in the zip (that name is git-ignored)
 README_TEMPLATE = TEMPLATES / "README_RU.txt"
+SNAPSHOT_TEMPLATE = TEMPLATES / "SNAPSHOT_RU.txt"      # how to send the curation back (snapshot)
 REPO_URL = "https://github.com/aoleg/dataset_tools"
 DROP_KEYS = ("reclassified", "reviewed")          # record keys that hold local folders and our own history
 LOCAL_PATH = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\)")
@@ -238,6 +239,7 @@ def build(store, base: Path, pick: Path, out: Path | None = None, name: str | No
             z.write(dbp, f"{name}/pastvu.db")
             z.writestr("pastvu.conf", fill(CONF_TEMPLATE, values).encode("utf-8"))
             z.writestr("README_RU.txt", fill(README_TEMPLATE, values).encode("utf-8"))
+            z.writestr("SNAPSHOT_RU.txt", fill(SNAPSHOT_TEMPLATE, values).encode("utf-8"))
         shutil.move(str(tmp_zip), out)
         digest = hashlib.sha256(out.read_bytes()).hexdigest()
         res.update(zip=str(out), bytes=out.stat().st_size, pick_bytes=size, commit=commit, sha256=digest,

@@ -72,7 +72,7 @@ IMPORT_COMMANDS = ("reclassify", "cleanup", "cherrypick", "autocaption", "scopes
                    "deduplicate")
 IMPORT_TOPS = ("color", "category", "none")
 # A shared pick (share, replica.py): run rebuilds it; the options it takes are the pace ones.
-REPLICA_COMMANDS = ("run",)
+REPLICA_COMMANDS = ("run", "snapshot")
 REPLICA_OPTIONS = ("limit", "retries", "report_every", "quiet", "json_progress", "fetchers", "read_timeout",
                    "image_deadline", "prepare_workers")
 # The options of the processing: a raw run (run --raw) refuses them, since it processes nothing.
@@ -586,6 +586,56 @@ def run_replica(args, conf, client, base: Path, store: Store) -> int:
         print(f"The photos skipped or failed for good are listed in {report}.")
     if left and not res.get("stopped"):
         print("Run the same command again to do the rest.")
+    return 0
+
+
+def cmd_snapshot(args, conf, client) -> int:
+    """snapshot on a shared pick: what the partner kept and deleted, as one file to send back."""
+    import replica as rp
+    where = Path(args.base).resolve() if getattr(args, "base", None) else conf.need_base()
+    if not (where / DB_NAME).is_file():                # a wrong base line: say so, make nothing
+        raise SystemExit(f"{where} holds no {DB_NAME}: [paths] base in the conf must be the folder of the shared pick")
+    base, store = open_base(args, conf)
+    if store.get_meta("kind") != "replica":
+        raise SystemExit(f"{base} is not a shared pick; snapshot works on the folder that run.bat run rebuilt")
+    with locked(store, "snapshot", "shared"):
+        snap = rp.snapshot(store, base)
+    path = rp.write_snapshot(snap, base)
+    print(f"{base}: {snap['photos']:,} photos in the pick; {len(snap['kept']):,} kept, {len(snap['deleted']):,} "
+          f"deleted, {len(snap['never']):,} never received" + (f", {len(snap['moved']):,} kept in another folder"
+                                                                if snap['moved'] else "")
+          + (f"; {snap['unknown']:,} other images ignored" if snap['unknown'] else "") + ".")
+    print(f"Send this file: {path}")
+    return 0
+
+
+def cmd_curate(args, conf, client) -> int:
+    """curate <pick> --from <snapshot>: move the photos the partner deleted out of the pick (curate.py)."""
+    import curate as cu
+    import replica as rp
+    base = Path(args.base).resolve() if args.base else conf.need_base()
+    pick = Path(args.pick).resolve()
+    dd = cu.deleted_dir(pick)
+    if args.undo:
+        res = cu.undo(pick, base)
+        print(f"curate run {res['run']} undone: {res['back']:,} photos back in {pick}"
+              + (f", {res['gone']:,} no longer in {dd}" if res["gone"] else "")
+              + (f", {res['blocked']:,} left there (a file of that name is in the pick)" if res["blocked"] else ""))
+        return 0
+    if not args.source:
+        raise SystemExit("give --from <snapshot file> (curation-....json.gz from the partner), or --undo")
+    snap = rp.read_snapshot(Path(args.source))
+    p = cu.plan(pick, base, snap)
+    print("\n".join(cu.summary(p, snap)))
+    if args.dry_run:
+        print(f"Dry run: nothing moved. Without --dry-run the {len(p['moves']):,} photos go to {dd}.")
+        return 0
+    res = cu.apply(pick, base, p, Path(args.source).name)
+    print(f"curate run {res['run']}: {res['moved']:,} photos moved to {dd}"
+          + (f", {res['conflict']:,} left (a file of that name is there)" if res["conflict"] else "")
+          + (f", {res['failed']:,} failed" if res["failed"] else "")
+          + f". {res['excluded']:,} photos are excluded from later cherrypicks into this folder; curate --undo "
+            f"puts this run back.")
     return 0
 
 
@@ -1627,6 +1677,8 @@ def cmd_cherrypick(args, conf, client) -> int:
                                     **conf.interest.thresholds()}
         res = cp.write(picked, base, out, criteria, None if no_modes else export_layout_of(conf), args.split,
                        args.link, args.prune, args.dry_run, record=not store.is_import)
+        if res.get("excluded"):
+            print(f"  {res['excluded']:,} picked photos were moved out by curate and are not copied again")
         if args.dry_run:
             print(f"Dry run: {res['new']:,} to copy into {out}, {res['there']:,} there already, "
                   f"{res['stale']:,} files of this base there that are no longer picked")
@@ -2503,6 +2555,16 @@ def parse_args(argv=None):
     p.add_argument("--embeddings", action="store_true",
                    help="also share the classifier's embeddings (about 2.3 KB a photo; the rebuild does not need them)")
 
+    sub.add_parser("snapshot", help="on a shared pick: list what was kept and deleted since run rebuilt it, as one "
+                                    "file to send back")
+
+    p = sub.add_parser("curate", help="move the photos a partner deleted from a shared pick (their snapshot) out of "
+                                      "this pick into <pick>_deleted; --undo puts them back")
+    p.add_argument("pick", metavar="DIR", help="the cherrypick folder that was shared")
+    p.add_argument("--from", dest="source", metavar="FILE", help="the partner's snapshot (curation-....json.gz)")
+    p.add_argument("--dry-run", action="store_true", help="count, move nothing")
+    p.add_argument("--undo", action="store_true", help="move the last curate run back")
+
     p = sub.add_parser("regroup", help="move saved photos into scopes by decade, country or region, no downloads")
     p.add_argument("target", nargs="*", metavar="SCOPE",
                    help="scopes to split (names, folders or patterns); none: group every scope of the base")
@@ -2552,7 +2614,8 @@ def main(argv=None) -> int:
                 "export": cmd_export, "autocaption": cmd_autocaption, "regroup": cmd_regroup, "drop": cmd_drop,
                 "extract": cmd_extract, "import": cmd_import, "cleanup": cmd_cleanup,
                 "cherrypick": cmd_cherrypick, "niqe": cmd_niqe, "detect": cmd_detect,
-                "deduplicate": cmd_deduplicate, "share": cmd_share}
+                "deduplicate": cmd_deduplicate, "share": cmd_share, "snapshot": cmd_snapshot,
+                "curate": cmd_curate}
         return cmds[args.cmd](args, conf, client)
     finally:
         client.close()

@@ -195,6 +195,8 @@ run.bat import --dataset <folder> [-o <folder>] [--against <base>] [--top color|
 run.bat --base <import folder> reclassify [--dry-run] [--yes]
 run.bat cherrypick [<0.85 | 30 | 5000> ...] -o <folder> [--balance 70] [--decades 1960s 1970s] [--interest] [--link] [--prune]
 run.bat share <pick folder> [-o <zip>] [--name NAME] [--embeddings]
+run.bat snapshot
+run.bat curate <pick folder> --from <snapshot> [--dry-run] | --undo
 run.bat extract <category> [...] [--region R] [--years A B | --decade D] [--bw | --color] [--min-res N]
                    [--target N [--colour-share X]] [-o DIR]
 run.bat scopes | aliases | count --region <alias> | regions [--find TEXT]
@@ -655,10 +657,11 @@ run.bat share D:\training --name soviet_pick
 
 Sends a pick to someone else without its images. A pick of 100,000 photos is about 100 GB, and its database is about 100 MB. `share` writes the database and a conf into one zip; the partner downloads the originals from PastVu and rebuilds the pick on their own computer with `run.bat run`.
 
-**The zip** holds three files:
+**The zip** holds four files:
 - `<name>\pastvu.db` is a base store with the picked photos only: their PastVu records, boxes, NIQE and hashes, a pending status row each, and the `replica` table. That table holds the photo's path in the pick, the text of its sidecars there (the captions), and the sha256 of the original download and of the saved file. The records lose their reclassify and review history and every value that is a local path. `--embeddings` adds the classifier's embeddings (about 2.3 KB a photo), which the rebuild does not read.
 - `pastvu.conf` has `[paths] base` and `fetchers`.
 - `README_RU.txt` is the partner's instructions, in Russian: install, unpack, edit one line, run.
+- `SNAPSHOT_RU.txt` tells the partner how to send their curation back ([Curate](#curate-what-the-partner-kept)).
 
 **The name.** `<name>` is the pick folder's name unless `--name` gives another, and it is the folder the partner makes. The photos are the ones the pick folder holds now: an image deleted from the folder by hand is left out. The instructions name the repository's commit; when the pastvu folder has changes that are not committed, `share` says so, since the partner downloads the program from GitHub.
 
@@ -667,9 +670,36 @@ Sends a pick to someone else without its images. A pick of 100,000 photos is abo
 - An original that PastVu no longer has: PastVu is asked for the record. A photo gone or not public is skipped with that reason. A new file with the same picture size is rebuilt with its own band (outcome `original changed`); anything else is skipped as `changed on PastVu`.
 - The CPU work runs in worker processes, and painted photos run with LaMa on the GPU (on the CPU when CUDA does not work). Twice as many threads as `fetchers` share the work, so PastVu never sees more than `fetchers` requests at once.
 - A photo is written like a download: claimed, then its image and sidecars are written, then the status and the outcome (`identical`, `rebuilt`, `original changed`) are committed together. Ctrl+C finishes the photos in hand; the same command continues. A failed photo is tried again by the next run, up to `--retries`.
-- At the end, `<base>\_reports\replica-missing.tsv` lists the photos skipped or failed for good, with their PastVu pages. A replica base takes no other command, and `run` on it takes only the pace options (`--limit`, `--retries`, `--fetchers`, `--quiet`, ...).
+- At the end, `<base>\_reports\replica-missing.tsv` lists the photos skipped or failed for good, with their PastVu pages. A replica base takes only `run` and `snapshot`, and `run` on it takes only the pace options (`--limit`, `--retries`, `--fetchers`, `--quiet`, ...).
 
 `install.bat replica` installs only what the rebuild needs, into `..\venv` (made when missing): torch for LaMa, the packages of `requirements-replica.txt`, `turbojpeg.dll` and the LaMa weights. It needs no classify, no detector and no root `install.bat`.
+
+### Curate: what the partner kept
+
+```
+run.bat snapshot                                                  (the partner, on the rebuilt pick)
+run.bat curate D:\training --from curation-20261120-1530.json.gz --dry-run
+run.bat curate D:\training --from curation-20261120-1530.json.gz
+run.bat curate D:\training --undo
+```
+
+The partner deletes the photos they find of no value from the rebuilt pick, then sends their decision back as one small file. Your pick folder then keeps only what they kept.
+
+**`snapshot`** (on the partner's computer) compares the folder with its `pastvu.db` and writes `<base>\curation-<date>-<time>.json.gz`, under 1 MB. A photo is identified by its number, the name of its image, wherever it is under the base:
+- **kept:** the rebuild saved it, and an image of that number is still there. A photo moved to another folder is kept, and the snapshot records where it is now.
+- **deleted:** the rebuild saved it, and no image of that number is left. A renamed image counts as deleted.
+- **never received:** the rebuild skipped or failed it, so the partner never judged it.
+
+Images whose names are not photos of the pick are counted and ignored, and so are folders whose names start with `_`. A snapshot can be made at any time; each one holds everything deleted so far.
+
+**`curate <pick> --from <snapshot>`** (on your computer) applies it to the pick folder that was shared:
+- It moves every photo the partner deleted, the image and every file of its name, into `<pick>_deleted`, under the same relative path. The folders are siblings on one drive, so a move is a rename; the hard links of a `--link` pick move, and the base is never touched.
+- The photos the partner never received stay, and so do the photos they moved to another category: their move is not repeated here.
+- It stops when the snapshot is of another pick (fewer than 95 % of its photos in the folder) and when `<pick>_deleted` exists without curate's log.
+- `--dry-run` prints the counts and moves nothing.
+- The moved photos are written into the folder's `cherrypick.json` as `excluded`. A later `cherrypick` into the folder does not copy them again. They still count in its ceilings, so the folder holds that many fewer.
+- A second snapshot moves only the photos deleted since the first; the ones moved before are counted apart.
+- Every run is logged in `<pick>_deleted\curate-log.json`. `--undo` moves the last run back and takes its photos off the excluded list.
 
 ## Extract
 
@@ -849,7 +879,8 @@ Each record carries what attribution and a takedown need: the PastVu page, the u
 | `cherrypick.py` | the training set picked by quality, balanced between colour and black-and-white, with a setting per category from the conf |
 | `interest.py` | the rules of `cherrypick --interest` on the boxes rows, and the tier of each photo |
 | `share.py`, `share_templates\` | `share`: a pick as one zip of its database, a conf and the Russian instructions |
-| `replica.py` | `run` on a shared pick: the download and the replay of each photo from its record |
+| `replica.py` | `run` on a shared pick: the download and the replay of each photo from its record; `snapshot` |
+| `curate.py` | `curate`: the partner's snapshot applied to the pick folder, and undo |
 | `autocaption.py` | the VLM client, the caption runs, and undo |
 | `detect.py` | the box statistics of the saved photos (YOLOE-26l with text prompts and the face model), and the `detect` command |
 | `vram.py` | the GPU memory of the whole card, through NVML |
